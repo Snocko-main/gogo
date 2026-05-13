@@ -7,8 +7,9 @@ import (
 )
 
 var (
-	responsePool = sync.Pool{New: func() any { return &Response{} }}
-	requestPool  = sync.Pool{New: func() any { return &Request{} }}
+	responsePool   = sync.Pool{New: func() any { return &Response{} }}
+	requestPool    = sync.Pool{New: func() any { return &Request{} }}
+	asyncStatePool = sync.Pool{New: func() any { return &asyncState{} }}
 )
 
 // Handler handles a single HTTP request.
@@ -144,6 +145,23 @@ func (r *Response) End(body string) {
 	r.inner.end(body)
 }
 
+// Send writes status, an optional Content-Type header, and body in a single
+// trip across the C boundary. Pass an empty contentType to omit the header.
+// In async mode the values are buffered like Status/Header/End and flushed
+// together when the asynchronous work completes.
+func (r *Response) Send(status, contentType, body string) {
+	if r.async != nil {
+		r.async.status = status
+		if contentType != "" {
+			r.async.headers = append(r.async.headers, [2]string{"Content-Type", contentType})
+		}
+		r.async.body.WriteString(body)
+		r.flushAsync()
+		return
+	}
+	r.inner.send(status, contentType, body)
+}
+
 // Async marks the response for asynchronous handling and runs fn on a new
 // goroutine. After calling Async, subsequent Status/Header/Write calls buffer
 // Go-side and End flushes the buffered response back onto the event loop with
@@ -156,11 +174,11 @@ func (r *Response) Async(fn func()) {
 	if r.async != nil {
 		return
 	}
-	r.async = &asyncState{
-		aborted: r.OnAborted(),
-		loop:    r.Loop(),
-		status:  "200 OK",
-	}
+	a := asyncStatePool.Get().(*asyncState)
+	a.aborted = r.OnAborted()
+	a.loop = r.Loop()
+	a.status = "200 OK"
+	r.async = a
 
 	go fn()
 }
@@ -177,18 +195,33 @@ func (r *Response) flushAsync() {
 			return
 		}
 		r.Cork(func() {
-			r.inner.status(a.status)
-			for _, h := range a.headers {
-				r.inner.header(h[0], h[1])
+			switch {
+			case len(a.headers) == 0:
+				r.inner.send(a.status, "", a.body.String())
+			case len(a.headers) == 1 && a.headers[0][0] == "Content-Type":
+				r.inner.send(a.status, a.headers[0][1], a.body.String())
+			default:
+				r.inner.status(a.status)
+				for _, h := range a.headers {
+					r.inner.header(h[0], h[1])
+				}
+				r.inner.end(a.body.String())
 			}
-			r.inner.end(a.body.String())
 		})
 	})
 }
 
 func (r *Response) recycle() {
+	if a := r.async; a != nil {
+		a.aborted = nil
+		a.loop = nil
+		a.status = ""
+		a.headers = a.headers[:0]
+		a.body.Reset()
+		asyncStatePool.Put(a)
+		r.async = nil
+	}
 	r.inner = responseNative{}
-	r.async = nil
 	responsePool.Put(r)
 }
 

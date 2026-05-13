@@ -122,6 +122,15 @@ func (r responseNative) end(body string) {
 	C.uwsgo_res_end(r.ptr, unsafeStringData(body), C.size_t(len(body)))
 }
 
+func (r responseNative) send(status, contentType, body string) {
+	C.uwsgo_res_send(
+		r.ptr,
+		unsafeStringData(status), C.size_t(len(status)),
+		unsafeStringData(contentType), C.size_t(len(contentType)),
+		unsafeStringData(body), C.size_t(len(body)),
+	)
+}
+
 func (r responseNative) loop() loopNative {
 	return loopNative{ptr: C.uwsgo_res_get_loop(r.ptr)}
 }

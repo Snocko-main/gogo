@@ -28,6 +28,11 @@ void uwsgo_res_write_status(uwsgo_res_t *res, const char *status, size_t status_
 void uwsgo_res_write_header(uwsgo_res_t *res, const char *key, size_t key_len, const char *value, size_t value_len);
 void uwsgo_res_write(uwsgo_res_t *res, const char *body, size_t body_len);
 void uwsgo_res_end(uwsgo_res_t *res, const char *body, size_t body_len);
+void uwsgo_res_send(
+    uwsgo_res_t *res,
+    const char *status, size_t status_len,
+    const char *content_type, size_t content_type_len,
+    const char *body, size_t body_len);
 
 uwsgo_loop_t *uwsgo_res_get_loop(uwsgo_res_t *res);
 void uwsgo_loop_defer(uwsgo_loop_t *loop, uintptr_t callback_id);

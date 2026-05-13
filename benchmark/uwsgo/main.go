@@ -22,33 +22,21 @@ func main() {
 	defer app.Close()
 
 	app.Get("/plain", func(res *uws.Response, req *uws.Request) {
-		res.
-			Status("200 OK").
-			Header("Content-Type", "text/plain; charset=utf-8").
-			End("hello world\n")
+		res.Send("200 OK", "text/plain; charset=utf-8", "hello world\n")
 	})
 
 	app.Get("/json", func(res *uws.Response, req *uws.Request) {
-		res.
-			Status("200 OK").
-			Header("Content-Type", "application/json").
-			End(`{"message":"hello world","ok":true}` + "\n")
+		res.Send("200 OK", "application/json", `{"message":"hello world","ok":true}`+"\n")
 	})
 
 	app.Get("/hello/:name", func(res *uws.Response, req *uws.Request) {
-		res.
-			Status("200 OK").
-			Header("Content-Type", "text/plain; charset=utf-8").
-			End("hello " + req.Parameter(0) + "\n")
+		res.Send("200 OK", "text/plain; charset=utf-8", "hello "+req.Parameter(0)+"\n")
 	})
 
 	app.Get("/sleep", func(res *uws.Response, req *uws.Request) {
 		res.Async(func() {
 			time.Sleep(2 * time.Millisecond)
-			res.
-				Status("200 OK").
-				Header("Content-Type", "text/plain; charset=utf-8").
-				End("slept\n")
+			res.Send("200 OK", "text/plain; charset=utf-8", "slept\n")
 		})
 	})
 

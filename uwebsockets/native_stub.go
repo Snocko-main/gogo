@@ -24,10 +24,11 @@ func (appNative) listen(int) bool                     { return false }
 func (appNative) run()                                {}
 func (appNative) close()                              {}
 
-func (responseNative) status(string)         {}
-func (responseNative) header(string, string) {}
-func (responseNative) write(string)          {}
-func (responseNative) end(string)            {}
+func (responseNative) status(string)             {}
+func (responseNative) header(string, string)     {}
+func (responseNative) write(string)              {}
+func (responseNative) end(string)                {}
+func (responseNative) send(string, string, string) {}
 func (responseNative) loop() loopNative      { return loopNative{} }
 func (responseNative) onAborted(*Aborted)    {}
 func (responseNative) cork(func())           {}

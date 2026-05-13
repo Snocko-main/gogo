@@ -154,6 +154,19 @@ extern "C" void uwsgo_res_end(uwsgo_res_t *res, const char *body, size_t body_le
     reinterpret_cast<uWS::HttpResponse<false> *>(res)->end(std::string_view(body, body_len));
 }
 
+extern "C" void uwsgo_res_send(
+    uwsgo_res_t *res,
+    const char *status, size_t status_len,
+    const char *content_type, size_t content_type_len,
+    const char *body, size_t body_len) {
+    auto *r = reinterpret_cast<uWS::HttpResponse<false> *>(res);
+    r->writeStatus(std::string_view(status, status_len));
+    if (content_type_len > 0) {
+        r->writeHeader(std::string_view("Content-Type", 12), std::string_view(content_type, content_type_len));
+    }
+    r->end(std::string_view(body, body_len));
+}
+
 extern "C" uwsgo_loop_t *uwsgo_res_get_loop(uwsgo_res_t * /*res*/) {
     // uWS loops are thread-local; calling from a route handler returns the
     // loop that runs the response.
