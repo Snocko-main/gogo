@@ -35,6 +35,11 @@ func (responseNative) cork(func())           {}
 
 func (loopNative) defer_(func()) {}
 
+func (responseNative) beginAsync() (uintptr, uintptr) { return 0, 0 }
+
+func asyncDeferSend(uintptr, uintptr, string, string, string) {}
+func asyncCtxRelease(uintptr)                              {}
+
 func (requestNative) url() string          { return "" }
 func (requestNative) header(string) string { return "" }
 func (requestNative) parameter(int) string { return "" }

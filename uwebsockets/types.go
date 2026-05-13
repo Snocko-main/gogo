@@ -98,11 +98,12 @@ type Response struct {
 }
 
 type asyncState struct {
-	aborted *Aborted
-	loop    *Loop
-	status  string
-	headers [][2]string
-	body    strings.Builder
+	loopPtr     uintptr
+	ctxHandle   uintptr
+	status      string
+	contentType string
+	body        strings.Builder
+	sent        bool
 }
 
 // Status sets the HTTP status text, for example "200 OK" or "404 Not Found".
@@ -116,9 +117,16 @@ func (r *Response) Status(status string) *Response {
 }
 
 // Header writes a response header.
+//
+// In async mode only Content-Type is supported via the fast path. Setting any
+// other header from inside Async panics; use Loop.Defer + Cork directly to
+// build multi-header responses asynchronously.
 func (r *Response) Header(key, value string) *Response {
 	if r.async != nil {
-		r.async.headers = append(r.async.headers, [2]string{key, value})
+		if key != "Content-Type" {
+			panic("uwebsockets: Header in async mode only supports Content-Type; use Loop.Defer/Cork for multi-header async responses")
+		}
+		r.async.contentType = value
 		return r
 	}
 	r.inner.header(key, value)
@@ -147,14 +155,12 @@ func (r *Response) End(body string) {
 
 // Send writes status, an optional Content-Type header, and body in a single
 // trip across the C boundary. Pass an empty contentType to omit the header.
-// In async mode the values are buffered like Status/Header/End and flushed
-// together when the asynchronous work completes.
+// In async mode the values are buffered and flushed together when the
+// asynchronous work completes, also in a single cgo call.
 func (r *Response) Send(status, contentType, body string) {
 	if r.async != nil {
 		r.async.status = status
-		if contentType != "" {
-			r.async.headers = append(r.async.headers, [2]string{"Content-Type", contentType})
-		}
+		r.async.contentType = contentType
 		r.async.body.WriteString(body)
 		r.flushAsync()
 		return
@@ -175,55 +181,50 @@ func (r *Response) Async(fn func()) {
 		return
 	}
 	a := asyncStatePool.Get().(*asyncState)
-	a.aborted = r.OnAborted()
-	a.loop = r.Loop()
+	a.loopPtr, a.ctxHandle = r.inner.beginAsync()
 	a.status = "200 OK"
+	a.sent = false
 	r.async = a
 
-	go fn()
+	go func() {
+		fn()
+		if !a.sent {
+			// fn returned without invoking Send/End. Drop the response.
+			asyncCtxRelease(a.ctxHandle)
+		}
+		// Recycle the Response wrapper here, AFTER fn returns, so the wrapper
+		// isn't reused for another request while our goroutine is still alive.
+		r.recycleAsync(a)
+	}()
 }
 
 func (r *Response) flushAsync() {
 	a := r.async
-	if a.aborted.Load() {
-		r.recycle()
+	if a.sent {
 		return
 	}
-	a.loop.Defer(func() {
-		defer r.recycle()
-		if a.aborted.Load() {
-			return
-		}
-		r.Cork(func() {
-			switch {
-			case len(a.headers) == 0:
-				r.inner.send(a.status, "", a.body.String())
-			case len(a.headers) == 1 && a.headers[0][0] == "Content-Type":
-				r.inner.send(a.status, a.headers[0][1], a.body.String())
-			default:
-				r.inner.status(a.status)
-				for _, h := range a.headers {
-					r.inner.header(h[0], h[1])
-				}
-				r.inner.end(a.body.String())
-			}
-		})
-	})
+	asyncDeferSend(a.loopPtr, a.ctxHandle, a.status, a.contentType, a.body.String())
+	a.sent = true
 }
 
-func (r *Response) recycle() {
-	if a := r.async; a != nil {
-		a.aborted = nil
-		a.loop = nil
-		a.status = ""
-		a.headers = a.headers[:0]
-		a.body.Reset()
-		asyncStatePool.Put(a)
-		r.async = nil
-	}
+// recycleAsync resets and returns the asyncState and Response wrappers to
+// their pools. Must be called only from the Async goroutine wrapper, after
+// fn has returned, to avoid handing out the Response while it is still in use.
+func (r *Response) recycleAsync(a *asyncState) {
+	r.async = nil
 	r.inner = responseNative{}
+
+	a.loopPtr = 0
+	a.ctxHandle = 0
+	a.status = ""
+	a.contentType = ""
+	a.body.Reset()
+	a.sent = false
+
+	asyncStatePool.Put(a)
 	responsePool.Put(r)
 }
+
 
 // Loop returns the event loop that owns this response. Capture it inside the
 // handler before spawning a goroutine. The returned Loop is safe to use from

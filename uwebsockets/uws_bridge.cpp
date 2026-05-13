@@ -5,6 +5,8 @@
 #include <App.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -199,6 +201,129 @@ extern "C" void uwsgo_res_cork(uwsgo_res_t *res, uintptr_t callback_id) {
     auto *r = reinterpret_cast<uWS::HttpResponse<false> *>(res);
     r->cork([callback_id]() {
         uwsgoHandleCork(callback_id);
+    });
+}
+
+namespace {
+
+// AsyncCtx is a reference-counted handle that tracks an in-flight async
+// response. Refs are held by:
+//   1. Go-side state, until uwsgo_res_defer_send or uwsgo_async_ctx_release transfers it
+//   2. The onAborted lambda registered with uWS, until the response is destroyed
+//   3. The defer lambda (if a response is sent), until that lambda runs
+// When the last ref drops, the ctx is deleted.
+struct AsyncCtx {
+    std::atomic<int> refcount{1};
+    std::atomic<int32_t> aborted{0};
+    uWS::HttpResponse<false> *response;
+
+    void retain() { refcount.fetch_add(1, std::memory_order_relaxed); }
+    void release() {
+        if (refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            delete this;
+        }
+    }
+};
+
+// CtxHold is a smart-pointer-like wrapper that retains/releases AsyncCtx,
+// suitable for capturing into uWS MoveOnlyFunction lambdas.
+struct CtxHold {
+    AsyncCtx *ctx;
+    explicit CtxHold(AsyncCtx *c) : ctx(c) { c->retain(); }
+    CtxHold(const CtxHold &o) : ctx(o.ctx) { ctx->retain(); }
+    CtxHold(CtxHold &&o) noexcept : ctx(o.ctx) { o.ctx = nullptr; }
+    CtxHold &operator=(const CtxHold &) = delete;
+    CtxHold &operator=(CtxHold &&) = delete;
+    ~CtxHold() { if (ctx) ctx->release(); }
+};
+
+// SendBuffer owns C-heap copies of status/content_type/body so the defer
+// lambda can outlive the originating Go string.
+struct SendBuffer {
+    char *status = nullptr;
+    size_t status_len = 0;
+    char *content_type = nullptr;
+    size_t content_type_len = 0;
+    char *body = nullptr;
+    size_t body_len = 0;
+
+    SendBuffer() = default;
+    SendBuffer(const SendBuffer &) = delete;
+    SendBuffer &operator=(const SendBuffer &) = delete;
+    SendBuffer(SendBuffer &&o) noexcept :
+        status(o.status), status_len(o.status_len),
+        content_type(o.content_type), content_type_len(o.content_type_len),
+        body(o.body), body_len(o.body_len) {
+        o.status = o.content_type = o.body = nullptr;
+    }
+    SendBuffer &operator=(SendBuffer &&) = delete;
+    ~SendBuffer() {
+        std::free(status);
+        std::free(content_type);
+        std::free(body);
+    }
+};
+
+inline char *dup_to_c_heap(const char *src, size_t n) {
+    if (n == 0) return nullptr;
+    char *p = static_cast<char *>(std::malloc(n));
+    if (p != nullptr) std::memcpy(p, src, n);
+    return p;
+}
+
+}  // namespace
+
+extern "C" uwsgo_loop_t *uwsgo_res_begin_async(uwsgo_res_t *res, void **out_ctx) {
+    auto *r = reinterpret_cast<uWS::HttpResponse<false> *>(res);
+    auto *ctx = new AsyncCtx;
+    ctx->response = r;
+
+    r->onAborted([hold = CtxHold(ctx)]() {
+        hold.ctx->aborted.store(1, std::memory_order_release);
+    });
+
+    *out_ctx = ctx;
+    return reinterpret_cast<uwsgo_loop_t *>(uWS::Loop::get());
+}
+
+extern "C" void uwsgo_async_ctx_release(void *ctx_handle) {
+    auto *ctx = static_cast<AsyncCtx *>(ctx_handle);
+    ctx->release();
+}
+
+extern "C" void uwsgo_res_defer_send(
+    uwsgo_loop_t *loop,
+    void *ctx_handle,
+    const char *status, size_t status_len,
+    const char *content_type, size_t content_type_len,
+    const char *body, size_t body_len) {
+    auto *l = reinterpret_cast<uWS::Loop *>(loop);
+    auto *ctx = static_cast<AsyncCtx *>(ctx_handle);
+
+    SendBuffer buf;
+    buf.status = dup_to_c_heap(status, status_len);
+    buf.status_len = status_len;
+    buf.content_type = dup_to_c_heap(content_type, content_type_len);
+    buf.content_type_len = content_type_len;
+    buf.body = dup_to_c_heap(body, body_len);
+    buf.body_len = body_len;
+
+    // The defer lambda takes ownership of Go's ctx ref (no extra retain).
+    l->defer([ctx, sb = std::move(buf)]() mutable {
+        if (ctx->aborted.load(std::memory_order_acquire)) {
+            ctx->release();
+            return;
+        }
+        auto *r = ctx->response;
+        r->cork([r, &sb]() {
+            r->writeStatus(std::string_view(sb.status, sb.status_len));
+            if (sb.content_type_len > 0) {
+                r->writeHeader(std::string_view("Content-Type", 12),
+                               std::string_view(sb.content_type, sb.content_type_len));
+            }
+            r->end(std::string_view(sb.body, sb.body_len));
+        });
+        ctx->release();
     });
 }
 

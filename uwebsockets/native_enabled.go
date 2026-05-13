@@ -150,6 +150,26 @@ func (l loopNative) defer_(fn func()) {
 	C.uwsgo_loop_defer(l.ptr, C.uintptr_t(handle))
 }
 
+func (r responseNative) beginAsync() (loopPtr, ctxHandle uintptr) {
+	var ctx unsafe.Pointer
+	loop := C.uwsgo_res_begin_async(r.ptr, &ctx)
+	return uintptr(unsafe.Pointer(loop)), uintptr(ctx)
+}
+
+func asyncDeferSend(loopPtr, ctxHandle uintptr, status, contentType, body string) {
+	C.uwsgo_res_defer_send(
+		(*C.uwsgo_loop_t)(unsafe.Pointer(loopPtr)),
+		unsafe.Pointer(ctxHandle),
+		unsafeStringData(status), C.size_t(len(status)),
+		unsafeStringData(contentType), C.size_t(len(contentType)),
+		unsafeStringData(body), C.size_t(len(body)),
+	)
+}
+
+func asyncCtxRelease(ctxHandle uintptr) {
+	C.uwsgo_async_ctx_release(unsafe.Pointer(ctxHandle))
+}
+
 func (r requestNative) url() string {
 	return readNativeString(func(buf *C.char, len C.size_t) C.size_t {
 		return C.uwsgo_req_url(r.ptr, buf, len)
