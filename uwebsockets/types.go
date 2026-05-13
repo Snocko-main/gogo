@@ -1,5 +1,7 @@
 package uwebsockets
 
+import "sync/atomic"
+
 // Handler handles a single HTTP request.
 //
 // The Request and Response values are only valid for the duration of the
@@ -101,6 +103,52 @@ func (r *Response) Write(body string) *Response {
 // End finishes the response.
 func (r *Response) End(body string) {
 	r.inner.end(body)
+}
+
+// Loop returns the event loop that owns this response. Capture it inside the
+// handler before spawning a goroutine. The returned Loop is safe to use from
+// any goroutine; the Response itself is not.
+func (r *Response) Loop() *Loop {
+	return &Loop{inner: r.inner.loop()}
+}
+
+// OnAborted registers an abort callback and returns an atomic flag that is set
+// to true if the client disconnects before the response is sent. Must be called
+// synchronously inside the route handler when responding asynchronously.
+func (r *Response) OnAborted() *Aborted {
+	state := &Aborted{}
+	r.inner.onAborted(state)
+	return state
+}
+
+// Cork batches all response writes inside fn into a single packet. Required
+// when sending a response from a deferred callback to avoid uWebSockets warning
+// about uncorked writes.
+func (r *Response) Cork(fn func()) {
+	r.inner.cork(fn)
+}
+
+// Loop is a uWebSockets event loop. Use Defer to schedule work back onto the
+// loop thread from any goroutine.
+type Loop struct {
+	inner loopNative
+}
+
+// Defer schedules fn to run on the loop thread. Safe to call from any
+// goroutine. fn runs once, in FIFO order with other deferred callbacks.
+func (l *Loop) Defer(fn func()) {
+	l.inner.defer_(fn)
+}
+
+// Aborted is a thread-safe flag set when a client aborts before the response is
+// fully sent. Check Load before touching the Response from a deferred callback.
+type Aborted struct {
+	state atomic.Bool
+}
+
+// Load reports whether the response was aborted.
+func (a *Aborted) Load() bool {
+	return a.state.Load()
 }
 
 // Request wraps a uWebSockets request.

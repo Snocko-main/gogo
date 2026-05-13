@@ -11,6 +11,7 @@ typedef struct uwsgo_app_t uwsgo_app_t;
 typedef struct uwsgo_res_t uwsgo_res_t;
 typedef struct uwsgo_req_t uwsgo_req_t;
 typedef struct uwsgo_ws_t uwsgo_ws_t;
+typedef struct uwsgo_loop_t uwsgo_loop_t;
 
 uwsgo_app_t *uwsgo_app_new(void);
 void uwsgo_app_free(uwsgo_app_t *app);
@@ -27,6 +28,11 @@ void uwsgo_res_write_status(uwsgo_res_t *res, const char *status);
 void uwsgo_res_write_header(uwsgo_res_t *res, const char *key, const char *value);
 void uwsgo_res_write(uwsgo_res_t *res, const char *body, size_t body_len);
 void uwsgo_res_end(uwsgo_res_t *res, const char *body, size_t body_len);
+
+uwsgo_loop_t *uwsgo_res_get_loop(uwsgo_res_t *res);
+void uwsgo_loop_defer(uwsgo_loop_t *loop, uintptr_t callback_id);
+void uwsgo_res_on_aborted(uwsgo_res_t *res, uintptr_t callback_id);
+void uwsgo_res_cork(uwsgo_res_t *res, uintptr_t callback_id);
 
 size_t uwsgo_req_url(uwsgo_req_t *req, char *buffer, size_t buffer_len);
 size_t uwsgo_req_header(uwsgo_req_t *req, const char *name, char *buffer, size_t buffer_len);

@@ -33,6 +33,10 @@ type websocketNative struct {
 	ptr *C.uwsgo_ws_t
 }
 
+type loopNative struct {
+	ptr *C.uwsgo_loop_t
+}
+
 func newAppNative() (appNative, error) {
 	return appNative{ptr: C.uwsgo_app_new()}, nil
 }
@@ -121,6 +125,25 @@ func (r responseNative) write(body string) {
 
 func (r responseNative) end(body string) {
 	C.uwsgo_res_end(r.ptr, unsafeStringData(body), C.size_t(len(body)))
+}
+
+func (r responseNative) loop() loopNative {
+	return loopNative{ptr: C.uwsgo_res_get_loop(r.ptr)}
+}
+
+func (r responseNative) onAborted(state *Aborted) {
+	handle := cgo.NewHandle(state)
+	C.uwsgo_res_on_aborted(r.ptr, C.uintptr_t(handle))
+}
+
+func (r responseNative) cork(fn func()) {
+	handle := cgo.NewHandle(fn)
+	C.uwsgo_res_cork(r.ptr, C.uintptr_t(handle))
+}
+
+func (l loopNative) defer_(fn func()) {
+	handle := cgo.NewHandle(fn)
+	C.uwsgo_loop_defer(l.ptr, C.uintptr_t(handle))
 }
 
 func (r requestNative) url() string {
@@ -227,4 +250,33 @@ func uwsgoHandleWSClose(handlerID C.uintptr_t, ws *C.uwsgo_ws_t, code C.int, mes
 			C.GoBytes(unsafe.Pointer(message), C.int(messageLen)),
 		)
 	}
+}
+
+//export uwsgoHandleDefer
+func uwsgoHandleDefer(callbackID C.uintptr_t) {
+	h := cgo.Handle(callbackID)
+	fn := h.Value().(func())
+	h.Delete()
+	fn()
+}
+
+//export uwsgoHandleAborted
+func uwsgoHandleAborted(callbackID C.uintptr_t) {
+	h := cgo.Handle(callbackID)
+	state := h.Value().(*Aborted)
+	h.Delete()
+	state.state.Store(true)
+}
+
+//export uwsgoHandleCork
+func uwsgoHandleCork(callbackID C.uintptr_t) {
+	h := cgo.Handle(callbackID)
+	fn := h.Value().(func())
+	h.Delete()
+	fn()
+}
+
+//export uwsgoReleaseHandle
+func uwsgoReleaseHandle(callbackID C.uintptr_t) {
+	cgo.Handle(callbackID).Delete()
 }

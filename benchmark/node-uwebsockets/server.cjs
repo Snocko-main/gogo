@@ -22,6 +22,20 @@ uWS
       .writeHeader("Content-Type", "text/plain; charset=utf-8")
       .end(`hello ${req.getParameter(0)}\n`);
   })
+  .get("/sleep", (res) => {
+    res.onAborted(() => {
+      res.aborted = true;
+    });
+    setTimeout(() => {
+      if (res.aborted) return;
+      res.cork(() => {
+        res
+          .writeStatus("200 OK")
+          .writeHeader("Content-Type", "text/plain; charset=utf-8")
+          .end("slept\n");
+      });
+    }, 2);
+  })
   .listen(port, (token) => {
     if (!token) {
       console.error(`failed to listen on :${port}`);

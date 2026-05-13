@@ -15,6 +15,40 @@ extern "C" void uwsgoHandleHTTP(uintptr_t handler_id, uwsgo_res_t *res, uwsgo_re
 extern "C" void uwsgoHandleWSOpen(uintptr_t handler_id, uwsgo_ws_t *ws);
 extern "C" void uwsgoHandleWSMessage(uintptr_t handler_id, uwsgo_ws_t *ws, const char *message, size_t message_len, int opcode);
 extern "C" void uwsgoHandleWSClose(uintptr_t handler_id, uwsgo_ws_t *ws, int code, const char *message, size_t message_len);
+extern "C" void uwsgoHandleDefer(uintptr_t callback_id);
+extern "C" void uwsgoHandleAborted(uintptr_t callback_id);
+extern "C" void uwsgoHandleCork(uintptr_t callback_id);
+extern "C" void uwsgoReleaseHandle(uintptr_t callback_id);
+
+namespace {
+
+// GoHandle owns a cgo handle: it releases the Go-side handle when destroyed
+// unless it was consumed (id cleared). Used to make sure handles registered for
+// callbacks that may never fire (e.g. onAborted on a non-aborted response) are
+// still released when the owning C++ lambda dies.
+struct GoHandle {
+    uintptr_t id;
+
+    explicit GoHandle(uintptr_t i) : id(i) {}
+    GoHandle(GoHandle &&other) noexcept : id(other.id) { other.id = 0; }
+    GoHandle(const GoHandle &) = delete;
+    GoHandle &operator=(GoHandle &&) = delete;
+    GoHandle &operator=(const GoHandle &) = delete;
+
+    ~GoHandle() {
+        if (id) {
+            uwsgoReleaseHandle(id);
+        }
+    }
+
+    uintptr_t consume() {
+        uintptr_t taken = id;
+        id = 0;
+        return taken;
+    }
+};
+
+}  // namespace
 
 struct uwsgo_ws_data_t {};
 
@@ -116,6 +150,41 @@ extern "C" void uwsgo_res_write(uwsgo_res_t *res, const char *body, size_t body_
 
 extern "C" void uwsgo_res_end(uwsgo_res_t *res, const char *body, size_t body_len) {
     reinterpret_cast<uWS::HttpResponse<false> *>(res)->end(std::string_view(body, body_len));
+}
+
+extern "C" uwsgo_loop_t *uwsgo_res_get_loop(uwsgo_res_t * /*res*/) {
+    // uWS loops are thread-local; calling from a route handler returns the
+    // loop that runs the response.
+    return reinterpret_cast<uwsgo_loop_t *>(uWS::Loop::get());
+}
+
+extern "C" void uwsgo_loop_defer(uwsgo_loop_t *loop, uintptr_t callback_id) {
+    auto *l = reinterpret_cast<uWS::Loop *>(loop);
+    GoHandle wrap{callback_id};
+    l->defer([wrap = std::move(wrap)]() mutable {
+        auto id = wrap.consume();
+        if (id) {
+            uwsgoHandleDefer(id);
+        }
+    });
+}
+
+extern "C" void uwsgo_res_on_aborted(uwsgo_res_t *res, uintptr_t callback_id) {
+    auto *r = reinterpret_cast<uWS::HttpResponse<false> *>(res);
+    GoHandle wrap{callback_id};
+    r->onAborted([wrap = std::move(wrap)]() mutable {
+        auto id = wrap.consume();
+        if (id) {
+            uwsgoHandleAborted(id);
+        }
+    });
+}
+
+extern "C" void uwsgo_res_cork(uwsgo_res_t *res, uintptr_t callback_id) {
+    auto *r = reinterpret_cast<uWS::HttpResponse<false> *>(res);
+    r->cork([callback_id]() {
+        uwsgoHandleCork(callback_id);
+    });
 }
 
 extern "C" size_t uwsgo_req_url(uwsgo_req_t *req, char *buffer, size_t buffer_len) {

@@ -10,6 +10,7 @@ type appNative struct{}
 type responseNative struct{}
 type requestNative struct{}
 type websocketNative struct{}
+type loopNative struct{}
 
 func newAppNative() (appNative, error) {
 	return appNative{}, errNativeDisabled
@@ -27,6 +28,11 @@ func (responseNative) status(string)         {}
 func (responseNative) header(string, string) {}
 func (responseNative) write(string)          {}
 func (responseNative) end(string)            {}
+func (responseNative) loop() loopNative      { return loopNative{} }
+func (responseNative) onAborted(*Aborted)    {}
+func (responseNative) cork(func())           {}
+
+func (loopNative) defer_(func()) {}
 
 func (requestNative) url() string          { return "" }
 func (requestNative) header(string) string { return "" }
