@@ -21,6 +21,13 @@ void uwsgo_app_post(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id)
 void uwsgo_app_any(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);
 void uwsgo_app_ws(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);
 
+// Async-routed handlers: the C++ shim sets up the abort context and passes it
+// to the Go callback along with the loop pointer, saving the begin_async cgo
+// crossing on every request. The Go callback signature does not include the
+// request pointer since the handler runs on a goroutine where the C++ request
+// object would have been freed.
+void uwsgo_app_get_async(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);
+
 int uwsgo_app_listen(uwsgo_app_t *app, int port);
 void uwsgo_app_run(uwsgo_app_t *app);
 

@@ -33,11 +33,9 @@ func main() {
 		res.Send("200 OK", "text/plain; charset=utf-8", "hello "+req.Parameter(0)+"\n")
 	})
 
-	app.Get("/sleep", func(res *uws.Response, req *uws.Request) {
-		res.Async(func() {
-			time.Sleep(2 * time.Millisecond)
-			res.Send("200 OK", "text/plain; charset=utf-8", "slept\n")
-		})
+	app.GetAsync("/sleep", func(res *uws.Response) {
+		time.Sleep(2 * time.Millisecond)
+		res.Send("200 OK", "text/plain; charset=utf-8", "slept\n")
 	})
 
 	if !app.Listen(3002) {

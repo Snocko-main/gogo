@@ -48,6 +48,16 @@ func (a *appNative) get(pattern string, handler Handler) {
 	C.uwsgo_app_get(a.ptr, cpattern, C.uintptr_t(handle))
 }
 
+func (a *appNative) getAsync(pattern string, handler AsyncHandler) {
+	cpattern := C.CString(pattern)
+	defer C.free(unsafe.Pointer(cpattern))
+
+	h := cgo.NewHandle(handler)
+	a.handles = append(a.handles, h)
+
+	C.uwsgo_app_get_async(a.ptr, cpattern, C.uintptr_t(h))
+}
+
 func (a *appNative) post(pattern string, handler Handler) {
 	cpattern, handle := a.prepareRoute(pattern, handler)
 	defer C.free(unsafe.Pointer(cpattern))
@@ -250,6 +260,29 @@ func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req
 		resWrap.inner = responseNative{}
 		responsePool.Put(resWrap)
 	}
+}
+
+//export uwsgoHandleHTTPAsync
+func uwsgoHandleHTTPAsync(handlerID C.uintptr_t, res *C.uwsgo_res_t, ctx unsafe.Pointer, loop *C.uwsgo_loop_t) {
+	handler := cgo.Handle(handlerID).Value().(AsyncHandler)
+
+	resWrap := responsePool.Get().(*Response)
+	resWrap.inner = responseNative{ptr: res}
+
+	a := asyncStatePool.Get().(*asyncState)
+	a.loopPtr = uintptr(unsafe.Pointer(loop))
+	a.ctxHandle = uintptr(ctx)
+	a.status = "200 OK"
+	a.sent = false
+	resWrap.async = a
+
+	go func() {
+		handler(resWrap)
+		if !a.sent {
+			asyncCtxRelease(a.ctxHandle)
+		}
+		resWrap.recycleAsync(a)
+	}()
 }
 
 //export uwsgoHandleWSOpen

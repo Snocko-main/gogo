@@ -18,6 +18,13 @@ var (
 // callback. Do not store them or use them from another goroutine.
 type Handler func(*Response, *Request)
 
+// AsyncHandler handles a request on a fresh goroutine that is free to block.
+// The Response arrives in async mode with the abort context pre-attached, so
+// every call site saves one cgo crossing versus a Handler that wraps its body
+// in res.Async. The Request is not provided; capture anything needed from it
+// from a sync Handler that delegates with res.Async.
+type AsyncHandler func(*Response)
+
 // OpCode identifies a WebSocket frame type.
 type OpCode int
 
@@ -54,6 +61,13 @@ func NewApp() (*App, error) {
 // Get registers a GET route.
 func (a *App) Get(pattern string, handler Handler) {
 	a.inner.get(pattern, handler)
+}
+
+// GetAsync registers a GET route whose handler runs on a fresh goroutine and
+// receives a Response that is already in async mode. Use this when the handler
+// will block (DB call, IO) and does not need to read the request.
+func (a *App) GetAsync(pattern string, handler AsyncHandler) {
+	a.inner.getAsync(pattern, handler)
 }
 
 // Post registers a POST route.

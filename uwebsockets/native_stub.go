@@ -17,6 +17,7 @@ func newAppNative() (appNative, error) {
 }
 
 func (appNative) get(string, Handler)                 {}
+func (appNative) getAsync(string, AsyncHandler)       {}
 func (appNative) post(string, Handler)                {}
 func (appNative) any(string, Handler)                 {}
 func (appNative) websocket(string, WebSocketBehavior) {}

@@ -14,6 +14,7 @@
 #include <utility>
 
 extern "C" void uwsgoHandleHTTP(uintptr_t handler_id, uwsgo_res_t *res, uwsgo_req_t *req);
+extern "C" void uwsgoHandleHTTPAsync(uintptr_t handler_id, uwsgo_res_t *res, void *ctx, uwsgo_loop_t *loop);
 extern "C" void uwsgoHandleWSOpen(uintptr_t handler_id, uwsgo_ws_t *ws);
 extern "C" void uwsgoHandleWSMessage(uintptr_t handler_id, uwsgo_ws_t *ws, const char *message, size_t message_len, int opcode);
 extern "C" void uwsgoHandleWSClose(uintptr_t handler_id, uwsgo_ws_t *ws, int code, const char *message, size_t message_len);
@@ -284,6 +285,22 @@ extern "C" uwsgo_loop_t *uwsgo_res_begin_async(uwsgo_res_t *res, void **out_ctx)
 
     *out_ctx = ctx;
     return reinterpret_cast<uwsgo_loop_t *>(uWS::Loop::get());
+}
+
+extern "C" void uwsgo_app_get_async(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id) {
+    app->app->get(pattern, [handler_id](auto *res, auto *req) {
+        (void)req;  // Async handlers don't receive the request; it would be
+                    // invalid by the time the goroutine reads it.
+        auto *ctx = new AsyncCtx;
+        ctx->response = res;
+        res->onAborted([hold = CtxHold(ctx)]() {
+            hold.ctx->aborted.store(1, std::memory_order_release);
+        });
+        uwsgoHandleHTTPAsync(handler_id,
+                             reinterpret_cast<uwsgo_res_t *>(res),
+                             ctx,
+                             reinterpret_cast<uwsgo_loop_t *>(uWS::Loop::get()));
+    });
 }
 
 extern "C" void uwsgo_async_ctx_release(void *ctx_handle) {
