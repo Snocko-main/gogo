@@ -1,0 +1,40 @@
+#pragma once
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct uwsgo_app_t uwsgo_app_t;
+typedef struct uwsgo_res_t uwsgo_res_t;
+typedef struct uwsgo_req_t uwsgo_req_t;
+typedef struct uwsgo_ws_t uwsgo_ws_t;
+
+uwsgo_app_t *uwsgo_app_new(void);
+void uwsgo_app_free(uwsgo_app_t *app);
+
+void uwsgo_app_get(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);
+void uwsgo_app_post(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);
+void uwsgo_app_any(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);
+void uwsgo_app_ws(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);
+
+int uwsgo_app_listen(uwsgo_app_t *app, int port);
+void uwsgo_app_run(uwsgo_app_t *app);
+
+void uwsgo_res_write_status(uwsgo_res_t *res, const char *status);
+void uwsgo_res_write_header(uwsgo_res_t *res, const char *key, const char *value);
+void uwsgo_res_write(uwsgo_res_t *res, const char *body, size_t body_len);
+void uwsgo_res_end(uwsgo_res_t *res, const char *body, size_t body_len);
+
+size_t uwsgo_req_url(uwsgo_req_t *req, char *buffer, size_t buffer_len);
+size_t uwsgo_req_header(uwsgo_req_t *req, const char *name, char *buffer, size_t buffer_len);
+size_t uwsgo_req_parameter(uwsgo_req_t *req, unsigned long index, char *buffer, size_t buffer_len);
+
+int uwsgo_ws_send(uwsgo_ws_t *ws, const char *message, size_t message_len, int opcode);
+void uwsgo_ws_end(uwsgo_ws_t *ws, int code, const char *message, size_t message_len);
+
+#ifdef __cplusplus
+}
+#endif

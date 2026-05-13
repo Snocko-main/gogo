@@ -1,0 +1,230 @@
+//go:build cgo && uwebsockets
+
+package uwebsockets
+
+/*
+#cgo CXXFLAGS: -std=c++20 -I${SRCDIR}/third_party/uWebSockets/src -I${SRCDIR}/third_party/uWebSockets/uSockets/src
+#cgo LDFLAGS: ${SRCDIR}/third_party/uWebSockets/uSockets/uSockets.a -lz
+#cgo linux LDFLAGS: -pthread
+#include <stdlib.h>
+#include "uws_bridge.h"
+*/
+import "C"
+
+import (
+	"runtime/cgo"
+	"unsafe"
+)
+
+type appNative struct {
+	ptr     *C.uwsgo_app_t
+	handles []cgo.Handle
+}
+
+type responseNative struct {
+	ptr *C.uwsgo_res_t
+}
+
+type requestNative struct {
+	ptr *C.uwsgo_req_t
+}
+
+type websocketNative struct {
+	ptr *C.uwsgo_ws_t
+}
+
+func newAppNative() (appNative, error) {
+	return appNative{ptr: C.uwsgo_app_new()}, nil
+}
+
+func (a *appNative) get(pattern string, handler Handler) {
+	cpattern, handle := a.prepareRoute(pattern, handler)
+	defer C.free(unsafe.Pointer(cpattern))
+
+	C.uwsgo_app_get(a.ptr, cpattern, C.uintptr_t(handle))
+}
+
+func (a *appNative) post(pattern string, handler Handler) {
+	cpattern, handle := a.prepareRoute(pattern, handler)
+	defer C.free(unsafe.Pointer(cpattern))
+
+	C.uwsgo_app_post(a.ptr, cpattern, C.uintptr_t(handle))
+}
+
+func (a *appNative) any(pattern string, handler Handler) {
+	cpattern, handle := a.prepareRoute(pattern, handler)
+	defer C.free(unsafe.Pointer(cpattern))
+
+	C.uwsgo_app_any(a.ptr, cpattern, C.uintptr_t(handle))
+}
+
+func (a *appNative) websocket(pattern string, behavior WebSocketBehavior) {
+	cpattern := C.CString(pattern)
+	defer C.free(unsafe.Pointer(cpattern))
+
+	handle := cgo.NewHandle(behavior)
+	a.handles = append(a.handles, handle)
+
+	C.uwsgo_app_ws(a.ptr, cpattern, C.uintptr_t(handle))
+}
+
+func (a *appNative) prepareRoute(pattern string, handler Handler) (*C.char, cgo.Handle) {
+	cpattern := C.CString(pattern)
+	handle := cgo.NewHandle(handler)
+	a.handles = append(a.handles, handle)
+	return cpattern, handle
+}
+
+func (a appNative) listen(port int) bool {
+	return C.uwsgo_app_listen(a.ptr, C.int(port)) != 0
+}
+
+func (a appNative) run() {
+	C.uwsgo_app_run(a.ptr)
+}
+
+func (a *appNative) close() {
+	if a.ptr == nil {
+		return
+	}
+
+	C.uwsgo_app_free(a.ptr)
+	a.ptr = nil
+
+	for _, handle := range a.handles {
+		handle.Delete()
+	}
+
+	a.handles = nil
+}
+
+func (r responseNative) status(status string) {
+	cstatus := C.CString(status)
+	defer C.free(unsafe.Pointer(cstatus))
+
+	C.uwsgo_res_write_status(r.ptr, cstatus)
+}
+
+func (r responseNative) header(key, value string) {
+	ckey := C.CString(key)
+	defer C.free(unsafe.Pointer(ckey))
+
+	cvalue := C.CString(value)
+	defer C.free(unsafe.Pointer(cvalue))
+
+	C.uwsgo_res_write_header(r.ptr, ckey, cvalue)
+}
+
+func (r responseNative) write(body string) {
+	C.uwsgo_res_write(r.ptr, unsafeStringData(body), C.size_t(len(body)))
+}
+
+func (r responseNative) end(body string) {
+	C.uwsgo_res_end(r.ptr, unsafeStringData(body), C.size_t(len(body)))
+}
+
+func (r requestNative) url() string {
+	return readNativeString(func(buf *C.char, len C.size_t) C.size_t {
+		return C.uwsgo_req_url(r.ptr, buf, len)
+	})
+}
+
+func (r requestNative) header(name string) string {
+	cname := C.CString(name)
+	defer C.free(unsafe.Pointer(cname))
+
+	return readNativeString(func(buf *C.char, len C.size_t) C.size_t {
+		return C.uwsgo_req_header(r.ptr, cname, buf, len)
+	})
+}
+
+func (r requestNative) parameter(index int) string {
+	return readNativeString(func(buf *C.char, len C.size_t) C.size_t {
+		return C.uwsgo_req_parameter(r.ptr, C.ulong(index), buf, len)
+	})
+}
+
+func readNativeString(read func(*C.char, C.size_t) C.size_t) string {
+	size := read(nil, 0)
+	if size == 0 {
+		return ""
+	}
+
+	buf := make([]byte, int(size))
+	read((*C.char)(unsafe.Pointer(&buf[0])), size)
+	return string(buf)
+}
+
+func unsafeStringData(s string) *C.char {
+	if len(s) == 0 {
+		return nil
+	}
+
+	return (*C.char)(unsafe.Pointer(unsafe.StringData(s)))
+}
+
+func unsafeByteData(b []byte) *C.char {
+	if len(b) == 0 {
+		return nil
+	}
+
+	return (*C.char)(unsafe.Pointer(unsafe.SliceData(b)))
+}
+
+func (ws websocketNative) send(message []byte, opcode OpCode) bool {
+	return C.uwsgo_ws_send(ws.ptr, unsafeByteData(message), C.size_t(len(message)), C.int(opcode)) != 0
+}
+
+func (ws websocketNative) sendString(message string, opcode OpCode) bool {
+	return C.uwsgo_ws_send(ws.ptr, unsafeStringData(message), C.size_t(len(message)), C.int(opcode)) != 0
+}
+
+func (ws websocketNative) end(code int, message string) {
+	C.uwsgo_ws_end(ws.ptr, C.int(code), unsafeStringData(message), C.size_t(len(message)))
+}
+
+//export uwsgoHandleHTTP
+func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req_t) {
+	handle := cgo.Handle(handlerID)
+	handler := handle.Value().(Handler)
+
+	handler(
+		&Response{inner: responseNative{ptr: res}},
+		&Request{inner: requestNative{ptr: req}},
+	)
+}
+
+//export uwsgoHandleWSOpen
+func uwsgoHandleWSOpen(handlerID C.uintptr_t, ws *C.uwsgo_ws_t) {
+	handle := cgo.Handle(handlerID)
+	behavior := handle.Value().(WebSocketBehavior)
+	if behavior.Open != nil {
+		behavior.Open(&WebSocket{inner: websocketNative{ptr: ws}})
+	}
+}
+
+//export uwsgoHandleWSMessage
+func uwsgoHandleWSMessage(handlerID C.uintptr_t, ws *C.uwsgo_ws_t, message *C.char, messageLen C.size_t, opcode C.int) {
+	handle := cgo.Handle(handlerID)
+	behavior := handle.Value().(WebSocketBehavior)
+	if behavior.Message != nil {
+		behavior.Message(
+			&WebSocket{inner: websocketNative{ptr: ws}},
+			C.GoBytes(unsafe.Pointer(message), C.int(messageLen)),
+			OpCode(opcode),
+		)
+	}
+}
+
+//export uwsgoHandleWSClose
+func uwsgoHandleWSClose(handlerID C.uintptr_t, ws *C.uwsgo_ws_t, code C.int, message *C.char, messageLen C.size_t) {
+	handle := cgo.Handle(handlerID)
+	behavior := handle.Value().(WebSocketBehavior)
+	if behavior.Close != nil {
+		behavior.Close(
+			&WebSocket{inner: websocketNative{ptr: ws}},
+			int(code),
+			C.GoBytes(unsafe.Pointer(message), C.int(messageLen)),
+		)
+	}
+}

@@ -1,0 +1,10 @@
+{
+  "name": "uwebsockets-node-benchmark",
+  "private": true,
+  "scripts": {
+    "start": "node server.cjs"
+  },
+  "dependencies": {
+    "uWebSockets.js": "git+https://github.com/uNetworking/uWebSockets.js.git#v20.64.0"
+  }
+}
