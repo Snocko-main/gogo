@@ -1,6 +1,9 @@
 package uwebsockets
 
-import "sync/atomic"
+import (
+	"strings"
+	"sync/atomic"
+)
 
 // Handler handles a single HTTP request.
 //
@@ -80,29 +83,99 @@ func (a *App) Close() {
 // Response wraps a uWebSockets response.
 type Response struct {
 	inner responseNative
+
+	// async is non-nil after Async has been called. Subsequent Status/Header/
+	// Write/End calls buffer into it instead of touching the C++ response;
+	// End flushes the buffer back onto the loop with a single cork.
+	async *asyncState
+}
+
+type asyncState struct {
+	aborted *Aborted
+	loop    *Loop
+	status  string
+	headers [][2]string
+	body    strings.Builder
 }
 
 // Status sets the HTTP status text, for example "200 OK" or "404 Not Found".
 func (r *Response) Status(status string) *Response {
+	if r.async != nil {
+		r.async.status = status
+		return r
+	}
 	r.inner.status(status)
 	return r
 }
 
 // Header writes a response header.
 func (r *Response) Header(key, value string) *Response {
+	if r.async != nil {
+		r.async.headers = append(r.async.headers, [2]string{key, value})
+		return r
+	}
 	r.inner.header(key, value)
 	return r
 }
 
 // Write appends a response chunk without ending the response.
 func (r *Response) Write(body string) *Response {
+	if r.async != nil {
+		r.async.body.WriteString(body)
+		return r
+	}
 	r.inner.write(body)
 	return r
 }
 
 // End finishes the response.
 func (r *Response) End(body string) {
+	if r.async != nil {
+		r.async.body.WriteString(body)
+		r.flushAsync()
+		return
+	}
 	r.inner.end(body)
+}
+
+// Async marks the response for asynchronous handling and runs fn on a new
+// goroutine. After calling Async, subsequent Status/Header/Write calls buffer
+// Go-side and End flushes the buffered response back onto the event loop with
+// a single cork. fn may block freely.
+//
+// Call Async at most once per response, and before any synchronous
+// Status/Header/Write/End calls. The outer handler should return immediately
+// after calling Async.
+func (r *Response) Async(fn func()) {
+	if r.async != nil {
+		return
+	}
+	r.async = &asyncState{
+		aborted: r.OnAborted(),
+		loop:    r.Loop(),
+		status:  "200 OK",
+	}
+
+	go fn()
+}
+
+func (r *Response) flushAsync() {
+	a := r.async
+	if a.aborted.Load() {
+		return
+	}
+	a.loop.Defer(func() {
+		if a.aborted.Load() {
+			return
+		}
+		r.Cork(func() {
+			r.inner.status(a.status)
+			for _, h := range a.headers {
+				r.inner.header(h[0], h[1])
+			}
+			r.inner.end(a.body.String())
+		})
+	})
 }
 
 // Loop returns the event loop that owns this response. Capture it inside the

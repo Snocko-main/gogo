@@ -36,22 +36,13 @@ func main() {
 	})
 
 	app.Get("/sleep", func(res *uws.Response, req *uws.Request) {
-		aborted := res.OnAborted()
-		loop := res.Loop()
-		go func() {
+		res.Async(func() {
 			time.Sleep(2 * time.Millisecond)
-			loop.Defer(func() {
-				if aborted.Load() {
-					return
-				}
-				res.Cork(func() {
-					res.
-						Status("200 OK").
-						Header("Content-Type", "text/plain; charset=utf-8").
-						End("slept\n")
-				})
-			})
-		}()
+			res.
+				Status("200 OK").
+				Header("Content-Type", "text/plain; charset=utf-8").
+				End("slept\n")
+		})
 	})
 
 	if !app.Listen(3002) {
