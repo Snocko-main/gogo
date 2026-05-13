@@ -103,20 +103,15 @@ func (a *appNative) close() {
 }
 
 func (r responseNative) status(status string) {
-	cstatus := C.CString(status)
-	defer C.free(unsafe.Pointer(cstatus))
-
-	C.uwsgo_res_write_status(r.ptr, cstatus)
+	C.uwsgo_res_write_status(r.ptr, unsafeStringData(status), C.size_t(len(status)))
 }
 
 func (r responseNative) header(key, value string) {
-	ckey := C.CString(key)
-	defer C.free(unsafe.Pointer(ckey))
-
-	cvalue := C.CString(value)
-	defer C.free(unsafe.Pointer(cvalue))
-
-	C.uwsgo_res_write_header(r.ptr, ckey, cvalue)
+	C.uwsgo_res_write_header(
+		r.ptr,
+		unsafeStringData(key), C.size_t(len(key)),
+		unsafeStringData(value), C.size_t(len(value)),
+	)
 }
 
 func (r responseNative) write(body string) {
@@ -153,11 +148,8 @@ func (r requestNative) url() string {
 }
 
 func (r requestNative) header(name string) string {
-	cname := C.CString(name)
-	defer C.free(unsafe.Pointer(cname))
-
-	return readNativeString(func(buf *C.char, len C.size_t) C.size_t {
-		return C.uwsgo_req_header(r.ptr, cname, buf, len)
+	return readNativeString(func(buf *C.char, bufLen C.size_t) C.size_t {
+		return C.uwsgo_req_header(r.ptr, unsafeStringData(name), C.size_t(len(name)), buf, bufLen)
 	})
 }
 
@@ -211,10 +203,24 @@ func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req
 	handle := cgo.Handle(handlerID)
 	handler := handle.Value().(Handler)
 
-	handler(
-		&Response{inner: responseNative{ptr: res}},
-		&Request{inner: requestNative{ptr: req}},
-	)
+	reqWrap := requestPool.Get().(*Request)
+	reqWrap.inner = requestNative{ptr: req}
+
+	resWrap := responsePool.Get().(*Response)
+	resWrap.inner = responseNative{ptr: res}
+	resWrap.async = nil
+
+	handler(resWrap, reqWrap)
+
+	reqWrap.inner = requestNative{}
+	requestPool.Put(reqWrap)
+
+	// Sync responses are done with resWrap by now; async ones keep using it
+	// from a goroutine, so we cannot recycle until the async flush returns it.
+	if resWrap.async == nil {
+		resWrap.inner = responseNative{}
+		responsePool.Put(resWrap)
+	}
 }
 
 //export uwsgoHandleWSOpen

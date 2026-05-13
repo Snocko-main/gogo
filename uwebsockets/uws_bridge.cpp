@@ -136,12 +136,14 @@ extern "C" void uwsgo_app_run(uwsgo_app_t *app) {
     app->app->run();
 }
 
-extern "C" void uwsgo_res_write_status(uwsgo_res_t *res, const char *status) {
-    reinterpret_cast<uWS::HttpResponse<false> *>(res)->writeStatus(status);
+extern "C" void uwsgo_res_write_status(uwsgo_res_t *res, const char *status, size_t status_len) {
+    reinterpret_cast<uWS::HttpResponse<false> *>(res)->writeStatus(std::string_view(status, status_len));
 }
 
-extern "C" void uwsgo_res_write_header(uwsgo_res_t *res, const char *key, const char *value) {
-    reinterpret_cast<uWS::HttpResponse<false> *>(res)->writeHeader(key, value);
+extern "C" void uwsgo_res_write_header(uwsgo_res_t *res, const char *key, size_t key_len, const char *value, size_t value_len) {
+    reinterpret_cast<uWS::HttpResponse<false> *>(res)->writeHeader(
+        std::string_view(key, key_len),
+        std::string_view(value, value_len));
 }
 
 extern "C" void uwsgo_res_write(uwsgo_res_t *res, const char *body, size_t body_len) {
@@ -192,8 +194,8 @@ extern "C" size_t uwsgo_req_url(uwsgo_req_t *req, char *buffer, size_t buffer_le
     return copy_string_view(value, buffer, buffer_len);
 }
 
-extern "C" size_t uwsgo_req_header(uwsgo_req_t *req, const char *name, char *buffer, size_t buffer_len) {
-    auto value = reinterpret_cast<uWS::HttpRequest *>(req)->getHeader(name);
+extern "C" size_t uwsgo_req_header(uwsgo_req_t *req, const char *name, size_t name_len, char *buffer, size_t buffer_len) {
+    auto value = reinterpret_cast<uWS::HttpRequest *>(req)->getHeader(std::string_view(name, name_len));
     return copy_string_view(value, buffer, buffer_len);
 }
 

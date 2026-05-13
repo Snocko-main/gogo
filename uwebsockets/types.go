@@ -2,7 +2,13 @@ package uwebsockets
 
 import (
 	"strings"
+	"sync"
 	"sync/atomic"
+)
+
+var (
+	responsePool = sync.Pool{New: func() any { return &Response{} }}
+	requestPool  = sync.Pool{New: func() any { return &Request{} }}
 )
 
 // Handler handles a single HTTP request.
@@ -162,9 +168,11 @@ func (r *Response) Async(fn func()) {
 func (r *Response) flushAsync() {
 	a := r.async
 	if a.aborted.Load() {
+		r.recycle()
 		return
 	}
 	a.loop.Defer(func() {
+		defer r.recycle()
 		if a.aborted.Load() {
 			return
 		}
@@ -176,6 +184,12 @@ func (r *Response) flushAsync() {
 			r.inner.end(a.body.String())
 		})
 	})
+}
+
+func (r *Response) recycle() {
+	r.inner = responseNative{}
+	r.async = nil
+	responsePool.Put(r)
 }
 
 // Loop returns the event loop that owns this response. Capture it inside the

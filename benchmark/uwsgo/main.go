@@ -2,12 +2,19 @@ package main
 
 import (
 	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"time"
 
 	uws "uwebsockets-go/uwebsockets"
 )
 
 func main() {
+	go func() {
+		log.Println("pprof on http://localhost:6060/debug/pprof")
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
+
 	app, err := uws.NewApp()
 	if err != nil {
 		log.Fatal(err)
