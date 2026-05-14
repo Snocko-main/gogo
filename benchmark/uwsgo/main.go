@@ -92,10 +92,12 @@ func main() {
 		app.GetAsync("/file", func(res *gogo.Response, req *gogo.Request) {
 			data, err := os.ReadFile(filePath)
 			if err != nil {
-				res.Send(500, "text/plain", err.Error())
+				res.SendShared(500, "text/plain", err.Error())
 				return
 			}
-			res.Send(200, "application/json", string(data))
+			// SendShared falls back to Send automatically if body exceeds
+			// the 8 KB inline cap, so it's safe to use on any size payload.
+			res.SendShared(200, "application/json", string(data))
 		})
 		app.GetAsync("/db", func(res *gogo.Response, req *gogo.Request) {
 			id := rand.IntN(1000) + 1
