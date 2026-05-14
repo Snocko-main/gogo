@@ -55,6 +55,12 @@ func main() {
 		return c.SendString("hello world\n")
 	})
 
+	// /health mirrors gogo's static Reply route — short JSON body.
+	app.Get("/health", func(c *fiber.Ctx) error {
+		c.Set("Content-Type", "application/json")
+		return c.SendString(`{"ok":true}` + "\n")
+	})
+
 	app.Get("/json", func(c *fiber.Ctx) error {
 		c.Set("Content-Type", "application/json")
 		return c.SendString(`{"message":"hello world","ok":true}` + "\n")

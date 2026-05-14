@@ -1,4 +1,4 @@
-//go:build cgo && uwebsockets
+//go:build cgo && gogo
 
 #include "uws_bridge.h"
 
@@ -16,13 +16,13 @@
 #include <vector>
 
 extern "C" void uwsgoHandleHTTP(uintptr_t handler_id, uwsgo_res_t *res, uwsgo_req_t *req);
-extern "C" void uwsgoHandleHTTPAsync(uintptr_t handler_id, uwsgo_res_t *res, void *ctx, uwsgo_loop_t *loop);
 extern "C" void uwsgoHandleWSOpen(uintptr_t handler_id, uwsgo_ws_t *ws);
 extern "C" void uwsgoHandleWSMessage(uintptr_t handler_id, uwsgo_ws_t *ws, const char *message, size_t message_len, int opcode);
 extern "C" void uwsgoHandleWSClose(uintptr_t handler_id, uwsgo_ws_t *ws, int code, const char *message, size_t message_len);
 extern "C" void uwsgoHandleDefer(uintptr_t callback_id);
 extern "C" void uwsgoHandleAborted(uintptr_t callback_id);
 extern "C" void uwsgoHandleCork(uintptr_t callback_id);
+extern "C" void uwsgoHandleData(uintptr_t callback_id, const char *data, size_t len, int is_last);
 extern "C" void uwsgoReleaseHandle(uintptr_t callback_id);
 
 namespace {
@@ -69,9 +69,14 @@ struct StaticResponse {
 
 struct uwsgo_app_t {
     std::unique_ptr<uWS::App> app;
+    uWS::Loop *loop = nullptr;
     us_listen_socket_t *listen_socket = nullptr;
     std::vector<std::unique_ptr<StaticResponse>> static_responses;
 };
+
+// Forward decl — definition lives near uwsgo_app_start_drain further below.
+// uwsgo_app_stop needs to close it during shutdown.
+static struct us_timer_t *g_drain_timer;
 
 static size_t copy_string_view(std::string_view value, char *buffer, size_t buffer_len) {
     if (buffer != nullptr && buffer_len > 0) {
@@ -82,7 +87,12 @@ static size_t copy_string_view(std::string_view value, char *buffer, size_t buff
 }
 
 extern "C" uwsgo_app_t *uwsgo_app_new(void) {
-    return new uwsgo_app_t{std::make_unique<uWS::App>()};
+    auto *a = new uwsgo_app_t{std::make_unique<uWS::App>()};
+    // Capture the loop pointer at app creation time. uWS::App() binds to the
+    // current thread's loop; later teardown calls from any thread defer through
+    // this captured loop rather than asking for the *caller's* loop.
+    a->loop = uWS::Loop::get();
+    return a;
 }
 
 extern "C" void uwsgo_app_free(uwsgo_app_t *app) {
@@ -172,6 +182,27 @@ extern "C" void uwsgo_app_run(uwsgo_app_t *app) {
     app->app->run();
 }
 
+// Closes the App (which closes the listen socket and all active connection
+// sockets via uWS::App::close), then closes the drain timer so the only
+// remaining loop refs drop and us_loop_run can return. The actual close calls
+// are dispatched via Loop::defer because they mutate loop state and must run
+// on the loop thread. Safe to call from any goroutine. Idempotent.
+extern "C" void uwsgo_app_stop(uwsgo_app_t *app) {
+    if (app->loop == nullptr) {
+        return;
+    }
+    app->loop->defer([app]() {
+        if (app->app != nullptr) {
+            app->app->close();
+            app->listen_socket = nullptr;
+        }
+        if (g_drain_timer != nullptr) {
+            us_timer_close(g_drain_timer);
+            g_drain_timer = nullptr;
+        }
+    });
+}
+
 extern "C" void uwsgo_res_write_status(uwsgo_res_t *res, const char *status, size_t status_len) {
     reinterpret_cast<uWS::HttpResponse<false> *>(res)->writeStatus(std::string_view(status, status_len));
 }
@@ -238,6 +269,24 @@ extern "C" void uwsgo_res_cork(uwsgo_res_t *res, uintptr_t callback_id) {
     });
 }
 
+// uWS invokes the onData callback once per body chunk it receives. On the
+// final chunk is_last == 1 — Go releases the handle after that call so the
+// lambda's GoHandle wrapper must hand ownership off before then. We capture
+// the handle in a shared_ptr so multi-chunk bodies don't accidentally release
+// it mid-stream.
+extern "C" void uwsgo_res_on_data(uwsgo_res_t *res, uintptr_t callback_id) {
+    auto *r = reinterpret_cast<uWS::HttpResponse<false> *>(res);
+    auto handle = std::make_shared<GoHandle>(callback_id);
+    r->onData([handle](std::string_view chunk, bool is_last) {
+        // uwsgoHandleData copies the chunk into Go memory before returning so
+        // it's safe for uWS to reuse the buffer once the call completes.
+        uwsgoHandleData(handle->id, chunk.data(), chunk.size(), is_last ? 1 : 0);
+        if (is_last) {
+            handle->consume(); // Go side released the handle.
+        }
+    });
+}
+
 namespace {
 
 // Maximum inline body bytes for shared-memory responses. Sized to cover
@@ -245,6 +294,18 @@ namespace {
 constexpr size_t INLINE_STATUS_CAP = 32;
 constexpr size_t INLINE_CT_CAP = 64;
 constexpr size_t INLINE_BODY_CAP = 8192;
+
+// Request-snapshot caps. uWS's HttpRequest becomes invalid the moment the
+// C++ handler returns; for async handlers (which run on a goroutine later)
+// we must copy the fields the user might want into the ctx up front.
+constexpr size_t SNAP_METHOD_CAP = 8;
+constexpr size_t SNAP_URL_CAP = 256;
+constexpr size_t SNAP_QUERY_CAP = 512;
+constexpr size_t SNAP_PARAM_CAP = 64;
+constexpr size_t SNAP_PARAM_MAX = 8;
+// Headers are encoded as "name\0value\0..." back-to-back so Go can parse on
+// access without knowing the count up front. 4 KB fits the typical request.
+constexpr size_t SNAP_HEADERS_CAP = 4096;
 
 // AsyncCtx is a reference-counted handle that tracks an in-flight async
 // response. Refs are held by:
@@ -261,6 +322,7 @@ struct AsyncCtx {
     std::atomic<int> refcount{1};
     std::atomic<int32_t> aborted{0};
     uWS::HttpResponse<false> *response;
+    uWS::Loop *loop = nullptr;  // The loop that owns this response (set at creation time)
     uint32_t handler_id = 0;  // Used by shared-dispatch path to pick which Go handler runs
 
     // Inline response slots populated by Go via shared-memory writes.
@@ -270,6 +332,21 @@ struct AsyncCtx {
     char inline_status[INLINE_STATUS_CAP];
     char inline_content_type[INLINE_CT_CAP];
     char inline_body[INLINE_BODY_CAP];
+
+    // Request snapshot. Captured in C++ before the route handler returns so
+    // the async goroutine can read URL/query/params/headers after uWS has
+    // freed the original HttpRequest.
+    uint32_t method_len = 0;
+    uint32_t url_len = 0;
+    uint32_t query_len = 0;
+    uint32_t param_count = 0;
+    uint32_t headers_len = 0;
+    uint32_t param_lens[SNAP_PARAM_MAX] = {0};
+    char method[SNAP_METHOD_CAP];
+    char url[SNAP_URL_CAP];
+    char query[SNAP_QUERY_CAP];
+    char params[SNAP_PARAM_MAX][SNAP_PARAM_CAP];
+    char headers[SNAP_HEADERS_CAP];
 
     void retain() { refcount.fetch_add(1, std::memory_order_relaxed); }
     void release() {
@@ -365,31 +442,17 @@ inline char *dup_to_c_heap(const char *src, size_t n) {
 
 extern "C" uwsgo_loop_t *uwsgo_res_begin_async(uwsgo_res_t *res, void **out_ctx) {
     auto *r = reinterpret_cast<uWS::HttpResponse<false> *>(res);
+    auto *loop = uWS::Loop::get();
     auto *ctx = new AsyncCtx;
     ctx->response = r;
+    ctx->loop = loop;
 
     r->onAborted([hold = CtxHold(ctx)]() {
         hold.ctx->aborted.store(1, std::memory_order_release);
     });
 
     *out_ctx = ctx;
-    return reinterpret_cast<uwsgo_loop_t *>(uWS::Loop::get());
-}
-
-extern "C" void uwsgo_app_get_async(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id) {
-    app->app->get(pattern, [handler_id](auto *res, auto *req) {
-        (void)req;  // Async handlers don't receive the request; it would be
-                    // invalid by the time the goroutine reads it.
-        auto *ctx = new AsyncCtx;
-        ctx->response = res;
-        res->onAborted([hold = CtxHold(ctx)]() {
-            hold.ctx->aborted.store(1, std::memory_order_release);
-        });
-        uwsgoHandleHTTPAsync(handler_id,
-                             reinterpret_cast<uwsgo_res_t *>(res),
-                             ctx,
-                             reinterpret_cast<uwsgo_loop_t *>(uWS::Loop::get()));
-    });
+    return reinterpret_cast<uwsgo_loop_t *>(loop);
 }
 
 extern "C" void uwsgo_async_ctx_release(void *ctx_handle) {
@@ -418,9 +481,29 @@ extern "C" void uwsgo_shared_layout(uwsgo_shared_layout_t *out) {
     out->ctx_ct_offset = offsetof(AsyncCtx, inline_content_type);
     out->ctx_body_offset = offsetof(AsyncCtx, inline_body);
     out->ctx_handler_id_offset = offsetof(AsyncCtx, handler_id);
+    out->ctx_response_offset = offsetof(AsyncCtx, response);
+    out->ctx_loop_offset = offsetof(AsyncCtx, loop);
     out->ctx_inline_status_cap = INLINE_STATUS_CAP;
     out->ctx_inline_ct_cap = INLINE_CT_CAP;
     out->ctx_inline_body_cap = INLINE_BODY_CAP;
+
+    out->ctx_method_len_offset = offsetof(AsyncCtx, method_len);
+    out->ctx_url_len_offset = offsetof(AsyncCtx, url_len);
+    out->ctx_query_len_offset = offsetof(AsyncCtx, query_len);
+    out->ctx_param_count_offset = offsetof(AsyncCtx, param_count);
+    out->ctx_headers_len_offset = offsetof(AsyncCtx, headers_len);
+    out->ctx_param_lens_offset = offsetof(AsyncCtx, param_lens);
+    out->ctx_method_offset = offsetof(AsyncCtx, method);
+    out->ctx_url_offset = offsetof(AsyncCtx, url);
+    out->ctx_query_offset = offsetof(AsyncCtx, query);
+    out->ctx_params_offset = offsetof(AsyncCtx, params);
+    out->ctx_headers_offset = offsetof(AsyncCtx, headers);
+    out->ctx_snap_method_cap = SNAP_METHOD_CAP;
+    out->ctx_snap_url_cap = SNAP_URL_CAP;
+    out->ctx_snap_query_cap = SNAP_QUERY_CAP;
+    out->ctx_snap_param_cap = SNAP_PARAM_CAP;
+    out->ctx_snap_param_max = SNAP_PARAM_MAX;
+    out->ctx_snap_headers_cap = SNAP_HEADERS_CAP;
 }
 
 // uwsgo_app_get_shared registers a route whose dispatch path skips the
@@ -428,26 +511,100 @@ extern "C" void uwsgo_shared_layout(uwsgo_shared_layout_t *out) {
 // AsyncCtx with handler_id stamped on it and pushes it onto the shared
 // request ring. Go worker goroutines (started by the binding at startup)
 // drain the ring with plain atomic ops and run the handler.
+// snapshot_request copies the fields of the live uWS HttpRequest into the
+// AsyncCtx so the async goroutine can read them after uWS frees the request.
+// Anything that doesn't fit the fixed buffers is truncated.
+static void snapshot_request(AsyncCtx *ctx, uWS::HttpRequest *req) {
+    auto copy_view = [](char *dst, size_t cap, std::string_view src) -> uint32_t {
+        size_t n = std::min(cap, src.size());
+        if (n > 0) std::memcpy(dst, src.data(), n);
+        return static_cast<uint32_t>(n);
+    };
+
+    ctx->method_len = copy_view(ctx->method, SNAP_METHOD_CAP, req->getMethod());
+    // getUrl returns the path; getQuery returns query string sans '?'.
+    ctx->url_len = copy_view(ctx->url, SNAP_URL_CAP, req->getUrl());
+    ctx->query_len = copy_view(ctx->query, SNAP_QUERY_CAP, req->getQuery());
+
+    // Route parameters: walk indices until uWS returns empty.
+    uint32_t param_count = 0;
+    for (uint32_t i = 0; i < SNAP_PARAM_MAX; i++) {
+        auto v = req->getParameter(i);
+        if (v.empty()) break;
+        ctx->param_lens[i] = copy_view(ctx->params[i], SNAP_PARAM_CAP, v);
+        param_count = i + 1;
+    }
+    ctx->param_count = param_count;
+
+    // Headers: encode as "name\0value\0..." back-to-back. Stop when the next
+    // pair won't fit so we don't half-write a value.
+    uint32_t hpos = 0;
+    for (auto it = req->begin(); it != req->end(); ++it) {
+        auto kv = *it;
+        std::string_view name = kv.first;
+        std::string_view value = kv.second;
+        size_t need = name.size() + 1 + value.size() + 1;
+        if (hpos + need > SNAP_HEADERS_CAP) break;
+        std::memcpy(ctx->headers + hpos, name.data(), name.size());
+        hpos += name.size();
+        ctx->headers[hpos++] = '\0';
+        std::memcpy(ctx->headers + hpos, value.data(), value.size());
+        hpos += value.size();
+        ctx->headers[hpos++] = '\0';
+    }
+    ctx->headers_len = hpos;
+}
+
 extern "C" void uwsgo_app_get_shared(uwsgo_app_t *app, const char *pattern, uint32_t handler_id) {
     app->app->get(pattern, [handler_id](auto *res, auto *req) {
-        (void)req;  // Shared-dispatch handlers can't read the request (uWS
-                    // recycles it after this lambda returns, before Go reads).
-        auto *ctx = new AsyncCtx;
-        ctx->response = res;
-        ctx->handler_id = handler_id;
-        res->onAborted([hold = CtxHold(ctx)]() {
-            hold.ctx->aborted.store(1, std::memory_order_release);
-        });
-
-        // MPMC push onto request ring. Producer = uWS loop thread (single),
-        // consumers = Go worker goroutines (multiple).
-        uint64_t idx = g_request.tail.fetch_add(1, std::memory_order_relaxed);
-        PendingSlot *slot = &g_request.slots[idx & RING_MASK];
-        while (slot->sequence.load(std::memory_order_acquire) != idx) {
-            // Ring full; spin briefly — shouldn't happen at normal load.
+        // CAS-based bounded MPMC enqueue. If the ring is full (next slot's
+        // sequence is behind our intended position), we reject the request
+        // with 503 instead of spinning — that would block the loop thread.
+        uint64_t tail = g_request.tail.load(std::memory_order_relaxed);
+        for (int spin = 0;; ++spin) {
+            PendingSlot *slot = &g_request.slots[tail & RING_MASK];
+            uint64_t seq = slot->sequence.load(std::memory_order_acquire);
+            int64_t diff = (int64_t)(seq - tail);
+            if (diff == 0) {
+                // Slot is empty for this tail; try to claim it.
+                if (g_request.tail.compare_exchange_weak(
+                        tail, tail + 1,
+                        std::memory_order_relaxed,
+                        std::memory_order_relaxed)) {
+                    auto *ctx = new AsyncCtx;
+                    ctx->response = res;
+                    ctx->loop = uWS::Loop::get();
+                    ctx->handler_id = handler_id;
+                    // Snapshot before any cgo / Go work — uWS HttpRequest is
+                    // live only inside this lambda.
+                    snapshot_request(ctx, req);
+                    res->onAborted([hold = CtxHold(ctx)]() {
+                        hold.ctx->aborted.store(1, std::memory_order_release);
+                    });
+                    slot->ctx = ctx;
+                    slot->sequence.store(tail + 1, std::memory_order_release);
+                    return;
+                }
+                // CAS lost; retry with new tail (already updated by CAS).
+            } else if (diff < 0) {
+                // Ring is full — consumer is RING_SIZE slots behind. Reject.
+                res->writeStatus("503 Service Unavailable");
+                res->writeHeader("Content-Type", "text/plain; charset=utf-8");
+                res->end("Server overloaded\n");
+                return;
+            } else {
+                // Another producer just claimed this slot; reload tail and retry.
+                tail = g_request.tail.load(std::memory_order_relaxed);
+            }
+            // Defensive cap: huge contention shouldn't happen, but bail out
+            // before the loop thread is locked indefinitely.
+            if (spin > 100000) {
+                res->writeStatus("503 Service Unavailable");
+                res->writeHeader("Content-Type", "text/plain; charset=utf-8");
+                res->end("Enqueue contention\n");
+                return;
+            }
         }
-        slot->ctx = ctx;
-        slot->sequence.store(idx + 1, std::memory_order_release);
     });
 }
 
@@ -485,14 +642,23 @@ static void drain_pending() {
 
 // uwsgo_app_start_drain installs a periodic timer on the current loop that
 // invokes drain_pending. interval_us is the polling interval; 50-200 us
-// trades wake latency vs CPU. Returns nothing; the timer lives for the
-// lifetime of the loop.
+// trades wake latency vs CPU.
+// uwsgo_wake_drain schedules a single drain run on the loop thread. Callable
+// from any goroutine via Go: after pushing onto the response ring, this
+// wakes the loop immediately instead of waiting up to ~1 ms for the
+// periodic drain timer to fire. Costs one cgo crossing per response in
+// exchange for sub-millisecond response latency.
+extern "C" void uwsgo_wake_drain(uwsgo_loop_t *loop) {
+    auto *l = reinterpret_cast<uWS::Loop *>(loop);
+    l->defer([]() { drain_pending(); });
+}
+
 extern "C" void uwsgo_app_start_drain(int interval_us) {
     auto *loop = reinterpret_cast<struct us_loop_t *>(uWS::Loop::get());
-    auto *timer = us_create_timer(loop, 0, 0);
+    g_drain_timer = us_create_timer(loop, 0, 0);
     int ms = interval_us / 1000;
     if (ms < 1) ms = 1;
-    us_timer_set(timer, [](struct us_timer_t * /*t*/) {
+    us_timer_set(g_drain_timer, [](struct us_timer_t * /*t*/) {
         drain_pending();
     }, ms, ms);
 }
@@ -533,6 +699,11 @@ extern "C" void uwsgo_res_defer_send(
     });
 }
 
+extern "C" size_t uwsgo_req_method(uwsgo_req_t *req, char *buffer, size_t buffer_len) {
+    auto value = reinterpret_cast<uWS::HttpRequest *>(req)->getMethod();
+    return copy_string_view(value, buffer, buffer_len);
+}
+
 extern "C" size_t uwsgo_req_url(uwsgo_req_t *req, char *buffer, size_t buffer_len) {
     auto value = reinterpret_cast<uWS::HttpRequest *>(req)->getUrl();
     return copy_string_view(value, buffer, buffer_len);
@@ -546,6 +717,42 @@ extern "C" size_t uwsgo_req_header(uwsgo_req_t *req, const char *name, size_t na
 extern "C" size_t uwsgo_req_parameter(uwsgo_req_t *req, unsigned long index, char *buffer, size_t buffer_len) {
     auto value = reinterpret_cast<uWS::HttpRequest *>(req)->getParameter(index);
     return copy_string_view(value, buffer, buffer_len);
+}
+
+extern "C" size_t uwsgo_req_query(uwsgo_req_t *req, char *buffer, size_t buffer_len) {
+    auto value = reinterpret_cast<uWS::HttpRequest *>(req)->getQuery();
+    return copy_string_view(value, buffer, buffer_len);
+}
+
+extern "C" size_t uwsgo_req_query_param(uwsgo_req_t *req, const char *name, size_t name_len, char *buffer, size_t buffer_len) {
+    auto value = reinterpret_cast<uWS::HttpRequest *>(req)->getQuery(std::string_view(name, name_len));
+    return copy_string_view(value, buffer, buffer_len);
+}
+
+extern "C" size_t uwsgo_req_headers_all(uwsgo_req_t *req_ptr, char *buffer, size_t buffer_len) {
+    auto *req = reinterpret_cast<uWS::HttpRequest *>(req_ptr);
+    // Two-pass: first compute the total size, then write if there's room.
+    size_t total = 0;
+    for (auto it = req->begin(); it != req->end(); ++it) {
+        auto kv = *it;
+        total += kv.first.size() + 1 + kv.second.size() + 1;
+    }
+    if (buffer == nullptr || buffer_len < total) {
+        return total;
+    }
+    size_t pos = 0;
+    for (auto it = req->begin(); it != req->end(); ++it) {
+        auto kv = *it;
+        std::string_view name = kv.first;
+        std::string_view value = kv.second;
+        std::memcpy(buffer + pos, name.data(), name.size());
+        pos += name.size();
+        buffer[pos++] = '\0';
+        std::memcpy(buffer + pos, value.data(), value.size());
+        pos += value.size();
+        buffer[pos++] = '\0';
+    }
+    return pos;
 }
 
 extern "C" int uwsgo_ws_send(uwsgo_ws_t *ws, const char *message, size_t message_len, int opcode) {

@@ -2,7 +2,7 @@
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-TARGET="$ROOT/uwebsockets/third_party/uWebSockets"
+TARGET="$ROOT/gogo/third_party/uWebSockets"
 
 if [ ! -d "$TARGET/.git" ]; then
 	mkdir -p "$(dirname "$TARGET")"

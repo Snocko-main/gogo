@@ -1,10 +1,10 @@
-//go:build !cgo || !uwebsockets
+//go:build !cgo || !gogo
 
-package uwebsockets
+package gogo
 
 import "errors"
 
-var errNativeDisabled = errors.New("uwebsockets native binding disabled: build with CGO_ENABLED=1 and -tags uwebsockets")
+var errNativeDisabled = errors.New("gogo native binding disabled: build with CGO_ENABLED=1 and -tags gogo")
 
 type appNative struct{}
 type responseNative struct{}
@@ -16,15 +16,15 @@ func newAppNative() (appNative, error) {
 	return appNative{}, errNativeDisabled
 }
 
-func (appNative) get(string, Handler)                 {}
-func (appNative) getStatic(string, string, string, string) {}
-func (appNative) getAsync(string, AsyncHandler)       {}
-func (appNative) getShared(string, AsyncHandler)      {}
+func (appNative) get(string, Handler)                      {}
+func (appNative) getStatic(string, string, string, string)  {}
+func (appNative) getShared(string, AsyncHandler)            {}
 func (appNative) post(string, Handler)                {}
 func (appNative) any(string, Handler)                 {}
 func (appNative) websocket(string, WebSocketBehavior) {}
 func (appNative) listen(int) bool                     { return false }
 func (appNative) run()                                {}
+func (appNative) stop()                               {}
 func (appNative) close()                              {}
 
 func (responseNative) status(string)             {}
@@ -35,6 +35,7 @@ func (responseNative) send(string, string, string) {}
 func (responseNative) loop() loopNative      { return loopNative{} }
 func (responseNative) onAborted(*Aborted)    {}
 func (responseNative) cork(func())           {}
+func (responseNative) onData(func([]byte, bool)) {}
 
 func (loopNative) defer_(func()) {}
 
@@ -47,9 +48,13 @@ func (responseNative) beginAsync() (uintptr, uintptr) { return 0, 0 }
 func asyncDeferSend(uintptr, uintptr, string, string, string) {}
 func asyncCtxRelease(uintptr)                              {}
 
-func (requestNative) url() string          { return "" }
-func (requestNative) header(string) string { return "" }
-func (requestNative) parameter(int) string { return "" }
+func (requestNative) method() string           { return "" }
+func (requestNative) url() string              { return "" }
+func (requestNative) header(string) string     { return "" }
+func (requestNative) parameter(int) string     { return "" }
+func (requestNative) query() string            { return "" }
+func (requestNative) queryParam(string) string { return "" }
+func (requestNative) headersAll() []byte       { return nil }
 
 func (websocketNative) send([]byte, OpCode) bool       { return false }
 func (websocketNative) sendString(string, OpCode) bool { return false }

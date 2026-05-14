@@ -1,32 +1,31 @@
-# uWebSockets for Go
+# gogo~
 
-This is a small cgo binding that makes the C++ uWebSockets HTTP app usable from
-Go.
+A Go HTTP framework built on the uWebSockets C++ HTTP server, designed for
+low cgo overhead and high concurrency on real-world IO-bound workloads.
 
 It is intentionally thin:
 
 - Go owns route registration and handlers.
 - C++ owns uWebSockets templates, the event loop, and response/request calls.
-- Request and response objects are valid only during the handler callback.
+- Async dispatch uses a shared-memory ring so the request hot path crosses
+  cgo zero times for shared-mode handlers.
 
-## Current Scope
+## Scope
 
-- Non-TLS `uWS::App`
-- `GET`, `POST`, and `ANY` routes
-- Request URL, headers, and route parameters
-- Response status, headers, write, and end
-- WebSocket open, message, close, send, and end callbacks
-
-TLS app options, publish/subscribe, async responses, backpressure tuning, and
-multi-threaded app-per-core orchestration are deliberately left out of the first
-pass.
+- Non-TLS `uWS::App` (TLS / HTTP/2 / WS publish-subscribe out of scope for now)
+- `GET`, `POST`, `Any` routes
+- `GetAsync` / `PostAsync` with goroutine handlers + request snapshot
+- Middleware chain (`app.Use`)
+- Cookies, JSON helpers
+- Graceful shutdown, panic recovery, request validation
+- WebSocket open / message / close / send / end
 
 ## Install Native Dependencies
 
 The binding expects uWebSockets to be vendored here:
 
 ```txt
-uwebsockets/third_party/uWebSockets
+gogo/third_party/uWebSockets
 ```
 
 One way to set that up:
@@ -35,16 +34,23 @@ One way to set that up:
 sh scripts/bootstrap_uwebsockets.sh
 ```
 
-Then run the example:
+Then run an example:
 
 ```sh
-CGO_ENABLED=1 go run -tags uwebsockets ./example/hello
+CGO_ENABLED=1 go run -tags gogo ./examples/hello
 curl http://localhost:3000/hello/inon
 ```
 
-Without `-tags uwebsockets`, the package builds a stub and `NewApp` returns a
+Without `-tags gogo`, the package builds a stub and `NewApp` returns a
 clear setup error. This keeps normal Go tooling usable before the native
 dependency is present.
+
+## Examples
+
+- `examples/hello` — static reply + sync handler + async handler
+- `examples/restapi` — in-memory CRUD with JSON + query filter
+- `examples/authmw` — logger middleware (before+after) + bearer auth
+- `examples/upload` — POST body collection with 413 + low-level OnData stream
 
 ## Why There Is a C++ Bridge
 
@@ -54,36 +60,36 @@ turns the parts Go needs into a small C ABI.
 
 ## Caveats
 
-- Do not store `*Request` or `*Response` outside a handler.
-- Do not call response methods from another goroutine in this first version.
-- Do not expect `net/http` middleware compatibility.
-- Treat this as a native binding, not a pure Go server.
+- `*Request` and `*Response` from sync handlers are valid only during the
+  handler callback. Async handlers receive a snapshot Request that survives
+  past the C-side lifetime.
+- `GetShared` was merged into `GetAsync` — pick the shared path automatically
+  when no middleware is registered.
+- `net/http` middleware is not directly compatible (different signature).
 
 ## Benchmarking
 
 There are three comparable HTTP benchmark servers:
 
 - `benchmark/nethttp`: Go standard library `net/http`
-- `benchmark/uwsgo`: this Go binding
-- `benchmark/node-uwebsockets`: uWebSockets.js on Node
+- `benchmark/uwsgo`: this binding
+- `benchmark/fiber`: gofiber/fiber on fasthttp
 
-Start each server in a separate terminal:
+Start each in a separate terminal:
 
 ```sh
 go run ./benchmark/nethttp
-CGO_ENABLED=1 go run -tags uwebsockets ./benchmark/uwsgo
-cd benchmark/node-uwebsockets && npm install && npm start
+CGO_ENABLED=1 go run -tags gogo ./benchmark/uwsgo
+go run ./benchmark/fiber
 ```
 
-Then run:
+Run wrk against them (use `-t 1` so client threads don't compete with the
+single-threaded uWS loop for CPU):
 
 ```sh
-npm install --prefix .tools/npm autocannon
-sh scripts/bench_http.sh
+wrk -t 1 -c 100 -d 10s http://localhost:3002/health   # gogo
+wrk -t 1 -c 100 -d 10s http://localhost:3004/health   # fiber
 ```
 
-Use the same machine, same CPU governor/power mode, same payloads, and repeat
-the run several times. Watch both throughput and latency percentiles. For this
-binding specifically, also compare `/plain` with `/hello/:name`: route
-parameters cross the C++/Go boundary and reveal cgo overhead better than a pure
-constant response.
+Use the same machine, same power mode, same payloads, and repeat each run
+3–5 times. Watch both throughput and latency percentiles.

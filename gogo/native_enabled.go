@@ -1,6 +1,6 @@
-//go:build cgo && uwebsockets
+//go:build cgo && gogo
 
-package uwebsockets
+package gogo
 
 /*
 #cgo CXXFLAGS: -std=c++20 -I${SRCDIR}/third_party/uWebSockets/src -I${SRCDIR}/third_party/uWebSockets/uSockets/src
@@ -56,15 +56,31 @@ func (a *appNative) get(pattern string, handler Handler) {
 // into AsyncCtx; Go workers look it up here. Slots are append-only — handlers
 // register at app setup time, never expire.
 var (
-	sharedHandlers    []AsyncHandler
-	sharedHandlersMu  sync.Mutex
-	sharedWorkersOnce sync.Once
+	// sharedHandlers is append-only after registration. Registration takes
+	// the mutex; workers read via an atomic snapshot to keep the request
+	// hot path lock-free.
+	sharedHandlers     []AsyncHandler
+	sharedHandlersMu   sync.Mutex
+	sharedHandlersSnap atomic.Pointer[[]AsyncHandler]
+	sharedWorkersOnce  sync.Once
+	sharedActive       atomic.Bool // true once a Shared route has been registered
 )
+
+func init() {
+	// Initialize the atomic snapshot with an empty slice so workers can
+	// Load() unconditionally without nil checks.
+	empty := []AsyncHandler{}
+	sharedHandlersSnap.Store(&empty)
+}
 
 func registerSharedHandler(h AsyncHandler) uint32 {
 	sharedHandlersMu.Lock()
 	defer sharedHandlersMu.Unlock()
 	sharedHandlers = append(sharedHandlers, h)
+	// Publish a fresh snapshot so workers see the new handler via an atomic
+	// pointer swap — no lock acquired on the request hot path.
+	snap := append([]AsyncHandler(nil), sharedHandlers...)
+	sharedHandlersSnap.Store(&snap)
 	return uint32(len(sharedHandlers) - 1)
 }
 
@@ -73,15 +89,36 @@ func (a *appNative) getShared(pattern string, handler AsyncHandler) {
 	cpattern := C.CString(pattern)
 	defer C.free(unsafe.Pointer(cpattern))
 	C.uwsgo_app_get_shared(a.ptr, cpattern, C.uint32_t(id))
+	sharedActive.Store(true)
 	// Lazily start worker goroutines on first shared route registration.
 	ensureSharedWorkers()
 }
 
+// workerCount controls how many goroutines drain the request ring. Read once
+// when the first shared route registers (and workers spin up); changing it
+// after that has no effect. Default = NumCPU — spinning workers compete
+// with the uWS loop thread on GOMAXPROCS, so over-subscribing tanks sync
+// route latency. For workloads dominated by slow IO, raise this via
+// SetWorkerCount before the first GetAsync registers.
+var workerCount atomic.Int32
+
+// SetWorkerCount configures the shared-dispatch worker pool size. Call
+// before registering any GetAsync route — calls after the pool starts
+// are no-ops. Pass 0 to restore the default (NumCPU).
+func SetWorkerCount(n int) {
+	if n < 0 {
+		n = 0
+	}
+	workerCount.Store(int32(n))
+}
+
 func ensureSharedWorkers() {
 	sharedWorkersOnce.Do(func() {
-		// One worker per CPU. Workers stay alive for the program's lifetime,
-		// busy-polling the request ring with adaptive back-off.
-		for i := 0; i < runtime.NumCPU(); i++ {
+		n := int(workerCount.Load())
+		if n == 0 {
+			n = runtime.NumCPU()
+		}
+		for i := 0; i < n; i++ {
 			go sharedWorker()
 		}
 	})
@@ -91,6 +128,10 @@ func ensureSharedWorkers() {
 // of iterations, then yield via Gosched, then sleep progressively longer up
 // to a cap. At sustained load the spin path catches work immediately; idle
 // workers settle to a cheap periodic wake.
+//
+// On handler panic, the worker recovers, sends a 500 response (if the
+// response hasn't already been written), releases the ctx, and continues
+// the loop — a single bad request never tears down a worker.
 func sharedWorker() {
 	const spinLimit = 256
 
@@ -135,26 +176,108 @@ func sharedWorker() {
 		// ringSize, so the next producer for this slot waits for idx+ringSize).
 		seqAddr.Store(idx + uint64(shared.ringMask) + 1)
 
-		sharedHandlersMu.Lock()
-		handler := sharedHandlers[handlerID]
-		sharedHandlersMu.Unlock()
+		// Read the handler from the atomic snapshot — append-only after
+		// registration, so no lock on the hot path.
+		snap := sharedHandlersSnap.Load()
+		handler := (*snap)[handlerID]
 
-		resWrap := responsePool.Get().(*Response)
-		resWrap.inner = responseNative{ptr: (*C.uwsgo_res_t)(unsafe.Pointer(ctxPtr))}
+		// Run inline on the worker. Workers are sized for typical short
+		// handlers (db queries, in-memory work). For longer-blocking
+		// handlers (large file IO), increase WorkerCount or call
+		// SetWorkerCount before the first GetAsync registration.
+		runSharedHandler(handler, ctxPtr)
+	}
+}
 
-		a := asyncStatePool.Get().(*asyncState)
-		a.loopPtr = 0
-		a.ctxHandle = ctxPtr
-		a.status = "200 OK"
-		a.sent = false
-		resWrap.async = a
+// runSharedHandler invokes a user-supplied AsyncHandler with full panic
+// containment. On panic it emits a 500 response (best-effort) and releases
+// the ctx so the worker can keep running.
+func runSharedHandler(handler AsyncHandler, ctxPtr uintptr) {
+	// Read the real HttpResponse / Loop pointers stored in AsyncCtx so the
+	// SendShared cgo-fallback path (when body exceeds inline caps) writes to
+	// the right C++ objects rather than dereferencing the ctx itself.
+	resPtr := *(**C.uwsgo_res_t)(unsafe.Pointer(ctxPtr + shared.ctxResponseOff))
+	loopPtrRaw := *(*uintptr)(unsafe.Pointer(ctxPtr + shared.ctxLoopOff))
 
-		handler(resWrap)
+	resWrap := responsePool.Get().(*Response)
+	resWrap.inner = responseNative{ptr: resPtr}
+
+	a := asyncStatePool.Get().(*asyncState)
+	a.loopPtr = loopPtrRaw
+	a.ctxHandle = ctxPtr
+	a.status = "200 OK"
+	a.sent = false
+	resWrap.async = a
+
+	// Build the request snapshot from ctx memory. C++ has already copied the
+	// fields it could into AsyncCtx; we copy out to Go-owned strings/bytes so
+	// the snapshot survives past ctx release.
+	reqWrap := requestPool.Get().(*Request)
+	reqWrap.snap = newSnapshotFromCtx(ctxPtr)
+
+	defer func() {
+		if r := recover(); r != nil {
+			panicHandler := getPanicHandler()
+			if panicHandler != nil {
+				panicHandler(r)
+			}
+			if !a.sent {
+				// Best-effort 500 so the client doesn't hang. Body is left
+				// minimal so we don't risk another panic during marshaling.
+				resWrap.SendShared(500, "text/plain; charset=utf-8", "Internal Server Error\n")
+			}
+		}
 		if !a.sent {
 			asyncCtxRelease(ctxPtr)
 		}
+		reqWrap.snap = nil
+		requestPool.Put(reqWrap)
 		resWrap.recycleAsync(a)
+	}()
+
+	handler(resWrap, reqWrap)
+}
+
+// newSnapshotFromCtx reads the request-snapshot fields C++ wrote into the
+// AsyncCtx and returns a Go-side requestSnapshot whose strings/bytes do not
+// alias ctx memory — so the snapshot stays valid after ctx is released.
+func newSnapshotFromCtx(ctxPtr uintptr) *requestSnapshot {
+	methodLen := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxMethodLenOff))
+	urlLen := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxURLLenOff))
+	queryLen := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxQueryLenOff))
+	paramCount := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxParamCountOff))
+	headersLen := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxHeadersLenOff))
+
+	snap := &requestSnapshot{
+		method: copyAt(ctxPtr+shared.ctxMethodOff, int(methodLen)),
+		url:    copyAt(ctxPtr+shared.ctxURLOff, int(urlLen)),
+		query:  copyAt(ctxPtr+shared.ctxQueryOff, int(queryLen)),
 	}
+
+	if paramCount > 0 {
+		paramsBase := ctxPtr + shared.ctxParamsOff
+		paramLensBase := ctxPtr + shared.ctxParamLensOff
+		params := make([]string, paramCount)
+		for i := uint32(0); i < paramCount; i++ {
+			plen := *(*uint32)(unsafe.Pointer(paramLensBase + uintptr(i)*unsafe.Sizeof(uint32(0))))
+			params[i] = copyAt(paramsBase+uintptr(i)*shared.snapParamCap, int(plen))
+		}
+		snap.params = params
+	}
+
+	if headersLen > 0 {
+		hdrs := make([]byte, headersLen)
+		copy(hdrs, unsafe.Slice((*byte)(unsafe.Pointer(ctxPtr+shared.ctxHeadersOff)), int(headersLen)))
+		snap.headers = hdrs
+	}
+	return snap
+}
+
+func copyAt(base uintptr, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return string(unsafe.Slice((*byte)(unsafe.Pointer(base)), n))
 }
 
 func (a *appNative) getStatic(pattern, status, contentType, body string) {
@@ -166,16 +289,6 @@ func (a *appNative) getStatic(pattern, status, contentType, body string) {
 		unsafeStringData(contentType), C.size_t(len(contentType)),
 		unsafeStringData(body), C.size_t(len(body)),
 	)
-}
-
-func (a *appNative) getAsync(pattern string, handler AsyncHandler) {
-	cpattern := C.CString(pattern)
-	defer C.free(unsafe.Pointer(cpattern))
-
-	h := cgo.NewHandle(handler)
-	a.handles = append(a.handles, h)
-
-	C.uwsgo_app_get_async(a.ptr, cpattern, C.uintptr_t(h))
 }
 
 func (a *appNative) post(pattern string, handler Handler) {
@@ -215,6 +328,10 @@ func (a appNative) listen(port int) bool {
 
 func (a appNative) run() {
 	C.uwsgo_app_run(a.ptr)
+}
+
+func (a appNative) stop() {
+	C.uwsgo_app_stop(a.ptr)
 }
 
 func (a *appNative) close() {
@@ -275,6 +392,11 @@ func (r responseNative) cork(fn func()) {
 	C.uwsgo_res_cork(r.ptr, C.uintptr_t(handle))
 }
 
+func (r responseNative) onData(fn func([]byte, bool)) {
+	handle := cgo.NewHandle(fn)
+	C.uwsgo_res_on_data(r.ptr, C.uintptr_t(handle))
+}
+
 func (l loopNative) defer_(fn func()) {
 	handle := cgo.NewHandle(fn)
 	C.uwsgo_loop_defer(l.ptr, C.uintptr_t(handle))
@@ -319,15 +441,44 @@ type sharedLayout struct {
 	ctxCtOff         uintptr
 	ctxBodyOff       uintptr
 	ctxHandlerIDOff  uintptr
+	ctxResponseOff   uintptr
+	ctxLoopOff       uintptr
 	statusCap        uintptr
 	ctCap            uintptr
 	bodyCap          uintptr
+	// Request snapshot offsets (populated by C++ before the ctx is enqueued).
+	ctxMethodLenOff  uintptr
+	ctxURLLenOff     uintptr
+	ctxQueryLenOff   uintptr
+	ctxParamCountOff uintptr
+	ctxHeadersLenOff uintptr
+	ctxParamLensOff  uintptr
+	ctxMethodOff     uintptr
+	ctxURLOff        uintptr
+	ctxQueryOff      uintptr
+	ctxParamsOff     uintptr
+	ctxHeadersOff    uintptr
+	snapMethodCap    uintptr
+	snapURLCap       uintptr
+	snapQueryCap     uintptr
+	snapParamCap     uintptr
+	snapParamMax     uintptr
+	snapHeadersCap   uintptr
 }
 
 var shared sharedLayout
 var sharedReady bool
+var sharedLayoutOnce sync.Once
 
 func initSharedLayout() {
+	// The layout is a process-wide constant exposed by C++; once read it does
+	// not change. Guard with sync.Once so multiple NewApp calls don't race on
+	// the global `shared` struct against workers that started reading after the
+	// first init.
+	sharedLayoutOnce.Do(initSharedLayoutOnce)
+}
+
+func initSharedLayoutOnce() {
 	var raw C.uwsgo_shared_layout_t
 	C.uwsgo_shared_layout(&raw)
 	shared = sharedLayout{
@@ -347,9 +498,29 @@ func initSharedLayout() {
 		ctxCtOff:        uintptr(raw.ctx_ct_offset),
 		ctxBodyOff:      uintptr(raw.ctx_body_offset),
 		ctxHandlerIDOff: uintptr(raw.ctx_handler_id_offset),
+		ctxResponseOff:  uintptr(raw.ctx_response_offset),
+		ctxLoopOff:      uintptr(raw.ctx_loop_offset),
 		statusCap:       uintptr(raw.ctx_inline_status_cap),
 		ctCap:           uintptr(raw.ctx_inline_ct_cap),
 		bodyCap:         uintptr(raw.ctx_inline_body_cap),
+
+		ctxMethodLenOff:  uintptr(raw.ctx_method_len_offset),
+		ctxURLLenOff:     uintptr(raw.ctx_url_len_offset),
+		ctxQueryLenOff:   uintptr(raw.ctx_query_len_offset),
+		ctxParamCountOff: uintptr(raw.ctx_param_count_offset),
+		ctxHeadersLenOff: uintptr(raw.ctx_headers_len_offset),
+		ctxParamLensOff:  uintptr(raw.ctx_param_lens_offset),
+		ctxMethodOff:     uintptr(raw.ctx_method_offset),
+		ctxURLOff:        uintptr(raw.ctx_url_offset),
+		ctxQueryOff:      uintptr(raw.ctx_query_offset),
+		ctxParamsOff:     uintptr(raw.ctx_params_offset),
+		ctxHeadersOff:    uintptr(raw.ctx_headers_offset),
+		snapMethodCap:    uintptr(raw.ctx_snap_method_cap),
+		snapURLCap:       uintptr(raw.ctx_snap_url_cap),
+		snapQueryCap:     uintptr(raw.ctx_snap_query_cap),
+		snapParamCap:     uintptr(raw.ctx_snap_param_cap),
+		snapParamMax:     uintptr(raw.ctx_snap_param_max),
+		snapHeadersCap:   uintptr(raw.ctx_snap_headers_cap),
 	}
 	sharedReady = true
 }
@@ -403,7 +574,22 @@ func asyncSendShared(ctxHandle uintptr, statusLine, contentType, body string) bo
 	}
 	*(*uintptr)(unsafe.Pointer(slotBase + shared.slotCtxOffset)) = ctxHandle
 	seqAddr.Store(idx + 1)
+
+	// Wake the loop so it drains the ring immediately. Without this the
+	// response waits up to 1 ms for the periodic drain timer to fire
+	// (libuS timers are ms-granularity). One cgo crossing per response,
+	// far cheaper than the ~0.5 ms average latency we'd otherwise eat.
+	loopPtr := *(*uintptr)(unsafe.Pointer(ctxHandle + shared.ctxLoopOff))
+	if loopPtr != 0 {
+		C.uwsgo_wake_drain((*C.uwsgo_loop_t)(unsafe.Pointer(loopPtr)))
+	}
 	return true
+}
+
+func (r requestNative) method() string {
+	return readNativeString(func(buf *C.char, len C.size_t) C.size_t {
+		return C.uwsgo_req_method(r.ptr, buf, len)
+	})
 }
 
 func (r requestNative) url() string {
@@ -422,6 +608,31 @@ func (r requestNative) parameter(index int) string {
 	return readNativeString(func(buf *C.char, len C.size_t) C.size_t {
 		return C.uwsgo_req_parameter(r.ptr, C.ulong(index), buf, len)
 	})
+}
+
+func (r requestNative) query() string {
+	return readNativeString(func(buf *C.char, len C.size_t) C.size_t {
+		return C.uwsgo_req_query(r.ptr, buf, len)
+	})
+}
+
+func (r requestNative) queryParam(name string) string {
+	return readNativeString(func(buf *C.char, bufLen C.size_t) C.size_t {
+		return C.uwsgo_req_query_param(r.ptr, unsafeStringData(name), C.size_t(len(name)), buf, bufLen)
+	})
+}
+
+// headersAll returns the request headers in the "name\0value\0..." format
+// used by requestSnapshot. Allocates and copies — only callable while the
+// uWS HttpRequest is still live.
+func (r requestNative) headersAll() []byte {
+	size := C.uwsgo_req_headers_all(r.ptr, nil, 0)
+	if size == 0 {
+		return nil
+	}
+	buf := make([]byte, int(size))
+	C.uwsgo_req_headers_all(r.ptr, (*C.char)(unsafe.Pointer(&buf[0])), size)
+	return buf
 }
 
 func readNativeString(read func(*C.char, C.size_t) C.size_t) string {
@@ -474,41 +685,21 @@ func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req
 	resWrap := responsePool.Get().(*Response)
 	resWrap.inner = responseNative{ptr: res}
 	resWrap.async = nil
+	resWrap.bodyPending = false
 
 	handler(resWrap, reqWrap)
 
 	reqWrap.inner = requestNative{}
 	requestPool.Put(reqWrap)
 
-	// Sync responses are done with resWrap by now; async ones keep using it
-	// from a goroutine, so we cannot recycle until the async flush returns it.
-	if resWrap.async == nil {
+	// Sync responses are done with resWrap by now. We must NOT recycle if:
+	//   - async is set: a goroutine still uses the wrapper
+	//   - bodyPending is set: onData hasn't received the final chunk yet
+	// Both paths take responsibility for their own recycle.
+	if resWrap.async == nil && !resWrap.bodyPending {
 		resWrap.inner = responseNative{}
 		responsePool.Put(resWrap)
 	}
-}
-
-//export uwsgoHandleHTTPAsync
-func uwsgoHandleHTTPAsync(handlerID C.uintptr_t, res *C.uwsgo_res_t, ctx unsafe.Pointer, loop *C.uwsgo_loop_t) {
-	handler := cgo.Handle(handlerID).Value().(AsyncHandler)
-
-	resWrap := responsePool.Get().(*Response)
-	resWrap.inner = responseNative{ptr: res}
-
-	a := asyncStatePool.Get().(*asyncState)
-	a.loopPtr = uintptr(unsafe.Pointer(loop))
-	a.ctxHandle = uintptr(ctx)
-	a.status = "200 OK"
-	a.sent = false
-	resWrap.async = a
-
-	go func() {
-		handler(resWrap)
-		if !a.sent {
-			asyncCtxRelease(a.ctxHandle)
-		}
-		resWrap.recycleAsync(a)
-	}()
 }
 
 //export uwsgoHandleWSOpen
@@ -573,4 +764,20 @@ func uwsgoHandleCork(callbackID C.uintptr_t) {
 //export uwsgoReleaseHandle
 func uwsgoReleaseHandle(callbackID C.uintptr_t) {
 	cgo.Handle(callbackID).Delete()
+}
+
+//export uwsgoHandleData
+func uwsgoHandleData(callbackID C.uintptr_t, data *C.char, size C.size_t, isLast C.int) {
+	h := cgo.Handle(callbackID)
+	fn := h.Value().(func([]byte, bool))
+	// Copy the chunk into Go memory — uWS reuses its buffer after this call.
+	var chunk []byte
+	if size > 0 {
+		chunk = C.GoBytes(unsafe.Pointer(data), C.int(size))
+	}
+	last := isLast != 0
+	if last {
+		h.Delete()
+	}
+	fn(chunk, last)
 }
