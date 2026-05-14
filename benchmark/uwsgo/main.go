@@ -1,13 +1,51 @@
 package main
 
 import (
+	"database/sql"
+	"fmt"
 	"log"
+	"math/rand/v2"
 	"net/http"
 	_ "net/http/pprof"
+	"os"
+	"runtime"
 	"time"
 
+	_ "github.com/mattn/go-sqlite3"
 	uws "uwebsockets-go/uwebsockets"
 )
+
+var dbConn *sql.DB
+
+func initDB(path string) error {
+	db, err := sql.Open("sqlite3", path+"?_journal=WAL&_synchronous=NORMAL")
+	if err != nil {
+		return err
+	}
+	db.SetMaxOpenConns(runtime.NumCPU() * 4)
+
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS users (
+		id INTEGER PRIMARY KEY,
+		name TEXT,
+		email TEXT,
+		role TEXT
+	)`); err != nil {
+		return err
+	}
+
+	var count int
+	db.QueryRow("SELECT COUNT(*) FROM users").Scan(&count)
+	if count < 1000 {
+		tx, _ := db.Begin()
+		for i := 1; i <= 1000; i++ {
+			tx.Exec(`INSERT OR IGNORE INTO users VALUES (?, ?, ?, ?)`,
+				i, fmt.Sprintf("User %d", i), fmt.Sprintf("user%d@example.com", i), "user")
+		}
+		tx.Commit()
+	}
+	dbConn = db
+	return nil
+}
 
 func main() {
 	go func() {
@@ -38,10 +76,44 @@ func main() {
 		res.Send("200 OK", "text/plain; charset=utf-8", "slept\n")
 	})
 
+	filePath := os.Getenv("BENCH_FILE")
+	if filePath == "" {
+		filePath = "benchmark/data/sample.json"
+	}
+	app.GetAsync("/file", func(res *uws.Response) {
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			res.Send("500 Internal Server Error", "text/plain", err.Error())
+			return
+		}
+		res.Send("200 OK", "application/json", string(data))
+	})
+
+	dbPath := os.Getenv("BENCH_DB")
+	if dbPath == "" {
+		dbPath = "/tmp/uwsbench/sample.db"
+	}
+	if err := initDB(dbPath); err != nil {
+		log.Fatal(err)
+	}
+	app.GetAsync("/db", func(res *uws.Response) {
+		id := rand.IntN(1000) + 1
+		var name, email, role string
+		err := dbConn.QueryRow("SELECT name, email, role FROM users WHERE id = ?", id).Scan(&name, &email, &role)
+		if err != nil {
+			res.Send("500 Internal Server Error", "text/plain", err.Error())
+			return
+		}
+		res.Send("200 OK", "application/json",
+			fmt.Sprintf(`{"id":%d,"name":%q,"email":%q,"role":%q}`+"\n", id, name, email, role))
+	})
+
 	if !app.Listen(3002) {
 		log.Fatal("failed to listen on :3002")
 	}
 
 	log.Println("uWebSockets-Go listening on http://localhost:3002")
 	app.Run()
+
+
 }
