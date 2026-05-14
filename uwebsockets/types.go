@@ -118,6 +118,18 @@ func (a *App) GetAsync(pattern string, handler AsyncHandler) {
 	a.inner.getAsync(pattern, handler)
 }
 
+// GetShared registers a GET route whose dispatch path skips the cgo callback
+// entirely. C++ pushes the request onto a shared lock-free ring and a pool
+// of long-lived Go worker goroutines drains it. Combined with SendShared in
+// the handler the per-request path has ZERO cgo crossings (uWS HTTP parse +
+// shared-memory writes + ring atomics + uWS socket write).
+//
+// Like GetAsync, the request body and URL params are not delivered — capture
+// anything you need from a regular Get handler.
+func (a *App) GetShared(pattern string, handler AsyncHandler) {
+	a.inner.getShared(pattern, handler)
+}
+
 // Post registers a POST route.
 func (a *App) Post(pattern string, handler Handler) {
 	a.inner.post(pattern, handler)

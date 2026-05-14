@@ -12,8 +12,11 @@ package uwebsockets
 import "C"
 
 import (
+	"runtime"
 	"runtime/cgo"
+	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 )
 
@@ -47,6 +50,111 @@ func (a *appNative) get(pattern string, handler Handler) {
 	defer C.free(unsafe.Pointer(cpattern))
 
 	C.uwsgo_app_get(a.ptr, cpattern, C.uintptr_t(handle))
+}
+
+// Shared-dispatch handler registry. C++ pushes the handler_id (a small int)
+// into AsyncCtx; Go workers look it up here. Slots are append-only — handlers
+// register at app setup time, never expire.
+var (
+	sharedHandlers    []AsyncHandler
+	sharedHandlersMu  sync.Mutex
+	sharedWorkersOnce sync.Once
+)
+
+func registerSharedHandler(h AsyncHandler) uint32 {
+	sharedHandlersMu.Lock()
+	defer sharedHandlersMu.Unlock()
+	sharedHandlers = append(sharedHandlers, h)
+	return uint32(len(sharedHandlers) - 1)
+}
+
+func (a *appNative) getShared(pattern string, handler AsyncHandler) {
+	id := registerSharedHandler(handler)
+	cpattern := C.CString(pattern)
+	defer C.free(unsafe.Pointer(cpattern))
+	C.uwsgo_app_get_shared(a.ptr, cpattern, C.uint32_t(id))
+	// Lazily start worker goroutines on first shared route registration.
+	ensureSharedWorkers()
+}
+
+func ensureSharedWorkers() {
+	sharedWorkersOnce.Do(func() {
+		// One worker per CPU. Workers stay alive for the program's lifetime,
+		// busy-polling the request ring with adaptive back-off.
+		for i := 0; i < runtime.NumCPU(); i++ {
+			go sharedWorker()
+		}
+	})
+}
+
+// sharedWorker polls the request ring with adaptive back-off. Spin a handful
+// of iterations, then yield via Gosched, then sleep progressively longer up
+// to a cap. At sustained load the spin path catches work immediately; idle
+// workers settle to a cheap periodic wake.
+func sharedWorker() {
+	const spinLimit = 256
+
+	headAddr := (*atomic.Uint64)(unsafe.Pointer(shared.requestRing + shared.headOffset))
+	idleSleep := time.Duration(0)
+	spins := 0
+
+	for {
+		idx := headAddr.Load()
+		slotBase := shared.requestRing + shared.slotsOffset + uintptr(idx&shared.ringMask)*shared.slotStride
+		seqAddr := (*atomic.Uint64)(unsafe.Pointer(slotBase + shared.slotSeqOffset))
+
+		if seqAddr.Load() != idx+1 {
+			// Slot not ready, or another worker has already advanced past idx.
+			// Back off without burning the CPU; the next iteration re-reads
+			// head, which will reflect the consumer that just claimed the slot.
+			spins++
+			if spins > spinLimit {
+				if idleSleep == 0 {
+					idleSleep = 10 * time.Microsecond
+				} else if idleSleep < 500*time.Microsecond {
+					idleSleep *= 2
+				}
+				time.Sleep(idleSleep)
+				spins = 0
+			} else {
+				runtime.Gosched()
+			}
+			continue
+		}
+		idleSleep = 0
+		spins = 0
+
+		// Slot is ready. Race other workers to claim it.
+		if !headAddr.CompareAndSwap(idx, idx+1) {
+			continue
+		}
+
+		ctxPtr := *(*uintptr)(unsafe.Pointer(slotBase + shared.slotCtxOffset))
+		handlerID := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxHandlerIDOff))
+		// Mark slot empty for the next generation of producers (idx wraps in
+		// ringSize, so the next producer for this slot waits for idx+ringSize).
+		seqAddr.Store(idx + uint64(shared.ringMask) + 1)
+
+		sharedHandlersMu.Lock()
+		handler := sharedHandlers[handlerID]
+		sharedHandlersMu.Unlock()
+
+		resWrap := responsePool.Get().(*Response)
+		resWrap.inner = responseNative{ptr: (*C.uwsgo_res_t)(unsafe.Pointer(ctxPtr))}
+
+		a := asyncStatePool.Get().(*asyncState)
+		a.loopPtr = 0
+		a.ctxHandle = ctxPtr
+		a.status = "200 OK"
+		a.sent = false
+		resWrap.async = a
+
+		handler(resWrap)
+		if !a.sent {
+			asyncCtxRelease(ctxPtr)
+		}
+		resWrap.recycleAsync(a)
+	}
 }
 
 func (a *appNative) getStatic(pattern, status, contentType, body string) {
@@ -196,6 +304,7 @@ func asyncCtxRelease(ctxHandle uintptr) {
 // responses with plain unsafe.Pointer arithmetic and atomic ops, no cgo.
 type sharedLayout struct {
 	ring             uintptr
+	requestRing      uintptr
 	ringMask         uint64
 	slotsOffset      uintptr
 	slotStride       uintptr
@@ -209,6 +318,7 @@ type sharedLayout struct {
 	ctxStatusOff     uintptr
 	ctxCtOff         uintptr
 	ctxBodyOff       uintptr
+	ctxHandlerIDOff  uintptr
 	statusCap        uintptr
 	ctCap            uintptr
 	bodyCap          uintptr
@@ -222,6 +332,7 @@ func initSharedLayout() {
 	C.uwsgo_shared_layout(&raw)
 	shared = sharedLayout{
 		ring:            uintptr(raw.ring),
+		requestRing:     uintptr(raw.request_ring),
 		ringMask:        uint64(raw.ring_mask),
 		slotsOffset:     uintptr(raw.ring_slots_offset),
 		slotStride:      uintptr(raw.ring_slot_stride),
@@ -235,6 +346,7 @@ func initSharedLayout() {
 		ctxStatusOff:    uintptr(raw.ctx_status_offset),
 		ctxCtOff:        uintptr(raw.ctx_ct_offset),
 		ctxBodyOff:      uintptr(raw.ctx_body_offset),
+		ctxHandlerIDOff: uintptr(raw.ctx_handler_id_offset),
 		statusCap:       uintptr(raw.ctx_inline_status_cap),
 		ctCap:           uintptr(raw.ctx_inline_ct_cap),
 		bodyCap:         uintptr(raw.ctx_inline_body_cap),

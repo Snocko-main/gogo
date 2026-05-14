@@ -129,6 +129,22 @@ func main() {
 			fmt.Sprintf(`{"id":%d,"name":%q,"email":%q,"role":%q}`+"\n", id, name, email, role))
 	})
 
+	// /db-pipeline uses GetShared on the INPUT side too: C++ pushes the
+	// request onto a ring buffer, a Go worker pool drains it (no cgo
+	// callback per request). Combined with SendShared on the OUTPUT side
+	// the hot path has zero cgo crossings.
+	app.GetShared("/db-pipeline", func(res *uws.Response) {
+		id := rand.IntN(1000) + 1
+		var name, email, role string
+		err := dbConn.QueryRow("SELECT name, email, role FROM users WHERE id = ?", id).Scan(&name, &email, &role)
+		if err != nil {
+			res.SendShared(500, "text/plain", err.Error())
+			return
+		}
+		res.SendShared(200, "application/json",
+			fmt.Sprintf(`{"id":%d,"name":%q,"email":%q,"role":%q}`+"\n", id, name, email, role))
+	})
+
 	if !app.Listen(3002) {
 		log.Fatal("failed to listen on :3002")
 	}

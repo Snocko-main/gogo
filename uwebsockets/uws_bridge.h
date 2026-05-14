@@ -85,6 +85,7 @@ void uwsgo_async_ctx_release(void *ctx);
 // response. The loop drains the ring on every drain-timer tick.
 typedef struct uwsgo_shared_layout_t {
     void *ring;
+    void *request_ring;
     size_t ring_size;
     size_t ring_mask;
     size_t ring_slots_offset;
@@ -99,6 +100,7 @@ typedef struct uwsgo_shared_layout_t {
     size_t ctx_status_offset;
     size_t ctx_ct_offset;
     size_t ctx_body_offset;
+    size_t ctx_handler_id_offset;
     size_t ctx_inline_status_cap;
     size_t ctx_inline_ct_cap;
     size_t ctx_inline_body_cap;
@@ -110,6 +112,12 @@ void uwsgo_shared_layout(uwsgo_shared_layout_t *out);
 // at interval_us microseconds. Trade lower interval for less wake latency at
 // the cost of more CPU. Typical: 100-500 us.
 void uwsgo_app_start_drain(int interval_us);
+
+// Registers a route whose dispatch path bypasses cgo entirely: C++ pushes
+// the AsyncCtx onto the request ring; Go worker goroutines drain the ring
+// and invoke the handler bound to handler_id. The Go side keeps the
+// handler_id -> handler map.
+void uwsgo_app_get_shared(uwsgo_app_t *app, const char *pattern, uint32_t handler_id);
 
 size_t uwsgo_req_url(uwsgo_req_t *req, char *buffer, size_t buffer_len);
 size_t uwsgo_req_header(uwsgo_req_t *req, const char *name, size_t name_len, char *buffer, size_t buffer_len);

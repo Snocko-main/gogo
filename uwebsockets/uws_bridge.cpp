@@ -261,6 +261,7 @@ struct AsyncCtx {
     std::atomic<int> refcount{1};
     std::atomic<int32_t> aborted{0};
     uWS::HttpResponse<false> *response;
+    uint32_t handler_id = 0;  // Used by shared-dispatch path to pick which Go handler runs
 
     // Inline response slots populated by Go via shared-memory writes.
     uint32_t inline_status_len = 0;
@@ -308,6 +309,11 @@ struct PendingRing {
 // Single global ring shared between all uWS loops in the process. Aligned to a
 // cache line to avoid false sharing between head and tail.
 alignas(128) static PendingRing g_pending;
+
+// RequestRing mirrors PendingRing but goes the other way: C++ enqueues incoming
+// requests (as AsyncCtx*), Go worker goroutines dequeue and dispatch. Same
+// Vyukov MPMC layout so both sides can read/write with plain atomics.
+alignas(128) static PendingRing g_request;
 
 // CtxHold is a smart-pointer-like wrapper that retains/releases AsyncCtx,
 // suitable for capturing into uWS MoveOnlyFunction lambdas.
@@ -393,7 +399,9 @@ extern "C" void uwsgo_async_ctx_release(void *ctx_handle) {
 
 extern "C" void uwsgo_shared_layout(uwsgo_shared_layout_t *out) {
     g_pending.init();
+    g_request.init();
     out->ring = &g_pending;
+    out->request_ring = &g_request;
     out->ring_size = RING_SIZE;
     out->ring_mask = RING_MASK;
     out->ring_slots_offset = offsetof(PendingRing, slots);
@@ -409,9 +417,38 @@ extern "C" void uwsgo_shared_layout(uwsgo_shared_layout_t *out) {
     out->ctx_status_offset = offsetof(AsyncCtx, inline_status);
     out->ctx_ct_offset = offsetof(AsyncCtx, inline_content_type);
     out->ctx_body_offset = offsetof(AsyncCtx, inline_body);
+    out->ctx_handler_id_offset = offsetof(AsyncCtx, handler_id);
     out->ctx_inline_status_cap = INLINE_STATUS_CAP;
     out->ctx_inline_ct_cap = INLINE_CT_CAP;
     out->ctx_inline_body_cap = INLINE_BODY_CAP;
+}
+
+// uwsgo_app_get_shared registers a route whose dispatch path skips the
+// Go-side cgo callback entirely. When a request matches, C++ builds an
+// AsyncCtx with handler_id stamped on it and pushes it onto the shared
+// request ring. Go worker goroutines (started by the binding at startup)
+// drain the ring with plain atomic ops and run the handler.
+extern "C" void uwsgo_app_get_shared(uwsgo_app_t *app, const char *pattern, uint32_t handler_id) {
+    app->app->get(pattern, [handler_id](auto *res, auto *req) {
+        (void)req;  // Shared-dispatch handlers can't read the request (uWS
+                    // recycles it after this lambda returns, before Go reads).
+        auto *ctx = new AsyncCtx;
+        ctx->response = res;
+        ctx->handler_id = handler_id;
+        res->onAborted([hold = CtxHold(ctx)]() {
+            hold.ctx->aborted.store(1, std::memory_order_release);
+        });
+
+        // MPMC push onto request ring. Producer = uWS loop thread (single),
+        // consumers = Go worker goroutines (multiple).
+        uint64_t idx = g_request.tail.fetch_add(1, std::memory_order_relaxed);
+        PendingSlot *slot = &g_request.slots[idx & RING_MASK];
+        while (slot->sequence.load(std::memory_order_acquire) != idx) {
+            // Ring full; spin briefly — shouldn't happen at normal load.
+        }
+        slot->ctx = ctx;
+        slot->sequence.store(idx + 1, std::memory_order_release);
+    });
 }
 
 // drain_pending runs on the loop thread (invoked from a periodic timer). It
