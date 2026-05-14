@@ -424,9 +424,12 @@ func asyncCtxRelease(ctxHandle uintptr) {
 
 // sharedLayout caches struct offsets exposed by C so the hot path can build
 // responses with plain unsafe.Pointer arithmetic and atomic ops, no cgo.
+// Each AsyncCtx carries a pointer to its App's pending ring; asyncSendShared
+// reads ctx->pending_ring rather than using a global so multiple App
+// instances can coexist.
 type sharedLayout struct {
-	ring             uintptr
 	requestRing      uintptr
+	ctxPendingRingOff uintptr
 	ringMask         uint64
 	slotsOffset      uintptr
 	slotStride       uintptr
@@ -482,8 +485,8 @@ func initSharedLayoutOnce() {
 	var raw C.uwsgo_shared_layout_t
 	C.uwsgo_shared_layout(&raw)
 	shared = sharedLayout{
-		ring:            uintptr(raw.ring),
-		requestRing:     uintptr(raw.request_ring),
+		requestRing:       uintptr(raw.request_ring),
+		ctxPendingRingOff: uintptr(raw.ctx_pending_ring_offset),
 		ringMask:        uint64(raw.ring_mask),
 		slotsOffset:     uintptr(raw.ring_slots_offset),
 		slotStride:      uintptr(raw.ring_slot_stride),
@@ -525,12 +528,8 @@ func initSharedLayoutOnce() {
 	sharedReady = true
 }
 
-func startSharedDrain(intervalUs int) {
-	C.uwsgo_app_start_drain(C.int(intervalUs))
-}
-
 func (a appNative) startSharedDrain(intervalUs int) {
-	startSharedDrain(intervalUs)
+	C.uwsgo_app_start_drain(a.ptr, C.int(intervalUs))
 }
 
 // asyncSendShared writes the response bytes directly into the AsyncCtx memory
@@ -563,10 +562,18 @@ func asyncSendShared(ctxHandle uintptr, statusLine, contentType, body string) bo
 	*(*uint32)(unsafe.Pointer(ctxHandle + shared.ctxCtLenOff)) = uint32(len(contentType))
 	*(*uint32)(unsafe.Pointer(ctxHandle + shared.ctxBodyLenOff)) = uint32(len(body))
 
+	// Read the App-specific pending ring this ctx targets. C++ stamps it
+	// onto the ctx at request-arrival time so multiple App instances each
+	// route responses to their own loop.
+	ringPtr := *(*uintptr)(unsafe.Pointer(ctxHandle + shared.ctxPendingRingOff))
+	if ringPtr == 0 {
+		return false
+	}
+
 	// MPSC enqueue: fetch_add tail, wait for slot.sequence == idx, write ctx, sequence = idx+1
-	tailAddr := (*atomic.Uint64)(unsafe.Pointer(shared.ring + shared.tailOffset))
+	tailAddr := (*atomic.Uint64)(unsafe.Pointer(ringPtr + shared.tailOffset))
 	idx := tailAddr.Add(1) - 1
-	slotBase := shared.ring + shared.slotsOffset + uintptr(idx&shared.ringMask)*shared.slotStride
+	slotBase := ringPtr + shared.slotsOffset + uintptr(idx&shared.ringMask)*shared.slotStride
 	seqAddr := (*atomic.Uint64)(unsafe.Pointer(slotBase + shared.slotSeqOffset))
 
 	for seqAddr.Load() != idx {
@@ -575,13 +582,14 @@ func asyncSendShared(ctxHandle uintptr, statusLine, contentType, body string) bo
 	*(*uintptr)(unsafe.Pointer(slotBase + shared.slotCtxOffset)) = ctxHandle
 	seqAddr.Store(idx + 1)
 
-	// Wake the loop so it drains the ring immediately. Without this the
-	// response waits up to 1 ms for the periodic drain timer to fire
-	// (libuS timers are ms-granularity). One cgo crossing per response,
-	// far cheaper than the ~0.5 ms average latency we'd otherwise eat.
+	// Wake the App's loop so it drains the ring immediately, passing the
+	// specific ring pointer so the drain runs on the right App's data.
 	loopPtr := *(*uintptr)(unsafe.Pointer(ctxHandle + shared.ctxLoopOff))
 	if loopPtr != 0 {
-		C.uwsgo_wake_drain((*C.uwsgo_loop_t)(unsafe.Pointer(loopPtr)))
+		C.uwsgo_wake_drain(
+			(*C.uwsgo_loop_t)(unsafe.Pointer(loopPtr)),
+			unsafe.Pointer(ringPtr),
+		)
 	}
 	return true
 }

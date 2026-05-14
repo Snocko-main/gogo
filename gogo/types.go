@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -344,6 +345,109 @@ func (a *App) Shutdown() {
 // Run if the app was never started.
 func (a *App) Close() {
 	a.inner.close()
+}
+
+// MultiCoreHandle controls a group of App instances started by RunMultiCore.
+// Shutdown stops all of them; Wait blocks until every Run loop has exited.
+type MultiCoreHandle struct {
+	apps []*App
+	done chan struct{}
+}
+
+// Shutdown initiates graceful stop on every App in the group. Idempotent;
+// safe to call from any goroutine.
+func (h *MultiCoreHandle) Shutdown() {
+	for _, a := range h.apps {
+		a.Shutdown()
+	}
+}
+
+// Wait blocks until every App in the group has exited its Run loop and
+// freed native resources. Returns immediately once all loops have finished.
+func (h *MultiCoreHandle) Wait() {
+	<-h.done
+}
+
+// RunMultiCore spawns n independent App instances on dedicated OS threads.
+// Each instance binds to the given port — uWS listen sockets enable
+// SO_REUSEPORT, so the kernel load-balances incoming connections across
+// the App instances. setup is called once per App, on the thread that
+// instance will run on, to register routes / middleware / etc.
+//
+// setup MUST register the same routes on every App for consistent behavior;
+// the framework just calls setup(app) and trusts user code to be
+// deterministic. Heavy shared state (DB pools, caches) should be created
+// ONCE outside RunMultiCore and captured into the handler closures so
+// per-App initialization stays cheap.
+//
+// Returns a MultiCoreHandle that can Shutdown or Wait. Returns an error if
+// any App fails to start; in that case already-started Apps are shut down
+// before returning.
+func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, error) {
+	if n <= 0 {
+		return nil, fmt.Errorf("gogo: RunMultiCore needs n>0, got %d", n)
+	}
+	if setup == nil {
+		return nil, fmt.Errorf("gogo: RunMultiCore requires a setup function")
+	}
+
+	type startResult struct {
+		app *App
+		err error
+	}
+	starts := make(chan startResult, n)
+	done := make(chan struct{})
+	apps := make([]*App, 0, n)
+
+	var runWg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		runWg.Add(1)
+		go func() {
+			defer runWg.Done()
+			// uWS::Loop is bound to the OS thread that created the App, so
+			// every API call against this App must happen on this thread.
+			// LockOSThread keeps us pinned for the lifetime of Run.
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+
+			app, err := NewApp()
+			if err != nil {
+				starts <- startResult{nil, err}
+				return
+			}
+			setup(app)
+			if !app.Listen(port) {
+				app.Close()
+				starts <- startResult{nil, fmt.Errorf("gogo: failed to Listen on :%d", port)}
+				return
+			}
+			starts <- startResult{app, nil}
+			app.Run()
+			app.Close()
+		}()
+	}
+
+	// Collect start results.
+	for i := 0; i < n; i++ {
+		r := <-starts
+		if r.err != nil {
+			// Shut down any apps that already started, then surface the error.
+			for _, a := range apps {
+				a.Shutdown()
+			}
+			runWg.Wait()
+			return nil, r.err
+		}
+		apps = append(apps, r.app)
+	}
+
+	// Signal Wait() once every Run loop has exited.
+	go func() {
+		runWg.Wait()
+		close(done)
+	}()
+
+	return &MultiCoreHandle{apps: apps, done: done}, nil
 }
 
 // Response wraps a uWebSockets response.

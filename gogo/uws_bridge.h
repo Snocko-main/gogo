@@ -103,6 +103,10 @@ typedef struct uwsgo_shared_layout_t {
     size_t ctx_handler_id_offset;
     size_t ctx_response_offset;
     size_t ctx_loop_offset;
+    // Per-App response ring pointer carried inline in each AsyncCtx so Go's
+    // SendShared can push to the right App's ring when multiple Apps run
+    // in the same process.
+    size_t ctx_pending_ring_offset;
     size_t ctx_inline_status_cap;
     size_t ctx_inline_ct_cap;
     size_t ctx_inline_body_cap;
@@ -128,16 +132,17 @@ typedef struct uwsgo_shared_layout_t {
 
 void uwsgo_shared_layout(uwsgo_shared_layout_t *out);
 
-// Installs a periodic timer on the current loop that drains the shared ring
-// at interval_us microseconds. libuS timers are millisecond-granularity, so
-// any value below 1000 us is clamped to 1 ms. Used as a safety net; the
-// per-response wake (uwsgo_wake_drain) keeps latency sub-ms in practice.
-void uwsgo_app_start_drain(int interval_us);
+// Installs a periodic timer on the given App's loop that drains the App's
+// pending ring. libuS timers are millisecond-granularity, so any value below
+// 1000 us is clamped to 1 ms. Used as a safety net; the per-response wake
+// (uwsgo_wake_drain) keeps latency sub-ms in practice.
+void uwsgo_app_start_drain(uwsgo_app_t *app, int interval_us);
 
-// Wakes the loop and runs one drain pass — call from Go after pushing onto
-// the response ring so the loop flushes immediately instead of waiting for
-// the periodic timer to fire. Thread-safe via uWS::Loop::defer.
-void uwsgo_wake_drain(uwsgo_loop_t *loop);
+// Wakes the given loop and runs one drain pass on the given ring. Called
+// from Go after pushing onto the response ring so the loop flushes
+// immediately instead of waiting for the periodic timer to fire.
+// Thread-safe via uWS::Loop::defer.
+void uwsgo_wake_drain(uwsgo_loop_t *loop, void *ring);
 
 // Registers a route whose dispatch path bypasses cgo entirely: C++ pushes
 // the AsyncCtx onto the request ring; Go worker goroutines drain the ring

@@ -67,16 +67,50 @@ struct StaticResponse {
     std::string body;
 };
 
+// Shared-dispatch ring types — defined up front so uwsgo_app_t can hold a
+// per-App PendingRing pointer without forward-decl gymnastics. AsyncCtx is
+// fully defined later (it has lots of fields); we forward-declare it here
+// so PendingSlot can reference it. Each App allocates one PendingRing on
+// the heap in uwsgo_app_new.
+struct AsyncCtx;
+
+constexpr uint64_t RING_SIZE = 4096;
+constexpr uint64_t RING_MASK = RING_SIZE - 1;
+
+struct PendingSlot {
+    std::atomic<uint64_t> sequence;
+    AsyncCtx *ctx;
+};
+
+struct PendingRing {
+    PendingSlot slots[RING_SIZE];
+    std::atomic<uint64_t> head;  // consumer index (loop thread only)
+    std::atomic<uint64_t> tail;  // producer index (any thread)
+
+    void init() {
+        for (uint64_t i = 0; i < RING_SIZE; i++) {
+            slots[i].sequence.store(i, std::memory_order_relaxed);
+            slots[i].ctx = nullptr;
+        }
+        head.store(0, std::memory_order_relaxed);
+        tail.store(0, std::memory_order_relaxed);
+    }
+};
+
 struct uwsgo_app_t {
     std::unique_ptr<uWS::App> app;
     uWS::Loop *loop = nullptr;
     us_listen_socket_t *listen_socket = nullptr;
     std::vector<std::unique_ptr<StaticResponse>> static_responses;
-};
 
-// Forward decl — definition lives near uwsgo_app_start_drain further below.
-// uwsgo_app_stop needs to close it during shutdown.
-static struct us_timer_t *g_drain_timer;
+    // Per-App response ring + drain timer. Each native App owns its own
+    // pending ring so SendShared can safely write from a worker thread and
+    // the drain timer on this App's loop can cork+send without crossing
+    // threads. Allocated on the heap so multiple App instances within the
+    // same process don't share state and don't contend on a global ring.
+    PendingRing *pending_ring = nullptr;
+    struct us_timer_t *drain_timer = nullptr;
+};
 
 static size_t copy_string_view(std::string_view value, char *buffer, size_t buffer_len) {
     if (buffer != nullptr && buffer_len > 0) {
@@ -92,10 +126,17 @@ extern "C" uwsgo_app_t *uwsgo_app_new(void) {
     // current thread's loop; later teardown calls from any thread defer through
     // this captured loop rather than asking for the *caller's* loop.
     a->loop = uWS::Loop::get();
+    // Allocate this App's response ring up front so multiple App instances
+    // in the same process don't share state and don't contend on a global.
+    a->pending_ring = new PendingRing;
+    a->pending_ring->init();
     return a;
 }
 
 extern "C" void uwsgo_app_free(uwsgo_app_t *app) {
+    if (app->pending_ring) {
+        delete app->pending_ring;
+    }
     delete app;
 }
 
@@ -196,9 +237,9 @@ extern "C" void uwsgo_app_stop(uwsgo_app_t *app) {
             app->app->close();
             app->listen_socket = nullptr;
         }
-        if (g_drain_timer != nullptr) {
-            us_timer_close(g_drain_timer);
-            g_drain_timer = nullptr;
+        if (app->drain_timer != nullptr) {
+            us_timer_close(app->drain_timer);
+            app->drain_timer = nullptr;
         }
     });
 }
@@ -287,7 +328,11 @@ extern "C" void uwsgo_res_on_data(uwsgo_res_t *res, uintptr_t callback_id) {
     });
 }
 
-namespace {
+// The shared-dispatch internals (AsyncCtx, PendingRing, etc.) live at file
+// scope rather than in an anonymous namespace so uwsgo_app_t (declared near
+// the top of the file) can hold a PendingRing* without a forward-decl tug
+// of war. They remain internal to this translation unit since the C ABI
+// only exposes opaque pointers.
 
 // Maximum inline body bytes for shared-memory responses. Sized to cover
 // most JSON API responses; larger responses fall back to the cgo defer path.
@@ -323,6 +368,7 @@ struct AsyncCtx {
     std::atomic<int32_t> aborted{0};
     uWS::HttpResponse<false> *response;
     uWS::Loop *loop = nullptr;  // The loop that owns this response (set at creation time)
+    PendingRing *pending_ring = nullptr;  // The response ring this ctx must be pushed onto
     uint32_t handler_id = 0;  // Used by shared-dispatch path to pick which Go handler runs
 
     // Inline response slots populated by Go via shared-memory writes.
@@ -356,40 +402,11 @@ struct AsyncCtx {
     }
 };
 
-// Vyukov-style MPMC ring buffer used as MPSC: many goroutines push ready
-// AsyncCtx pointers; the uWS loop is the sole consumer. Each slot carries a
-// sequence number so producers and consumer don't trample each other without
-// locks. POOL_SIZE must be a power of two.
-constexpr uint64_t RING_SIZE = 4096;
-constexpr uint64_t RING_MASK = RING_SIZE - 1;
-
-struct PendingSlot {
-    std::atomic<uint64_t> sequence;
-    AsyncCtx *ctx;
-};
-
-struct PendingRing {
-    PendingSlot slots[RING_SIZE];
-    std::atomic<uint64_t> head;  // consumer index (loop thread only)
-    std::atomic<uint64_t> tail;  // producer index (any thread)
-
-    void init() {
-        for (uint64_t i = 0; i < RING_SIZE; i++) {
-            slots[i].sequence.store(i, std::memory_order_relaxed);
-            slots[i].ctx = nullptr;
-        }
-        head.store(0, std::memory_order_relaxed);
-        tail.store(0, std::memory_order_relaxed);
-    }
-};
-
-// Single global ring shared between all uWS loops in the process. Aligned to a
-// cache line to avoid false sharing between head and tail.
-alignas(128) static PendingRing g_pending;
-
-// RequestRing mirrors PendingRing but goes the other way: C++ enqueues incoming
-// requests (as AsyncCtx*), Go worker goroutines dequeue and dispatch. Same
-// Vyukov MPMC layout so both sides can read/write with plain atomics.
+// RequestRing is shared across all App instances: C++ enqueues incoming
+// requests (as AsyncCtx*), Go worker goroutines dequeue and dispatch. Single
+// global ring + single worker pool is fine because workers are stateless —
+// they look up the per-ctx pending_ring at response time. Aligned to a cache
+// line to avoid false sharing between head and tail.
 alignas(128) static PendingRing g_request;
 
 // CtxHold is a smart-pointer-like wrapper that retains/releases AsyncCtx,
@@ -438,8 +455,6 @@ inline char *dup_to_c_heap(const char *src, size_t n) {
     return p;
 }
 
-}  // namespace
-
 extern "C" uwsgo_loop_t *uwsgo_res_begin_async(uwsgo_res_t *res, void **out_ctx) {
     auto *r = reinterpret_cast<uWS::HttpResponse<false> *>(res);
     auto *loop = uWS::Loop::get();
@@ -461,9 +476,12 @@ extern "C" void uwsgo_async_ctx_release(void *ctx_handle) {
 }
 
 extern "C" void uwsgo_shared_layout(uwsgo_shared_layout_t *out) {
-    g_pending.init();
     g_request.init();
-    out->ring = &g_pending;
+    // ring is no longer a global pointer; each AsyncCtx carries its App's
+    // pending_ring via the ctx_pending_ring_offset field. Go reads it from
+    // the ctx in asyncSendShared so multiple App instances each use their
+    // own ring.
+    out->ring = nullptr;
     out->request_ring = &g_request;
     out->ring_size = RING_SIZE;
     out->ring_mask = RING_MASK;
@@ -483,6 +501,7 @@ extern "C" void uwsgo_shared_layout(uwsgo_shared_layout_t *out) {
     out->ctx_handler_id_offset = offsetof(AsyncCtx, handler_id);
     out->ctx_response_offset = offsetof(AsyncCtx, response);
     out->ctx_loop_offset = offsetof(AsyncCtx, loop);
+    out->ctx_pending_ring_offset = offsetof(AsyncCtx, pending_ring);
     out->ctx_inline_status_cap = INLINE_STATUS_CAP;
     out->ctx_inline_ct_cap = INLINE_CT_CAP;
     out->ctx_inline_body_cap = INLINE_BODY_CAP;
@@ -556,7 +575,7 @@ static void snapshot_request(AsyncCtx *ctx, uWS::HttpRequest *req) {
 }
 
 extern "C" void uwsgo_app_get_shared(uwsgo_app_t *app, const char *pattern, uint32_t handler_id) {
-    app->app->get(pattern, [handler_id](auto *res, auto *req) {
+    app->app->get(pattern, [app, handler_id](auto *res, auto *req) {
         // CAS-based bounded MPMC enqueue. If the ring is full (next slot's
         // sequence is behind our intended position), we reject the request
         // with 503 instead of spinning — that would block the loop thread.
@@ -574,6 +593,7 @@ extern "C" void uwsgo_app_get_shared(uwsgo_app_t *app, const char *pattern, uint
                     auto *ctx = new AsyncCtx;
                     ctx->response = res;
                     ctx->loop = uWS::Loop::get();
+                    ctx->pending_ring = app->pending_ring;
                     ctx->handler_id = handler_id;
                     // Snapshot before any cgo / Go work — uWS HttpRequest is
                     // live only inside this lambda.
@@ -608,13 +628,14 @@ extern "C" void uwsgo_app_get_shared(uwsgo_app_t *app, const char *pattern, uint
     });
 }
 
-// drain_pending runs on the loop thread (invoked from a periodic timer). It
-// consumes every ready slot from the ring and sends the response. Single
-// consumer so no CAS needed on head.
-static void drain_pending() {
-    uint64_t h = g_pending.head.load(std::memory_order_relaxed);
+// drain_pending walks a specific App's response ring on its loop thread.
+// Single consumer (the loop) so no CAS needed on head. Takes the ring as a
+// parameter so the same routine serves multiple App instances each with its
+// own ring + loop.
+static void drain_pending(PendingRing *ring) {
+    uint64_t h = ring->head.load(std::memory_order_relaxed);
     while (true) {
-        PendingSlot *slot = &g_pending.slots[h & RING_MASK];
+        PendingSlot *slot = &ring->slots[h & RING_MASK];
         uint64_t seq = slot->sequence.load(std::memory_order_acquire);
         if (seq != h + 1) break;  // slot not ready
 
@@ -637,29 +658,35 @@ static void drain_pending() {
         ctx->release();
         h++;
     }
-    g_pending.head.store(h, std::memory_order_relaxed);
+    ring->head.store(h, std::memory_order_relaxed);
 }
 
-// uwsgo_app_start_drain installs a periodic timer on the current loop that
-// invokes drain_pending. interval_us is the polling interval; 50-200 us
-// trades wake latency vs CPU.
-// uwsgo_wake_drain schedules a single drain run on the loop thread. Callable
-// from any goroutine via Go: after pushing onto the response ring, this
-// wakes the loop immediately instead of waiting up to ~1 ms for the
-// periodic drain timer to fire. Costs one cgo crossing per response in
-// exchange for sub-millisecond response latency.
-extern "C" void uwsgo_wake_drain(uwsgo_loop_t *loop) {
+// uwsgo_wake_drain schedules a single drain pass on the given loop, draining
+// the given ring. Callable from any goroutine via Go: after pushing onto the
+// response ring, this wakes the loop immediately instead of waiting up to
+// ~1 ms for the periodic drain timer to fire. Costs one cgo crossing per
+// response in exchange for sub-millisecond response latency.
+extern "C" void uwsgo_wake_drain(uwsgo_loop_t *loop, void *ring) {
     auto *l = reinterpret_cast<uWS::Loop *>(loop);
-    l->defer([]() { drain_pending(); });
+    auto *r = reinterpret_cast<PendingRing *>(ring);
+    l->defer([r]() { drain_pending(r); });
 }
 
-extern "C" void uwsgo_app_start_drain(int interval_us) {
-    auto *loop = reinterpret_cast<struct us_loop_t *>(uWS::Loop::get());
-    g_drain_timer = us_create_timer(loop, 0, 0);
+// uwsgo_app_start_drain installs a periodic safety-net drain timer on this
+// App's loop. The wake-on-write path normally fires drains immediately;
+// this timer just catches anything that slips through.
+extern "C" void uwsgo_app_start_drain(uwsgo_app_t *app, int interval_us) {
+    auto *loop = reinterpret_cast<struct us_loop_t *>(app->loop);
+    // Allocate ext_size = sizeof(PendingRing*) so we can stash the ring
+    // pointer inline with the timer; libuS gives us back the timer in the
+    // callback and us_timer_ext recovers the trailing user data.
+    app->drain_timer = us_create_timer(loop, 0, sizeof(PendingRing *));
     int ms = interval_us / 1000;
     if (ms < 1) ms = 1;
-    us_timer_set(g_drain_timer, [](struct us_timer_t * /*t*/) {
-        drain_pending();
+    *reinterpret_cast<PendingRing **>(us_timer_ext(app->drain_timer)) = app->pending_ring;
+    us_timer_set(app->drain_timer, [](struct us_timer_t *t) {
+        auto *r = *reinterpret_cast<PendingRing **>(us_timer_ext(t));
+        drain_pending(r);
     }, ms, ms);
 }
 
