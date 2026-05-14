@@ -183,7 +183,7 @@ func TestAsyncHandler(t *testing.T) {
 func TestSharedDispatch(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.GetAsync("/shared", func(res *gogo.Response, req *gogo.Request) {
-			res.SendShared(200, "application/json", `{"path":"shared"}`)
+			res.Send(200, "application/json", `{"path":"shared"}`)
 		})
 	})
 	defer teardown()
@@ -206,7 +206,7 @@ func TestPanicRecoveryInSharedHandler(t *testing.T) {
 			panic("kaboom")
 		})
 		app.GetAsync("/ok", func(res *gogo.Response, req *gogo.Request) {
-			res.SendShared(200, "text/plain", "still alive")
+			res.Send(200, "text/plain", "still alive")
 		})
 	})
 	defer teardown()
@@ -231,7 +231,7 @@ func TestConcurrentLoad(t *testing.T) {
 	// Stress the shared-dispatch + worker pool to flush out races.
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.GetAsync("/c", func(res *gogo.Response, req *gogo.Request) {
-			res.SendShared(200, "text/plain", "x")
+			res.Send(200, "text/plain", "x")
 		})
 	})
 	defer teardown()
@@ -618,7 +618,7 @@ func TestAsyncRequestSnapshot(t *testing.T) {
 	// snapshot captured before uWS freed the live request.
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.GetAsync("/users/:id", func(res *gogo.Response, req *gogo.Request) {
-			res.SendShared(200, "application/json", fmt.Sprintf(
+			res.Send(200, "application/json", fmt.Sprintf(
 				`{"method":%q,"url":%q,"param":%q,"q":%q,"qp":%q,"hdr":%q}`,
 				req.Method(), req.URL(), req.Parameter(0),
 				req.Query(), req.QueryParam("token"), req.Header("x-custom"),
@@ -847,7 +847,7 @@ func TestSnapshotBoundaries(t *testing.T) {
 	// PARAM=64 each.
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.GetAsync("/echo/:p", func(res *gogo.Response, req *gogo.Request) {
-			res.SendShared(200, "application/json", fmt.Sprintf(
+			res.Send(200, "application/json", fmt.Sprintf(
 				`{"urlLen":%d,"queryLen":%d,"paramLen":%d}`,
 				len(req.URL()), len(req.Query()), len(req.Parameter(0)),
 			))
@@ -891,7 +891,7 @@ func TestSnapshotURLTruncation(t *testing.T) {
 	// URL that exceeds URL_CAP=256 — uWS allows long paths, snapshot truncates.
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.GetAsync("/long/:p", func(res *gogo.Response, req *gogo.Request) {
-			res.SendShared(200, "text/plain", fmt.Sprintf("urlLen=%d", len(req.URL())))
+			res.Send(200, "text/plain", fmt.Sprintf("urlLen=%d", len(req.URL())))
 		})
 	})
 	defer teardown()
@@ -919,7 +919,7 @@ func TestStressShortBursts(t *testing.T) {
 		var counter atomic.Int64
 		app.GetAsync("/async", func(res *gogo.Response, req *gogo.Request) {
 			counter.Add(1)
-			res.SendShared(200, "text/plain", "ok")
+			res.Send(200, "text/plain", "ok")
 		})
 		app.Get("/sync", func(res *gogo.Response, req *gogo.Request) {
 			res.Send(200, "text/plain", "sync")
@@ -986,7 +986,7 @@ func TestClientAbortDuringAsync(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.GetAsync("/slow", func(res *gogo.Response, req *gogo.Request) {
 			time.Sleep(80 * time.Millisecond)
-			res.SendShared(200, "text/plain", "late")
+			res.Send(200, "text/plain", "late")
 			handlerDone.Add(1)
 		})
 	})

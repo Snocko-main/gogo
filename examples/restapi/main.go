@@ -57,14 +57,14 @@ func main() {
 	app.GetAsync("/users/:id", func(res *gogo.Response, req *gogo.Request) {
 		id, err := strconv.Atoi(req.Parameter(0))
 		if err != nil {
-			res.SendShared(400, "text/plain", "bad id")
+			res.Send(400, "text/plain", "bad id")
 			return
 		}
 		usersMu.RLock()
 		u, ok := users[id]
 		usersMu.RUnlock()
 		if !ok {
-			res.SendShared(404, "text/plain", "not found")
+			res.Send(404, "text/plain", "not found")
 			return
 		}
 		res.JSON(200, u)

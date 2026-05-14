@@ -60,11 +60,14 @@
 //
 // # Responses
 //
-// Use res.Send for one-shot replies with status, content-type, and body in
-// a single cgo call. Inside an async handler, res.SendShared writes into
-// the AsyncCtx's inline buffers and pushes onto a response ring drained by
-// the loop — zero cgo per response when the body fits 8 KB. res.JSON wraps
-// Send/SendShared with json.Marshal and the correct Content-Type.
+// Use res.Send for one-shot replies with status, content-type, and body.
+// The framework auto-picks the fastest path:
+//   - Sync handler: one cgo crossing into uWS.
+//   - Async handler with body ≤ 8 KB: ZERO cgo — written into shared-memory
+//     inline buffers and pushed onto the App's response ring; the loop
+//     drains it.
+//   - Async handler with body > 8 KB: cgo Loop::defer falls back.
+// res.JSON wraps Send with json.Marshal and Content-Type: application/json.
 //
 // # Middleware
 //

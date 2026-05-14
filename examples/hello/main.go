@@ -37,7 +37,7 @@ func main() {
 	// zero cgo crossings on the hot path.
 	app.GetAsync("/work", func(res *gogo.Response, req *gogo.Request) {
 		time.Sleep(10 * time.Millisecond)
-		res.SendShared(200, "text/plain; charset=utf-8", "done\n")
+		res.Send(200, "text/plain; charset=utf-8", "done\n")
 	})
 
 	if !app.Listen(3000) {

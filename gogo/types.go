@@ -526,22 +526,39 @@ func (r *Response) End(body string) {
 	r.inner.end(body)
 }
 
-// Send writes status code, an optional Content-Type header, and body in a
-// single trip across the C boundary. Pass an empty contentType to omit the
-// header. In async mode the values are buffered and flushed together when
-// the asynchronous work completes, also in a single cgo call.
+// Send writes status code, an optional Content-Type header, and body in
+// one call. The framework picks the lowest-overhead path based on the
+// handler's mode:
+//
+//   - Sync handler (Get / Post / Any): one cgo crossing into uWS.
+//   - Async handler (GetAsync / PostAsync) with body up to 8 KB:
+//     ZERO cgo per request — written to shared-memory inline buffers and
+//     pushed onto the App's response ring; the loop drains it.
+//   - Async handler with body > 8 KB: cgo Loop::defer with the full
+//     payload, status, and Content-Type.
+//
+// Pass an empty contentType to omit the header.
 func (r *Response) Send(code int, contentType, body string) {
 	if contentType != "" {
 		validateHeaderValue("Content-Type", contentType)
 	}
 	line := statusLine(code)
-	if r.async != nil {
+
+	// Async mode: try the zero-cgo shared-memory path first. Falls back
+	// to the cgo defer path when the body exceeds inline capacity.
+	if r.async != nil && !r.async.sent {
+		if asyncSendShared(r.async.ctxHandle, line, contentType, body) {
+			r.async.sent = true
+			return
+		}
 		r.async.status = line
 		r.async.contentType = contentType
 		r.async.body.WriteString(body)
 		r.flushAsync()
 		return
 	}
+
+	// Sync mode: direct cgo call into uWS.
 	r.inner.send(line, contentType, body)
 }
 
@@ -550,45 +567,13 @@ func (r *Response) Send(code int, contentType, body string) {
 // is written as plain text — json.Marshal only fails for unsupported value
 // shapes (channels, functions, cyclic structures), which are programming
 // errors the caller should fix.
-//
-// Inside an async handler this uses the same fast path as Send/SendShared;
-// pass jsonContentTypeShared to skip the second Send overhead if you've
-// already serialized — but for typical use, just call JSON.
 func (r *Response) JSON(code int, v any) {
 	data, err := json.Marshal(v)
 	if err != nil {
 		r.Send(500, "text/plain; charset=utf-8", "json marshal error: "+err.Error())
 		return
 	}
-	// Hot path: prefer SendShared when we're inside async mode so the cgo
-	// crossing is avoided for response bodies that fit the inline cap.
-	if r.async != nil {
-		r.SendShared(code, "application/json", string(data))
-		return
-	}
 	r.Send(code, "application/json", string(data))
-}
-
-// SendShared writes the response into the AsyncCtx's inline buffers and
-// enqueues it on the shared lock-free ring for the uWS loop to flush. The
-// hot path makes ZERO cgo crossings — pure shared-memory writes plus atomic
-// ring push. Body must fit the inline cap (8192 bytes), otherwise the call
-// falls back to the cgo Send path. Only valid inside an Async handler.
-func (r *Response) SendShared(code int, contentType, body string) {
-	if contentType != "" {
-		validateHeaderValue("Content-Type", contentType)
-	}
-	if r.async == nil || r.async.sent {
-		// Fall back to regular Send for sync mode or double-send.
-		r.Send(code, contentType, body)
-		return
-	}
-	if asyncSendShared(r.async.ctxHandle, statusLine(code), contentType, body) {
-		r.async.sent = true
-		return
-	}
-	// Inline buffers too small — fall back to cgo defer path.
-	r.Send(code, contentType, body)
 }
 
 // Async marks the response for asynchronous handling and runs fn on a new

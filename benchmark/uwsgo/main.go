@@ -87,31 +87,29 @@ func main() {
 		})
 		app.GetAsync("/sleep", func(res *gogo.Response, req *gogo.Request) {
 			time.Sleep(2 * time.Millisecond)
-			res.SendShared(200, "text/plain; charset=utf-8", "slept\n")
+			res.Send(200, "text/plain; charset=utf-8", "slept\n")
 		})
 		app.GetAsync("/file", func(res *gogo.Response, req *gogo.Request) {
 			data, err := os.ReadFile(filePath)
 			if err != nil {
-				res.SendShared(500, "text/plain", err.Error())
+				res.Send(500, "text/plain", err.Error())
 				return
 			}
-			// SendShared falls back to Send automatically if body exceeds
-			// the 8 KB inline cap, so it's safe to use on any size payload.
-			res.SendShared(200, "application/json", string(data))
+			res.Send(200, "application/json", string(data))
 		})
 		app.GetAsync("/db", func(res *gogo.Response, req *gogo.Request) {
 			id := rand.IntN(1000) + 1
 			var name, email, role string
 			err := dbConn.QueryRow("SELECT name, email, role FROM users WHERE id = ?", id).Scan(&name, &email, &role)
 			if err != nil {
-				res.SendShared(500, "text/plain", err.Error())
+				res.Send(500, "text/plain", err.Error())
 				return
 			}
-			res.SendShared(200, "application/json",
+			res.Send(200, "application/json",
 				fmt.Sprintf(`{"id":%d,"name":%q,"email":%q,"role":%q}`+"\n", id, name, email, role))
 		})
 		app.GetAsync("/user/:id", func(res *gogo.Response, req *gogo.Request) {
-			res.SendShared(200, "application/json",
+			res.Send(200, "application/json",
 				fmt.Sprintf(`{"id":%q}`+"\n", req.Parameter(0)))
 		})
 	}

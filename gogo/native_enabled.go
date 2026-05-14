@@ -224,7 +224,7 @@ func runSharedHandler(handler AsyncHandler, ctxPtr uintptr) {
 			if !a.sent {
 				// Best-effort 500 so the client doesn't hang. Body is left
 				// minimal so we don't risk another panic during marshaling.
-				resWrap.SendShared(500, "text/plain; charset=utf-8", "Internal Server Error\n")
+				resWrap.Send(500, "text/plain; charset=utf-8", "Internal Server Error\n")
 			}
 		}
 		if !a.sent {
