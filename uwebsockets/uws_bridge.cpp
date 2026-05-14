@@ -6,12 +6,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 extern "C" void uwsgoHandleHTTP(uintptr_t handler_id, uwsgo_res_t *res, uwsgo_req_t *req);
 extern "C" void uwsgoHandleHTTPAsync(uintptr_t handler_id, uwsgo_res_t *res, void *ctx, uwsgo_loop_t *loop);
@@ -57,9 +59,18 @@ struct uwsgo_ws_data_t {};
 
 using GoWebSocket = uWS::WebSocket<false, true, uwsgo_ws_data_t>;
 
+// StaticResponse holds the captured bytes for a route that the C++ event loop
+// can serve without crossing back into Go. Owned by the app for its lifetime.
+struct StaticResponse {
+    std::string status;
+    std::string content_type;
+    std::string body;
+};
+
 struct uwsgo_app_t {
     std::unique_ptr<uWS::App> app;
     us_listen_socket_t *listen_socket = nullptr;
+    std::vector<std::unique_ptr<StaticResponse>> static_responses;
 };
 
 static size_t copy_string_view(std::string_view value, char *buffer, size_t buffer_len) {
@@ -81,6 +92,28 @@ extern "C" void uwsgo_app_free(uwsgo_app_t *app) {
 extern "C" void uwsgo_app_get(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id) {
     app->app->get(pattern, [handler_id](auto *res, auto *req) {
         uwsgoHandleHTTP(handler_id, reinterpret_cast<uwsgo_res_t *>(res), reinterpret_cast<uwsgo_req_t *>(req));
+    });
+}
+
+extern "C" void uwsgo_app_get_static(uwsgo_app_t *app, const char *pattern,
+    const char *status, size_t status_len,
+    const char *content_type, size_t content_type_len,
+    const char *body, size_t body_len) {
+    auto stored = std::make_unique<StaticResponse>();
+    stored->status.assign(status, status_len);
+    stored->content_type.assign(content_type, content_type_len);
+    stored->body.assign(body, body_len);
+    auto *raw = stored.get();
+    app->static_responses.push_back(std::move(stored));
+
+    app->app->get(pattern, [raw](auto *res, auto *req) {
+        (void)req;
+        res->writeStatus(std::string_view(raw->status));
+        if (!raw->content_type.empty()) {
+            res->writeHeader(std::string_view("Content-Type", 12),
+                             std::string_view(raw->content_type));
+        }
+        res->end(std::string_view(raw->body));
     });
 }
 
@@ -207,16 +240,35 @@ extern "C" void uwsgo_res_cork(uwsgo_res_t *res, uintptr_t callback_id) {
 
 namespace {
 
+// Maximum inline body bytes for shared-memory responses. Sized to cover
+// most JSON API responses; larger responses fall back to the cgo defer path.
+constexpr size_t INLINE_STATUS_CAP = 32;
+constexpr size_t INLINE_CT_CAP = 64;
+constexpr size_t INLINE_BODY_CAP = 8192;
+
 // AsyncCtx is a reference-counted handle that tracks an in-flight async
 // response. Refs are held by:
 //   1. Go-side state, until uwsgo_res_defer_send or uwsgo_async_ctx_release transfers it
 //   2. The onAborted lambda registered with uWS, until the response is destroyed
 //   3. The defer lambda (if a response is sent), until that lambda runs
 // When the last ref drops, the ctx is deleted.
+//
+// The inline_* fields exist so Go can write the response directly into ctx
+// memory (which lives in the C heap) and enqueue the ctx on the shared
+// pending ring without any cgo call. The uWS loop drains the ring on every
+// timer tick and serves the response from these buffers.
 struct AsyncCtx {
     std::atomic<int> refcount{1};
     std::atomic<int32_t> aborted{0};
     uWS::HttpResponse<false> *response;
+
+    // Inline response slots populated by Go via shared-memory writes.
+    uint32_t inline_status_len = 0;
+    uint32_t inline_ct_len = 0;
+    uint32_t inline_body_len = 0;
+    char inline_status[INLINE_STATUS_CAP];
+    char inline_content_type[INLINE_CT_CAP];
+    char inline_body[INLINE_BODY_CAP];
 
     void retain() { refcount.fetch_add(1, std::memory_order_relaxed); }
     void release() {
@@ -225,6 +277,37 @@ struct AsyncCtx {
         }
     }
 };
+
+// Vyukov-style MPMC ring buffer used as MPSC: many goroutines push ready
+// AsyncCtx pointers; the uWS loop is the sole consumer. Each slot carries a
+// sequence number so producers and consumer don't trample each other without
+// locks. POOL_SIZE must be a power of two.
+constexpr uint64_t RING_SIZE = 4096;
+constexpr uint64_t RING_MASK = RING_SIZE - 1;
+
+struct PendingSlot {
+    std::atomic<uint64_t> sequence;
+    AsyncCtx *ctx;
+};
+
+struct PendingRing {
+    PendingSlot slots[RING_SIZE];
+    std::atomic<uint64_t> head;  // consumer index (loop thread only)
+    std::atomic<uint64_t> tail;  // producer index (any thread)
+
+    void init() {
+        for (uint64_t i = 0; i < RING_SIZE; i++) {
+            slots[i].sequence.store(i, std::memory_order_relaxed);
+            slots[i].ctx = nullptr;
+        }
+        head.store(0, std::memory_order_relaxed);
+        tail.store(0, std::memory_order_relaxed);
+    }
+};
+
+// Single global ring shared between all uWS loops in the process. Aligned to a
+// cache line to avoid false sharing between head and tail.
+alignas(128) static PendingRing g_pending;
 
 // CtxHold is a smart-pointer-like wrapper that retains/releases AsyncCtx,
 // suitable for capturing into uWS MoveOnlyFunction lambdas.
@@ -306,6 +389,75 @@ extern "C" void uwsgo_app_get_async(uwsgo_app_t *app, const char *pattern, uintp
 extern "C" void uwsgo_async_ctx_release(void *ctx_handle) {
     auto *ctx = static_cast<AsyncCtx *>(ctx_handle);
     ctx->release();
+}
+
+extern "C" void uwsgo_shared_layout(uwsgo_shared_layout_t *out) {
+    g_pending.init();
+    out->ring = &g_pending;
+    out->ring_size = RING_SIZE;
+    out->ring_mask = RING_MASK;
+    out->ring_slots_offset = offsetof(PendingRing, slots);
+    out->ring_slot_stride = sizeof(PendingSlot);
+    out->ring_slot_seq_offset = offsetof(PendingSlot, sequence);
+    out->ring_slot_ctx_offset = offsetof(PendingSlot, ctx);
+    out->ring_head_offset = offsetof(PendingRing, head);
+    out->ring_tail_offset = offsetof(PendingRing, tail);
+
+    out->ctx_status_len_offset = offsetof(AsyncCtx, inline_status_len);
+    out->ctx_ct_len_offset = offsetof(AsyncCtx, inline_ct_len);
+    out->ctx_body_len_offset = offsetof(AsyncCtx, inline_body_len);
+    out->ctx_status_offset = offsetof(AsyncCtx, inline_status);
+    out->ctx_ct_offset = offsetof(AsyncCtx, inline_content_type);
+    out->ctx_body_offset = offsetof(AsyncCtx, inline_body);
+    out->ctx_inline_status_cap = INLINE_STATUS_CAP;
+    out->ctx_inline_ct_cap = INLINE_CT_CAP;
+    out->ctx_inline_body_cap = INLINE_BODY_CAP;
+}
+
+// drain_pending runs on the loop thread (invoked from a periodic timer). It
+// consumes every ready slot from the ring and sends the response. Single
+// consumer so no CAS needed on head.
+static void drain_pending() {
+    uint64_t h = g_pending.head.load(std::memory_order_relaxed);
+    while (true) {
+        PendingSlot *slot = &g_pending.slots[h & RING_MASK];
+        uint64_t seq = slot->sequence.load(std::memory_order_acquire);
+        if (seq != h + 1) break;  // slot not ready
+
+        AsyncCtx *ctx = slot->ctx;
+        slot->sequence.store(h + RING_SIZE, std::memory_order_release);
+
+        if (!ctx->aborted.load(std::memory_order_acquire)) {
+            auto *r = ctx->response;
+            r->cork([r, ctx]() {
+                if (ctx->inline_status_len > 0) {
+                    r->writeStatus(std::string_view(ctx->inline_status, ctx->inline_status_len));
+                }
+                if (ctx->inline_ct_len > 0) {
+                    r->writeHeader(std::string_view("Content-Type", 12),
+                                   std::string_view(ctx->inline_content_type, ctx->inline_ct_len));
+                }
+                r->end(std::string_view(ctx->inline_body, ctx->inline_body_len));
+            });
+        }
+        ctx->release();
+        h++;
+    }
+    g_pending.head.store(h, std::memory_order_relaxed);
+}
+
+// uwsgo_app_start_drain installs a periodic timer on the current loop that
+// invokes drain_pending. interval_us is the polling interval; 50-200 us
+// trades wake latency vs CPU. Returns nothing; the timer lives for the
+// lifetime of the loop.
+extern "C" void uwsgo_app_start_drain(int interval_us) {
+    auto *loop = reinterpret_cast<struct us_loop_t *>(uWS::Loop::get());
+    auto *timer = us_create_timer(loop, 0, 0);
+    int ms = interval_us / 1000;
+    if (ms < 1) ms = 1;
+    us_timer_set(timer, [](struct us_timer_t * /*t*/) {
+        drain_pending();
+    }, ms, ms);
 }
 
 extern "C" void uwsgo_res_defer_send(

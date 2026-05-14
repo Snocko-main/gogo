@@ -13,6 +13,7 @@ import "C"
 
 import (
 	"runtime/cgo"
+	"sync/atomic"
 	"unsafe"
 )
 
@@ -46,6 +47,17 @@ func (a *appNative) get(pattern string, handler Handler) {
 	defer C.free(unsafe.Pointer(cpattern))
 
 	C.uwsgo_app_get(a.ptr, cpattern, C.uintptr_t(handle))
+}
+
+func (a *appNative) getStatic(pattern, status, contentType, body string) {
+	cpattern := C.CString(pattern)
+	defer C.free(unsafe.Pointer(cpattern))
+
+	C.uwsgo_app_get_static(a.ptr, cpattern,
+		unsafeStringData(status), C.size_t(len(status)),
+		unsafeStringData(contentType), C.size_t(len(contentType)),
+		unsafeStringData(body), C.size_t(len(body)),
+	)
 }
 
 func (a *appNative) getAsync(pattern string, handler AsyncHandler) {
@@ -178,6 +190,108 @@ func asyncDeferSend(loopPtr, ctxHandle uintptr, status, contentType, body string
 
 func asyncCtxRelease(ctxHandle uintptr) {
 	C.uwsgo_async_ctx_release(unsafe.Pointer(ctxHandle))
+}
+
+// sharedLayout caches struct offsets exposed by C so the hot path can build
+// responses with plain unsafe.Pointer arithmetic and atomic ops, no cgo.
+type sharedLayout struct {
+	ring             uintptr
+	ringMask         uint64
+	slotsOffset      uintptr
+	slotStride       uintptr
+	slotSeqOffset    uintptr
+	slotCtxOffset    uintptr
+	headOffset       uintptr
+	tailOffset       uintptr
+	ctxStatusLenOff  uintptr
+	ctxCtLenOff      uintptr
+	ctxBodyLenOff    uintptr
+	ctxStatusOff     uintptr
+	ctxCtOff         uintptr
+	ctxBodyOff       uintptr
+	statusCap        uintptr
+	ctCap            uintptr
+	bodyCap          uintptr
+}
+
+var shared sharedLayout
+var sharedReady bool
+
+func initSharedLayout() {
+	var raw C.uwsgo_shared_layout_t
+	C.uwsgo_shared_layout(&raw)
+	shared = sharedLayout{
+		ring:            uintptr(raw.ring),
+		ringMask:        uint64(raw.ring_mask),
+		slotsOffset:     uintptr(raw.ring_slots_offset),
+		slotStride:      uintptr(raw.ring_slot_stride),
+		slotSeqOffset:   uintptr(raw.ring_slot_seq_offset),
+		slotCtxOffset:   uintptr(raw.ring_slot_ctx_offset),
+		headOffset:      uintptr(raw.ring_head_offset),
+		tailOffset:      uintptr(raw.ring_tail_offset),
+		ctxStatusLenOff: uintptr(raw.ctx_status_len_offset),
+		ctxCtLenOff:     uintptr(raw.ctx_ct_len_offset),
+		ctxBodyLenOff:   uintptr(raw.ctx_body_len_offset),
+		ctxStatusOff:    uintptr(raw.ctx_status_offset),
+		ctxCtOff:        uintptr(raw.ctx_ct_offset),
+		ctxBodyOff:      uintptr(raw.ctx_body_offset),
+		statusCap:       uintptr(raw.ctx_inline_status_cap),
+		ctCap:           uintptr(raw.ctx_inline_ct_cap),
+		bodyCap:         uintptr(raw.ctx_inline_body_cap),
+	}
+	sharedReady = true
+}
+
+func startSharedDrain(intervalUs int) {
+	C.uwsgo_app_start_drain(C.int(intervalUs))
+}
+
+func (a appNative) startSharedDrain(intervalUs int) {
+	startSharedDrain(intervalUs)
+}
+
+// asyncSendShared writes the response bytes directly into the AsyncCtx memory
+// (allocated in the C heap), then pushes the ctx pointer onto the shared
+// MPMC ring. No cgo crossing happens on the hot path. Returns false when the
+// body or content_type exceeds the inline buffer caps; caller should fall
+// back to the cgo defer path in that case.
+func asyncSendShared(ctxHandle uintptr, statusLine, contentType, body string) bool {
+	if !sharedReady || uintptr(len(statusLine)) > shared.statusCap ||
+		uintptr(len(contentType)) > shared.ctCap ||
+		uintptr(len(body)) > shared.bodyCap {
+		return false
+	}
+
+	// Write status/ct/body bytes into the ctx's inline buffers.
+	if n := len(statusLine); n > 0 {
+		dst := unsafe.Slice((*byte)(unsafe.Pointer(ctxHandle+shared.ctxStatusOff)), int(shared.statusCap))
+		copy(dst, statusLine)
+	}
+	if n := len(contentType); n > 0 {
+		dst := unsafe.Slice((*byte)(unsafe.Pointer(ctxHandle+shared.ctxCtOff)), int(shared.ctCap))
+		copy(dst, contentType)
+	}
+	if n := len(body); n > 0 {
+		dst := unsafe.Slice((*byte)(unsafe.Pointer(ctxHandle+shared.ctxBodyOff)), int(shared.bodyCap))
+		copy(dst, body)
+	}
+	// Lengths.
+	*(*uint32)(unsafe.Pointer(ctxHandle + shared.ctxStatusLenOff)) = uint32(len(statusLine))
+	*(*uint32)(unsafe.Pointer(ctxHandle + shared.ctxCtLenOff)) = uint32(len(contentType))
+	*(*uint32)(unsafe.Pointer(ctxHandle + shared.ctxBodyLenOff)) = uint32(len(body))
+
+	// MPSC enqueue: fetch_add tail, wait for slot.sequence == idx, write ctx, sequence = idx+1
+	tailAddr := (*atomic.Uint64)(unsafe.Pointer(shared.ring + shared.tailOffset))
+	idx := tailAddr.Add(1) - 1
+	slotBase := shared.ring + shared.slotsOffset + uintptr(idx&shared.ringMask)*shared.slotStride
+	seqAddr := (*atomic.Uint64)(unsafe.Pointer(slotBase + shared.slotSeqOffset))
+
+	for seqAddr.Load() != idx {
+		// Ring is full — spin briefly waiting for consumer.
+	}
+	*(*uintptr)(unsafe.Pointer(slotBase + shared.slotCtxOffset)) = ctxHandle
+	seqAddr.Store(idx + 1)
+	return true
 }
 
 func (r requestNative) url() string {

@@ -17,6 +17,7 @@ func newAppNative() (appNative, error) {
 }
 
 func (appNative) get(string, Handler)                 {}
+func (appNative) getStatic(string, string, string, string) {}
 func (appNative) getAsync(string, AsyncHandler)       {}
 func (appNative) post(string, Handler)                {}
 func (appNative) any(string, Handler)                 {}
@@ -35,6 +36,10 @@ func (responseNative) onAborted(*Aborted)    {}
 func (responseNative) cork(func())           {}
 
 func (loopNative) defer_(func()) {}
+
+func (appNative) startSharedDrain(int) {}
+func initSharedLayout()                {}
+func asyncSendShared(uintptr, string, string, string) bool { return false }
 
 func (responseNative) beginAsync() (uintptr, uintptr) { return 0, 0 }
 

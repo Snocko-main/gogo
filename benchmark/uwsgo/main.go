@@ -60,20 +60,28 @@ func main() {
 	defer app.Close()
 
 	app.Get("/plain", func(res *uws.Response, req *uws.Request) {
-		res.Send("200 OK", "text/plain; charset=utf-8", "hello world\n")
+		res.Send(200, "text/plain; charset=utf-8", "hello world\n")
 	})
 
 	app.Get("/json", func(res *uws.Response, req *uws.Request) {
-		res.Send("200 OK", "application/json", `{"message":"hello world","ok":true}`+"\n")
+		res.Send(200, "application/json", `{"message":"hello world","ok":true}`+"\n")
 	})
 
+	// Static routes — served entirely by uWS C++, zero cgo per request.
+	app.Get("/health", uws.Reply{
+		Status:      200,
+		ContentType: "application/json",
+		Body:        `{"ok":true}` + "\n",
+	})
+	app.Get("/plain-static", "hello world\n")
+
 	app.Get("/hello/:name", func(res *uws.Response, req *uws.Request) {
-		res.Send("200 OK", "text/plain; charset=utf-8", "hello "+req.Parameter(0)+"\n")
+		res.Send(200, "text/plain; charset=utf-8", "hello "+req.Parameter(0)+"\n")
 	})
 
 	app.GetAsync("/sleep", func(res *uws.Response) {
 		time.Sleep(2 * time.Millisecond)
-		res.Send("200 OK", "text/plain; charset=utf-8", "slept\n")
+		res.Send(200, "text/plain; charset=utf-8", "slept\n")
 	})
 
 	filePath := os.Getenv("BENCH_FILE")
@@ -83,10 +91,10 @@ func main() {
 	app.GetAsync("/file", func(res *uws.Response) {
 		data, err := os.ReadFile(filePath)
 		if err != nil {
-			res.Send("500 Internal Server Error", "text/plain", err.Error())
+			res.Send(500, "text/plain", err.Error())
 			return
 		}
-		res.Send("200 OK", "application/json", string(data))
+		res.Send(200, "application/json", string(data))
 	})
 
 	dbPath := os.Getenv("BENCH_DB")
@@ -101,10 +109,23 @@ func main() {
 		var name, email, role string
 		err := dbConn.QueryRow("SELECT name, email, role FROM users WHERE id = ?", id).Scan(&name, &email, &role)
 		if err != nil {
-			res.Send("500 Internal Server Error", "text/plain", err.Error())
+			res.Send(500, "text/plain", err.Error())
 			return
 		}
-		res.Send("200 OK", "application/json",
+		res.Send(200, "application/json",
+			fmt.Sprintf(`{"id":%d,"name":%q,"email":%q,"role":%q}`+"\n", id, name, email, role))
+	})
+
+	// Same as /db but uses SendShared (shared-memory + lock-free ring, 0 cgo on hot path).
+	app.GetAsync("/db-shared", func(res *uws.Response) {
+		id := rand.IntN(1000) + 1
+		var name, email, role string
+		err := dbConn.QueryRow("SELECT name, email, role FROM users WHERE id = ?", id).Scan(&name, &email, &role)
+		if err != nil {
+			res.SendShared(500, "text/plain", err.Error())
+			return
+		}
+		res.SendShared(200, "application/json",
 			fmt.Sprintf(`{"id":%d,"name":%q,"email":%q,"role":%q}`+"\n", id, name, email, role))
 	})
 

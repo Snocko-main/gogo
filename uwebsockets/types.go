@@ -1,10 +1,24 @@
 package uwebsockets
 
 import (
+	"fmt"
+	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 )
+
+// statusLine formats an HTTP status code into the "<code> <reason>" string
+// uWS writes verbatim onto the wire. Standard codes get their canonical reason
+// phrase via net/http; unknown codes fall back to just the number.
+func statusLine(code int) string {
+	text := http.StatusText(code)
+	if text == "" {
+		return strconv.Itoa(code)
+	}
+	return strconv.Itoa(code) + " " + text
+}
 
 var (
 	responsePool   = sync.Pool{New: func() any { return &Response{} }}
@@ -54,13 +68,47 @@ func NewApp() (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-
+	initSharedLayout()
 	return &App{inner: inner}, nil
 }
 
-// Get registers a GET route.
-func (a *App) Get(pattern string, handler Handler) {
-	a.inner.get(pattern, handler)
+// Reply is a static response captured once at registration time. Routes
+// registered with this target are served entirely by the C++ event loop with
+// no cgo callback per request — use it for /health, /version, cached config,
+// or any constant response.
+type Reply struct {
+	Status      int    // defaults to 200 when zero
+	ContentType string // omits Content-Type header when empty
+	Body        string
+}
+
+// Get registers a GET route. The target may be:
+//
+//   - Handler / func(*Response, *Request) — dynamic, invoked per request via cgo
+//   - string                              — static body served by C++ (no cgo per request)
+//   - []byte                              — same as string
+//   - Reply                               — static body with explicit status and Content-Type
+//
+// Static targets are served entirely in C++ with no Go work per request.
+func (a *App) Get(pattern string, target any) {
+	switch v := target.(type) {
+	case Handler:
+		a.inner.get(pattern, v)
+	case func(*Response, *Request):
+		a.inner.get(pattern, Handler(v))
+	case Reply:
+		code := v.Status
+		if code == 0 {
+			code = 200
+		}
+		a.inner.getStatic(pattern, statusLine(code), v.ContentType, v.Body)
+	case string:
+		a.inner.getStatic(pattern, statusLine(200), "", v)
+	case []byte:
+		a.inner.getStatic(pattern, statusLine(200), "", string(v))
+	default:
+		panic(fmt.Sprintf("uwebsockets: unsupported Get target type %T for %q", target, pattern))
+	}
 }
 
 // GetAsync registers a GET route whose handler runs on a fresh goroutine and
@@ -90,8 +138,11 @@ func (a *App) Listen(port int) bool {
 	return a.inner.listen(port)
 }
 
-// Run starts the uWebSockets event loop and blocks.
+// Run starts the uWebSockets event loop and blocks. Before running, installs
+// the shared-memory drain timer on this loop so SendShared responses can be
+// flushed by the loop thread.
 func (a *App) Run() {
+	a.inner.startSharedDrain(200) // 200μs drain interval
 	a.inner.run()
 }
 
@@ -120,13 +171,16 @@ type asyncState struct {
 	sent        bool
 }
 
-// Status sets the HTTP status text, for example "200 OK" or "404 Not Found".
-func (r *Response) Status(status string) *Response {
+// Status sets the HTTP status code. The standard reason phrase from
+// net/http is appended automatically (e.g. 200 → "200 OK", 404 → "404 Not
+// Found"); unknown codes are written as the bare number.
+func (r *Response) Status(code int) *Response {
+	line := statusLine(code)
 	if r.async != nil {
-		r.async.status = status
+		r.async.status = line
 		return r
 	}
-	r.inner.status(status)
+	r.inner.status(line)
 	return r
 }
 
@@ -167,19 +221,39 @@ func (r *Response) End(body string) {
 	r.inner.end(body)
 }
 
-// Send writes status, an optional Content-Type header, and body in a single
-// trip across the C boundary. Pass an empty contentType to omit the header.
-// In async mode the values are buffered and flushed together when the
-// asynchronous work completes, also in a single cgo call.
-func (r *Response) Send(status, contentType, body string) {
+// Send writes status code, an optional Content-Type header, and body in a
+// single trip across the C boundary. Pass an empty contentType to omit the
+// header. In async mode the values are buffered and flushed together when
+// the asynchronous work completes, also in a single cgo call.
+func (r *Response) Send(code int, contentType, body string) {
+	line := statusLine(code)
 	if r.async != nil {
-		r.async.status = status
+		r.async.status = line
 		r.async.contentType = contentType
 		r.async.body.WriteString(body)
 		r.flushAsync()
 		return
 	}
-	r.inner.send(status, contentType, body)
+	r.inner.send(line, contentType, body)
+}
+
+// SendShared writes the response into the AsyncCtx's inline buffers and
+// enqueues it on the shared lock-free ring for the uWS loop to flush. The
+// hot path makes ZERO cgo crossings — pure shared-memory writes plus atomic
+// ring push. Body must fit the inline cap (8192 bytes), otherwise the call
+// falls back to the cgo Send path. Only valid inside an Async handler.
+func (r *Response) SendShared(code int, contentType, body string) {
+	if r.async == nil || r.async.sent {
+		// Fall back to regular Send for sync mode or double-send.
+		r.Send(code, contentType, body)
+		return
+	}
+	if asyncSendShared(r.async.ctxHandle, statusLine(code), contentType, body) {
+		r.async.sent = true
+		return
+	}
+	// Inline buffers too small — fall back to cgo defer path.
+	r.Send(code, contentType, body)
 }
 
 // Async marks the response for asynchronous handling and runs fn on a new

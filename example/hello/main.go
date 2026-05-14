@@ -21,7 +21,7 @@ func main() {
 		}
 
 		res.
-			Status("200 OK").
+			Status(200).
 			Header("Content-Type", "text/plain; charset=utf-8").
 			End(fmt.Sprintf("hello %s\n", name))
 	})
