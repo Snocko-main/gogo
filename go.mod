@@ -1,10 +1,12 @@
 module uwebsockets-go
 
-go 1.22
+go 1.24
 
 require github.com/gofiber/fiber/v2 v2.52.13
 
 require (
+	git.urbach.dev/go/router v0.0.0-20250721083733-8d04266bc544 // indirect
+	git.urbach.dev/go/web v0.0.0-20250827103423-e50f220853ff // indirect
 	github.com/andybalholm/brotli v1.1.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/klauspost/compress v1.17.9 // indirect
