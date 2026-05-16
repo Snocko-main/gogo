@@ -1467,20 +1467,28 @@ type Request struct {
 	// the map is reused) when the Request returns to the pool.
 	locals map[string]any
 
-	// syncURLPtr / syncURLLen point at the URL bytes uWS has already parsed
-	// for this request. The C++ bridge fills them at handler entry so
-	// URL() can materialize a Go string on first read without a cgo call.
-	// The pointer is valid only for the lifetime of the sync callback —
-	// resetForPool clears the fields before the wrapper is reused.
-	syncURLPtr unsafe.Pointer
-	syncURLLen int
+	// sync{Method,URL,Query}{Ptr,Len} point at uWS-parsed bytes inside
+	// the live HttpRequest. The C++ bridge fills them at handler entry
+	// so Request.{Method,URL,Query} can materialize a Go string on first
+	// read without a cgo round-trip. The pointers are valid only for the
+	// lifetime of the sync callback; resetForPool clears them before the
+	// wrapper returns to the pool.
+	syncMethodPtr unsafe.Pointer
+	syncMethodLen int
+	syncURLPtr    unsafe.Pointer
+	syncURLLen    int
+	syncQueryPtr  unsafe.Pointer
+	syncQueryLen  int
 
-	// cachedURL is the materialized Go string, allocated lazily on the first
-	// URL() call. urlCached lets the empty string ("") be a valid cache
-	// value (request with empty URL — uWS rejects these, but the flag keeps
-	// the check explicit).
-	cachedURL string
-	urlCached bool
+	// cached{URL,Method,Query} hold the materialized Go strings allocated
+	// lazily on the first accessor call. The {field}Cached bool lets the
+	// empty string be a valid cache value without re-materializing.
+	cachedURL    string
+	urlCached    bool
+	cachedMethod string
+	methodCached bool
+	cachedQuery  string
+	queryCached  bool
 }
 
 // requestSnapshot holds the Go-side captured copy of an HttpRequest, used by
@@ -1538,10 +1546,18 @@ func (r *Request) resetForPool() {
 	r.inner = requestNative{}
 	r.snap = nil
 	r.body = nil
+	r.syncMethodPtr = nil
+	r.syncMethodLen = 0
 	r.syncURLPtr = nil
 	r.syncURLLen = 0
+	r.syncQueryPtr = nil
+	r.syncQueryLen = 0
 	r.cachedURL = ""
 	r.urlCached = false
+	r.cachedMethod = ""
+	r.methodCached = false
+	r.cachedQuery = ""
+	r.queryCached = false
 	for k := range r.locals {
 		delete(r.locals, k)
 	}
@@ -1575,12 +1591,26 @@ func (r *Request) URL() string {
 }
 
 // Method returns the HTTP method ("get", "post", ...). uWS lower-cases it
-// during parsing.
+// during parsing. Sync handlers serve this from the pre-cached method
+// pointer the bridge stashed at handler entry; first call allocates a
+// Go string, subsequent calls return the cached value — no cgo on the
+// hot path.
 func (r *Request) Method() string {
 	if r.snap != nil {
 		return r.snap.method
 	}
-	return r.inner.method()
+	if r.methodCached {
+		return r.cachedMethod
+	}
+	if r.syncMethodPtr != nil {
+		r.cachedMethod = goStringFromC(r.syncMethodPtr, r.syncMethodLen)
+		r.methodCached = true
+		return r.cachedMethod
+	}
+	s := r.inner.method()
+	r.cachedMethod = s
+	r.methodCached = true
+	return s
 }
 
 // Header returns a request header value. Header lookups in async/shared
@@ -1613,11 +1643,25 @@ func (r *Request) Parameter(index int) string {
 //
 // For parsed access, prefer QueryParam(key) for single keys or pass the
 // result to net/url.ParseQuery for a full map.
+//
+// Sync handlers serve from the pre-cached query pointer (no cgo) on first
+// call; subsequent calls hit the cache.
 func (r *Request) Query() string {
 	if r.snap != nil {
 		return r.snap.query
 	}
-	return r.inner.query()
+	if r.queryCached {
+		return r.cachedQuery
+	}
+	if r.syncQueryPtr != nil {
+		r.cachedQuery = goStringFromC(r.syncQueryPtr, r.syncQueryLen)
+		r.queryCached = true
+		return r.cachedQuery
+	}
+	s := r.inner.query()
+	r.cachedQuery = s
+	r.queryCached = true
+	return s
 }
 
 // QueryParam returns the value of a single query parameter. Returns "" if

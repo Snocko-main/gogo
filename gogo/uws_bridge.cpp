@@ -15,7 +15,10 @@
 #include <utility>
 #include <vector>
 
-extern "C" void uwsgoHandleHTTP(uintptr_t handler_id, uwsgo_res_t *res, uwsgo_req_t *req, const char *url, size_t url_len);
+extern "C" void uwsgoHandleHTTP(uintptr_t handler_id, uwsgo_res_t *res, uwsgo_req_t *req,
+    const char *method, size_t method_len,
+    const char *url, size_t url_len,
+    const char *query, size_t query_len);
 extern "C" void uwsgoHandleWSOpen(uintptr_t handler_id, uwsgo_ws_t *ws);
 extern "C" void uwsgoHandleWSMessage(uintptr_t handler_id, uwsgo_ws_t *ws, const char *message, size_t message_len, int opcode);
 extern "C" void uwsgoHandleWSClose(uintptr_t handler_id, uwsgo_ws_t *ws, int code, const char *message, size_t message_len);
@@ -153,16 +156,28 @@ extern "C" void uwsgo_app_free(uwsgo_app_t *app) {
     delete app;
 }
 
+// dispatch_sync invokes uwsgoHandleHTTP with method / URL / query already
+// pulled out of the uWS request. uWS keeps these as std::string_view
+// pointers into its own request buffer; the buffer is alive for the
+// duration of the C++ callback, which is exactly the lifetime of the Go
+// Request wrapper, so passing the raw (data, len) pairs to Go is safe
+// and lets Request.{Method,URL,Query} materialize lazily without a cgo
+// round-trip back into uWS.
+static inline void dispatch_sync(uintptr_t handler_id, uWS::HttpResponse<false> *res, uWS::HttpRequest *req) {
+    auto method = req->getMethod();
+    auto url = req->getUrl();
+    auto query = req->getQuery();
+    uwsgoHandleHTTP(handler_id,
+        reinterpret_cast<uwsgo_res_t *>(res),
+        reinterpret_cast<uwsgo_req_t *>(req),
+        method.data(), method.size(),
+        url.data(), url.size(),
+        query.data(), query.size());
+}
+
 extern "C" void uwsgo_app_get(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id) {
     app->app->get(pattern, [handler_id](auto *res, auto *req) {
-        // Pre-fetch URL on the C++ side and pass it to Go inline so Go's
-        // Request.URL() (used by the path-scoped middleware guard on dynamic
-        // routes) is a cache hit instead of a two-call cgo round-trip.
-        auto url = req->getUrl();
-        uwsgoHandleHTTP(handler_id,
-            reinterpret_cast<uwsgo_res_t *>(res),
-            reinterpret_cast<uwsgo_req_t *>(req),
-            url.data(), url.size());
+        dispatch_sync(handler_id, res, req);
     });
 }
 
@@ -215,22 +230,14 @@ static bool body_limit_rejects(uwsgo_app_t *app, uWS::HttpResponse<false> *res, 
 extern "C" void uwsgo_app_post(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id) {
     app->app->post(pattern, [app, handler_id](auto *res, auto *req) {
         if (body_limit_rejects(app, res, req)) return;
-        auto url = req->getUrl();
-        uwsgoHandleHTTP(handler_id,
-            reinterpret_cast<uwsgo_res_t *>(res),
-            reinterpret_cast<uwsgo_req_t *>(req),
-            url.data(), url.size());
+        dispatch_sync(handler_id, res, req);
     });
 }
 
 extern "C" void uwsgo_app_any(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id) {
     app->app->any(pattern, [app, handler_id](auto *res, auto *req) {
         if (body_limit_rejects(app, res, req)) return;
-        auto url = req->getUrl();
-        uwsgoHandleHTTP(handler_id,
-            reinterpret_cast<uwsgo_res_t *>(res),
-            reinterpret_cast<uwsgo_req_t *>(req),
-            url.data(), url.size());
+        dispatch_sync(handler_id, res, req);
     });
 }
 

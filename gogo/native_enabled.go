@@ -780,19 +780,26 @@ func (ws websocketNative) end(code int, message string) {
 }
 
 //export uwsgoHandleHTTP
-func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req_t, urlPtr *C.char, urlLen C.size_t) {
+func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req_t,
+	methodPtr *C.char, methodLen C.size_t,
+	urlPtr *C.char, urlLen C.size_t,
+	queryPtr *C.char, queryLen C.size_t) {
 	handle := cgo.Handle(handlerID)
 	handler := handle.Value().(Handler)
 
 	reqWrap := requestPool.Get().(*Request)
 	reqWrap.inner = requestNative{ptr: req}
-	// uWS already had the URL parsed; the C++ side passed the std::string_view
-	// in alongside res/req so Request.URL() can serve it without a cgo round-
-	// trip. ptr is valid for the lifetime of this callback (i.e. the lifetime
-	// of reqWrap before it returns to the pool). Materialization is lazy in
-	// Request.URL(); we just record the source here.
+	// uWS already had method / URL / query parsed; C++ passes the
+	// std::string_view pointers into uWS's request buffer so Request's
+	// accessors can materialize lazily without a cgo round-trip. The
+	// pointers are valid for the lifetime of this callback (= the
+	// lifetime of reqWrap before it returns to the pool).
+	reqWrap.syncMethodPtr = unsafe.Pointer(methodPtr)
+	reqWrap.syncMethodLen = int(methodLen)
 	reqWrap.syncURLPtr = unsafe.Pointer(urlPtr)
 	reqWrap.syncURLLen = int(urlLen)
+	reqWrap.syncQueryPtr = unsafe.Pointer(queryPtr)
+	reqWrap.syncQueryLen = int(queryLen)
 
 	resWrap := responsePool.Get().(*Response)
 	resWrap.inner = responseNative{ptr: res}
