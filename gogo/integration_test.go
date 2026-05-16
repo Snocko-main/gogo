@@ -2125,3 +2125,264 @@ func TestGroupGlobalUseStillWraps(t *testing.T) {
 		t.Fatalf("hits global=%d group=%d, want 1 each", globalHits.Load(), groupHits.Load())
 	}
 }
+
+// -----------------------------------------------------------------------------
+// P0 security-hardening tests (P0-1, P0-2, P0-4, P0-6, P0-9 from ROADMAP).
+// -----------------------------------------------------------------------------
+
+// startAppCfg mirrors startApp but lets the caller pass an explicit
+// gogo.Config (BodyLimit, BindAddr, …).
+func startAppCfg(t *testing.T, cfg gogo.Config, configure func(app *gogo.App)) (port int, teardown func()) {
+	t.Helper()
+	port = freePort(t)
+	ready := make(chan *gogo.App, 1)
+	listenErr := make(chan error, 1)
+	runDone := make(chan struct{})
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		app, err := gogo.NewApp(cfg)
+		if err != nil {
+			listenErr <- fmt.Errorf("NewApp: %w", err)
+			close(runDone)
+			return
+		}
+		configure(app)
+		if !app.Listen(port) {
+			listenErr <- fmt.Errorf("Listen :%d failed", port)
+			app.Close()
+			close(runDone)
+			return
+		}
+		ready <- app
+		app.Run()
+		app.Close()
+		close(runDone)
+	}()
+	var app *gogo.App
+	select {
+	case app = <-ready:
+	case err := <-listenErr:
+		t.Fatal(err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("app setup timed out")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		bind := cfg.BindAddr
+		if bind == "" {
+			bind = "127.0.0.1"
+		}
+		c, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", bind, port), 50*time.Millisecond)
+		if err == nil {
+			c.Close()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	teardown = func() {
+		app.Shutdown()
+		select {
+		case <-runDone:
+		case <-time.After(10 * time.Second):
+			t.Errorf("app.Run did not exit after Shutdown")
+		}
+	}
+	return port, teardown
+}
+
+// TestReplyContentTypeRejectsCRLF: passing CRLF into Reply.ContentType
+// must panic at App.Get registration, matching the dynamic-header
+// validation that already rejects this.
+func TestReplyContentTypeRejectsCRLF(t *testing.T) {
+	app, err := gogo.NewApp()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("Reply{ContentType: …\\r\\n…} did not panic")
+		}
+	}()
+	app.Get("/x", gogo.Reply{
+		ContentType: "text/plain\r\nX-Injected: evil",
+		Body:        "ok",
+	})
+}
+
+// TestRouterReplyContentTypeRejectsCRLF: same check on the Router.Get
+// path, which has its own Reply branch.
+func TestRouterReplyContentTypeRejectsCRLF(t *testing.T) {
+	app, err := gogo.NewApp()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("Router.Get(Reply{CT:…\\r\\n…}) did not panic")
+		}
+	}()
+	app.Group("/api").Get("/x", gogo.Reply{
+		ContentType: "text/plain\r\nX-Injected: 1",
+		Body:        "ok",
+	})
+}
+
+// TestJSONMarshalErrorDoesNotLeak: marshalling an unsupported value
+// (a channel) must end with a generic 500 and reach the panic handler;
+// the wire body must not include Go-internal text like "json marshal".
+func TestJSONMarshalErrorDoesNotLeak(t *testing.T) {
+	var captured atomic.Pointer[string]
+	gogo.SetPanicHandler(func(rec any) {
+		s := fmt.Sprintf("%v", rec)
+		captured.Store(&s)
+	})
+	defer gogo.SetPanicHandler(nil)
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/bad", func(res *gogo.Response, req *gogo.Request) {
+			ch := make(chan int)
+			res.JSON(200, ch) // json.Marshal returns UnsupportedTypeError
+		})
+	})
+	defer teardown()
+
+	status, body := httpGet(t, port, "/bad")
+	if status != 500 {
+		t.Fatalf("status: got %d, want 500", status)
+	}
+	if strings.Contains(strings.ToLower(body), "json") || strings.Contains(strings.ToLower(body), "unsupported") {
+		t.Fatalf("body leaks marshal error detail: %q", body)
+	}
+	// Server-side report should have fired with the underlying error.
+	got := captured.Load()
+	if got == nil {
+		t.Fatal("panic handler did not see the marshal error")
+	}
+	if !strings.Contains(*got, "JSON marshal") && !strings.Contains(*got, "unsupported") {
+		t.Fatalf("panic handler payload: %q", *got)
+	}
+}
+
+// TestCookieValueStripQuotes: Cookie("k") returns the unquoted value
+// for `k="v"` (RFC 6265 §5.2). Unquoted and quoted-with-internal-text
+// should both work.
+func TestCookieValueStripQuotes(t *testing.T) {
+	var captured atomic.Pointer[string]
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/cookie", func(res *gogo.Response, req *gogo.Request) {
+			v := req.Cookie("session")
+			captured.Store(&v)
+			res.Send(200, "text/plain", v)
+		})
+	})
+	defer teardown()
+
+	for _, tc := range []struct{ header, want string }{
+		{`session=plain`, "plain"},
+		{`session="quoted"`, "quoted"},
+		{`other=x; session="quoted"; more=y`, "quoted"},
+		{`session=""`, ""}, // matched empty quotes
+		{`session="`, `"`}, // single open quote not stripped
+	} {
+		req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/cookie", port), nil)
+		req.Header.Set("Cookie", tc.header)
+		resp, err := noKeepaliveClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET cookie=%q: %v", tc.header, err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if string(b) != tc.want {
+			t.Errorf("cookie=%q: got %q, want %q", tc.header, string(b), tc.want)
+		}
+	}
+}
+
+// TestBodyLimitContentLengthRejected: POST with Content-Length above
+// the app's BodyLimit must get a 413 from the C++ pre-check; the Go
+// handler must not be invoked.
+func TestBodyLimitContentLengthRejected(t *testing.T) {
+	var handlerHits atomic.Int32
+	port, teardown := startAppCfg(t, gogo.Config{BodyLimit: 1024}, func(app *gogo.App) {
+		app.Post("/upload", func(res *gogo.Response, req *gogo.Request) {
+			handlerHits.Add(1)
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	// Exactly at the limit → handler runs.
+	resp, err := noKeepaliveClient.Post(
+		fmt.Sprintf("http://127.0.0.1:%d/upload", port),
+		"text/plain", bytes.NewReader(bytes.Repeat([]byte("x"), 1024)))
+	if err != nil {
+		t.Fatalf("at-limit POST: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("at-limit POST: got %d, want 200", resp.StatusCode)
+	}
+	if handlerHits.Load() != 1 {
+		t.Fatalf("handler hits at limit = %d, want 1", handlerHits.Load())
+	}
+
+	// One byte over → 413, handler must NOT be invoked.
+	resp, err = noKeepaliveClient.Post(
+		fmt.Sprintf("http://127.0.0.1:%d/upload", port),
+		"text/plain", bytes.NewReader(bytes.Repeat([]byte("x"), 1025)))
+	if err != nil {
+		t.Fatalf("over-limit POST: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 413 {
+		t.Fatalf("over-limit POST: got %d, want 413", resp.StatusCode)
+	}
+	if handlerHits.Load() != 1 {
+		t.Fatalf("handler ran for over-limit POST: hits=%d, want 1", handlerHits.Load())
+	}
+}
+
+// TestBindAddrLocalhost: when Config.BindAddr is set to 127.0.0.1, the
+// listener is reachable on loopback. (We can't reliably test refusal on
+// a non-loopback IP without knowing the box's external addresses; the
+// loopback-reach assertion is the practical signal we care about.)
+func TestBindAddrLocalhost(t *testing.T) {
+	port, teardown := startAppCfg(t, gogo.Config{BindAddr: "127.0.0.1"}, func(app *gogo.App) {
+		app.Get("/ok", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "loopback")
+		})
+	})
+	defer teardown()
+
+	status, body := httpGet(t, port, "/ok")
+	if status != 200 || body != "loopback" {
+		t.Fatalf("/ok via 127.0.0.1: got %d %q", status, body)
+	}
+}
+
+// TestWebSocketBehaviorAcceptsLimits: the new limit fields on
+// WebSocketBehavior should at least register without crashing. Full
+// runtime enforcement is uWS-side; we just confirm the bridge accepts
+// the values.
+func TestWebSocketBehaviorAcceptsLimits(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.WebSocket("/ws", gogo.WebSocketBehavior{
+			MaxPayloadLength: 4096,
+			IdleTimeout:      30 * time.Second,
+			MaxBackpressure:  8192,
+			DisablePings:     true,
+		})
+		app.Get("/ping", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "pong")
+		})
+	})
+	defer teardown()
+
+	// HTTP endpoint should still work after WS registration.
+	if status, body := httpGet(t, port, "/ping"); status != 200 || body != "pong" {
+		t.Fatalf("/ping after WS register: got %d %q", status, body)
+	}
+}

@@ -312,7 +312,25 @@ func (a *appNative) websocket(pattern string, behavior WebSocketBehavior) {
 	handle := cgo.NewHandle(behavior)
 	a.handles = append(a.handles, handle)
 
-	C.uwsgo_app_ws(a.ptr, cpattern, C.uintptr_t(handle))
+	maxPayload := behavior.MaxPayloadLength
+	if maxPayload <= 0 {
+		maxPayload = 16 << 20 // 16 MiB
+	}
+	idleSec := int(behavior.IdleTimeout / time.Second)
+	if idleSec <= 0 {
+		idleSec = 120
+	}
+	maxBp := behavior.MaxBackpressure
+	if maxBp <= 0 {
+		maxBp = 64 << 10 // 64 KiB
+	}
+	pings := 1
+	if behavior.DisablePings {
+		pings = 0
+	}
+
+	C.uwsgo_app_ws(a.ptr, cpattern, C.uintptr_t(handle),
+		C.size_t(maxPayload), C.int(idleSec), C.size_t(maxBp), C.int(pings))
 }
 
 func (a *appNative) prepareRoute(pattern string, handler Handler) (*C.char, cgo.Handle) {
@@ -322,8 +340,17 @@ func (a *appNative) prepareRoute(pattern string, handler Handler) (*C.char, cgo.
 	return cpattern, handle
 }
 
-func (a appNative) listen(port int) bool {
-	return C.uwsgo_app_listen(a.ptr, C.int(port)) != 0
+func (a appNative) listen(host string, port int) bool {
+	var chost *C.char
+	if host != "" {
+		chost = C.CString(host)
+		defer C.free(unsafe.Pointer(chost))
+	}
+	return C.uwsgo_app_listen(a.ptr, chost, C.int(port)) != 0
+}
+
+func (a appNative) setBodyLimit(limit int) {
+	C.uwsgo_app_set_body_limit(a.ptr, C.size_t(limit))
 }
 
 func (a appNative) run() {
@@ -437,6 +464,7 @@ type sharedLayout struct {
 	slotCtxOffset     uintptr
 	headOffset        uintptr
 	tailOffset        uintptr
+	wakePendingOffset uintptr
 	ctxStatusLenOff   uintptr
 	ctxCtLenOff       uintptr
 	ctxBodyLenOff     uintptr
@@ -495,6 +523,7 @@ func initSharedLayoutOnce() {
 		slotCtxOffset:     uintptr(raw.ring_slot_ctx_offset),
 		headOffset:        uintptr(raw.ring_head_offset),
 		tailOffset:        uintptr(raw.ring_tail_offset),
+		wakePendingOffset: uintptr(raw.ring_wake_pending_offset),
 		ctxStatusLenOff:   uintptr(raw.ctx_status_len_offset),
 		ctxCtLenOff:       uintptr(raw.ctx_ct_len_offset),
 		ctxBodyLenOff:     uintptr(raw.ctx_body_len_offset),
@@ -616,11 +645,23 @@ claimed:
 
 	// Ctx is now owned by the consumer — do NOT touch it again. Use the
 	// cached loopPtr to wake the drain.
+	//
+	// Skip the wake_drain cgo crossing if another producer (or a stale
+	// scheduled wake) already has one pending: drain clears wake_pending
+	// the moment it starts, so a successful CAS(0,1) here means "I'm the
+	// first producer since the last drain pass began, the wake is mine
+	// to call". Under sustained load this drops the cgo wake rate by
+	// the average batch size of the ring — at 91k rps on /db a single
+	// drain commonly consumes dozens of slots, so this typically
+	// eliminates 90%+ of wake_drain crossings.
 	if loopPtr != 0 {
-		C.uwsgo_wake_drain(
-			(*C.uwsgo_loop_t)(unsafe.Pointer(loopPtr)),
-			unsafe.Pointer(ringPtr),
-		)
+		wakeAddr := (*atomic.Uint32)(unsafe.Pointer(ringPtr + shared.wakePendingOffset))
+		if wakeAddr.CompareAndSwap(0, 1) {
+			C.uwsgo_wake_drain(
+				(*C.uwsgo_loop_t)(unsafe.Pointer(loopPtr)),
+				unsafe.Pointer(ringPtr),
+			)
+		}
 	}
 	return true
 }
@@ -661,16 +702,30 @@ func (r requestNative) queryParam(name string) string {
 	})
 }
 
+// maxSyncHeadersBytes caps the buffer allocation for the sync-mode header
+// snapshot. Matches the SNAP_HEADERS_CAP that bounds the shared / async
+// path on the C++ side so callers see consistent behavior across modes.
+// uWS's own default request-buffer is ~8 KiB, so this is the natural
+// ceiling for header data we'd ever see in practice.
+const maxSyncHeadersBytes = 8 << 10
+
 // headersAll returns the request headers in the "name\0value\0..." format
 // used by requestSnapshot. Allocates and copies — only callable while the
-// uWS HttpRequest is still live.
+// uWS HttpRequest is still live. Returns the buffer truncated to
+// maxSyncHeadersBytes if uWS reports more bytes than that — the
+// readNativeString-style two-pass dance lets us pass the cap to C so the
+// second call writes only what fits.
 func (r requestNative) headersAll() []byte {
 	size := C.uwsgo_req_headers_all(r.ptr, nil, 0)
 	if size == 0 {
 		return nil
 	}
-	buf := make([]byte, int(size))
-	C.uwsgo_req_headers_all(r.ptr, (*C.char)(unsafe.Pointer(&buf[0])), size)
+	n := int(size)
+	if n > maxSyncHeadersBytes {
+		n = maxSyncHeadersBytes
+	}
+	buf := make([]byte, n)
+	C.uwsgo_req_headers_all(r.ptr, (*C.char)(unsafe.Pointer(&buf[0])), C.size_t(n))
 	return buf
 }
 
@@ -725,19 +780,38 @@ func (ws websocketNative) end(code int, message string) {
 }
 
 //export uwsgoHandleHTTP
-func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req_t, urlPtr *C.char, urlLen C.size_t) {
+func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req_t,
+	methodPtr *C.char, methodLen C.size_t,
+	urlPtr *C.char, urlLen C.size_t,
+	queryPtr *C.char, queryLen C.size_t,
+	p0Ptr *C.char, p0Len C.size_t,
+	p1Ptr *C.char, p1Len C.size_t,
+	p2Ptr *C.char, p2Len C.size_t,
+	p3Ptr *C.char, p3Len C.size_t) {
 	handle := cgo.Handle(handlerID)
 	handler := handle.Value().(Handler)
 
 	reqWrap := requestPool.Get().(*Request)
 	reqWrap.inner = requestNative{ptr: req}
-	// uWS already had the URL parsed; the C++ side passed the std::string_view
-	// in alongside res/req so Request.URL() can serve it without a cgo round-
-	// trip. ptr is valid for the lifetime of this callback (i.e. the lifetime
-	// of reqWrap before it returns to the pool). Materialization is lazy in
-	// Request.URL(); we just record the source here.
+	// uWS already had method / URL / query / first 4 params parsed; C++
+	// passes the std::string_view pointers into uWS's request buffer so
+	// Request's accessors can materialize lazily without a cgo round-
+	// trip. The pointers are valid for the lifetime of this callback
+	// (= the lifetime of reqWrap before it returns to the pool).
+	reqWrap.syncMethodPtr = unsafe.Pointer(methodPtr)
+	reqWrap.syncMethodLen = int(methodLen)
 	reqWrap.syncURLPtr = unsafe.Pointer(urlPtr)
 	reqWrap.syncURLLen = int(urlLen)
+	reqWrap.syncQueryPtr = unsafe.Pointer(queryPtr)
+	reqWrap.syncQueryLen = int(queryLen)
+	reqWrap.syncParamPtrs[0] = unsafe.Pointer(p0Ptr)
+	reqWrap.syncParamLens[0] = int(p0Len)
+	reqWrap.syncParamPtrs[1] = unsafe.Pointer(p1Ptr)
+	reqWrap.syncParamLens[1] = int(p1Len)
+	reqWrap.syncParamPtrs[2] = unsafe.Pointer(p2Ptr)
+	reqWrap.syncParamLens[2] = int(p2Len)
+	reqWrap.syncParamPtrs[3] = unsafe.Pointer(p3Ptr)
+	reqWrap.syncParamLens[3] = int(p3Len)
 
 	resWrap := responsePool.Get().(*Response)
 	resWrap.inner = responseNative{ptr: res}

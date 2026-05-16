@@ -15,7 +15,14 @@
 #include <utility>
 #include <vector>
 
-extern "C" void uwsgoHandleHTTP(uintptr_t handler_id, uwsgo_res_t *res, uwsgo_req_t *req, const char *url, size_t url_len);
+extern "C" void uwsgoHandleHTTP(uintptr_t handler_id, uwsgo_res_t *res, uwsgo_req_t *req,
+    const char *method, size_t method_len,
+    const char *url, size_t url_len,
+    const char *query, size_t query_len,
+    const char *p0, size_t p0_len,
+    const char *p1, size_t p1_len,
+    const char *p2, size_t p2_len,
+    const char *p3, size_t p3_len);
 extern "C" void uwsgoHandleWSOpen(uintptr_t handler_id, uwsgo_ws_t *ws);
 extern "C" void uwsgoHandleWSMessage(uintptr_t handler_id, uwsgo_ws_t *ws, const char *message, size_t message_len, int opcode);
 extern "C" void uwsgoHandleWSClose(uintptr_t handler_id, uwsgo_ws_t *ws, int code, const char *message, size_t message_len);
@@ -86,6 +93,13 @@ struct PendingRing {
     PendingSlot slots[RING_SIZE];
     std::atomic<uint64_t> head;  // consumer index (loop thread only)
     std::atomic<uint64_t> tail;  // producer index (any thread)
+    // wake_pending is 0 when no Go producer has yet called wake_drain
+    // since the last loop-thread drain pass began. Producers CAS(0,1)
+    // to claim the right to call wake_drain — the CAS loser knows the
+    // drain is already scheduled and skips the cgo crossing. The drain
+    // handler clears this back to 0 the moment it begins, so any newly
+    // arrived ctx after that point will get a fresh wake.
+    std::atomic<uint32_t> wake_pending;
 
     void init() {
         for (uint64_t i = 0; i < RING_SIZE; i++) {
@@ -94,6 +108,7 @@ struct PendingRing {
         }
         head.store(0, std::memory_order_relaxed);
         tail.store(0, std::memory_order_relaxed);
+        wake_pending.store(0, std::memory_order_relaxed);
     }
 };
 
@@ -110,6 +125,11 @@ struct uwsgo_app_t {
     // same process don't share state and don't contend on a global ring.
     PendingRing *pending_ring = nullptr;
     struct us_timer_t *drain_timer = nullptr;
+
+    // body_limit is enforced for Post / Any routes by checking the
+    // Content-Length header at request arrival before dispatching to Go.
+    // 0 disables the check.
+    size_t body_limit = 0;
 };
 
 static size_t copy_string_view(std::string_view value, char *buffer, size_t buffer_len) {
@@ -140,16 +160,40 @@ extern "C" void uwsgo_app_free(uwsgo_app_t *app) {
     delete app;
 }
 
+// dispatch_sync invokes uwsgoHandleHTTP with method / URL / query / the
+// first four route parameters already pulled out of the uWS request.
+// uWS keeps these as std::string_view pointers into its own request
+// buffer; the buffer is alive for the duration of the C++ callback,
+// which is exactly the lifetime of the Go Request wrapper, so passing
+// the raw (data, len) pairs to Go is safe and lets Request's accessors
+// materialize lazily without a cgo round-trip back into uWS.
+//
+// Four params covers the realistic ceiling — uWS itself supports more,
+// but routes with more than four named params are extremely rare. Reads
+// past index 3 fall through to the cgo getParameter helper.
+static inline void dispatch_sync(uintptr_t handler_id, uWS::HttpResponse<false> *res, uWS::HttpRequest *req) {
+    auto method = req->getMethod();
+    auto url = req->getUrl();
+    auto query = req->getQuery();
+    auto p0 = req->getParameter(0);
+    auto p1 = req->getParameter(1);
+    auto p2 = req->getParameter(2);
+    auto p3 = req->getParameter(3);
+    uwsgoHandleHTTP(handler_id,
+        reinterpret_cast<uwsgo_res_t *>(res),
+        reinterpret_cast<uwsgo_req_t *>(req),
+        method.data(), method.size(),
+        url.data(), url.size(),
+        query.data(), query.size(),
+        p0.data(), p0.size(),
+        p1.data(), p1.size(),
+        p2.data(), p2.size(),
+        p3.data(), p3.size());
+}
+
 extern "C" void uwsgo_app_get(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id) {
     app->app->get(pattern, [handler_id](auto *res, auto *req) {
-        // Pre-fetch URL on the C++ side and pass it to Go inline so Go's
-        // Request.URL() (used by the path-scoped middleware guard on dynamic
-        // routes) is a cache hit instead of a two-call cgo round-trip.
-        auto url = req->getUrl();
-        uwsgoHandleHTTP(handler_id,
-            reinterpret_cast<uwsgo_res_t *>(res),
-            reinterpret_cast<uwsgo_req_t *>(req),
-            url.data(), url.size());
+        dispatch_sync(handler_id, res, req);
     });
 }
 
@@ -175,28 +219,57 @@ extern "C" void uwsgo_app_get_static(uwsgo_app_t *app, const char *pattern,
     });
 }
 
+// body_limit_rejects checks the declared Content-Length against the app's
+// body_limit and writes a 413 directly without dispatching to Go if it
+// exceeds. Returns true when the request was rejected. The check is
+// best-effort: requests with no Content-Length (chunked transfer) slip
+// through and must be policed by res.Body(maxN, ...) on the Go side.
+static bool body_limit_rejects(uwsgo_app_t *app, uWS::HttpResponse<false> *res, uWS::HttpRequest *req) {
+    if (app->body_limit == 0) return false;
+    auto cl = req->getHeader("content-length");
+    if (cl.empty()) return false;
+    // strtoull-style parse; if the header is malformed we conservatively
+    // reject too — clients that send junk Content-Length deserve a 400/413.
+    unsigned long long n = 0;
+    for (char c : cl) {
+        if (c < '0' || c > '9') { n = ~0ULL; break; }
+        n = n * 10 + static_cast<unsigned long long>(c - '0');
+        if (n > app->body_limit) break;
+    }
+    if (n <= app->body_limit) return false;
+    res->writeStatus("413 Payload Too Large");
+    res->writeHeader("Content-Type", "text/plain; charset=utf-8");
+    res->end("payload too large\n");
+    return true;
+}
+
 extern "C" void uwsgo_app_post(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id) {
-    app->app->post(pattern, [handler_id](auto *res, auto *req) {
-        auto url = req->getUrl();
-        uwsgoHandleHTTP(handler_id,
-            reinterpret_cast<uwsgo_res_t *>(res),
-            reinterpret_cast<uwsgo_req_t *>(req),
-            url.data(), url.size());
+    app->app->post(pattern, [app, handler_id](auto *res, auto *req) {
+        if (body_limit_rejects(app, res, req)) return;
+        dispatch_sync(handler_id, res, req);
     });
 }
 
 extern "C" void uwsgo_app_any(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id) {
-    app->app->any(pattern, [handler_id](auto *res, auto *req) {
-        auto url = req->getUrl();
-        uwsgoHandleHTTP(handler_id,
-            reinterpret_cast<uwsgo_res_t *>(res),
-            reinterpret_cast<uwsgo_req_t *>(req),
-            url.data(), url.size());
+    app->app->any(pattern, [app, handler_id](auto *res, auto *req) {
+        if (body_limit_rejects(app, res, req)) return;
+        dispatch_sync(handler_id, res, req);
     });
 }
 
-extern "C" void uwsgo_app_ws(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id) {
+extern "C" void uwsgo_app_set_body_limit(uwsgo_app_t *app, size_t limit) {
+    app->body_limit = limit;
+}
+
+extern "C" void uwsgo_app_ws(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id,
+    size_t max_payload, int idle_seconds, size_t max_backpressure,
+    int send_pings_automatically) {
     uWS::App::WebSocketBehavior<uwsgo_ws_data_t> behavior = {};
+
+    behavior.maxPayloadLength = static_cast<unsigned int>(max_payload);
+    behavior.idleTimeout = static_cast<unsigned short>(idle_seconds);
+    behavior.maxBackpressure = static_cast<unsigned int>(max_backpressure);
+    behavior.sendPingsAutomatically = send_pings_automatically != 0;
 
     behavior.open = [handler_id](auto *ws) {
         uwsgoHandleWSOpen(handler_id, reinterpret_cast<uwsgo_ws_t *>(ws));
@@ -223,14 +296,17 @@ extern "C" void uwsgo_app_ws(uwsgo_app_t *app, const char *pattern, uintptr_t ha
     app->app->ws<uwsgo_ws_data_t>(pattern, std::move(behavior));
 }
 
-extern "C" int uwsgo_app_listen(uwsgo_app_t *app, int port) {
+extern "C" int uwsgo_app_listen(uwsgo_app_t *app, const char *host, int port) {
     bool ok = false;
-
-    app->app->listen(port, [&ok, app](auto *listen_socket) {
+    auto cb = [&ok, app](auto *listen_socket) {
         app->listen_socket = listen_socket;
         ok = listen_socket != nullptr;
-    });
-
+    };
+    if (host != nullptr && host[0] != '\0') {
+        app->app->listen(std::string(host), port, std::move(cb));
+    } else {
+        app->app->listen(port, std::move(cb));
+    }
     return ok ? 1 : 0;
 }
 
@@ -507,6 +583,7 @@ extern "C" void uwsgo_shared_layout(uwsgo_shared_layout_t *out) {
     out->ring_slot_ctx_offset = offsetof(PendingSlot, ctx);
     out->ring_head_offset = offsetof(PendingRing, head);
     out->ring_tail_offset = offsetof(PendingRing, tail);
+    out->ring_wake_pending_offset = offsetof(PendingRing, wake_pending);
 
     out->ctx_status_len_offset = offsetof(AsyncCtx, inline_status_len);
     out->ctx_ct_len_offset = offsetof(AsyncCtx, inline_ct_len);
@@ -667,7 +744,13 @@ extern "C" void uwsgo_app_get_shared(uwsgo_app_t *app, const char *pattern, uint
 // Single consumer (the loop) so no CAS needed on head. Takes the ring as a
 // parameter so the same routine serves multiple App instances each with its
 // own ring + loop.
+//
+// Clears ring->wake_pending at the start so any producer that publishes a
+// slot AFTER this point will succeed in CAS(0,1) and call wake_drain for
+// the next pass. Producers that publish BEFORE this clear are already
+// in the slots we're about to walk; no wake needed.
 static void drain_pending(PendingRing *ring) {
+    ring->wake_pending.store(0, std::memory_order_release);
     uint64_t h = ring->head.load(std::memory_order_relaxed);
     while (true) {
         PendingSlot *slot = &ring->slots[h & RING_MASK];

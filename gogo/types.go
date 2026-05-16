@@ -4,11 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 )
 
@@ -91,20 +94,38 @@ var (
 // PanicHandler is invoked when user code panics inside an HTTP, async,
 // WebSocket, defer, or body callback. HTTP paths emit a best-effort 500 when a
 // response is still available. The argument is the recovered value (the panic
-// payload). Setting a panic handler is optional; without one panics are
-// silently caught.
+// payload).
+//
+// The framework ships a default handler that prints the panic value plus a
+// goroutine stack trace to stderr, so production deployments never have a
+// panic disappear silently. Call SetPanicHandler with a custom function to
+// route panics elsewhere (structured logger, error tracker), or pass nil
+// to restore the default.
 type PanicHandler func(recovered any)
 
 var (
 	panicHandlerMu sync.RWMutex
-	panicHandlerFn PanicHandler
+	panicHandlerFn PanicHandler = defaultPanicHandler
 )
 
-// SetPanicHandler registers fn as the global panic handler. Pass nil to clear.
-// The handler must not panic itself.
+// defaultPanicHandler writes the recovered value and a goroutine stack
+// trace to stderr. Matches the format Go's runtime uses for unrecovered
+// panics so operators have something familiar to grep for.
+func defaultPanicHandler(recovered any) {
+	fmt.Fprintf(os.Stderr, "gogo: recovered panic: %v\n%s\n",
+		recovered, debug.Stack())
+}
+
+// SetPanicHandler registers fn as the global panic handler. Pass nil to
+// restore the default stderr logger. The handler must not panic itself
+// (any panic inside it is recovered silently).
 func SetPanicHandler(fn PanicHandler) {
 	panicHandlerMu.Lock()
-	panicHandlerFn = fn
+	if fn == nil {
+		panicHandlerFn = defaultPanicHandler
+	} else {
+		panicHandlerFn = fn
+	}
 	panicHandlerMu.Unlock()
 }
 
@@ -149,11 +170,35 @@ const (
 	Binary OpCode = 2
 )
 
-// WebSocketBehavior contains callbacks for a WebSocket route.
+// WebSocketBehavior contains callbacks and per-route limits for a
+// WebSocket endpoint. Limit fields default to safe production values
+// when zero — pick explicit numbers when you need different limits, do
+// not leave them at zero hoping for "unlimited".
 type WebSocketBehavior struct {
 	Open    func(*WebSocket)
 	Message func(*WebSocket, []byte, OpCode)
 	Close   func(*WebSocket, int, []byte)
+
+	// MaxPayloadLength is the largest single incoming message the
+	// server will accept. Frames over this cap cause uWS to close the
+	// connection. Default 16 MiB.
+	MaxPayloadLength int
+
+	// IdleTimeout is the maximum time a WebSocket may sit idle (no
+	// frames in either direction) before uWS closes it. Default 120s.
+	IdleTimeout time.Duration
+
+	// MaxBackpressure is the bytes uWS will queue per-socket for a
+	// slow consumer before closing the connection. Protects the
+	// loop from being held hostage by a single non-draining client.
+	// Default 64 KiB.
+	MaxBackpressure int
+
+	// DisablePings turns off uWS's built-in ping/pong keepalive.
+	// Default (zero) leaves automatic pings ON so an idle connection
+	// doesn't get reaped by NAT boxes; set true only if your client
+	// drives its own ping protocol.
+	DisablePings bool
 }
 
 // Middleware wraps a Handler with cross-cutting behavior (auth, logging,
@@ -201,21 +246,61 @@ type asyncMiddlewareEntry struct {
 	mw     AsyncMiddleware
 }
 
+// Config tunes per-App behavior. All fields are optional; the zero value
+// is a safe production default. Pass to NewApp; values are applied at
+// app creation and bind time. The struct is intentionally narrow — knobs
+// only get added here when they need a single, app-wide value.
+type Config struct {
+	// BodyLimit caps the request-body bytes a Post / Any route will
+	// accept. The framework rejects oversized requests with 413 at
+	// arrival by checking the Content-Length header on the C++ side
+	// before dispatching to Go — zero per-request cost beyond the
+	// existing header lookup. Chunked transfer-encoded requests with
+	// no Content-Length bypass this check; handlers that accept those
+	// must call res.Body(maxN, ...) for protection. Set to 0 to
+	// disable. Default 4 MiB.
+	BodyLimit int
+
+	// BindAddr is the local interface to bind on. Empty string means
+	// "all interfaces" (uWS default 0.0.0.0). Use "127.0.0.1" for a
+	// localhost-only service. Applied at Listen time.
+	BindAddr string
+}
+
 // App is a uWebSockets HTTP application.
 type App struct {
 	inner            appNative
 	middlewares      []middlewareEntry
 	asyncMiddlewares []asyncMiddlewareEntry
+	cfg              Config
 }
 
-// NewApp creates a non-TLS uWebSockets app.
-func NewApp() (*App, error) {
+// defaultConfig fills in safe production defaults for any zero Config
+// fields. Mutates and returns the input.
+func defaultConfig(c Config) Config {
+	if c.BodyLimit == 0 {
+		c.BodyLimit = 4 << 20 // 4 MiB
+	}
+	return c
+}
+
+// NewApp creates a non-TLS uWebSockets app. With no Config the app uses
+// safe production defaults; pass one Config to override (extra Configs
+// are ignored — variadic only for backward compat with the old zero-arg
+// signature).
+func NewApp(cfg ...Config) (*App, error) {
 	inner, err := newAppNative()
 	if err != nil {
 		return nil, err
 	}
 	initSharedLayout()
-	return &App{inner: inner}, nil
+	var c Config
+	if len(cfg) > 0 {
+		c = cfg[0]
+	}
+	c = defaultConfig(c)
+	inner.setBodyLimit(c.BodyLimit)
+	return &App{inner: inner, cfg: c}, nil
 }
 
 // Reply is a static response captured once at registration time. Routes
@@ -520,6 +605,9 @@ func (a *App) Get(pattern string, target any) {
 		if code == 0 {
 			code = 200
 		}
+		if v.ContentType != "" {
+			validateHeaderValue("Content-Type", v.ContentType)
+		}
 		a.inner.getStatic(pattern, statusLine(code), v.ContentType, v.Body)
 	case string:
 		a.inner.getStatic(pattern, statusLine(200), "", v)
@@ -755,6 +843,9 @@ func (r *Router) Get(pattern string, target any) {
 		if code == 0 {
 			code = 200
 		}
+		if v.ContentType != "" {
+			validateHeaderValue("Content-Type", v.ContentType)
+		}
 		if !r.hasGroupOrAppMW(full) {
 			r.app.inner.getStatic(full, statusLine(code), v.ContentType, v.Body)
 			return
@@ -875,9 +966,11 @@ func (r *Router) WebSocket(pattern string, behavior WebSocketBehavior) {
 	r.app.inner.websocket(full, behavior)
 }
 
-// Listen binds the app to the given port and reports whether binding succeeded.
+// Listen binds the app to the given port and reports whether binding
+// succeeded. The bind interface comes from Config.BindAddr; an empty
+// BindAddr keeps the uWS default of all interfaces (0.0.0.0).
 func (a *App) Listen(port int) bool {
-	return a.inner.listen(port)
+	return a.inner.listen(a.cfg.BindAddr, port)
 }
 
 // Run starts the uWebSockets event loop and blocks. Before running, installs
@@ -1127,14 +1220,17 @@ func (r *Response) Send(code int, contentType, body string) {
 }
 
 // JSON marshals v and sends it with Content-Type: application/json. If
-// marshalling fails the response is replaced with 500 and the marshal error
-// is written as plain text — json.Marshal only fails for unsupported value
-// shapes (channels, functions, cyclic structures), which are programming
-// errors the caller should fix.
+// marshalling fails the response is replaced with a generic 500 and the
+// underlying marshal error is reported through the panic handler so the
+// programmer sees it server-side without leaking type / package names to
+// the network. json.Marshal only fails for unsupported value shapes
+// (channels, functions, cyclic structures), so failures here always
+// indicate a bug in caller code.
 func (r *Response) JSON(code int, v any) {
 	data, err := json.Marshal(v)
 	if err != nil {
-		r.Send(500, "text/plain; charset=utf-8", "json marshal error: "+err.Error())
+		reportPanic(fmt.Errorf("gogo: JSON marshal: %w", err))
+		r.Send(500, "text/plain; charset=utf-8", "Internal Server Error\n")
 		return
 	}
 	r.Send(code, "application/json", string(data))
@@ -1371,20 +1467,37 @@ type Request struct {
 	// the map is reused) when the Request returns to the pool.
 	locals map[string]any
 
-	// syncURLPtr / syncURLLen point at the URL bytes uWS has already parsed
-	// for this request. The C++ bridge fills them at handler entry so
-	// URL() can materialize a Go string on first read without a cgo call.
-	// The pointer is valid only for the lifetime of the sync callback —
-	// resetForPool clears the fields before the wrapper is reused.
-	syncURLPtr unsafe.Pointer
-	syncURLLen int
+	// sync{Method,URL,Query}{Ptr,Len} and syncParam{Ptrs,Lens} point at
+	// uWS-parsed bytes inside the live HttpRequest. The C++ bridge fills
+	// them at handler entry so Request's accessors can materialize a Go
+	// string on first read without a cgo round-trip. Pointers are valid
+	// only for the lifetime of the sync callback; resetForPool clears them
+	// before the wrapper returns to the pool.
+	//
+	// Only the first four route parameters are pre-cached; reads past
+	// index 3 fall through to the cgo Parameter helper. Real routes
+	// rarely exceed that.
+	syncMethodPtr unsafe.Pointer
+	syncMethodLen int
+	syncURLPtr    unsafe.Pointer
+	syncURLLen    int
+	syncQueryPtr  unsafe.Pointer
+	syncQueryLen  int
+	syncParamPtrs [4]unsafe.Pointer
+	syncParamLens [4]int
 
-	// cachedURL is the materialized Go string, allocated lazily on the first
-	// URL() call. urlCached lets the empty string ("") be a valid cache
-	// value (request with empty URL — uWS rejects these, but the flag keeps
-	// the check explicit).
-	cachedURL string
-	urlCached bool
+	// cached{URL,Method,Query,Params} hold the materialized Go strings
+	// allocated lazily on the first accessor call. The corresponding
+	// *Cached field is true once the cache slot is valid (the empty
+	// string is a legitimate cached value).
+	cachedURL          string
+	urlCached          bool
+	cachedMethod       string
+	methodCached       bool
+	cachedQuery        string
+	queryCached        bool
+	cachedParams       [4]string
+	paramCached        [4]bool
 }
 
 // requestSnapshot holds the Go-side captured copy of an HttpRequest, used by
@@ -1442,10 +1555,22 @@ func (r *Request) resetForPool() {
 	r.inner = requestNative{}
 	r.snap = nil
 	r.body = nil
+	r.syncMethodPtr = nil
+	r.syncMethodLen = 0
 	r.syncURLPtr = nil
 	r.syncURLLen = 0
+	r.syncQueryPtr = nil
+	r.syncQueryLen = 0
+	r.syncParamPtrs = [4]unsafe.Pointer{}
+	r.syncParamLens = [4]int{}
 	r.cachedURL = ""
 	r.urlCached = false
+	r.cachedMethod = ""
+	r.methodCached = false
+	r.cachedQuery = ""
+	r.queryCached = false
+	r.cachedParams = [4]string{}
+	r.paramCached = [4]bool{}
 	for k := range r.locals {
 		delete(r.locals, k)
 	}
@@ -1479,12 +1604,26 @@ func (r *Request) URL() string {
 }
 
 // Method returns the HTTP method ("get", "post", ...). uWS lower-cases it
-// during parsing.
+// during parsing. Sync handlers serve this from the pre-cached method
+// pointer the bridge stashed at handler entry; first call allocates a
+// Go string, subsequent calls return the cached value — no cgo on the
+// hot path.
 func (r *Request) Method() string {
 	if r.snap != nil {
 		return r.snap.method
 	}
-	return r.inner.method()
+	if r.methodCached {
+		return r.cachedMethod
+	}
+	if r.syncMethodPtr != nil {
+		r.cachedMethod = goStringFromC(r.syncMethodPtr, r.syncMethodLen)
+		r.methodCached = true
+		return r.cachedMethod
+	}
+	s := r.inner.method()
+	r.cachedMethod = s
+	r.methodCached = true
+	return s
 }
 
 // Header returns a request header value. Header lookups in async/shared
@@ -1498,7 +1637,10 @@ func (r *Request) Header(name string) string {
 }
 
 // Parameter returns a route parameter by index. Returns "" for negative or
-// out-of-range indices. Snapshot mode caps at 8 parameters.
+// out-of-range indices. Snapshot mode caps at 8 parameters; sync mode
+// caches indices 0..3 inline (the bridge pre-fills them at handler entry
+// — no cgo on first read) and falls back to the cgo getParameter helper
+// for indices 4+.
 func (r *Request) Parameter(index int) string {
 	if index < 0 {
 		return ""
@@ -1509,6 +1651,13 @@ func (r *Request) Parameter(index int) string {
 		}
 		return r.snap.params[index]
 	}
+	if index < 4 {
+		if !r.paramCached[index] {
+			r.cachedParams[index] = goStringFromC(r.syncParamPtrs[index], r.syncParamLens[index])
+			r.paramCached[index] = true
+		}
+		return r.cachedParams[index]
+	}
 	return r.inner.parameter(index)
 }
 
@@ -1517,11 +1666,25 @@ func (r *Request) Parameter(index int) string {
 //
 // For parsed access, prefer QueryParam(key) for single keys or pass the
 // result to net/url.ParseQuery for a full map.
+//
+// Sync handlers serve from the pre-cached query pointer (no cgo) on first
+// call; subsequent calls hit the cache.
 func (r *Request) Query() string {
 	if r.snap != nil {
 		return r.snap.query
 	}
-	return r.inner.query()
+	if r.queryCached {
+		return r.cachedQuery
+	}
+	if r.syncQueryPtr != nil {
+		r.cachedQuery = goStringFromC(r.syncQueryPtr, r.syncQueryLen)
+		r.queryCached = true
+		return r.cachedQuery
+	}
+	s := r.inner.query()
+	r.cachedQuery = s
+	r.queryCached = true
+	return s
 }
 
 // QueryParam returns the value of a single query parameter. Returns "" if
@@ -1634,7 +1797,9 @@ func (r *Request) Cookie(name string) string {
 }
 
 // parseCookieValue scans a Cookie header for a name=value pair. Pairs are
-// separated by ";" optionally followed by whitespace.
+// separated by ";" optionally followed by whitespace. Values surrounded by
+// a matched pair of ASCII double quotes are unquoted per RFC 6265 §5.2;
+// single quotes are not special.
 func parseCookieValue(header, name string) string {
 	for len(header) > 0 {
 		// Skip leading whitespace.
@@ -1655,7 +1820,11 @@ func parseCookieValue(header, name string) string {
 			continue
 		}
 		if pair[:eq] == name {
-			return pair[eq+1:]
+			v := pair[eq+1:]
+			if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
+				v = v[1 : len(v)-1]
+			}
+			return v
 		}
 	}
 	return ""
