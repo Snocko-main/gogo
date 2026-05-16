@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -610,6 +611,472 @@ func TestMiddlewareOnGetAsync(t *testing.T) {
 	status, body := httpGet(t, port, "/work?token=abc")
 	if status != 200 || body != "done" {
 		t.Fatalf("with token: got %d %q", status, body)
+	}
+}
+
+// TestMiddlewarePathScoped verifies Use("/api/*", mw) applies only to routes
+// whose pattern starts with /api/ (or is exactly /api).
+func TestMiddlewarePathScoped(t *testing.T) {
+	var apiHits atomic.Int32
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use("/api/*", func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				apiHits.Add(1)
+				if req.Header("x-api-key") != "secret" {
+					res.Send(401, "text/plain", "no key")
+					return
+				}
+				next(res, req)
+			}
+		})
+		app.Get("/api/users", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "users")
+		})
+		app.Get("/public", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "public")
+		})
+	})
+	defer teardown()
+
+	// /public bypasses the path-scoped middleware entirely.
+	status, body := httpGet(t, port, "/public")
+	if status != 200 || body != "public" {
+		t.Fatalf("/public: got %d %q", status, body)
+	}
+	if apiHits.Load() != 0 {
+		t.Fatalf("api middleware ran for /public: hits=%d", apiHits.Load())
+	}
+
+	// /api/users without key → 401 from the middleware.
+	status, body = httpGet(t, port, "/api/users")
+	if status != 401 || body != "no key" {
+		t.Fatalf("/api/users unauth: got %d %q", status, body)
+	}
+
+	// /api/users with key → 200 from the handler.
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/api/users", port), nil)
+	req.Header.Set("X-API-Key", "secret")
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("/api/users authed: %v", err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || string(b) != "users" {
+		t.Fatalf("/api/users authed: got %d %q", resp.StatusCode, string(b))
+	}
+	if apiHits.Load() != 2 {
+		t.Fatalf("api middleware hit count = %d, want 2", apiHits.Load())
+	}
+}
+
+// TestMiddlewarePathScopedExactPrefix checks that Use("/api", mw) matches
+// "/api" exactly as well as routes under "/api/", but not "/apiv2".
+func TestMiddlewarePathScopedExactPrefix(t *testing.T) {
+	var hits atomic.Int32
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use("/api", func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				hits.Add(1)
+				next(res, req)
+			}
+		})
+		app.Get("/api", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "root")
+		})
+		app.Get("/api/users", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "users")
+		})
+		app.Get("/apiv2/users", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "v2")
+		})
+	})
+	defer teardown()
+
+	for _, p := range []string{"/api", "/api/users"} {
+		if status, _ := httpGet(t, port, p); status != 200 {
+			t.Fatalf("%s: got %d", p, status)
+		}
+	}
+	if hits.Load() != 2 {
+		t.Fatalf("/api + /api/users should each hit mw: got %d, want 2", hits.Load())
+	}
+
+	// /apiv2/users shares the literal prefix "api" but not the segment;
+	// path-scoped middleware must not run for it.
+	if status, _ := httpGet(t, port, "/apiv2/users"); status != 200 {
+		t.Fatalf("/apiv2/users: got %d", status)
+	}
+	if hits.Load() != 2 {
+		t.Fatalf("/apiv2/users wrongly ran mw: hits=%d", hits.Load())
+	}
+}
+
+// TestMiddlewareGlobalAndScopedTogether verifies global Use and path-scoped
+// Use compose correctly when both are present.
+func TestMiddlewareGlobalAndScopedTogether(t *testing.T) {
+	var trace []string
+	var traceMu sync.Mutex
+	record := func(s string) {
+		traceMu.Lock()
+		trace = append(trace, s)
+		traceMu.Unlock()
+	}
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				record("global")
+				next(res, req)
+			}
+		})
+		app.Use("/api/*", func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				record("api")
+				next(res, req)
+			}
+		})
+		app.Get("/api/x", func(res *gogo.Response, req *gogo.Request) {
+			record("handler-api")
+			res.Send(200, "text/plain", "api")
+		})
+		app.Get("/other", func(res *gogo.Response, req *gogo.Request) {
+			record("handler-other")
+			res.Send(200, "text/plain", "other")
+		})
+	})
+	defer teardown()
+
+	httpGet(t, port, "/api/x")
+	traceMu.Lock()
+	got := strings.Join(trace, ",")
+	trace = nil
+	traceMu.Unlock()
+	if got != "global,api,handler-api" {
+		t.Fatalf("/api/x trace: got %q", got)
+	}
+
+	httpGet(t, port, "/other")
+	traceMu.Lock()
+	got = strings.Join(trace, ",")
+	traceMu.Unlock()
+	if got != "global,handler-other" {
+		t.Fatalf("/other trace: got %q", got)
+	}
+}
+
+// TestMiddlewarePathScopedGetAsyncFastPath confirms GetAsync still uses the
+// zero-cgo shared-memory dispatch when the only registered middleware is
+// scoped to a path that doesn't include the async route.
+func TestMiddlewarePathScopedGetAsyncFastPath(t *testing.T) {
+	var apiHits atomic.Int32
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use("/api/*", func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				apiHits.Add(1)
+				next(res, req)
+			}
+		})
+		// Async route lives OUTSIDE /api so the scoped middleware must not
+		// pull it onto the sync fallback path.
+		app.GetAsync("/work", func(res *gogo.Response, req *gogo.Request) {
+			time.Sleep(2 * time.Millisecond)
+			res.Send(200, "text/plain", "done")
+		})
+		// And one /api route to make sure scoped mw still runs where it should.
+		app.GetAsync("/api/work", func(res *gogo.Response, req *gogo.Request) {
+			time.Sleep(2 * time.Millisecond)
+			res.Send(200, "text/plain", "api-done")
+		})
+	})
+	defer teardown()
+
+	if status, body := httpGet(t, port, "/work"); status != 200 || body != "done" {
+		t.Fatalf("/work: got %d %q", status, body)
+	}
+	if apiHits.Load() != 0 {
+		t.Fatalf("scoped mw ran for /work: hits=%d", apiHits.Load())
+	}
+
+	if status, body := httpGet(t, port, "/api/work"); status != 200 || body != "api-done" {
+		t.Fatalf("/api/work: got %d %q", status, body)
+	}
+	if apiHits.Load() != 1 {
+		t.Fatalf("scoped mw hits for /api/work = %d, want 1", apiHits.Load())
+	}
+}
+
+// TestAsyncMiddlewareLoadsUser exercises the canonical async middleware
+// flow: a blocking "lookup" runs on the goroutine, sets a Local, and the
+// handler reads it back. Shared dispatch path (no sync middleware).
+func TestAsyncMiddlewareLoadsUser(t *testing.T) {
+	type user struct{ ID int; Name string }
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.UseAsync("/api/*", func(next gogo.AsyncHandler) gogo.AsyncHandler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				token := req.Header("authorization")
+				if token == "" {
+					res.Send(401, "text/plain", "no token")
+					return
+				}
+				// Simulate a blocking DB lookup.
+				time.Sleep(1 * time.Millisecond)
+				req.SetLocal("user", &user{ID: 42, Name: "alice"})
+				next(res, req)
+			}
+		})
+		app.GetAsync("/api/me", func(res *gogo.Response, req *gogo.Request) {
+			u := req.Local("user").(*user)
+			res.Send(200, "text/plain", fmt.Sprintf("hi %s (%d)", u.Name, u.ID))
+		})
+	})
+	defer teardown()
+
+	// Missing token short-circuits.
+	if status, body := httpGet(t, port, "/api/me"); status != 401 || body != "no token" {
+		t.Fatalf("no-token: got %d %q", status, body)
+	}
+
+	// With token, async mw loads the user and the handler reads it back.
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/api/me", port), nil)
+	req.Header.Set("Authorization", "Bearer x")
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("authed: %v", err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || string(b) != "hi alice (42)" {
+		t.Fatalf("authed: got %d %q", resp.StatusCode, string(b))
+	}
+}
+
+// TestAsyncMiddlewareLocalsResetBetweenRequests confirms request-scoped
+// state from one request never leaks into another via the request pool.
+func TestAsyncMiddlewareLocalsResetBetweenRequests(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.UseAsync("/api/*", func(next gogo.AsyncHandler) gogo.AsyncHandler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				if req.QueryParam("set") == "1" {
+					req.SetLocal("flag", "set-by-mw")
+				}
+				next(res, req)
+			}
+		})
+		app.GetAsync("/api/x", func(res *gogo.Response, req *gogo.Request) {
+			v := req.Local("flag")
+			if v == nil {
+				res.Send(200, "text/plain", "none")
+				return
+			}
+			res.Send(200, "text/plain", v.(string))
+		})
+	})
+	defer teardown()
+
+	// Drive a sequence of alternating requests to force pool reuse: any
+	// "set" leaking into the next "unset" request would surface immediately.
+	for i := 0; i < 20; i++ {
+		_, body := httpGet(t, port, "/api/x?set=1")
+		if body != "set-by-mw" {
+			t.Fatalf("iter %d set: %q", i, body)
+		}
+		_, body = httpGet(t, port, "/api/x")
+		if body != "none" {
+			t.Fatalf("iter %d unset: %q (locals leaked across pool reuse)", i, body)
+		}
+	}
+}
+
+// TestAsyncMiddlewareChainOrder verifies outermost-first ordering for async
+// middleware, mirroring the sync chain semantics.
+func TestAsyncMiddlewareChainOrder(t *testing.T) {
+	var trace []string
+	var traceMu sync.Mutex
+	record := func(s string) {
+		traceMu.Lock()
+		trace = append(trace, s)
+		traceMu.Unlock()
+	}
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.UseAsync(func(next gogo.AsyncHandler) gogo.AsyncHandler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				record("a-before")
+				next(res, req)
+				record("a-after")
+			}
+		})
+		app.UseAsync(func(next gogo.AsyncHandler) gogo.AsyncHandler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				record("b-before")
+				next(res, req)
+				record("b-after")
+			}
+		})
+		app.GetAsync("/x", func(res *gogo.Response, req *gogo.Request) {
+			record("handler")
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	if status, body := httpGet(t, port, "/x"); status != 200 || body != "ok" {
+		t.Fatalf("got %d %q", status, body)
+	}
+	traceMu.Lock()
+	got := strings.Join(trace, ",")
+	traceMu.Unlock()
+	want := "a-before,b-before,handler,b-after,a-after"
+	if got != want {
+		t.Fatalf("trace: got %q want %q", got, want)
+	}
+}
+
+// TestAsyncMiddlewareWithSyncMiddleware mixes sync and async middleware on
+// the same async route. Sync mw runs first on the loop thread (header check
+// before async dispatch); async mw runs after the goroutine transition.
+func TestAsyncMiddlewareWithSyncMiddleware(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		// Sync gate: must have x-tenant header at all.
+		app.Use("/api/*", func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				if req.Header("x-tenant") == "" {
+					res.Send(400, "text/plain", "no tenant")
+					return
+				}
+				next(res, req)
+			}
+		})
+		// Async gate: simulate a DB lookup to validate the tenant.
+		app.UseAsync("/api/*", func(next gogo.AsyncHandler) gogo.AsyncHandler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				time.Sleep(1 * time.Millisecond)
+				tenant := req.Header("x-tenant")
+				if tenant != "acme" {
+					res.Send(403, "text/plain", "bad tenant")
+					return
+				}
+				req.SetLocal("tenant", tenant)
+				next(res, req)
+			}
+		})
+		app.GetAsync("/api/work", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "for "+req.Local("tenant").(string))
+		})
+	})
+	defer teardown()
+
+	// No header → sync mw responds first, async mw never runs.
+	if status, body := httpGet(t, port, "/api/work"); status != 400 || body != "no tenant" {
+		t.Fatalf("no-tenant: got %d %q", status, body)
+	}
+
+	// Bad tenant header → sync passes, async rejects.
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/api/work", port), nil)
+	req.Header.Set("X-Tenant", "evil")
+	resp, _ := noKeepaliveClient.Do(req)
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 403 || string(b) != "bad tenant" {
+		t.Fatalf("bad-tenant: got %d %q", resp.StatusCode, string(b))
+	}
+
+	// Good tenant → both pass, handler reads local.
+	req, _ = http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/api/work", port), nil)
+	req.Header.Set("X-Tenant", "acme")
+	resp, _ = noKeepaliveClient.Do(req)
+	b, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || string(b) != "for acme" {
+		t.Fatalf("acme: got %d %q", resp.StatusCode, string(b))
+	}
+}
+
+// TestAsyncMiddlewareOnPostAsync verifies async mw runs after body collection
+// and that req.Body() returns the collected body inside the middleware.
+func TestAsyncMiddlewareOnPostAsync(t *testing.T) {
+	var seenBodyLen atomic.Int32
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.UseAsync("/upload", func(next gogo.AsyncHandler) gogo.AsyncHandler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				// Body is available inside async middleware.
+				body := req.Body()
+				seenBodyLen.Store(int32(len(body)))
+				req.SetLocal("sig", "len-"+strconv.Itoa(len(body)))
+				next(res, req)
+			}
+		})
+		app.PostAsync("/upload", 1024, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			res.Send(200, "text/plain", req.Local("sig").(string)+"/"+strconv.Itoa(len(body)))
+		})
+	})
+	defer teardown()
+
+	payload := []byte("hello-world")
+	status, body := httpPost(t, port, "/upload", "text/plain", payload)
+	if status != 200 || body != "len-11/11" {
+		t.Fatalf("got %d %q", status, body)
+	}
+	if seenBodyLen.Load() != int32(len(payload)) {
+		t.Fatalf("async mw body len = %d, want %d", seenBodyLen.Load(), len(payload))
+	}
+}
+
+// TestUseAsyncRejectsBadArgs mirrors TestUseRejectsBadArgs for UseAsync.
+func TestUseAsyncRejectsBadArgs(t *testing.T) {
+	cases := []struct {
+		name string
+		call func(app *gogo.App)
+	}{
+		{"int arg", func(app *gogo.App) { app.UseAsync(42) }},
+		{"sync mw passed to async", func(app *gogo.App) {
+			app.UseAsync(gogo.Middleware(func(next gogo.Handler) gogo.Handler { return next }))
+		}},
+		{"two strings", func(app *gogo.App) { app.UseAsync("/api/*", "/users") }},
+		{"prefix only no mw", func(app *gogo.App) { app.UseAsync("/api/*") }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Fatalf("expected panic for %s, got none", c.name)
+				}
+			}()
+			app, err := gogo.NewApp()
+			if err != nil {
+				t.Fatalf("NewApp: %v", err)
+			}
+			defer app.Close()
+			c.call(app)
+		})
+	}
+}
+
+// TestUseRejectsBadArgs verifies the Use type-switch panics on garbage args.
+func TestUseRejectsBadArgs(t *testing.T) {
+	cases := []struct {
+		name string
+		call func(app *gogo.App)
+	}{
+		{"int arg", func(app *gogo.App) { app.Use(42) }},
+		{"two strings", func(app *gogo.App) { app.Use("/api/*", "/users") }},
+		{"prefix only no mw", func(app *gogo.App) { app.Use("/api/*") }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Fatalf("expected panic for %s, got none", c.name)
+				}
+			}()
+			app, err := gogo.NewApp()
+			if err != nil {
+				t.Fatalf("NewApp: %v", err)
+			}
+			defer app.Close()
+			c.call(app)
+		})
 	}
 }
 

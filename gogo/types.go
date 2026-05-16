@@ -152,14 +152,47 @@ type WebSocketBehavior struct {
 // App.Use that introduced it; reordering Use and route registration changes
 // the effective chain for those routes.
 //
+// Middleware runs on the uWS loop thread and MUST NOT block — no DB queries,
+// no remote calls. For middleware that needs to block (e.g. resolving a user
+// from a session token via a DB lookup), use AsyncMiddleware with UseAsync;
+// it runs on a goroutine and is free to block.
+//
 // Static replies (Reply, string, []byte targets of App.Get) and GetShared
 // routes bypass middleware because they have no Go-side handler to wrap.
 type Middleware func(next Handler) Handler
 
+// AsyncMiddleware wraps an AsyncHandler the same way Middleware wraps a
+// Handler, but executes on the goroutine that runs the user's async handler
+// so it is free to block (DB queries, downstream HTTP calls, etc.).
+//
+// Async middleware applies only to GetAsync and PostAsync routes. Use it
+// when the cross-cutting work itself needs to block; for cheap header /
+// query inspection prefer sync Middleware (smaller per-request overhead and
+// also applicable to sync routes).
+//
+// Pass data through to the user handler via Request.SetLocal / Request.Local.
+type AsyncMiddleware func(next AsyncHandler) AsyncHandler
+
+// middlewareEntry is a single Use call's middleware bound to an optional
+// path prefix. prefix == "" means "global" (apply to every later route);
+// otherwise the middleware applies only to routes whose pattern is the
+// prefix itself or sits under "prefix/".
+type middlewareEntry struct {
+	prefix string
+	mw     Middleware
+}
+
+// asyncMiddlewareEntry mirrors middlewareEntry for the async chain.
+type asyncMiddlewareEntry struct {
+	prefix string
+	mw     AsyncMiddleware
+}
+
 // App is a uWebSockets HTTP application.
 type App struct {
-	inner       appNative
-	middlewares []Middleware
+	inner            appNative
+	middlewares      []middlewareEntry
+	asyncMiddlewares []asyncMiddlewareEntry
 }
 
 // NewApp creates a non-TLS uWebSockets app.
@@ -184,17 +217,182 @@ type Reply struct {
 
 // Use appends middleware to the chain. Each registered route that follows
 // this call wraps its handler in the current chain at registration time.
-// Pass multiple middlewares to apply them in left-to-right order — the
-// first argument runs first (outermost). Safe to call multiple times.
-func (a *App) Use(mw ...Middleware) {
-	a.middlewares = append(a.middlewares, mw...)
+//
+// The first argument may optionally be a path pattern (string), scoping the
+// middleware to routes whose pattern starts with that prefix:
+//
+//	app.Use(authMW)                       // applies to every later route
+//	app.Use("/api/*", authMW)             // applies to routes under /api/
+//	app.Use("/admin", auditMW, rateMW)    // /admin and routes under /admin/
+//
+// Trailing "/*" or "/**" on the prefix is stripped — "/api/*" and "/api"
+// mean the same thing (prefix = "/api"). A pattern of "/*" or "/" means
+// "every route" (equivalent to no pattern).
+//
+// Middlewares run left-to-right — the first argument runs first (outermost).
+// Path matching happens once at route registration; per-request cost is
+// just the function calls of the matched chain. Safe to call multiple times.
+func (a *App) Use(args ...any) {
+	if len(args) == 0 {
+		return
+	}
+
+	var (
+		prefix     string
+		hasPrefix  bool
+		startIndex int
+	)
+	if s, ok := args[0].(string); ok {
+		prefix = normalizeMWPrefix(s)
+		hasPrefix = true
+		startIndex = 1
+	}
+
+	if startIndex == len(args) {
+		if hasPrefix {
+			panic("gogo: Use: path pattern given but no middleware passed")
+		}
+		return
+	}
+
+	for i := startIndex; i < len(args); i++ {
+		var m Middleware
+		switch v := args[i].(type) {
+		case Middleware:
+			m = v
+		case func(next Handler) Handler:
+			m = Middleware(v)
+		case string:
+			panic("gogo: Use: only the first argument may be a path pattern")
+		default:
+			panic(fmt.Sprintf("gogo: Use: unsupported argument type %T at index %d", v, i))
+		}
+		a.middlewares = append(a.middlewares, middlewareEntry{prefix: prefix, mw: m})
+	}
 }
 
-// wrap composes the registered middleware around h. Outermost-first: the
-// first middleware registered runs first, wraps the next, and so on.
-func (a *App) wrap(h Handler) Handler {
+// normalizeMWPrefix turns a user-facing Use pattern into the stored prefix
+// form. "/api/*" → "/api"; "/api/**" → "/api"; "/" or "/*" → "" (global).
+func normalizeMWPrefix(p string) string {
+	validatePattern(p)
+	for strings.HasSuffix(p, "/**") {
+		p = p[:len(p)-3]
+	}
+	for strings.HasSuffix(p, "/*") {
+		p = p[:len(p)-2]
+	}
+	if p == "" || p == "/" {
+		return ""
+	}
+	return p
+}
+
+// mwMatches reports whether a middleware bound to prefix should apply to a
+// route registered with routePattern.
+func mwMatches(prefix, routePattern string) bool {
+	if prefix == "" {
+		return true
+	}
+	if routePattern == prefix {
+		return true
+	}
+	return strings.HasPrefix(routePattern, prefix+"/")
+}
+
+// wrap composes registered middleware around h, including only entries whose
+// prefix matches routePattern. Outermost-first: the first matching middleware
+// registered runs first and wraps the next.
+func (a *App) wrap(routePattern string, h Handler) Handler {
 	for i := len(a.middlewares) - 1; i >= 0; i-- {
-		h = a.middlewares[i](h)
+		e := a.middlewares[i]
+		if mwMatches(e.prefix, routePattern) {
+			h = e.mw(h)
+		}
+	}
+	return h
+}
+
+// hasMatchingMiddleware reports whether any registered sync middleware
+// applies to routePattern. Used by GetAsync to decide between the zero-cgo
+// shared path and the sync wrapper fallback.
+func (a *App) hasMatchingMiddleware(routePattern string) bool {
+	for _, e := range a.middlewares {
+		if mwMatches(e.prefix, routePattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// UseAsync appends an async middleware to the chain that wraps GetAsync /
+// PostAsync handlers. The middleware runs on the goroutine that runs the
+// user handler, so it is free to block (DB queries, downstream HTTP).
+//
+// Like Use, the first argument may optionally be a path pattern:
+//
+//	app.UseAsync(loadUserMW)                         // every async route
+//	app.UseAsync("/api/*", loadUserMW)               // routes under /api/
+//	app.UseAsync("/api/v2", rateLimitMW, loadMW)     // /api/v2 and children
+//
+// Trailing "/*" or "/**" is stripped. A pattern of "/", "/*", or no pattern
+// at all means "every async route".
+//
+// To pass values from middleware down to the handler (e.g. the loaded user),
+// store them on the Request via req.SetLocal; the handler reads them with
+// req.Local.
+//
+// Async middleware applies only to GetAsync / PostAsync — sync routes
+// (Get / Post / Any) never see it. If only async middleware matches a
+// GetAsync route, the framework still uses the zero-cgo shared-memory
+// dispatch path; the async chain composes inside the worker goroutine.
+func (a *App) UseAsync(args ...any) {
+	if len(args) == 0 {
+		return
+	}
+
+	var (
+		prefix     string
+		hasPrefix  bool
+		startIndex int
+	)
+	if s, ok := args[0].(string); ok {
+		prefix = normalizeMWPrefix(s)
+		hasPrefix = true
+		startIndex = 1
+	}
+
+	if startIndex == len(args) {
+		if hasPrefix {
+			panic("gogo: UseAsync: path pattern given but no middleware passed")
+		}
+		return
+	}
+
+	for i := startIndex; i < len(args); i++ {
+		var m AsyncMiddleware
+		switch v := args[i].(type) {
+		case AsyncMiddleware:
+			m = v
+		case func(next AsyncHandler) AsyncHandler:
+			m = AsyncMiddleware(v)
+		case string:
+			panic("gogo: UseAsync: only the first argument may be a path pattern")
+		default:
+			panic(fmt.Sprintf("gogo: UseAsync: unsupported argument type %T at index %d", v, i))
+		}
+		a.asyncMiddlewares = append(a.asyncMiddlewares, asyncMiddlewareEntry{prefix: prefix, mw: m})
+	}
+}
+
+// wrapAsync composes registered async middleware around h, including only
+// entries whose prefix matches routePattern. Outermost-first ordering matches
+// the sync chain: the first matching middleware registered runs first.
+func (a *App) wrapAsync(routePattern string, h AsyncHandler) AsyncHandler {
+	for i := len(a.asyncMiddlewares) - 1; i >= 0; i-- {
+		e := a.asyncMiddlewares[i]
+		if mwMatches(e.prefix, routePattern) {
+			h = e.mw(h)
+		}
 	}
 	return h
 }
@@ -211,9 +409,9 @@ func (a *App) Get(pattern string, target any) {
 	validatePattern(pattern)
 	switch v := target.(type) {
 	case Handler:
-		a.inner.get(pattern, a.wrap(v))
+		a.inner.get(pattern, a.wrap(pattern, v))
 	case func(*Response, *Request):
-		a.inner.get(pattern, a.wrap(Handler(v)))
+		a.inner.get(pattern, a.wrap(pattern, Handler(v)))
 	case Reply:
 		code := v.Status
 		if code == 0 {
@@ -245,19 +443,29 @@ func (a *App) Get(pattern string, target any) {
 // per request only when middleware is in use.
 func (a *App) GetAsync(pattern string, handler AsyncHandler) {
 	validatePattern(pattern)
-	if len(a.middlewares) == 0 {
-		a.inner.getShared(pattern, handler)
+
+	// Compose the async middleware chain once at registration. wrappedAsync
+	// runs the user handler last; matching AsyncMiddleware wraps it
+	// outermost-first.
+	wrappedAsync := a.wrapAsync(pattern, handler)
+
+	if !a.hasMatchingMiddleware(pattern) {
+		// No sync middleware matches → keep the zero-cgo shared-memory
+		// dispatch path. The async chain composes inside the worker
+		// goroutine alongside the user handler.
+		a.inner.getShared(pattern, wrappedAsync)
 		return
 	}
-	a.inner.get(pattern, a.wrap(func(res *Response, req *Request) {
+
+	a.inner.get(pattern, a.wrap(pattern, func(res *Response, req *Request) {
 		// Capture req fields before the sync wrapper returns — uWS frees the
 		// underlying HttpRequest the moment we return from this cgo callback.
 		snap := req.snapshotFromSync()
 		res.Async(func() {
 			snapReq := requestPool.Get().(*Request)
 			snapReq.snap = snap
-			handler(res, snapReq)
-			snapReq.snap = nil
+			wrappedAsync(res, snapReq)
+			snapReq.resetForPool()
 			requestPool.Put(snapReq)
 		})
 	}))
@@ -266,7 +474,7 @@ func (a *App) GetAsync(pattern string, handler AsyncHandler) {
 // Post registers a POST route.
 func (a *App) Post(pattern string, handler Handler) {
 	validatePattern(pattern)
-	a.inner.post(pattern, a.wrap(handler))
+	a.inner.post(pattern, a.wrap(pattern, handler))
 }
 
 // PostAsyncHandler is the handler signature for PostAsync routes. It receives
@@ -281,7 +489,17 @@ type PostAsyncHandler func(res *Response, req *Request, body []byte)
 // sends 413 Payload Too Large automatically and the handler is not called.
 func (a *App) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandler) {
 	validatePattern(pattern)
-	a.inner.post(pattern, a.wrap(func(res *Response, req *Request) {
+
+	// Adapt the body-receiving handler into the AsyncHandler shape that
+	// AsyncMiddleware expects. The body is stashed on req.body in the
+	// runtime wrapper below; middleware can read it via req.Body() and the
+	// final user handler still receives it as a parameter.
+	finalAsync := AsyncHandler(func(res *Response, req *Request) {
+		handler(res, req, req.body)
+	})
+	wrappedAsync := a.wrapAsync(pattern, finalAsync)
+
+	a.inner.post(pattern, a.wrap(pattern, func(res *Response, req *Request) {
 		// Snapshot the request before its lifetime ends. Body collection
 		// happens via onData callbacks fired after we return, by which time
 		// req would be invalid; the snapshot survives.
@@ -296,8 +514,9 @@ func (a *App) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandl
 			res.Async(func() {
 				snapReq := requestPool.Get().(*Request)
 				snapReq.snap = snap
-				handler(res, snapReq, body)
-				snapReq.snap = nil
+				snapReq.body = body
+				wrappedAsync(res, snapReq)
+				snapReq.resetForPool()
 				requestPool.Put(snapReq)
 			})
 		})
@@ -307,7 +526,7 @@ func (a *App) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandl
 // Any registers a route for every HTTP method.
 func (a *App) Any(pattern string, handler Handler) {
 	validatePattern(pattern)
-	a.inner.any(pattern, a.wrap(handler))
+	a.inner.any(pattern, a.wrap(pattern, handler))
 }
 
 // WebSocket registers a WebSocket route.
@@ -761,6 +980,17 @@ func (a *Aborted) Load() bool {
 type Request struct {
 	inner requestNative
 	snap  *requestSnapshot
+
+	// body is the fully collected request body for PostAsync routes, set
+	// by the runtime wrapper before invoking the async middleware chain so
+	// async middleware can inspect it via Body() and the final user
+	// PostAsyncHandler receives it as a parameter.
+	body []byte
+
+	// locals carries request-scoped key/value state between middleware and
+	// the final handler. Lazy: nil until the first SetLocal. Cleared (but
+	// the map is reused) when the Request returns to the pool.
+	locals map[string]any
 }
 
 // requestSnapshot holds the Go-side captured copy of an HttpRequest, used by
@@ -777,6 +1007,49 @@ type requestSnapshot struct {
 	// C++; we parse on access rather than building a map up front so the hot
 	// path stays allocation-light when headers aren't read.
 	headers []byte
+}
+
+// SetLocal stores a request-scoped value under key. Intended for passing
+// state from middleware down to the handler (e.g. an authenticated user
+// resolved by async middleware). The value lives only as long as the
+// request — the map is cleared when the Request returns to its pool.
+//
+// SetLocal is not safe for concurrent use within a single request; treat
+// the Request as owned by whatever goroutine is currently running it.
+func (r *Request) SetLocal(key string, value any) {
+	if r.locals == nil {
+		r.locals = make(map[string]any, 4)
+	}
+	r.locals[key] = value
+}
+
+// Local fetches a value previously stored with SetLocal. Returns nil if
+// the key is absent.
+func (r *Request) Local(key string) any {
+	if r.locals == nil {
+		return nil
+	}
+	return r.locals[key]
+}
+
+// Body returns the fully collected request body for PostAsync routes; for
+// other routes (Get, Post, GetAsync, Any) it returns nil. The slice is owned
+// by the framework — do not retain it past the handler call.
+func (r *Request) Body() []byte {
+	return r.body
+}
+
+// resetForPool clears every request-scoped field so the wrapper can return
+// to the sync.Pool without leaking the previous request's data into the
+// next user. Keeping the locals map alive avoids re-allocating on the next
+// SetLocal — just empty it.
+func (r *Request) resetForPool() {
+	r.inner = requestNative{}
+	r.snap = nil
+	r.body = nil
+	for k := range r.locals {
+		delete(r.locals, k)
+	}
 }
 
 // URL returns the request URL path. Query string is exposed separately via

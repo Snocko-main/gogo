@@ -230,6 +230,62 @@ func BenchmarkStatusLine(b *testing.B) {
 	}
 }
 
+// TestNormalizeMWPrefix covers the user-facing patterns Use() accepts and
+// the canonical stored form (trailing /* or /** stripped; root means global).
+func TestNormalizeMWPrefix(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"/api", "/api"},
+		{"/api/*", "/api"},
+		{"/api/**", "/api"},
+		{"/api/v1/*", "/api/v1"},
+		{"/admin/users/**", "/admin/users"},
+		{"/", ""},
+		{"/*", ""},
+		{"/**", ""},
+	}
+	for _, c := range cases {
+		if got := normalizeMWPrefix(c.in); got != c.want {
+			t.Errorf("normalizeMWPrefix(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestMWMatches pins down the path-scope matching semantics: exact match,
+// child match via "/", and reject same-prefix-different-segment like /apiv2.
+func TestMWMatches(t *testing.T) {
+	cases := []struct {
+		prefix, route string
+		want          bool
+	}{
+		// Global (empty prefix) matches everything.
+		{"", "/anything", true},
+		{"", "/", true},
+
+		// Exact match.
+		{"/api", "/api", true},
+
+		// Child paths under the prefix.
+		{"/api", "/api/users", true},
+		{"/api", "/api/users/:id", true},
+
+		// Sibling that shares the prefix string but not the segment.
+		{"/api", "/apiv2", false},
+		{"/api", "/apiv2/users", false},
+
+		// Unrelated route.
+		{"/api", "/other", false},
+
+		// Deeper prefix.
+		{"/api/v1", "/api/v1/users", true},
+		{"/api/v1", "/api/v2/users", false},
+	}
+	for _, c := range cases {
+		if got := mwMatches(c.prefix, c.route); got != c.want {
+			t.Errorf("mwMatches(%q, %q) = %v, want %v", c.prefix, c.route, got, c.want)
+		}
+	}
+}
+
 // TestStatusLineKnown checks that the statusLine helper matches net/http for
 // a set of well-known codes (mostly for sanity — the underlying call is
 // http.StatusText).

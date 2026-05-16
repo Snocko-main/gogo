@@ -230,7 +230,7 @@ func runSharedHandler(handler AsyncHandler, ctxPtr uintptr) {
 		if !a.sent {
 			asyncCtxRelease(ctxPtr)
 		}
-		reqWrap.snap = nil
+		reqWrap.resetForPool()
 		requestPool.Put(reqWrap)
 		resWrap.recycleAsync(a)
 	}()
@@ -697,7 +697,7 @@ func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req
 
 	handler(resWrap, reqWrap)
 
-	reqWrap.inner = requestNative{}
+	reqWrap.resetForPool()
 	requestPool.Put(reqWrap)
 
 	// Sync responses are done with resWrap by now. We must NOT recycle if:

@@ -71,7 +71,11 @@
 //
 // # Middleware
 //
-//	app.Use(authMW, corsMW)
+// Sync middleware runs on the uWS loop thread and must NOT block. Use it
+// for cheap cross-cutting work (auth header check, logging, CORS).
+//
+//	app.Use(loggerMW)                    // every route registered later
+//	app.Use("/api/*", authMW, corsMW)    // only routes under /api/
 //	app.Get("/api/x", handleX)
 //
 //	authMW := func(next gogo.Handler) gogo.Handler {
@@ -84,9 +88,50 @@
 //	    }
 //	}
 //
-// Middleware composes at registration time, so per-request overhead is
-// just a function call. Static replies (Reply, string, []byte targets of
-// app.Get) bypass middleware.
+// The first argument to Use may optionally be a path pattern that scopes the
+// middleware to routes whose pattern starts with that prefix. "/api/*" and
+// "/api" mean the same thing — trailing "/*" or "/**" is stripped. Without a
+// pattern, middleware applies to every later-registered route.
+//
+// Path matching happens at route registration, so per-request overhead is
+// just a function call through the matched chain — no string comparison per
+// request. Static replies (Reply, string, []byte targets of app.Get) bypass
+// middleware.
+//
+// # Async middleware
+//
+// AsyncMiddleware wraps GetAsync / PostAsync handlers and runs on the same
+// goroutine as the user handler, so it IS free to block — typical use:
+// resolve a user from a session token via a DB lookup, then hand the
+// loaded user to the handler.
+//
+//	app.UseAsync("/api/*", func(next gogo.AsyncHandler) gogo.AsyncHandler {
+//	    return func(res *gogo.Response, req *gogo.Request) {
+//	        token := req.Header("authorization")
+//	        user, err := db.LoadUserByToken(token)   // blocking — ok
+//	        if err != nil {
+//	            res.Send(401, "text/plain", "unauthorized\n")
+//	            return
+//	        }
+//	        req.SetLocal("user", user)
+//	        next(res, req)
+//	    }
+//	})
+//
+//	app.GetAsync("/api/me", func(res *gogo.Response, req *gogo.Request) {
+//	    user := req.Local("user").(*User)
+//	    res.JSON(200, user)
+//	})
+//
+// Async middleware applies only to GetAsync / PostAsync. If only async
+// middleware matches a GetAsync route (no sync mw), the framework still
+// uses the zero-cgo shared-memory dispatch path; the async chain composes
+// inside the worker goroutine alongside the user handler. Sync routes
+// (Get, Post, Any) never see async middleware.
+//
+// req.SetLocal / req.Local pass values from middleware to the handler;
+// req.Body() returns the collected body for PostAsync routes (nil
+// otherwise), so async middleware can inspect the body before the handler.
 //
 // # Cookies, JSON
 //
