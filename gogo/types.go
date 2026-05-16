@@ -1018,13 +1018,16 @@ type Response struct {
 	// End flushes the buffer back onto the loop with a single cork.
 	async *asyncState
 
-	// bodyPending is true after OnData/Body has been registered but the final
-	// chunk hasn't arrived yet. The sync uwsgoHandleHTTP wrapper checks this
-	// to keep the wrapper out of the pool — onData fires after the handler
-	// has already returned, and recycling here would corrupt the closure.
-	bodyPending bool
-
-	bodyRecycled bool
+	// refs is the wrapper's reference count. The wrapper is alive (in use,
+	// safe to dereference) while refs > 0. Each holder that may outlive
+	// the main HTTP handler — the body-collection callback chain, the
+	// Async goroutine, the shared-dispatch worker, etc. — increments refs
+	// when it takes ownership and decrements (via releaseRef) when it is
+	// done. The decrement that drops refs to zero returns the wrapper to
+	// its sync.Pool. This makes the wrapper lifecycle CAS-correct: a late-
+	// firing OnData callback and a fast Async goroutine can no longer race
+	// each other into double-recycling the same wrapper.
+	refs atomic.Int32
 }
 
 type asyncState struct {
@@ -1154,6 +1157,7 @@ func (r *Response) Async(fn func()) {
 	a.status = "200 OK"
 	a.sent = false
 	r.async = a
+	r.acquireRef()
 
 	go func() {
 		defer func() {
@@ -1168,9 +1172,7 @@ func (r *Response) Async(fn func()) {
 				// the best-effort 500 from being sent. Drop the response.
 				asyncCtxRelease(a.ctxHandle)
 			}
-			// Recycle the Response wrapper here, AFTER fn returns, so the wrapper
-			// isn't reused for another request while our goroutine is still alive.
-			r.recycleAsync(a)
+			r.finishAsync(a)
 		}()
 		fn()
 	}()
@@ -1185,37 +1187,37 @@ func (r *Response) flushAsync() {
 	a.sent = true
 }
 
-// recycleAsync resets and returns the asyncState and Response wrappers to
-// their pools. Must be called only from the Async goroutine wrapper, after
-// fn has returned, to avoid handing out the Response while it is still in use.
-func (r *Response) recycleAsync(a *asyncState) {
-	r.async = nil
-	r.bodyPending = false
-	r.bodyRecycled = false
-	r.inner = responseNative{}
+// acquireRef adds one to the wrapper's refcount. Callers must pair every
+// acquireRef with exactly one releaseRef. Safe to call from any goroutine.
+func (r *Response) acquireRef() {
+	r.refs.Add(1)
+}
 
+// releaseRef drops one ref. The decrement that takes the count to zero is
+// the unique recycle point: it returns the wrapper's inner pointer to nil
+// and Puts the wrapper back into responsePool. Any later access via a stale
+// pointer is the caller's bug (they kept a ref past releaseRef).
+func (r *Response) releaseRef() {
+	if r.refs.Add(-1) != 0 {
+		return
+	}
+	r.inner = responseNative{}
+	r.async = nil
+	responsePool.Put(r)
+}
+
+// finishAsync returns the asyncState to its pool, then drops one wrapper
+// ref. Used by the Async goroutine after fn returns and by runSharedHandler
+// once the user-supplied AsyncHandler is done.
+func (r *Response) finishAsync(a *asyncState) {
 	a.loopPtr = 0
 	a.ctxHandle = 0
 	a.status = ""
 	a.contentType = ""
 	a.body.Reset()
 	a.sent = false
-
 	asyncStatePool.Put(a)
-	responsePool.Put(r)
-}
-
-// recycleSync returns a sync-mode Response wrapper to the pool. Called by the
-// OnData done callback when the user did not switch to Async mode and the
-// uwsgoHandleHTTP path skipped recycling because bodyPending was set.
-func (r *Response) recycleSync() {
-	if r.bodyRecycled {
-		return
-	}
-	r.bodyPending = false
-	r.bodyRecycled = true
-	r.inner = responseNative{}
-	responsePool.Put(r)
+	r.releaseRef()
 }
 
 // Loop returns the event loop that owns this response. Capture it inside the
@@ -1248,18 +1250,23 @@ func (r *Response) Cork(fn func()) {
 //
 // Each chunk slice is freshly allocated; the caller owns it and may retain
 // references after fn returns.
+// OnData takes one wrapper ref at registration. The ref is released on
+// isLast — at which point the cgo handle for the lambda is also freed.
+// Body's onAborted handler releases this ref on early abort (when the last
+// chunk would never fire).
+// OnData registers a body-chunk callback. Each chunk is freshly allocated;
+// the caller owns it. fn runs on the loop thread.
+//
+// OnData takes one wrapper ref at registration and releases it on the
+// final chunk (isLast == true). When the connection aborts before isLast
+// fires the ref is held until the response is destroyed; for the
+// Body() collector that case is covered explicitly via its own onAborted.
 func (r *Response) OnData(fn func(chunk []byte, isLast bool)) {
-	r.bodyPending = true
+	r.acquireRef()
 	r.inner.onData(func(chunk []byte, isLast bool) {
-		if isLast {
-			r.bodyPending = false
-		}
 		fn(chunk, isLast)
-		if isLast && r.async == nil && !r.bodyRecycled {
-			// User did not switch to async mode in the done callback, so the
-			// sync wrapper that called OnData has already returned and the
-			// pool slot is waiting on us. Return the wrapper now.
-			r.recycleSync()
+		if isLast {
+			r.releaseRef()
 		}
 	})
 }
@@ -1281,25 +1288,30 @@ func (r *Response) Body(maxBytes int, done func(body []byte, err error)) {
 	var buf []byte
 	var finished bool
 	aborted := &Aborted{}
+	// Body takes one wrapper ref that's released exactly once on whichever
+	// of these fires first: the final chunk, body-too-large, or abort.
+	// Going through r.inner.onData directly (instead of Response.OnData)
+	// keeps that release symmetric — Response.OnData would release on
+	// isLast on its own and double-release with us on bodyTooLarge/abort.
+	r.acquireRef()
+	release := func() {
+		if finished {
+			return
+		}
+		finished = true
+		r.releaseRef()
+	}
 	r.inner.onAborted(func() {
 		aborted.state.Store(true)
-		if !finished {
-			finished = true
-			if r.async == nil {
-				r.recycleSync()
-			}
-		}
+		release()
 	})
-	r.OnData(func(chunk []byte, isLast bool) {
+	r.inner.onData(func(chunk []byte, isLast bool) {
 		if finished || aborted.Load() {
 			return
 		}
 		if len(buf)+len(chunk) > maxBytes {
-			finished = true
 			done(nil, ErrBodyTooLarge)
-			if r.async == nil {
-				r.recycleSync()
-			}
+			release()
 			return
 		}
 		if buf == nil && len(chunk) > 0 {
@@ -1307,8 +1319,8 @@ func (r *Response) Body(maxBytes int, done func(body []byte, err error)) {
 		}
 		buf = append(buf, chunk...)
 		if isLast {
-			finished = true
 			done(buf, nil)
+			release()
 		}
 	})
 }

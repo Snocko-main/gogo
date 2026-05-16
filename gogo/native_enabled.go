@@ -201,6 +201,7 @@ func runSharedHandler(handler AsyncHandler, ctxPtr uintptr) {
 
 	resWrap := responsePool.Get().(*Response)
 	resWrap.inner = responseNative{ptr: resPtr}
+	resWrap.refs.Store(1)
 
 	a := asyncStatePool.Get().(*asyncState)
 	a.loopPtr = loopPtrRaw
@@ -229,7 +230,7 @@ func runSharedHandler(handler AsyncHandler, ctxPtr uintptr) {
 		}
 		reqWrap.resetForPool()
 		requestPool.Put(reqWrap)
-		resWrap.recycleAsync(a)
+		resWrap.finishAsync(a)
 	}()
 
 	handler(resWrap, reqWrap)
@@ -741,8 +742,10 @@ func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req
 	resWrap := responsePool.Get().(*Response)
 	resWrap.inner = responseNative{ptr: res}
 	resWrap.async = nil
-	resWrap.bodyPending = false
-	resWrap.bodyRecycled = false
+	// One ref for the main handler. Body() and Async() each take their own
+	// additional ref; the wrapper is returned to the pool by whichever
+	// releaseRef drops the count to zero.
+	resWrap.refs.Store(1)
 
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -754,15 +757,7 @@ func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req
 
 		reqWrap.resetForPool()
 		requestPool.Put(reqWrap)
-
-		// Sync responses are done with resWrap by now. We must NOT recycle if:
-		//   - async is set: a goroutine still uses the wrapper
-		//   - bodyPending is set: onData hasn't received the final chunk yet
-		// Both paths take responsibility for their own recycle.
-		if resWrap.async == nil && !resWrap.bodyPending && !resWrap.bodyRecycled {
-			resWrap.inner = responseNative{}
-			responsePool.Put(resWrap)
-		}
+		resWrap.releaseRef()
 	}()
 
 	handler(resWrap, reqWrap)
