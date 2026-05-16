@@ -322,57 +322,46 @@ func mwMatches(prefix, routePattern string) bool {
 	return strings.HasPrefix(routePattern, prefix+"/")
 }
 
-// wrap composes registered middleware around h. The strategy depends on
-// each middleware entry plus the shape of routePattern:
-//
-//   - Global middleware (prefix == "") wraps at registration with zero
-//     per-request cost — it always applies.
-//   - Path-scoped middleware on a literal route (no ':' or '*' in the
-//     pattern) is also decided at registration: the pattern string is the
-//     only URL the route ever serves, so urlUnderPrefix(routePattern,
-//     prefix) gives the exact answer with no runtime work.
-//   - Path-scoped middleware on a dynamic route is wrapped in a URL guard.
-//     The middleware factory is invoked once at registration; at request
-//     time the guard does a single req.URL() + HasPrefix check and
-//     dispatches to either the wrapped chain (in scope) or the unmodified
-//     next handler (out of scope). No per-request chain reconstruction.
-//
-// Net result: the only routes that pay any per-request middleware-matching
-// cost are dynamic routes with at least one path-scoped middleware, and
-// even there the cost is one URL fetch and one HasPrefix per scoped entry.
-// This closes the bypass that pattern-string matching had for dynamic
-// patterns (e.g. Get("/api/:section") serving /api/admin previously did
-// not trigger Use("/api/admin", auth)) without giving up the registration-
-// time wrap for the common static-pattern case.
+// wrap composes registered middleware around h. Global middleware (prefix
+// == "") is wrapped at registration time with zero per-request cost. When
+// any path-scoped middleware is present, composition is deferred to request
+// time and matched against the live URL via req.URL() rather than the route
+// pattern string — this closes the bypass that pattern-string matching had
+// for dynamic / wildcard routes (e.g. Get("/api/:section") serving
+// /api/admin would not have triggered Use("/api/admin", auth) under the
+// old scheme because the literal strings "/api/:section" and "/api/admin"
+// do not share a prefix).
 func (a *App) wrap(routePattern string, h Handler) Handler {
 	if len(a.middlewares) == 0 {
 		return h
 	}
-	dynamic := isDynamicPattern(routePattern)
-	for i := len(a.middlewares) - 1; i >= 0; i-- {
-		e := a.middlewares[i]
-		if e.prefix == "" {
-			h = e.mw(h)
-			continue
-		}
-		if !dynamic {
-			if urlUnderPrefix(routePattern, e.prefix) {
-				h = e.mw(h)
-			}
-			continue
-		}
-		next := h
-		wrapped := e.mw(next)
-		prefix := e.prefix
-		h = func(res *Response, req *Request) {
-			if urlUnderPrefix(req.URL(), prefix) {
-				wrapped(res, req)
-				return
-			}
-			next(res, req)
+	hasScoped := false
+	for _, e := range a.middlewares {
+		if e.prefix != "" {
+			hasScoped = true
+			break
 		}
 	}
-	return h
+	if !hasScoped {
+		for i := len(a.middlewares) - 1; i >= 0; i-- {
+			h = a.middlewares[i].mw(h)
+		}
+		return h
+	}
+	entries := make([]middlewareEntry, len(a.middlewares))
+	copy(entries, a.middlewares)
+	inner := h
+	return func(res *Response, req *Request) {
+		url := req.URL()
+		chain := inner
+		for i := len(entries) - 1; i >= 0; i-- {
+			e := entries[i]
+			if e.prefix == "" || urlUnderPrefix(url, e.prefix) {
+				chain = e.mw(chain)
+			}
+		}
+		chain(res, req)
+	}
 }
 
 // urlUnderPrefix reports whether the request URL falls within the path
@@ -382,13 +371,6 @@ func urlUnderPrefix(url, prefix string) bool {
 		return true
 	}
 	return strings.HasPrefix(url, prefix+"/")
-}
-
-// isDynamicPattern reports whether a uWS route pattern contains parameter
-// (":name") or wildcard ("*") segments, meaning the set of URLs it serves
-// is not knowable from the pattern string alone.
-func isDynamicPattern(p string) bool {
-	return strings.ContainsAny(p, ":*")
 }
 
 // hasMatchingMiddleware reports whether any registered sync middleware could
@@ -402,7 +384,7 @@ func (a *App) hasMatchingMiddleware(routePattern string) bool {
 	if len(a.middlewares) == 0 {
 		return false
 	}
-	dynamic := isDynamicPattern(routePattern)
+	dynamic := strings.ContainsAny(routePattern, ":*")
 	for _, e := range a.middlewares {
 		if e.prefix == "" {
 			return true
@@ -410,7 +392,7 @@ func (a *App) hasMatchingMiddleware(routePattern string) bool {
 		if dynamic {
 			return true
 		}
-		if urlUnderPrefix(routePattern, e.prefix) {
+		if mwMatches(e.prefix, routePattern) {
 			return true
 		}
 	}
@@ -481,38 +463,41 @@ func (a *App) UseAsync(args ...any) {
 	}
 }
 
-// wrapAsync mirrors wrap for the async chain: literal routes wrap at
-// registration; dynamic routes get a per-MW URL guard that calls the
-// factory once.
+// wrapAsync composes registered async middleware around h. Mirrors wrap:
+// global async MW wraps at registration; path-scoped async MW composes at
+// request time against the live URL so dynamic routes can't bypass scoped
+// middleware via pattern/URL mismatch.
 func (a *App) wrapAsync(routePattern string, h AsyncHandler) AsyncHandler {
 	if len(a.asyncMiddlewares) == 0 {
 		return h
 	}
-	dynamic := isDynamicPattern(routePattern)
-	for i := len(a.asyncMiddlewares) - 1; i >= 0; i-- {
-		e := a.asyncMiddlewares[i]
-		if e.prefix == "" {
-			h = e.mw(h)
-			continue
-		}
-		if !dynamic {
-			if urlUnderPrefix(routePattern, e.prefix) {
-				h = e.mw(h)
-			}
-			continue
-		}
-		next := h
-		wrapped := e.mw(next)
-		prefix := e.prefix
-		h = func(res *Response, req *Request) {
-			if urlUnderPrefix(req.URL(), prefix) {
-				wrapped(res, req)
-				return
-			}
-			next(res, req)
+	hasScoped := false
+	for _, e := range a.asyncMiddlewares {
+		if e.prefix != "" {
+			hasScoped = true
+			break
 		}
 	}
-	return h
+	if !hasScoped {
+		for i := len(a.asyncMiddlewares) - 1; i >= 0; i-- {
+			h = a.asyncMiddlewares[i].mw(h)
+		}
+		return h
+	}
+	entries := make([]asyncMiddlewareEntry, len(a.asyncMiddlewares))
+	copy(entries, a.asyncMiddlewares)
+	inner := h
+	return func(res *Response, req *Request) {
+		url := req.URL()
+		chain := inner
+		for i := len(entries) - 1; i >= 0; i-- {
+			e := entries[i]
+			if e.prefix == "" || urlUnderPrefix(url, e.prefix) {
+				chain = e.mw(chain)
+			}
+		}
+		chain(res, req)
+	}
 }
 
 // Get registers a GET route. The target may be:
