@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 )
 
@@ -169,11 +170,35 @@ const (
 	Binary OpCode = 2
 )
 
-// WebSocketBehavior contains callbacks for a WebSocket route.
+// WebSocketBehavior contains callbacks and per-route limits for a
+// WebSocket endpoint. Limit fields default to safe production values
+// when zero — pick explicit numbers when you need different limits, do
+// not leave them at zero hoping for "unlimited".
 type WebSocketBehavior struct {
 	Open    func(*WebSocket)
 	Message func(*WebSocket, []byte, OpCode)
 	Close   func(*WebSocket, int, []byte)
+
+	// MaxPayloadLength is the largest single incoming message the
+	// server will accept. Frames over this cap cause uWS to close the
+	// connection. Default 16 MiB.
+	MaxPayloadLength int
+
+	// IdleTimeout is the maximum time a WebSocket may sit idle (no
+	// frames in either direction) before uWS closes it. Default 120s.
+	IdleTimeout time.Duration
+
+	// MaxBackpressure is the bytes uWS will queue per-socket for a
+	// slow consumer before closing the connection. Protects the
+	// loop from being held hostage by a single non-draining client.
+	// Default 64 KiB.
+	MaxBackpressure int
+
+	// DisablePings turns off uWS's built-in ping/pong keepalive.
+	// Default (zero) leaves automatic pings ON so an idle connection
+	// doesn't get reaped by NAT boxes; set true only if your client
+	// drives its own ping protocol.
+	DisablePings bool
 }
 
 // Middleware wraps a Handler with cross-cutting behavior (auth, logging,

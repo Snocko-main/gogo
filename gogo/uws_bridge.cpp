@@ -230,8 +230,15 @@ extern "C" void uwsgo_app_set_body_limit(uwsgo_app_t *app, size_t limit) {
     app->body_limit = limit;
 }
 
-extern "C" void uwsgo_app_ws(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id) {
+extern "C" void uwsgo_app_ws(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id,
+    size_t max_payload, int idle_seconds, size_t max_backpressure,
+    int send_pings_automatically) {
     uWS::App::WebSocketBehavior<uwsgo_ws_data_t> behavior = {};
+
+    behavior.maxPayloadLength = static_cast<unsigned int>(max_payload);
+    behavior.idleTimeout = static_cast<unsigned short>(idle_seconds);
+    behavior.maxBackpressure = static_cast<unsigned int>(max_backpressure);
+    behavior.sendPingsAutomatically = send_pings_automatically != 0;
 
     behavior.open = [handler_id](auto *ws) {
         uwsgoHandleWSOpen(handler_id, reinterpret_cast<uwsgo_ws_t *>(ws));

@@ -312,7 +312,25 @@ func (a *appNative) websocket(pattern string, behavior WebSocketBehavior) {
 	handle := cgo.NewHandle(behavior)
 	a.handles = append(a.handles, handle)
 
-	C.uwsgo_app_ws(a.ptr, cpattern, C.uintptr_t(handle))
+	maxPayload := behavior.MaxPayloadLength
+	if maxPayload <= 0 {
+		maxPayload = 16 << 20 // 16 MiB
+	}
+	idleSec := int(behavior.IdleTimeout / time.Second)
+	if idleSec <= 0 {
+		idleSec = 120
+	}
+	maxBp := behavior.MaxBackpressure
+	if maxBp <= 0 {
+		maxBp = 64 << 10 // 64 KiB
+	}
+	pings := 1
+	if behavior.DisablePings {
+		pings = 0
+	}
+
+	C.uwsgo_app_ws(a.ptr, cpattern, C.uintptr_t(handle),
+		C.size_t(maxPayload), C.int(idleSec), C.size_t(maxBp), C.int(pings))
 }
 
 func (a *appNative) prepareRoute(pattern string, handler Handler) (*C.char, cgo.Handle) {

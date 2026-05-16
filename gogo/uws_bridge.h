@@ -27,7 +27,12 @@ void uwsgo_app_set_body_limit(uwsgo_app_t *app, size_t limit);
 void uwsgo_app_get(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);
 void uwsgo_app_post(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);
 void uwsgo_app_any(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);
-void uwsgo_app_ws(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);
+// uwsgo_app_ws registers a WebSocket endpoint with per-route limits
+// forwarded to the uWS WebSocketBehavior template (max payload, idle
+// timeout in seconds, backpressure cap, automatic ping/pong toggle).
+void uwsgo_app_ws(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id,
+    size_t max_payload, int idle_seconds, size_t max_backpressure,
+    int send_pings_automatically);
 
 // Static GET: response is captured once at registration time and served by
 // the C++ event loop directly without any cgo callback per request. Status,
