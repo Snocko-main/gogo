@@ -86,6 +86,13 @@ struct PendingRing {
     PendingSlot slots[RING_SIZE];
     std::atomic<uint64_t> head;  // consumer index (loop thread only)
     std::atomic<uint64_t> tail;  // producer index (any thread)
+    // wake_pending is 0 when no Go producer has yet called wake_drain
+    // since the last loop-thread drain pass began. Producers CAS(0,1)
+    // to claim the right to call wake_drain — the CAS loser knows the
+    // drain is already scheduled and skips the cgo crossing. The drain
+    // handler clears this back to 0 the moment it begins, so any newly
+    // arrived ctx after that point will get a fresh wake.
+    std::atomic<uint32_t> wake_pending;
 
     void init() {
         for (uint64_t i = 0; i < RING_SIZE; i++) {
@@ -94,6 +101,7 @@ struct PendingRing {
         }
         head.store(0, std::memory_order_relaxed);
         tail.store(0, std::memory_order_relaxed);
+        wake_pending.store(0, std::memory_order_relaxed);
     }
 };
 
@@ -552,6 +560,7 @@ extern "C" void uwsgo_shared_layout(uwsgo_shared_layout_t *out) {
     out->ring_slot_ctx_offset = offsetof(PendingSlot, ctx);
     out->ring_head_offset = offsetof(PendingRing, head);
     out->ring_tail_offset = offsetof(PendingRing, tail);
+    out->ring_wake_pending_offset = offsetof(PendingRing, wake_pending);
 
     out->ctx_status_len_offset = offsetof(AsyncCtx, inline_status_len);
     out->ctx_ct_len_offset = offsetof(AsyncCtx, inline_ct_len);
@@ -712,7 +721,13 @@ extern "C" void uwsgo_app_get_shared(uwsgo_app_t *app, const char *pattern, uint
 // Single consumer (the loop) so no CAS needed on head. Takes the ring as a
 // parameter so the same routine serves multiple App instances each with its
 // own ring + loop.
+//
+// Clears ring->wake_pending at the start so any producer that publishes a
+// slot AFTER this point will succeed in CAS(0,1) and call wake_drain for
+// the next pass. Producers that publish BEFORE this clear are already
+// in the slots we're about to walk; no wake needed.
 static void drain_pending(PendingRing *ring) {
+    ring->wake_pending.store(0, std::memory_order_release);
     uint64_t h = ring->head.load(std::memory_order_relaxed);
     while (true) {
         PendingSlot *slot = &ring->slots[h & RING_MASK];

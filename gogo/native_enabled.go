@@ -464,6 +464,7 @@ type sharedLayout struct {
 	slotCtxOffset     uintptr
 	headOffset        uintptr
 	tailOffset        uintptr
+	wakePendingOffset uintptr
 	ctxStatusLenOff   uintptr
 	ctxCtLenOff       uintptr
 	ctxBodyLenOff     uintptr
@@ -522,6 +523,7 @@ func initSharedLayoutOnce() {
 		slotCtxOffset:     uintptr(raw.ring_slot_ctx_offset),
 		headOffset:        uintptr(raw.ring_head_offset),
 		tailOffset:        uintptr(raw.ring_tail_offset),
+		wakePendingOffset: uintptr(raw.ring_wake_pending_offset),
 		ctxStatusLenOff:   uintptr(raw.ctx_status_len_offset),
 		ctxCtLenOff:       uintptr(raw.ctx_ct_len_offset),
 		ctxBodyLenOff:     uintptr(raw.ctx_body_len_offset),
@@ -643,11 +645,23 @@ claimed:
 
 	// Ctx is now owned by the consumer — do NOT touch it again. Use the
 	// cached loopPtr to wake the drain.
+	//
+	// Skip the wake_drain cgo crossing if another producer (or a stale
+	// scheduled wake) already has one pending: drain clears wake_pending
+	// the moment it starts, so a successful CAS(0,1) here means "I'm the
+	// first producer since the last drain pass began, the wake is mine
+	// to call". Under sustained load this drops the cgo wake rate by
+	// the average batch size of the ring — at 91k rps on /db a single
+	// drain commonly consumes dozens of slots, so this typically
+	// eliminates 90%+ of wake_drain crossings.
 	if loopPtr != 0 {
-		C.uwsgo_wake_drain(
-			(*C.uwsgo_loop_t)(unsafe.Pointer(loopPtr)),
-			unsafe.Pointer(ringPtr),
-		)
+		wakeAddr := (*atomic.Uint32)(unsafe.Pointer(ringPtr + shared.wakePendingOffset))
+		if wakeAddr.CompareAndSwap(0, 1) {
+			C.uwsgo_wake_drain(
+				(*C.uwsgo_loop_t)(unsafe.Pointer(loopPtr)),
+				unsafe.Pointer(ringPtr),
+			)
+		}
 	}
 	return true
 }

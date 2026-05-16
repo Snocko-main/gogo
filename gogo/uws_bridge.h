@@ -109,6 +109,7 @@ typedef struct uwsgo_shared_layout_t {
     size_t ring_slot_ctx_offset;
     size_t ring_head_offset;
     size_t ring_tail_offset;
+    size_t ring_wake_pending_offset;
     size_t ctx_status_len_offset;
     size_t ctx_ct_len_offset;
     size_t ctx_body_len_offset;
