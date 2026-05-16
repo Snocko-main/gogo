@@ -217,10 +217,7 @@ func runSharedHandler(handler AsyncHandler, ctxPtr uintptr) {
 
 	defer func() {
 		if r := recover(); r != nil {
-			panicHandler := getPanicHandler()
-			if panicHandler != nil {
-				panicHandler(r)
-			}
+			reportPanic(r)
 			if !a.sent {
 				// Best-effort 500 so the client doesn't hang. Body is left
 				// minimal so we don't risk another panic during marshaling.
@@ -247,11 +244,13 @@ func newSnapshotFromCtx(ctxPtr uintptr) *requestSnapshot {
 	queryLen := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxQueryLenOff))
 	paramCount := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxParamCountOff))
 	headersLen := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxHeadersLenOff))
+	truncated := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxTruncatedOff)) != 0
 
 	snap := &requestSnapshot{
-		method: copyAt(ctxPtr+shared.ctxMethodOff, int(methodLen)),
-		url:    copyAt(ctxPtr+shared.ctxURLOff, int(urlLen)),
-		query:  copyAt(ctxPtr+shared.ctxQueryOff, int(queryLen)),
+		method:    copyAt(ctxPtr+shared.ctxMethodOff, int(methodLen)),
+		url:       copyAt(ctxPtr+shared.ctxURLOff, int(urlLen)),
+		query:     copyAt(ctxPtr+shared.ctxQueryOff, int(queryLen)),
+		truncated: truncated,
 	}
 
 	if paramCount > 0 {
@@ -382,8 +381,8 @@ func (r responseNative) loop() loopNative {
 	return loopNative{ptr: C.uwsgo_res_get_loop(r.ptr)}
 }
 
-func (r responseNative) onAborted(state *Aborted) {
-	handle := cgo.NewHandle(state)
+func (r responseNative) onAborted(callback any) {
+	handle := cgo.NewHandle(callback)
 	C.uwsgo_res_on_aborted(r.ptr, C.uintptr_t(handle))
 }
 
@@ -428,33 +427,34 @@ func asyncCtxRelease(ctxHandle uintptr) {
 // reads ctx->pending_ring rather than using a global so multiple App
 // instances can coexist.
 type sharedLayout struct {
-	requestRing      uintptr
+	requestRing       uintptr
 	ctxPendingRingOff uintptr
-	ringMask         uint64
-	slotsOffset      uintptr
-	slotStride       uintptr
-	slotSeqOffset    uintptr
-	slotCtxOffset    uintptr
-	headOffset       uintptr
-	tailOffset       uintptr
-	ctxStatusLenOff  uintptr
-	ctxCtLenOff      uintptr
-	ctxBodyLenOff    uintptr
-	ctxStatusOff     uintptr
-	ctxCtOff         uintptr
-	ctxBodyOff       uintptr
-	ctxHandlerIDOff  uintptr
-	ctxResponseOff   uintptr
-	ctxLoopOff       uintptr
-	statusCap        uintptr
-	ctCap            uintptr
-	bodyCap          uintptr
+	ringMask          uint64
+	slotsOffset       uintptr
+	slotStride        uintptr
+	slotSeqOffset     uintptr
+	slotCtxOffset     uintptr
+	headOffset        uintptr
+	tailOffset        uintptr
+	ctxStatusLenOff   uintptr
+	ctxCtLenOff       uintptr
+	ctxBodyLenOff     uintptr
+	ctxStatusOff      uintptr
+	ctxCtOff          uintptr
+	ctxBodyOff        uintptr
+	ctxHandlerIDOff   uintptr
+	ctxResponseOff    uintptr
+	ctxLoopOff        uintptr
+	statusCap         uintptr
+	ctCap             uintptr
+	bodyCap           uintptr
 	// Request snapshot offsets (populated by C++ before the ctx is enqueued).
 	ctxMethodLenOff  uintptr
 	ctxURLLenOff     uintptr
 	ctxQueryLenOff   uintptr
 	ctxParamCountOff uintptr
 	ctxHeadersLenOff uintptr
+	ctxTruncatedOff  uintptr
 	ctxParamLensOff  uintptr
 	ctxMethodOff     uintptr
 	ctxURLOff        uintptr
@@ -487,31 +487,32 @@ func initSharedLayoutOnce() {
 	shared = sharedLayout{
 		requestRing:       uintptr(raw.request_ring),
 		ctxPendingRingOff: uintptr(raw.ctx_pending_ring_offset),
-		ringMask:        uint64(raw.ring_mask),
-		slotsOffset:     uintptr(raw.ring_slots_offset),
-		slotStride:      uintptr(raw.ring_slot_stride),
-		slotSeqOffset:   uintptr(raw.ring_slot_seq_offset),
-		slotCtxOffset:   uintptr(raw.ring_slot_ctx_offset),
-		headOffset:      uintptr(raw.ring_head_offset),
-		tailOffset:      uintptr(raw.ring_tail_offset),
-		ctxStatusLenOff: uintptr(raw.ctx_status_len_offset),
-		ctxCtLenOff:     uintptr(raw.ctx_ct_len_offset),
-		ctxBodyLenOff:   uintptr(raw.ctx_body_len_offset),
-		ctxStatusOff:    uintptr(raw.ctx_status_offset),
-		ctxCtOff:        uintptr(raw.ctx_ct_offset),
-		ctxBodyOff:      uintptr(raw.ctx_body_offset),
-		ctxHandlerIDOff: uintptr(raw.ctx_handler_id_offset),
-		ctxResponseOff:  uintptr(raw.ctx_response_offset),
-		ctxLoopOff:      uintptr(raw.ctx_loop_offset),
-		statusCap:       uintptr(raw.ctx_inline_status_cap),
-		ctCap:           uintptr(raw.ctx_inline_ct_cap),
-		bodyCap:         uintptr(raw.ctx_inline_body_cap),
+		ringMask:          uint64(raw.ring_mask),
+		slotsOffset:       uintptr(raw.ring_slots_offset),
+		slotStride:        uintptr(raw.ring_slot_stride),
+		slotSeqOffset:     uintptr(raw.ring_slot_seq_offset),
+		slotCtxOffset:     uintptr(raw.ring_slot_ctx_offset),
+		headOffset:        uintptr(raw.ring_head_offset),
+		tailOffset:        uintptr(raw.ring_tail_offset),
+		ctxStatusLenOff:   uintptr(raw.ctx_status_len_offset),
+		ctxCtLenOff:       uintptr(raw.ctx_ct_len_offset),
+		ctxBodyLenOff:     uintptr(raw.ctx_body_len_offset),
+		ctxStatusOff:      uintptr(raw.ctx_status_offset),
+		ctxCtOff:          uintptr(raw.ctx_ct_offset),
+		ctxBodyOff:        uintptr(raw.ctx_body_offset),
+		ctxHandlerIDOff:   uintptr(raw.ctx_handler_id_offset),
+		ctxResponseOff:    uintptr(raw.ctx_response_offset),
+		ctxLoopOff:        uintptr(raw.ctx_loop_offset),
+		statusCap:         uintptr(raw.ctx_inline_status_cap),
+		ctCap:             uintptr(raw.ctx_inline_ct_cap),
+		bodyCap:           uintptr(raw.ctx_inline_body_cap),
 
 		ctxMethodLenOff:  uintptr(raw.ctx_method_len_offset),
 		ctxURLLenOff:     uintptr(raw.ctx_url_len_offset),
 		ctxQueryLenOff:   uintptr(raw.ctx_query_len_offset),
 		ctxParamCountOff: uintptr(raw.ctx_param_count_offset),
 		ctxHeadersLenOff: uintptr(raw.ctx_headers_len_offset),
+		ctxTruncatedOff:  uintptr(raw.ctx_truncated_offset),
 		ctxParamLensOff:  uintptr(raw.ctx_param_lens_offset),
 		ctxMethodOff:     uintptr(raw.ctx_method_offset),
 		ctxURLOff:        uintptr(raw.ctx_url_offset),
@@ -570,17 +571,42 @@ func asyncSendShared(ctxHandle uintptr, statusLine, contentType, body string) bo
 		return false
 	}
 
-	// MPSC enqueue: fetch_add tail, wait for slot.sequence == idx, write ctx, sequence = idx+1
+	// MPSC enqueue: claim a ready slot with CAS. If the response ring is full
+	// or heavily contended, return false so the caller can fall back to
+	// Loop::defer instead of spinning unbounded on a worker goroutine.
 	tailAddr := (*atomic.Uint64)(unsafe.Pointer(ringPtr + shared.tailOffset))
-	idx := tailAddr.Add(1) - 1
-	slotBase := ringPtr + shared.slotsOffset + uintptr(idx&shared.ringMask)*shared.slotStride
-	seqAddr := (*atomic.Uint64)(unsafe.Pointer(slotBase + shared.slotSeqOffset))
-
-	for seqAddr.Load() != idx {
-		// Ring is full — spin briefly waiting for consumer.
+	tail := tailAddr.Load()
+	var (
+		slotBase uintptr
+		seqAddr  *atomic.Uint64
+	)
+	for spin := 0; ; spin++ {
+		slotBase = ringPtr + shared.slotsOffset + uintptr(tail&shared.ringMask)*shared.slotStride
+		seqAddr = (*atomic.Uint64)(unsafe.Pointer(slotBase + shared.slotSeqOffset))
+		seq := seqAddr.Load()
+		diff := int64(seq - tail)
+		switch {
+		case diff == 0:
+			if tailAddr.CompareAndSwap(tail, tail+1) {
+				goto claimed
+			}
+			tail = tailAddr.Load()
+		case diff < 0:
+			return false
+		default:
+			tail = tailAddr.Load()
+		}
+		if spin > 100000 {
+			return false
+		}
+		if spin%256 == 0 {
+			runtime.Gosched()
+		}
 	}
+
+claimed:
 	*(*uintptr)(unsafe.Pointer(slotBase + shared.slotCtxOffset)) = ctxHandle
-	seqAddr.Store(idx + 1)
+	seqAddr.Store(tail + 1)
 
 	// Wake the App's loop so it drains the ring immediately, passing the
 	// specific ring pointer so the drain runs on the right App's data.
@@ -694,20 +720,30 @@ func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req
 	resWrap.inner = responseNative{ptr: res}
 	resWrap.async = nil
 	resWrap.bodyPending = false
+	resWrap.bodyRecycled = false
+
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			reportPanic(recovered)
+			if resWrap.async == nil {
+				resWrap.Send(500, "text/plain; charset=utf-8", "Internal Server Error\n")
+			}
+		}
+
+		reqWrap.resetForPool()
+		requestPool.Put(reqWrap)
+
+		// Sync responses are done with resWrap by now. We must NOT recycle if:
+		//   - async is set: a goroutine still uses the wrapper
+		//   - bodyPending is set: onData hasn't received the final chunk yet
+		// Both paths take responsibility for their own recycle.
+		if resWrap.async == nil && !resWrap.bodyPending && !resWrap.bodyRecycled {
+			resWrap.inner = responseNative{}
+			responsePool.Put(resWrap)
+		}
+	}()
 
 	handler(resWrap, reqWrap)
-
-	reqWrap.resetForPool()
-	requestPool.Put(reqWrap)
-
-	// Sync responses are done with resWrap by now. We must NOT recycle if:
-	//   - async is set: a goroutine still uses the wrapper
-	//   - bodyPending is set: onData hasn't received the final chunk yet
-	// Both paths take responsibility for their own recycle.
-	if resWrap.async == nil && !resWrap.bodyPending {
-		resWrap.inner = responseNative{}
-		responsePool.Put(resWrap)
-	}
 }
 
 //export uwsgoHandleWSOpen
@@ -715,6 +751,11 @@ func uwsgoHandleWSOpen(handlerID C.uintptr_t, ws *C.uwsgo_ws_t) {
 	handle := cgo.Handle(handlerID)
 	behavior := handle.Value().(WebSocketBehavior)
 	if behavior.Open != nil {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				reportPanic(recovered)
+			}
+		}()
 		behavior.Open(&WebSocket{inner: websocketNative{ptr: ws}})
 	}
 }
@@ -724,6 +765,11 @@ func uwsgoHandleWSMessage(handlerID C.uintptr_t, ws *C.uwsgo_ws_t, message *C.ch
 	handle := cgo.Handle(handlerID)
 	behavior := handle.Value().(WebSocketBehavior)
 	if behavior.Message != nil {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				reportPanic(recovered)
+			}
+		}()
 		behavior.Message(
 			&WebSocket{inner: websocketNative{ptr: ws}},
 			C.GoBytes(unsafe.Pointer(message), C.int(messageLen)),
@@ -737,6 +783,11 @@ func uwsgoHandleWSClose(handlerID C.uintptr_t, ws *C.uwsgo_ws_t, code C.int, mes
 	handle := cgo.Handle(handlerID)
 	behavior := handle.Value().(WebSocketBehavior)
 	if behavior.Close != nil {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				reportPanic(recovered)
+			}
+		}()
 		behavior.Close(
 			&WebSocket{inner: websocketNative{ptr: ws}},
 			int(code),
@@ -750,15 +801,30 @@ func uwsgoHandleDefer(callbackID C.uintptr_t) {
 	h := cgo.Handle(callbackID)
 	fn := h.Value().(func())
 	h.Delete()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			reportPanic(recovered)
+		}
+	}()
 	fn()
 }
 
 //export uwsgoHandleAborted
 func uwsgoHandleAborted(callbackID C.uintptr_t) {
 	h := cgo.Handle(callbackID)
-	state := h.Value().(*Aborted)
+	value := h.Value()
 	h.Delete()
-	state.state.Store(true)
+	switch cb := value.(type) {
+	case *Aborted:
+		cb.state.Store(true)
+	case func():
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				reportPanic(recovered)
+			}
+		}()
+		cb()
+	}
 }
 
 //export uwsgoHandleCork
@@ -766,6 +832,11 @@ func uwsgoHandleCork(callbackID C.uintptr_t) {
 	h := cgo.Handle(callbackID)
 	fn := h.Value().(func())
 	h.Delete()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			reportPanic(recovered)
+		}
+	}()
 	fn()
 }
 
@@ -787,5 +858,10 @@ func uwsgoHandleData(callbackID C.uintptr_t, data *C.char, size C.size_t, isLast
 	if last {
 		h.Delete()
 	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			reportPanic(recovered)
+		}
+	}()
 	fn(chunk, last)
 }

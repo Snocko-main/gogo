@@ -116,6 +116,7 @@ typedef struct uwsgo_shared_layout_t {
     size_t ctx_query_len_offset;
     size_t ctx_param_count_offset;
     size_t ctx_headers_len_offset;
+    size_t ctx_truncated_offset;
     size_t ctx_param_lens_offset;
     size_t ctx_method_offset;
     size_t ctx_url_offset;

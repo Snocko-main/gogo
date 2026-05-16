@@ -87,10 +87,11 @@ var (
 	asyncStatePool = sync.Pool{New: func() any { return &asyncState{} }}
 )
 
-// PanicHandler is invoked from the worker goroutine when a route handler
-// panics, after the worker has emitted a best-effort 500 response. The
-// argument is the recovered value (the panic payload). Setting a panic
-// handler is optional; without one panics are silently caught.
+// PanicHandler is invoked when user code panics inside an HTTP, async,
+// WebSocket, defer, or body callback. HTTP paths emit a best-effort 500 when a
+// response is still available. The argument is the recovered value (the panic
+// payload). Setting a panic handler is optional; without one panics are
+// silently caught.
 type PanicHandler func(recovered any)
 
 var (
@@ -98,8 +99,8 @@ var (
 	panicHandlerFn PanicHandler
 )
 
-// SetPanicHandler registers fn as the global panic handler for shared
-// workers. Pass nil to clear. The handler must not panic itself.
+// SetPanicHandler registers fn as the global panic handler. Pass nil to clear.
+// The handler must not panic itself.
 func SetPanicHandler(fn PanicHandler) {
 	panicHandlerMu.Lock()
 	panicHandlerFn = fn
@@ -110,6 +111,17 @@ func getPanicHandler() PanicHandler {
 	panicHandlerMu.RLock()
 	defer panicHandlerMu.RUnlock()
 	return panicHandlerFn
+}
+
+func reportPanic(recovered any) {
+	panicHandler := getPanicHandler()
+	if panicHandler == nil {
+		return
+	}
+	defer func() {
+		_ = recover()
+	}()
+	panicHandler(recovered)
 }
 
 // Handler handles a single HTTP request.
@@ -683,6 +695,8 @@ type Response struct {
 	// to keep the wrapper out of the pool — onData fires after the handler
 	// has already returned, and recycling here would corrupt the closure.
 	bodyPending bool
+
+	bodyRecycled bool
 }
 
 type asyncState struct {
@@ -814,14 +828,23 @@ func (r *Response) Async(fn func()) {
 	r.async = a
 
 	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				reportPanic(recovered)
+				if !a.sent {
+					r.Send(500, "text/plain; charset=utf-8", "Internal Server Error\n")
+				}
+			}
+			if !a.sent {
+				// fn returned without invoking Send/End, or a panic prevented
+				// the best-effort 500 from being sent. Drop the response.
+				asyncCtxRelease(a.ctxHandle)
+			}
+			// Recycle the Response wrapper here, AFTER fn returns, so the wrapper
+			// isn't reused for another request while our goroutine is still alive.
+			r.recycleAsync(a)
+		}()
 		fn()
-		if !a.sent {
-			// fn returned without invoking Send/End. Drop the response.
-			asyncCtxRelease(a.ctxHandle)
-		}
-		// Recycle the Response wrapper here, AFTER fn returns, so the wrapper
-		// isn't reused for another request while our goroutine is still alive.
-		r.recycleAsync(a)
 	}()
 }
 
@@ -840,6 +863,7 @@ func (r *Response) flushAsync() {
 func (r *Response) recycleAsync(a *asyncState) {
 	r.async = nil
 	r.bodyPending = false
+	r.bodyRecycled = false
 	r.inner = responseNative{}
 
 	a.loopPtr = 0
@@ -857,11 +881,14 @@ func (r *Response) recycleAsync(a *asyncState) {
 // OnData done callback when the user did not switch to Async mode and the
 // uwsgoHandleHTTP path skipped recycling because bodyPending was set.
 func (r *Response) recycleSync() {
+	if r.bodyRecycled {
+		return
+	}
 	r.bodyPending = false
+	r.bodyRecycled = true
 	r.inner = responseNative{}
 	responsePool.Put(r)
 }
-
 
 // Loop returns the event loop that owns this response. Capture it inside the
 // handler before spawning a goroutine. The returned Loop is safe to use from
@@ -900,7 +927,7 @@ func (r *Response) OnData(fn func(chunk []byte, isLast bool)) {
 			r.bodyPending = false
 		}
 		fn(chunk, isLast)
-		if isLast && r.async == nil {
+		if isLast && r.async == nil && !r.bodyRecycled {
 			// User did not switch to async mode in the done callback, so the
 			// sync wrapper that called OnData has already returned and the
 			// pool slot is waiting on us. Return the wrapper now.
@@ -925,7 +952,16 @@ func (e errFramework) Error() string { return string(e) }
 func (r *Response) Body(maxBytes int, done func(body []byte, err error)) {
 	var buf []byte
 	var finished bool
-	aborted := r.OnAborted()
+	aborted := &Aborted{}
+	r.inner.onAborted(func() {
+		aborted.state.Store(true)
+		if !finished {
+			finished = true
+			if r.async == nil {
+				r.recycleSync()
+			}
+		}
+	})
 	r.OnData(func(chunk []byte, isLast bool) {
 		if finished || aborted.Load() {
 			return
@@ -933,6 +969,9 @@ func (r *Response) Body(maxBytes int, done func(body []byte, err error)) {
 		if len(buf)+len(chunk) > maxBytes {
 			finished = true
 			done(nil, ErrBodyTooLarge)
+			if r.async == nil {
+				r.recycleSync()
+			}
 			return
 		}
 		if buf == nil && len(chunk) > 0 {
@@ -974,9 +1013,9 @@ func (a *Aborted) Load() bool {
 // Request backed by a snapshot copied into the AsyncCtx before the original
 // request was freed.
 //
-// Both modes expose the same accessors. The snapshot has fixed capacity
+// Both modes expose the same accessors. The shared snapshot has fixed capacity
 // per field (URL 256, query 512, params 64 each up to 8, headers 4 KB total);
-// anything past those caps is silently truncated.
+// requests past those caps are rejected with 431 before reaching user code.
 type Request struct {
 	inner requestNative
 	snap  *requestSnapshot
@@ -999,10 +1038,11 @@ type Request struct {
 // (shared path) or by the sync wrapper before spawning a goroutine
 // (middleware fallback path).
 type requestSnapshot struct {
-	method  string
-	url     string
-	query   string
-	params  []string
+	method    string
+	url       string
+	query     string
+	params    []string
+	truncated bool
 	// headers is the raw "name\0value\0name\0value\0..." buffer captured from
 	// C++; we parse on access rather than building a map up front so the hot
 	// path stays allocation-light when headers aren't read.
@@ -1118,6 +1158,14 @@ func (r *Request) QueryParam(name string) string {
 		return parseSingleQueryParam(r.snap.query, name)
 	}
 	return r.inner.queryParam(name)
+}
+
+// Truncated reports whether an async request snapshot exceeded one of gogo's
+// fixed capture buffers. The shared fast path rejects truncated requests before
+// invoking handlers; this remains useful for diagnostics and future snapshot
+// paths.
+func (r *Request) Truncated() bool {
+	return r.snap != nil && r.snap.truncated
 }
 
 // lookupHeader scans the raw "name\0value\0..." buffer for a matching key.

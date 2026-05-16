@@ -55,8 +55,9 @@
 // All async handlers receive a *Request snapshot (URL/method/query/params/
 // headers all captured before uWS freed the live request). Snapshot caps in
 // the zero-cgo shared path: URL 256, query 512, params 8x64, headers 4 KB
-// total. The middleware/PostAsync paths copy headers exactly via cgo so
-// they have no cap.
+// total; requests that exceed those caps are rejected with 431 rather than
+// being silently truncated. The middleware/PostAsync paths copy headers exactly
+// via cgo so they have no cap.
 //
 // # Responses
 //
@@ -67,6 +68,7 @@
 //     inline buffers and pushed onto the App's response ring; the loop
 //     drains it.
 //   - Async handler with body > 8 KB: cgo Loop::defer falls back.
+//
 // res.JSON wraps Send with json.Marshal and Content-Type: application/json.
 //
 // # Middleware
@@ -153,7 +155,7 @@
 //     not framework.
 //   - statusLine for common HTTP codes (200/201/204/3xx/4xx/5xx) is
 //     precomputed and zero-alloc.
-//   - PanicHandler (see SetPanicHandler) catches handler panics in the
-//     shared-dispatch worker, emits a best-effort 500, and keeps the worker
-//     alive.
+//   - PanicHandler (see SetPanicHandler) catches handler panics across HTTP,
+//     async, WebSocket, defer, and body callbacks, emits a best-effort 500
+//     where an HTTP response is still available, and keeps the server alive.
 package gogo

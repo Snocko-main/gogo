@@ -387,6 +387,7 @@ struct AsyncCtx {
     uint32_t query_len = 0;
     uint32_t param_count = 0;
     uint32_t headers_len = 0;
+    uint32_t truncated = 0;
     uint32_t param_lens[SNAP_PARAM_MAX] = {0};
     char method[SNAP_METHOD_CAP];
     char url[SNAP_URL_CAP];
@@ -511,6 +512,7 @@ extern "C" void uwsgo_shared_layout(uwsgo_shared_layout_t *out) {
     out->ctx_query_len_offset = offsetof(AsyncCtx, query_len);
     out->ctx_param_count_offset = offsetof(AsyncCtx, param_count);
     out->ctx_headers_len_offset = offsetof(AsyncCtx, headers_len);
+    out->ctx_truncated_offset = offsetof(AsyncCtx, truncated);
     out->ctx_param_lens_offset = offsetof(AsyncCtx, param_lens);
     out->ctx_method_offset = offsetof(AsyncCtx, method);
     out->ctx_url_offset = offsetof(AsyncCtx, url);
@@ -534,9 +536,11 @@ extern "C" void uwsgo_shared_layout(uwsgo_shared_layout_t *out) {
 // AsyncCtx so the async goroutine can read them after uWS frees the request.
 // Anything that doesn't fit the fixed buffers is truncated.
 static void snapshot_request(AsyncCtx *ctx, uWS::HttpRequest *req) {
-    auto copy_view = [](char *dst, size_t cap, std::string_view src) -> uint32_t {
+    bool truncated = false;
+    auto copy_view = [&truncated](char *dst, size_t cap, std::string_view src) -> uint32_t {
         size_t n = std::min(cap, src.size());
         if (n > 0) std::memcpy(dst, src.data(), n);
+        if (src.size() > cap) truncated = true;
         return static_cast<uint32_t>(n);
     };
 
@@ -553,6 +557,7 @@ static void snapshot_request(AsyncCtx *ctx, uWS::HttpRequest *req) {
         ctx->param_lens[i] = copy_view(ctx->params[i], SNAP_PARAM_CAP, v);
         param_count = i + 1;
     }
+    if (!req->getParameter(SNAP_PARAM_MAX).empty()) truncated = true;
     ctx->param_count = param_count;
 
     // Headers: encode as "name\0value\0..." back-to-back. Stop when the next
@@ -563,7 +568,10 @@ static void snapshot_request(AsyncCtx *ctx, uWS::HttpRequest *req) {
         std::string_view name = kv.first;
         std::string_view value = kv.second;
         size_t need = name.size() + 1 + value.size() + 1;
-        if (hpos + need > SNAP_HEADERS_CAP) break;
+        if (hpos + need > SNAP_HEADERS_CAP) {
+            truncated = true;
+            break;
+        }
         std::memcpy(ctx->headers + hpos, name.data(), name.size());
         hpos += name.size();
         ctx->headers[hpos++] = '\0';
@@ -572,10 +580,28 @@ static void snapshot_request(AsyncCtx *ctx, uWS::HttpRequest *req) {
         ctx->headers[hpos++] = '\0';
     }
     ctx->headers_len = hpos;
+    ctx->truncated = truncated ? 1 : 0;
 }
 
 extern "C" void uwsgo_app_get_shared(uwsgo_app_t *app, const char *pattern, uint32_t handler_id) {
     app->app->get(pattern, [app, handler_id](auto *res, auto *req) {
+        auto *ctx = new AsyncCtx;
+        ctx->response = res;
+        ctx->loop = uWS::Loop::get();
+        ctx->pending_ring = app->pending_ring;
+        ctx->handler_id = handler_id;
+        // Snapshot before any cgo / Go work — uWS HttpRequest is live only
+        // inside this lambda. Reject oversized snapshots instead of handing
+        // security-sensitive middleware silently truncated request data.
+        snapshot_request(ctx, req);
+        if (ctx->truncated) {
+            ctx->release();
+            res->writeStatus("431 Request Header Fields Too Large");
+            res->writeHeader("Content-Type", "text/plain; charset=utf-8");
+            res->end("Request snapshot too large\n");
+            return;
+        }
+
         // CAS-based bounded MPMC enqueue. If the ring is full (next slot's
         // sequence is behind our intended position), we reject the request
         // with 503 instead of spinning — that would block the loop thread.
@@ -590,14 +616,6 @@ extern "C" void uwsgo_app_get_shared(uwsgo_app_t *app, const char *pattern, uint
                         tail, tail + 1,
                         std::memory_order_relaxed,
                         std::memory_order_relaxed)) {
-                    auto *ctx = new AsyncCtx;
-                    ctx->response = res;
-                    ctx->loop = uWS::Loop::get();
-                    ctx->pending_ring = app->pending_ring;
-                    ctx->handler_id = handler_id;
-                    // Snapshot before any cgo / Go work — uWS HttpRequest is
-                    // live only inside this lambda.
-                    snapshot_request(ctx, req);
                     res->onAborted([hold = CtxHold(ctx)]() {
                         hold.ctx->aborted.store(1, std::memory_order_release);
                     });
@@ -608,6 +626,7 @@ extern "C" void uwsgo_app_get_shared(uwsgo_app_t *app, const char *pattern, uint
                 // CAS lost; retry with new tail (already updated by CAS).
             } else if (diff < 0) {
                 // Ring is full — consumer is RING_SIZE slots behind. Reject.
+                ctx->release();
                 res->writeStatus("503 Service Unavailable");
                 res->writeHeader("Content-Type", "text/plain; charset=utf-8");
                 res->end("Server overloaded\n");
@@ -619,6 +638,7 @@ extern "C" void uwsgo_app_get_shared(uwsgo_app_t *app, const char *pattern, uint
             // Defensive cap: huge contention shouldn't happen, but bail out
             // before the loop thread is locked indefinitely.
             if (spin > 100000) {
+                ctx->release();
                 res->writeStatus("503 Service Unavailable");
                 res->writeHeader("Content-Type", "text/plain; charset=utf-8");
                 res->end("Enqueue contention\n");

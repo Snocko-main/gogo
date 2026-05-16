@@ -17,36 +17,36 @@ func newAppNative() (appNative, error) {
 }
 
 func (appNative) get(string, Handler)                      {}
-func (appNative) getStatic(string, string, string, string)  {}
-func (appNative) getShared(string, AsyncHandler)            {}
-func (appNative) post(string, Handler)                {}
-func (appNative) any(string, Handler)                 {}
-func (appNative) websocket(string, WebSocketBehavior) {}
-func (appNative) listen(int) bool                     { return false }
-func (appNative) run()                                {}
-func (appNative) stop()                               {}
-func (appNative) close()                              {}
+func (appNative) getStatic(string, string, string, string) {}
+func (appNative) getShared(string, AsyncHandler)           {}
+func (appNative) post(string, Handler)                     {}
+func (appNative) any(string, Handler)                      {}
+func (appNative) websocket(string, WebSocketBehavior)      {}
+func (appNative) listen(int) bool                          { return false }
+func (appNative) run()                                     {}
+func (appNative) stop()                                    {}
+func (appNative) close()                                   {}
 
-func (responseNative) status(string)             {}
-func (responseNative) header(string, string)     {}
-func (responseNative) write(string)              {}
-func (responseNative) end(string)                {}
+func (responseNative) status(string)               {}
+func (responseNative) header(string, string)       {}
+func (responseNative) write(string)                {}
+func (responseNative) end(string)                  {}
 func (responseNative) send(string, string, string) {}
-func (responseNative) loop() loopNative      { return loopNative{} }
-func (responseNative) onAborted(*Aborted)    {}
-func (responseNative) cork(func())           {}
-func (responseNative) onData(func([]byte, bool)) {}
+func (responseNative) loop() loopNative            { return loopNative{} }
+func (responseNative) onAborted(any)               {}
+func (responseNative) cork(func())                 {}
+func (responseNative) onData(func([]byte, bool))   {}
 
 func (loopNative) defer_(func()) {}
 
-func (appNative) startSharedDrain(int) {}
-func initSharedLayout()                {}
+func (appNative) startSharedDrain(int)                     {}
+func initSharedLayout()                                    {}
 func asyncSendShared(uintptr, string, string, string) bool { return false }
 
 func (responseNative) beginAsync() (uintptr, uintptr) { return 0, 0 }
 
 func asyncDeferSend(uintptr, uintptr, string, string, string) {}
-func asyncCtxRelease(uintptr)                              {}
+func asyncCtxRelease(uintptr)                                 {}
 
 func (requestNative) method() string           { return "" }
 func (requestNative) url() string              { return "" }

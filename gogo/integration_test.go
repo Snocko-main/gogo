@@ -228,6 +228,73 @@ func TestPanicRecoveryInSharedHandler(t *testing.T) {
 	}
 }
 
+func TestPanicRecoveryInSyncHandler(t *testing.T) {
+	var panicked atomic.Int32
+	gogo.SetPanicHandler(func(recovered any) {
+		panicked.Add(1)
+	})
+	defer gogo.SetPanicHandler(nil)
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/boom", func(res *gogo.Response, req *gogo.Request) {
+			panic("sync kaboom")
+		})
+		app.Get("/ok", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "still alive")
+		})
+	})
+	defer teardown()
+
+	status, body := httpGet(t, port, "/boom")
+	if status != 500 || !strings.Contains(body, "Internal Server Error") {
+		t.Fatalf("expected 500 after sync panic, got %d %q", status, body)
+	}
+	if panicked.Load() != 1 {
+		t.Fatalf("panic handler not called, got %d", panicked.Load())
+	}
+
+	status, body = httpGet(t, port, "/ok")
+	if status != 200 || body != "still alive" {
+		t.Fatalf("server died after sync panic; got %d %q", status, body)
+	}
+}
+
+func TestPanicRecoveryInAsyncFallbackHandler(t *testing.T) {
+	var panicked atomic.Int32
+	gogo.SetPanicHandler(func(recovered any) {
+		panicked.Add(1)
+	})
+	defer gogo.SetPanicHandler(nil)
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use("/api/*", func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				next(res, req)
+			}
+		})
+		app.GetAsync("/api/boom", func(res *gogo.Response, req *gogo.Request) {
+			panic("async fallback kaboom")
+		})
+		app.GetAsync("/api/ok", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "still alive")
+		})
+	})
+	defer teardown()
+
+	status, body := httpGet(t, port, "/api/boom")
+	if status != 500 || !strings.Contains(body, "Internal Server Error") {
+		t.Fatalf("expected 500 after async fallback panic, got %d %q", status, body)
+	}
+	if panicked.Load() != 1 {
+		t.Fatalf("panic handler not called, got %d", panicked.Load())
+	}
+
+	status, body = httpGet(t, port, "/api/ok")
+	if status != 200 || body != "still alive" {
+		t.Fatalf("server died after async fallback panic; got %d %q", status, body)
+	}
+}
+
 func TestConcurrentLoad(t *testing.T) {
 	// Stress the shared-dispatch + worker pool to flush out races.
 	port, teardown := startApp(t, func(app *gogo.App) {
@@ -810,7 +877,10 @@ func TestMiddlewarePathScopedGetAsyncFastPath(t *testing.T) {
 // flow: a blocking "lookup" runs on the goroutine, sets a Local, and the
 // handler reads it back. Shared dispatch path (no sync middleware).
 func TestAsyncMiddlewareLoadsUser(t *testing.T) {
-	type user struct{ ID int; Name string }
+	type user struct {
+		ID   int
+		Name string
+	}
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.UseAsync("/api/*", func(next gogo.AsyncHandler) gogo.AsyncHandler {
 			return func(res *gogo.Response, req *gogo.Request) {
@@ -1306,10 +1376,8 @@ func TestSetCookieRejectsBadValue(t *testing.T) {
 }
 
 func TestSnapshotBoundaries(t *testing.T) {
-	// The C++ snapshot has fixed caps per field. Verify oversized URL/query/
-	// params are silently truncated instead of crashing. Note: uWS itself
-	// rejects requests with very large headers at the HTTP parse stage, so
-	// we don't fuzz the header buffer cap here — uWS guards that path.
+	// The C++ snapshot has fixed caps per field. Oversized snapshots are
+	// rejected instead of silently truncating security-sensitive request data.
 	// Caps mirror SNAP_* constants in uws_bridge.cpp: URL=256, QUERY=512,
 	// PARAM=64 each.
 	port, teardown := startApp(t, func(app *gogo.App) {
@@ -1332,30 +1400,14 @@ func TestSnapshotBoundaries(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
-	}
-
-	var lens struct{ URLLen, QueryLen, ParamLen int }
-	if err := json.Unmarshal(body, &lens); err != nil {
-		t.Fatalf("unmarshal: %v body=%s", err, body)
-	}
-	// URL: "/echo/" + 200 'p' = 206 bytes, fits within 256 — no truncation.
-	if lens.URLLen != len("/echo/")+200 {
-		t.Errorf("URL len=%d, want %d", lens.URLLen, len("/echo/")+200)
-	}
-	// Query: "k=" + 600 'v' = 602 bytes, expect truncation at QUERY_CAP=512.
-	if lens.QueryLen != 512 {
-		t.Errorf("query truncated to %d, want 512", lens.QueryLen)
-	}
-	// Param: 200 'p', expect truncation at PARAM_CAP=64.
-	if lens.ParamLen != 64 {
-		t.Errorf("param truncated to %d, want 64", lens.ParamLen)
+	if resp.StatusCode != 431 || !strings.Contains(string(body), "snapshot too large") {
+		t.Fatalf("oversized snapshot: got %d %q, want 431", resp.StatusCode, body)
 	}
 }
 
 func TestSnapshotURLTruncation(t *testing.T) {
-	// URL that exceeds URL_CAP=256 — uWS allows long paths, snapshot truncates.
+	// URL that exceeds URL_CAP=256 — uWS allows long paths, gogo rejects before
+	// dispatching the async handler.
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.GetAsync("/long/:p", func(res *gogo.Response, req *gogo.Request) {
 			res.Send(200, "text/plain", fmt.Sprintf("urlLen=%d", len(req.URL())))
@@ -1371,8 +1423,8 @@ func TestSnapshotURLTruncation(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if string(body) != "urlLen=256" {
-		t.Fatalf("got %q, want urlLen=256", body)
+	if resp.StatusCode != 431 || !strings.Contains(string(body), "snapshot too large") {
+		t.Fatalf("long URL: got %d %q, want 431", resp.StatusCode, body)
 	}
 }
 
@@ -1484,6 +1536,37 @@ func TestClientAbortDuringAsync(t *testing.T) {
 	}
 	if handlerDone.Load() < int32(n) {
 		t.Errorf("only %d/%d handlers finished — possible deadlock or crash", handlerDone.Load(), n)
+	}
+}
+
+func TestClientAbortDuringPostBodyThenServerContinues(t *testing.T) {
+	var completed atomic.Int32
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.PostAsync("/upload", 1024*1024, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			completed.Add(1)
+			res.Send(200, "text/plain", fmt.Sprintf("got %d", len(body)))
+		})
+	})
+	defer teardown()
+
+	const aborted = 20
+	for i := 0; i < aborted; i++ {
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), time.Second)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		fmt.Fprintf(conn, "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 100000\r\nConnection: close\r\n\r\npartial")
+		conn.Close()
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	if completed.Load() != 0 {
+		t.Fatalf("aborted uploads reached handler: %d", completed.Load())
+	}
+
+	status, body := httpPost(t, port, "/upload", "text/plain", []byte("hello"))
+	if status != 200 || body != "got 5" {
+		t.Fatalf("server did not continue after aborted uploads: got %d %q", status, body)
 	}
 }
 
