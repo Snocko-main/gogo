@@ -1467,28 +1467,37 @@ type Request struct {
 	// the map is reused) when the Request returns to the pool.
 	locals map[string]any
 
-	// sync{Method,URL,Query}{Ptr,Len} point at uWS-parsed bytes inside
-	// the live HttpRequest. The C++ bridge fills them at handler entry
-	// so Request.{Method,URL,Query} can materialize a Go string on first
-	// read without a cgo round-trip. The pointers are valid only for the
-	// lifetime of the sync callback; resetForPool clears them before the
-	// wrapper returns to the pool.
+	// sync{Method,URL,Query}{Ptr,Len} and syncParam{Ptrs,Lens} point at
+	// uWS-parsed bytes inside the live HttpRequest. The C++ bridge fills
+	// them at handler entry so Request's accessors can materialize a Go
+	// string on first read without a cgo round-trip. Pointers are valid
+	// only for the lifetime of the sync callback; resetForPool clears them
+	// before the wrapper returns to the pool.
+	//
+	// Only the first four route parameters are pre-cached; reads past
+	// index 3 fall through to the cgo Parameter helper. Real routes
+	// rarely exceed that.
 	syncMethodPtr unsafe.Pointer
 	syncMethodLen int
 	syncURLPtr    unsafe.Pointer
 	syncURLLen    int
 	syncQueryPtr  unsafe.Pointer
 	syncQueryLen  int
+	syncParamPtrs [4]unsafe.Pointer
+	syncParamLens [4]int
 
-	// cached{URL,Method,Query} hold the materialized Go strings allocated
-	// lazily on the first accessor call. The {field}Cached bool lets the
-	// empty string be a valid cache value without re-materializing.
-	cachedURL    string
-	urlCached    bool
-	cachedMethod string
-	methodCached bool
-	cachedQuery  string
-	queryCached  bool
+	// cached{URL,Method,Query,Params} hold the materialized Go strings
+	// allocated lazily on the first accessor call. The corresponding
+	// *Cached field is true once the cache slot is valid (the empty
+	// string is a legitimate cached value).
+	cachedURL          string
+	urlCached          bool
+	cachedMethod       string
+	methodCached       bool
+	cachedQuery        string
+	queryCached        bool
+	cachedParams       [4]string
+	paramCached        [4]bool
 }
 
 // requestSnapshot holds the Go-side captured copy of an HttpRequest, used by
@@ -1552,12 +1561,16 @@ func (r *Request) resetForPool() {
 	r.syncURLLen = 0
 	r.syncQueryPtr = nil
 	r.syncQueryLen = 0
+	r.syncParamPtrs = [4]unsafe.Pointer{}
+	r.syncParamLens = [4]int{}
 	r.cachedURL = ""
 	r.urlCached = false
 	r.cachedMethod = ""
 	r.methodCached = false
 	r.cachedQuery = ""
 	r.queryCached = false
+	r.cachedParams = [4]string{}
+	r.paramCached = [4]bool{}
 	for k := range r.locals {
 		delete(r.locals, k)
 	}
@@ -1624,7 +1637,10 @@ func (r *Request) Header(name string) string {
 }
 
 // Parameter returns a route parameter by index. Returns "" for negative or
-// out-of-range indices. Snapshot mode caps at 8 parameters.
+// out-of-range indices. Snapshot mode caps at 8 parameters; sync mode
+// caches indices 0..3 inline (the bridge pre-fills them at handler entry
+// — no cgo on first read) and falls back to the cgo getParameter helper
+// for indices 4+.
 func (r *Request) Parameter(index int) string {
 	if index < 0 {
 		return ""
@@ -1634,6 +1650,13 @@ func (r *Request) Parameter(index int) string {
 			return ""
 		}
 		return r.snap.params[index]
+	}
+	if index < 4 {
+		if !r.paramCached[index] {
+			r.cachedParams[index] = goStringFromC(r.syncParamPtrs[index], r.syncParamLens[index])
+			r.paramCached[index] = true
+		}
+		return r.cachedParams[index]
 	}
 	return r.inner.parameter(index)
 }

@@ -783,23 +783,35 @@ func (ws websocketNative) end(code int, message string) {
 func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req_t,
 	methodPtr *C.char, methodLen C.size_t,
 	urlPtr *C.char, urlLen C.size_t,
-	queryPtr *C.char, queryLen C.size_t) {
+	queryPtr *C.char, queryLen C.size_t,
+	p0Ptr *C.char, p0Len C.size_t,
+	p1Ptr *C.char, p1Len C.size_t,
+	p2Ptr *C.char, p2Len C.size_t,
+	p3Ptr *C.char, p3Len C.size_t) {
 	handle := cgo.Handle(handlerID)
 	handler := handle.Value().(Handler)
 
 	reqWrap := requestPool.Get().(*Request)
 	reqWrap.inner = requestNative{ptr: req}
-	// uWS already had method / URL / query parsed; C++ passes the
-	// std::string_view pointers into uWS's request buffer so Request's
-	// accessors can materialize lazily without a cgo round-trip. The
-	// pointers are valid for the lifetime of this callback (= the
-	// lifetime of reqWrap before it returns to the pool).
+	// uWS already had method / URL / query / first 4 params parsed; C++
+	// passes the std::string_view pointers into uWS's request buffer so
+	// Request's accessors can materialize lazily without a cgo round-
+	// trip. The pointers are valid for the lifetime of this callback
+	// (= the lifetime of reqWrap before it returns to the pool).
 	reqWrap.syncMethodPtr = unsafe.Pointer(methodPtr)
 	reqWrap.syncMethodLen = int(methodLen)
 	reqWrap.syncURLPtr = unsafe.Pointer(urlPtr)
 	reqWrap.syncURLLen = int(urlLen)
 	reqWrap.syncQueryPtr = unsafe.Pointer(queryPtr)
 	reqWrap.syncQueryLen = int(queryLen)
+	reqWrap.syncParamPtrs[0] = unsafe.Pointer(p0Ptr)
+	reqWrap.syncParamLens[0] = int(p0Len)
+	reqWrap.syncParamPtrs[1] = unsafe.Pointer(p1Ptr)
+	reqWrap.syncParamLens[1] = int(p1Len)
+	reqWrap.syncParamPtrs[2] = unsafe.Pointer(p2Ptr)
+	reqWrap.syncParamLens[2] = int(p2Len)
+	reqWrap.syncParamPtrs[3] = unsafe.Pointer(p3Ptr)
+	reqWrap.syncParamLens[3] = int(p3Len)
 
 	resWrap := responsePool.Get().(*Response)
 	resWrap.inner = responseNative{ptr: res}

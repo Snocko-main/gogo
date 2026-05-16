@@ -18,7 +18,11 @@
 extern "C" void uwsgoHandleHTTP(uintptr_t handler_id, uwsgo_res_t *res, uwsgo_req_t *req,
     const char *method, size_t method_len,
     const char *url, size_t url_len,
-    const char *query, size_t query_len);
+    const char *query, size_t query_len,
+    const char *p0, size_t p0_len,
+    const char *p1, size_t p1_len,
+    const char *p2, size_t p2_len,
+    const char *p3, size_t p3_len);
 extern "C" void uwsgoHandleWSOpen(uintptr_t handler_id, uwsgo_ws_t *ws);
 extern "C" void uwsgoHandleWSMessage(uintptr_t handler_id, uwsgo_ws_t *ws, const char *message, size_t message_len, int opcode);
 extern "C" void uwsgoHandleWSClose(uintptr_t handler_id, uwsgo_ws_t *ws, int code, const char *message, size_t message_len);
@@ -156,23 +160,35 @@ extern "C" void uwsgo_app_free(uwsgo_app_t *app) {
     delete app;
 }
 
-// dispatch_sync invokes uwsgoHandleHTTP with method / URL / query already
-// pulled out of the uWS request. uWS keeps these as std::string_view
-// pointers into its own request buffer; the buffer is alive for the
-// duration of the C++ callback, which is exactly the lifetime of the Go
-// Request wrapper, so passing the raw (data, len) pairs to Go is safe
-// and lets Request.{Method,URL,Query} materialize lazily without a cgo
-// round-trip back into uWS.
+// dispatch_sync invokes uwsgoHandleHTTP with method / URL / query / the
+// first four route parameters already pulled out of the uWS request.
+// uWS keeps these as std::string_view pointers into its own request
+// buffer; the buffer is alive for the duration of the C++ callback,
+// which is exactly the lifetime of the Go Request wrapper, so passing
+// the raw (data, len) pairs to Go is safe and lets Request's accessors
+// materialize lazily without a cgo round-trip back into uWS.
+//
+// Four params covers the realistic ceiling — uWS itself supports more,
+// but routes with more than four named params are extremely rare. Reads
+// past index 3 fall through to the cgo getParameter helper.
 static inline void dispatch_sync(uintptr_t handler_id, uWS::HttpResponse<false> *res, uWS::HttpRequest *req) {
     auto method = req->getMethod();
     auto url = req->getUrl();
     auto query = req->getQuery();
+    auto p0 = req->getParameter(0);
+    auto p1 = req->getParameter(1);
+    auto p2 = req->getParameter(2);
+    auto p3 = req->getParameter(3);
     uwsgoHandleHTTP(handler_id,
         reinterpret_cast<uwsgo_res_t *>(res),
         reinterpret_cast<uwsgo_req_t *>(req),
         method.data(), method.size(),
         url.data(), url.size(),
-        query.data(), query.size());
+        query.data(), query.size(),
+        p0.data(), p0.size(),
+        p1.data(), p1.size(),
+        p2.data(), p2.size(),
+        p3.data(), p3.size());
 }
 
 extern "C" void uwsgo_app_get(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id) {
