@@ -563,13 +563,18 @@ func asyncSendShared(ctxHandle uintptr, statusLine, contentType, body string) bo
 	*(*uint32)(unsafe.Pointer(ctxHandle + shared.ctxCtLenOff)) = uint32(len(contentType))
 	*(*uint32)(unsafe.Pointer(ctxHandle + shared.ctxBodyLenOff)) = uint32(len(body))
 
-	// Read the App-specific pending ring this ctx targets. C++ stamps it
-	// onto the ctx at request-arrival time so multiple App instances each
-	// route responses to their own loop.
+	// Read the App-specific pending ring AND loop pointer this ctx targets
+	// BEFORE publishing the ctx onto the ring. C++ stamps both fields onto
+	// the ctx at request-arrival time and they don't change for the life of
+	// the ctx, so reading them now is fine — but the moment we publish (the
+	// seqAddr.Store below), the loop-thread consumer is free to drain the
+	// slot, send the response, and release the ctx. Any read off ctx after
+	// publish is a use-after-free hazard.
 	ringPtr := *(*uintptr)(unsafe.Pointer(ctxHandle + shared.ctxPendingRingOff))
 	if ringPtr == 0 {
 		return false
 	}
+	loopPtr := *(*uintptr)(unsafe.Pointer(ctxHandle + shared.ctxLoopOff))
 
 	// MPSC enqueue: claim a ready slot with CAS. If the response ring is full
 	// or heavily contended, return false so the caller can fall back to
@@ -608,9 +613,8 @@ claimed:
 	*(*uintptr)(unsafe.Pointer(slotBase + shared.slotCtxOffset)) = ctxHandle
 	seqAddr.Store(tail + 1)
 
-	// Wake the App's loop so it drains the ring immediately, passing the
-	// specific ring pointer so the drain runs on the right App's data.
-	loopPtr := *(*uintptr)(unsafe.Pointer(ctxHandle + shared.ctxLoopOff))
+	// Ctx is now owned by the consumer — do NOT touch it again. Use the
+	// cached loopPtr to wake the drain.
 	if loopPtr != 0 {
 		C.uwsgo_wake_drain(
 			(*C.uwsgo_loop_t)(unsafe.Pointer(loopPtr)),
