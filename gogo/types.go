@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -91,20 +93,38 @@ var (
 // PanicHandler is invoked when user code panics inside an HTTP, async,
 // WebSocket, defer, or body callback. HTTP paths emit a best-effort 500 when a
 // response is still available. The argument is the recovered value (the panic
-// payload). Setting a panic handler is optional; without one panics are
-// silently caught.
+// payload).
+//
+// The framework ships a default handler that prints the panic value plus a
+// goroutine stack trace to stderr, so production deployments never have a
+// panic disappear silently. Call SetPanicHandler with a custom function to
+// route panics elsewhere (structured logger, error tracker), or pass nil
+// to restore the default.
 type PanicHandler func(recovered any)
 
 var (
 	panicHandlerMu sync.RWMutex
-	panicHandlerFn PanicHandler
+	panicHandlerFn PanicHandler = defaultPanicHandler
 )
 
-// SetPanicHandler registers fn as the global panic handler. Pass nil to clear.
-// The handler must not panic itself.
+// defaultPanicHandler writes the recovered value and a goroutine stack
+// trace to stderr. Matches the format Go's runtime uses for unrecovered
+// panics so operators have something familiar to grep for.
+func defaultPanicHandler(recovered any) {
+	fmt.Fprintf(os.Stderr, "gogo: recovered panic: %v\n%s\n",
+		recovered, debug.Stack())
+}
+
+// SetPanicHandler registers fn as the global panic handler. Pass nil to
+// restore the default stderr logger. The handler must not panic itself
+// (any panic inside it is recovered silently).
 func SetPanicHandler(fn PanicHandler) {
 	panicHandlerMu.Lock()
-	panicHandlerFn = fn
+	if fn == nil {
+		panicHandlerFn = defaultPanicHandler
+	} else {
+		panicHandlerFn = fn
+	}
 	panicHandlerMu.Unlock()
 }
 
