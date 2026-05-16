@@ -520,6 +520,9 @@ func (a *App) Get(pattern string, target any) {
 		if code == 0 {
 			code = 200
 		}
+		if v.ContentType != "" {
+			validateHeaderValue("Content-Type", v.ContentType)
+		}
 		a.inner.getStatic(pattern, statusLine(code), v.ContentType, v.Body)
 	case string:
 		a.inner.getStatic(pattern, statusLine(200), "", v)
@@ -754,6 +757,9 @@ func (r *Router) Get(pattern string, target any) {
 		code := v.Status
 		if code == 0 {
 			code = 200
+		}
+		if v.ContentType != "" {
+			validateHeaderValue("Content-Type", v.ContentType)
 		}
 		if !r.hasGroupOrAppMW(full) {
 			r.app.inner.getStatic(full, statusLine(code), v.ContentType, v.Body)
@@ -1127,14 +1133,17 @@ func (r *Response) Send(code int, contentType, body string) {
 }
 
 // JSON marshals v and sends it with Content-Type: application/json. If
-// marshalling fails the response is replaced with 500 and the marshal error
-// is written as plain text — json.Marshal only fails for unsupported value
-// shapes (channels, functions, cyclic structures), which are programming
-// errors the caller should fix.
+// marshalling fails the response is replaced with a generic 500 and the
+// underlying marshal error is reported through the panic handler so the
+// programmer sees it server-side without leaking type / package names to
+// the network. json.Marshal only fails for unsupported value shapes
+// (channels, functions, cyclic structures), so failures here always
+// indicate a bug in caller code.
 func (r *Response) JSON(code int, v any) {
 	data, err := json.Marshal(v)
 	if err != nil {
-		r.Send(500, "text/plain; charset=utf-8", "json marshal error: "+err.Error())
+		reportPanic(fmt.Errorf("gogo: JSON marshal: %w", err))
+		r.Send(500, "text/plain; charset=utf-8", "Internal Server Error\n")
 		return
 	}
 	r.Send(code, "application/json", string(data))
@@ -1634,7 +1643,9 @@ func (r *Request) Cookie(name string) string {
 }
 
 // parseCookieValue scans a Cookie header for a name=value pair. Pairs are
-// separated by ";" optionally followed by whitespace.
+// separated by ";" optionally followed by whitespace. Values surrounded by
+// a matched pair of ASCII double quotes are unquoted per RFC 6265 §5.2;
+// single quotes are not special.
 func parseCookieValue(header, name string) string {
 	for len(header) > 0 {
 		// Skip leading whitespace.
@@ -1655,7 +1666,11 @@ func parseCookieValue(header, name string) string {
 			continue
 		}
 		if pair[:eq] == name {
-			return pair[eq+1:]
+			v := pair[eq+1:]
+			if len(v) >= 2 && v[0] == '"' && v[len(v)-1] == '"' {
+				v = v[1 : len(v)-1]
+			}
+			return v
 		}
 	}
 	return ""

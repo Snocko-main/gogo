@@ -661,16 +661,30 @@ func (r requestNative) queryParam(name string) string {
 	})
 }
 
+// maxSyncHeadersBytes caps the buffer allocation for the sync-mode header
+// snapshot. Matches the SNAP_HEADERS_CAP that bounds the shared / async
+// path on the C++ side so callers see consistent behavior across modes.
+// uWS's own default request-buffer is ~8 KiB, so this is the natural
+// ceiling for header data we'd ever see in practice.
+const maxSyncHeadersBytes = 8 << 10
+
 // headersAll returns the request headers in the "name\0value\0..." format
 // used by requestSnapshot. Allocates and copies — only callable while the
-// uWS HttpRequest is still live.
+// uWS HttpRequest is still live. Returns the buffer truncated to
+// maxSyncHeadersBytes if uWS reports more bytes than that — the
+// readNativeString-style two-pass dance lets us pass the cap to C so the
+// second call writes only what fits.
 func (r requestNative) headersAll() []byte {
 	size := C.uwsgo_req_headers_all(r.ptr, nil, 0)
 	if size == 0 {
 		return nil
 	}
-	buf := make([]byte, int(size))
-	C.uwsgo_req_headers_all(r.ptr, (*C.char)(unsafe.Pointer(&buf[0])), size)
+	n := int(size)
+	if n > maxSyncHeadersBytes {
+		n = maxSyncHeadersBytes
+	}
+	buf := make([]byte, n)
+	C.uwsgo_req_headers_all(r.ptr, (*C.char)(unsafe.Pointer(&buf[0])), C.size_t(n))
 	return buf
 }
 
