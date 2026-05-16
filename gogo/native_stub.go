@@ -27,7 +27,8 @@ func (appNative) getShared(string, AsyncHandler)           {}
 func (appNative) post(string, Handler)                     {}
 func (appNative) any(string, Handler)                      {}
 func (appNative) websocket(string, WebSocketBehavior)      {}
-func (appNative) listen(int) bool                          { return false }
+func (appNative) listen(string, int) bool                  { return false }
+func (appNative) setBodyLimit(int)                         {}
 func (appNative) run()                                     {}
 func (appNative) stop()                                    {}
 func (appNative) close()                                   {}

@@ -16,6 +16,14 @@ typedef struct uwsgo_loop_t uwsgo_loop_t;
 uwsgo_app_t *uwsgo_app_new(void);
 void uwsgo_app_free(uwsgo_app_t *app);
 
+// uwsgo_app_set_body_limit sets the maximum body bytes a Post / Any route
+// will accept. uWS evaluates the Content-Length header at request arrival
+// and rejects with 413 before dispatching to Go when the declared length
+// exceeds the limit. Chunked requests with no Content-Length bypass this
+// check; handlers that accept chunked uploads should call res.Body(maxN,
+// ...) themselves for protection. Pass 0 to disable.
+void uwsgo_app_set_body_limit(uwsgo_app_t *app, size_t limit);
+
 void uwsgo_app_get(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);
 void uwsgo_app_post(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);
 void uwsgo_app_any(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);
@@ -30,7 +38,9 @@ void uwsgo_app_get_static(uwsgo_app_t *app, const char *pattern,
     const char *content_type, size_t content_type_len,
     const char *body, size_t body_len);
 
-int uwsgo_app_listen(uwsgo_app_t *app, int port);
+// uwsgo_app_listen binds the app to host:port. Pass NULL or "" for host
+// to keep uWS's default behavior (all interfaces, 0.0.0.0).
+int uwsgo_app_listen(uwsgo_app_t *app, const char *host, int port);
 void uwsgo_app_run(uwsgo_app_t *app);
 void uwsgo_app_stop(uwsgo_app_t *app);
 

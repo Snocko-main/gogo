@@ -221,21 +221,61 @@ type asyncMiddlewareEntry struct {
 	mw     AsyncMiddleware
 }
 
+// Config tunes per-App behavior. All fields are optional; the zero value
+// is a safe production default. Pass to NewApp; values are applied at
+// app creation and bind time. The struct is intentionally narrow — knobs
+// only get added here when they need a single, app-wide value.
+type Config struct {
+	// BodyLimit caps the request-body bytes a Post / Any route will
+	// accept. The framework rejects oversized requests with 413 at
+	// arrival by checking the Content-Length header on the C++ side
+	// before dispatching to Go — zero per-request cost beyond the
+	// existing header lookup. Chunked transfer-encoded requests with
+	// no Content-Length bypass this check; handlers that accept those
+	// must call res.Body(maxN, ...) for protection. Set to 0 to
+	// disable. Default 4 MiB.
+	BodyLimit int
+
+	// BindAddr is the local interface to bind on. Empty string means
+	// "all interfaces" (uWS default 0.0.0.0). Use "127.0.0.1" for a
+	// localhost-only service. Applied at Listen time.
+	BindAddr string
+}
+
 // App is a uWebSockets HTTP application.
 type App struct {
 	inner            appNative
 	middlewares      []middlewareEntry
 	asyncMiddlewares []asyncMiddlewareEntry
+	cfg              Config
 }
 
-// NewApp creates a non-TLS uWebSockets app.
-func NewApp() (*App, error) {
+// defaultConfig fills in safe production defaults for any zero Config
+// fields. Mutates and returns the input.
+func defaultConfig(c Config) Config {
+	if c.BodyLimit == 0 {
+		c.BodyLimit = 4 << 20 // 4 MiB
+	}
+	return c
+}
+
+// NewApp creates a non-TLS uWebSockets app. With no Config the app uses
+// safe production defaults; pass one Config to override (extra Configs
+// are ignored — variadic only for backward compat with the old zero-arg
+// signature).
+func NewApp(cfg ...Config) (*App, error) {
 	inner, err := newAppNative()
 	if err != nil {
 		return nil, err
 	}
 	initSharedLayout()
-	return &App{inner: inner}, nil
+	var c Config
+	if len(cfg) > 0 {
+		c = cfg[0]
+	}
+	c = defaultConfig(c)
+	inner.setBodyLimit(c.BodyLimit)
+	return &App{inner: inner, cfg: c}, nil
 }
 
 // Reply is a static response captured once at registration time. Routes
@@ -901,9 +941,11 @@ func (r *Router) WebSocket(pattern string, behavior WebSocketBehavior) {
 	r.app.inner.websocket(full, behavior)
 }
 
-// Listen binds the app to the given port and reports whether binding succeeded.
+// Listen binds the app to the given port and reports whether binding
+// succeeded. The bind interface comes from Config.BindAddr; an empty
+// BindAddr keeps the uWS default of all interfaces (0.0.0.0).
 func (a *App) Listen(port int) bool {
-	return a.inner.listen(port)
+	return a.inner.listen(a.cfg.BindAddr, port)
 }
 
 // Run starts the uWebSockets event loop and blocks. Before running, installs

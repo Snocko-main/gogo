@@ -322,8 +322,17 @@ func (a *appNative) prepareRoute(pattern string, handler Handler) (*C.char, cgo.
 	return cpattern, handle
 }
 
-func (a appNative) listen(port int) bool {
-	return C.uwsgo_app_listen(a.ptr, C.int(port)) != 0
+func (a appNative) listen(host string, port int) bool {
+	var chost *C.char
+	if host != "" {
+		chost = C.CString(host)
+		defer C.free(unsafe.Pointer(chost))
+	}
+	return C.uwsgo_app_listen(a.ptr, chost, C.int(port)) != 0
+}
+
+func (a appNative) setBodyLimit(limit int) {
+	C.uwsgo_app_set_body_limit(a.ptr, C.size_t(limit))
 }
 
 func (a appNative) run() {

@@ -110,6 +110,11 @@ struct uwsgo_app_t {
     // same process don't share state and don't contend on a global ring.
     PendingRing *pending_ring = nullptr;
     struct us_timer_t *drain_timer = nullptr;
+
+    // body_limit is enforced for Post / Any routes by checking the
+    // Content-Length header at request arrival before dispatching to Go.
+    // 0 disables the check.
+    size_t body_limit = 0;
 };
 
 static size_t copy_string_view(std::string_view value, char *buffer, size_t buffer_len) {
@@ -175,8 +180,33 @@ extern "C" void uwsgo_app_get_static(uwsgo_app_t *app, const char *pattern,
     });
 }
 
+// body_limit_rejects checks the declared Content-Length against the app's
+// body_limit and writes a 413 directly without dispatching to Go if it
+// exceeds. Returns true when the request was rejected. The check is
+// best-effort: requests with no Content-Length (chunked transfer) slip
+// through and must be policed by res.Body(maxN, ...) on the Go side.
+static bool body_limit_rejects(uwsgo_app_t *app, uWS::HttpResponse<false> *res, uWS::HttpRequest *req) {
+    if (app->body_limit == 0) return false;
+    auto cl = req->getHeader("content-length");
+    if (cl.empty()) return false;
+    // strtoull-style parse; if the header is malformed we conservatively
+    // reject too — clients that send junk Content-Length deserve a 400/413.
+    unsigned long long n = 0;
+    for (char c : cl) {
+        if (c < '0' || c > '9') { n = ~0ULL; break; }
+        n = n * 10 + static_cast<unsigned long long>(c - '0');
+        if (n > app->body_limit) break;
+    }
+    if (n <= app->body_limit) return false;
+    res->writeStatus("413 Payload Too Large");
+    res->writeHeader("Content-Type", "text/plain; charset=utf-8");
+    res->end("payload too large\n");
+    return true;
+}
+
 extern "C" void uwsgo_app_post(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id) {
-    app->app->post(pattern, [handler_id](auto *res, auto *req) {
+    app->app->post(pattern, [app, handler_id](auto *res, auto *req) {
+        if (body_limit_rejects(app, res, req)) return;
         auto url = req->getUrl();
         uwsgoHandleHTTP(handler_id,
             reinterpret_cast<uwsgo_res_t *>(res),
@@ -186,13 +216,18 @@ extern "C" void uwsgo_app_post(uwsgo_app_t *app, const char *pattern, uintptr_t 
 }
 
 extern "C" void uwsgo_app_any(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id) {
-    app->app->any(pattern, [handler_id](auto *res, auto *req) {
+    app->app->any(pattern, [app, handler_id](auto *res, auto *req) {
+        if (body_limit_rejects(app, res, req)) return;
         auto url = req->getUrl();
         uwsgoHandleHTTP(handler_id,
             reinterpret_cast<uwsgo_res_t *>(res),
             reinterpret_cast<uwsgo_req_t *>(req),
             url.data(), url.size());
     });
+}
+
+extern "C" void uwsgo_app_set_body_limit(uwsgo_app_t *app, size_t limit) {
+    app->body_limit = limit;
 }
 
 extern "C" void uwsgo_app_ws(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id) {
@@ -223,14 +258,17 @@ extern "C" void uwsgo_app_ws(uwsgo_app_t *app, const char *pattern, uintptr_t ha
     app->app->ws<uwsgo_ws_data_t>(pattern, std::move(behavior));
 }
 
-extern "C" int uwsgo_app_listen(uwsgo_app_t *app, int port) {
+extern "C" int uwsgo_app_listen(uwsgo_app_t *app, const char *host, int port) {
     bool ok = false;
-
-    app->app->listen(port, [&ok, app](auto *listen_socket) {
+    auto cb = [&ok, app](auto *listen_socket) {
         app->listen_socket = listen_socket;
         ok = listen_socket != nullptr;
-    });
-
+    };
+    if (host != nullptr && host[0] != '\0') {
+        app->app->listen(std::string(host), port, std::move(cb));
+    } else {
+        app->app->listen(port, std::move(cb));
+    }
     return ok ? 1 : 0;
 }
 
