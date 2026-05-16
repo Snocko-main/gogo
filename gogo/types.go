@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 )
 
 // commonStatusLines caches the formatted status line for codes likely to
@@ -228,22 +229,32 @@ type Reply struct {
 }
 
 // Use appends middleware to the chain. Each registered route that follows
-// this call wraps its handler in the current chain at registration time.
+// this call wraps its handler in the current chain.
 //
 // The first argument may optionally be a path pattern (string), scoping the
-// middleware to routes whose pattern starts with that prefix:
+// middleware to URLs that fall under that prefix at request time:
 //
 //	app.Use(authMW)                       // applies to every later route
-//	app.Use("/api/*", authMW)             // applies to routes under /api/
-//	app.Use("/admin", auditMW, rateMW)    // /admin and routes under /admin/
+//	app.Use("/api/*", authMW)             // applies to URLs under /api/
+//	app.Use("/admin", auditMW, rateMW)    // /admin and URLs under /admin/
 //
 // Trailing "/*" or "/**" on the prefix is stripped — "/api/*" and "/api"
 // mean the same thing (prefix = "/api"). A pattern of "/*" or "/" means
 // "every route" (equivalent to no pattern).
 //
+// Scoped Use matches the live request URL via req.URL(), not the route
+// pattern string. This makes it safe against parametric / wildcard routes
+// (e.g. Get("/api/:section") serving /api/admin will go through a
+// Use("/api/admin", auth) middleware). Cost: one URL string compare per
+// scoped entry per request — global Use (no prefix) still composes at
+// registration with zero per-request cost.
+//
+// Prefer App.Group(prefix, mws...) for scoping new code: Group binds
+// middleware by Router identity, so the chain composes at registration
+// time and matching is unambiguous without the per-request URL check.
+//
 // Middlewares run left-to-right — the first argument runs first (outermost).
-// Path matching happens once at route registration; per-request cost is
-// just the function calls of the matched chain. Safe to call multiple times.
+// Safe to call multiple times.
 func (a *App) Use(args ...any) {
 	if len(args) == 0 {
 		return
@@ -311,24 +322,76 @@ func mwMatches(prefix, routePattern string) bool {
 	return strings.HasPrefix(routePattern, prefix+"/")
 }
 
-// wrap composes registered middleware around h, including only entries whose
-// prefix matches routePattern. Outermost-first: the first matching middleware
-// registered runs first and wraps the next.
+// wrap composes registered middleware around h. Global middleware (prefix
+// == "") is wrapped at registration time with zero per-request cost. When
+// any path-scoped middleware is present, composition is deferred to request
+// time and matched against the live URL via req.URL() rather than the route
+// pattern string — this closes the bypass that pattern-string matching had
+// for dynamic / wildcard routes (e.g. Get("/api/:section") serving
+// /api/admin would not have triggered Use("/api/admin", auth) under the
+// old scheme because the literal strings "/api/:section" and "/api/admin"
+// do not share a prefix).
 func (a *App) wrap(routePattern string, h Handler) Handler {
-	for i := len(a.middlewares) - 1; i >= 0; i-- {
-		e := a.middlewares[i]
-		if mwMatches(e.prefix, routePattern) {
-			h = e.mw(h)
+	if len(a.middlewares) == 0 {
+		return h
+	}
+	hasScoped := false
+	for _, e := range a.middlewares {
+		if e.prefix != "" {
+			hasScoped = true
+			break
 		}
 	}
-	return h
+	if !hasScoped {
+		for i := len(a.middlewares) - 1; i >= 0; i-- {
+			h = a.middlewares[i].mw(h)
+		}
+		return h
+	}
+	entries := make([]middlewareEntry, len(a.middlewares))
+	copy(entries, a.middlewares)
+	inner := h
+	return func(res *Response, req *Request) {
+		url := req.URL()
+		chain := inner
+		for i := len(entries) - 1; i >= 0; i-- {
+			e := entries[i]
+			if e.prefix == "" || urlUnderPrefix(url, e.prefix) {
+				chain = e.mw(chain)
+			}
+		}
+		chain(res, req)
+	}
 }
 
-// hasMatchingMiddleware reports whether any registered sync middleware
-// applies to routePattern. Used by GetAsync to decide between the zero-cgo
-// shared path and the sync wrapper fallback.
+// urlUnderPrefix reports whether the request URL falls within the path
+// prefix scope: exact match or any path under "prefix/".
+func urlUnderPrefix(url, prefix string) bool {
+	if url == prefix {
+		return true
+	}
+	return strings.HasPrefix(url, prefix+"/")
+}
+
+// hasMatchingMiddleware reports whether any registered sync middleware could
+// apply to a request that uWS will route to routePattern. Used by GetAsync
+// to choose between the zero-cgo shared path and the sync wrapper fallback.
+//
+// Conservatively reports true when the pattern is dynamic (contains : or *)
+// and any scoped middleware exists, because the pattern string alone does
+// not tell us which URLs the route will actually serve.
 func (a *App) hasMatchingMiddleware(routePattern string) bool {
+	if len(a.middlewares) == 0 {
+		return false
+	}
+	dynamic := strings.ContainsAny(routePattern, ":*")
 	for _, e := range a.middlewares {
+		if e.prefix == "" {
+			return true
+		}
+		if dynamic {
+			return true
+		}
 		if mwMatches(e.prefix, routePattern) {
 			return true
 		}
@@ -343,11 +406,15 @@ func (a *App) hasMatchingMiddleware(routePattern string) bool {
 // Like Use, the first argument may optionally be a path pattern:
 //
 //	app.UseAsync(loadUserMW)                         // every async route
-//	app.UseAsync("/api/*", loadUserMW)               // routes under /api/
+//	app.UseAsync("/api/*", loadUserMW)               // URLs under /api/
 //	app.UseAsync("/api/v2", rateLimitMW, loadMW)     // /api/v2 and children
 //
 // Trailing "/*" or "/**" is stripped. A pattern of "/", "/*", or no pattern
 // at all means "every async route".
+//
+// Scoped UseAsync matches the live request URL at request time (same fix as
+// scoped Use). Prefer App.Group(...).UseAsync(...) for new code to avoid the
+// per-request URL check.
 //
 // To pass values from middleware down to the handler (e.g. the loaded user),
 // store them on the Request via req.SetLocal; the handler reads them with
@@ -396,17 +463,41 @@ func (a *App) UseAsync(args ...any) {
 	}
 }
 
-// wrapAsync composes registered async middleware around h, including only
-// entries whose prefix matches routePattern. Outermost-first ordering matches
-// the sync chain: the first matching middleware registered runs first.
+// wrapAsync composes registered async middleware around h. Mirrors wrap:
+// global async MW wraps at registration; path-scoped async MW composes at
+// request time against the live URL so dynamic routes can't bypass scoped
+// middleware via pattern/URL mismatch.
 func (a *App) wrapAsync(routePattern string, h AsyncHandler) AsyncHandler {
-	for i := len(a.asyncMiddlewares) - 1; i >= 0; i-- {
-		e := a.asyncMiddlewares[i]
-		if mwMatches(e.prefix, routePattern) {
-			h = e.mw(h)
+	if len(a.asyncMiddlewares) == 0 {
+		return h
+	}
+	hasScoped := false
+	for _, e := range a.asyncMiddlewares {
+		if e.prefix != "" {
+			hasScoped = true
+			break
 		}
 	}
-	return h
+	if !hasScoped {
+		for i := len(a.asyncMiddlewares) - 1; i >= 0; i-- {
+			h = a.asyncMiddlewares[i].mw(h)
+		}
+		return h
+	}
+	entries := make([]asyncMiddlewareEntry, len(a.asyncMiddlewares))
+	copy(entries, a.asyncMiddlewares)
+	inner := h
+	return func(res *Response, req *Request) {
+		url := req.URL()
+		chain := inner
+		for i := len(entries) - 1; i >= 0; i-- {
+			e := entries[i]
+			if e.prefix == "" || urlUnderPrefix(url, e.prefix) {
+				chain = e.mw(chain)
+			}
+		}
+		chain(res, req)
+	}
 }
 
 // Get registers a GET route. The target may be:
@@ -545,6 +636,243 @@ func (a *App) Any(pattern string, handler Handler) {
 func (a *App) WebSocket(pattern string, behavior WebSocketBehavior) {
 	validatePattern(pattern)
 	a.inner.websocket(pattern, behavior)
+}
+
+// Router scopes middleware and a path prefix to a subtree of routes. Created
+// by App.Group or Router.Group. Routes registered through a Router have the
+// Router's prefix prepended and inherit the Router's middleware stack on top
+// of the App's global / scoped middleware.
+//
+// Group scope is identity-based — a route is wrapped because it is registered
+// through this Router, not because its pattern string starts with some
+// prefix. That avoids the pattern/URL mismatch that App.Use(prefix, mw) has
+// to guard against at request time, so Group middleware composes at
+// registration with zero per-request cost.
+//
+// Prefer Group over App.Use(prefix, mw) for scoping new code.
+type Router struct {
+	app     *App
+	prefix  string
+	syncMW  []Middleware
+	asyncMW []AsyncMiddleware
+}
+
+// Group returns a Router scoped to prefix with mws applied to every route
+// subsequently registered through it. Prefix must start with '/' and contain
+// no wildcards; trailing slash is stripped so Group("/api") and Group("/api/")
+// behave identically. Group("/") is equivalent to no prefix.
+func (a *App) Group(prefix string, mws ...Middleware) *Router {
+	return &Router{
+		app:    a,
+		prefix: normalizeGroupPrefix(prefix),
+		syncMW: append([]Middleware(nil), mws...),
+	}
+}
+
+// Group creates a nested Router. The child prefix is appended to the parent's
+// prefix and middleware is inherited then extended — mws here run inside the
+// parent group's middleware.
+func (r *Router) Group(prefix string, mws ...Middleware) *Router {
+	return &Router{
+		app:     r.app,
+		prefix:  r.prefix + normalizeGroupPrefix(prefix),
+		syncMW:  append(append([]Middleware(nil), r.syncMW...), mws...),
+		asyncMW: append([]AsyncMiddleware(nil), r.asyncMW...),
+	}
+}
+
+// Use appends sync middleware to this Router. Applies to every route
+// subsequently registered through this Router (or any child Group created
+// after this call).
+func (r *Router) Use(mws ...Middleware) {
+	r.syncMW = append(r.syncMW, mws...)
+}
+
+// UseAsync appends async middleware to this Router. Applies only to GetAsync
+// and PostAsync routes registered through this Router.
+func (r *Router) UseAsync(mws ...AsyncMiddleware) {
+	r.asyncMW = append(r.asyncMW, mws...)
+}
+
+// normalizeGroupPrefix validates a Group prefix and trims trailing slashes.
+// Wildcards (* / **) are rejected because the prefix is concatenated literally
+// onto child route patterns; expressing "everything under here" is the job of
+// Group itself, not its prefix.
+func normalizeGroupPrefix(p string) string {
+	validatePattern(p)
+	if strings.ContainsAny(p, "*") {
+		panic(fmt.Sprintf("gogo: Group prefix %q must not contain wildcards", p))
+	}
+	for len(p) > 1 && p[len(p)-1] == '/' {
+		p = p[:len(p)-1]
+	}
+	if p == "/" {
+		return ""
+	}
+	return p
+}
+
+func (r *Router) wrapGroupSync(h Handler) Handler {
+	for i := len(r.syncMW) - 1; i >= 0; i-- {
+		h = r.syncMW[i](h)
+	}
+	return h
+}
+
+func (r *Router) wrapGroupAsync(h AsyncHandler) AsyncHandler {
+	for i := len(r.asyncMW) - 1; i >= 0; i-- {
+		h = r.asyncMW[i](h)
+	}
+	return h
+}
+
+// hasGroupOrAppMW reports whether any sync middleware (group or app, global
+// or scoped) could touch a route registered through this Router. Used to
+// decide whether a static target (Reply / string / []byte) can take the
+// zero-cgo static path or must fall back to a dynamic handler so middleware
+// can intercept.
+func (r *Router) hasGroupOrAppMW(fullPattern string) bool {
+	return len(r.syncMW) > 0 || r.app.hasMatchingMiddleware(fullPattern)
+}
+
+// Get registers a GET route under this Router. Target follows the same rules
+// as App.Get: Handler, func, Reply, string, []byte. Static targets bypass
+// middleware only when neither the Router nor the App has any middleware
+// touching this route; otherwise the static body is served by a synthetic
+// dynamic handler so middleware can intercept.
+func (r *Router) Get(pattern string, target any) {
+	validatePattern(pattern)
+	full := r.prefix + pattern
+	switch v := target.(type) {
+	case Handler:
+		h := r.app.wrap(full, r.wrapGroupSync(v))
+		r.app.inner.get(full, h)
+	case func(*Response, *Request):
+		h := r.app.wrap(full, r.wrapGroupSync(Handler(v)))
+		r.app.inner.get(full, h)
+	case Reply:
+		code := v.Status
+		if code == 0 {
+			code = 200
+		}
+		if !r.hasGroupOrAppMW(full) {
+			r.app.inner.getStatic(full, statusLine(code), v.ContentType, v.Body)
+			return
+		}
+		cType, body := v.ContentType, v.Body
+		h := r.app.wrap(full, r.wrapGroupSync(func(res *Response, req *Request) {
+			res.Send(code, cType, body)
+		}))
+		r.app.inner.get(full, h)
+	case string:
+		if !r.hasGroupOrAppMW(full) {
+			r.app.inner.getStatic(full, statusLine(200), "", v)
+			return
+		}
+		body := v
+		h := r.app.wrap(full, r.wrapGroupSync(func(res *Response, req *Request) {
+			res.Send(200, "", body)
+		}))
+		r.app.inner.get(full, h)
+	case []byte:
+		body := string(v)
+		if !r.hasGroupOrAppMW(full) {
+			r.app.inner.getStatic(full, statusLine(200), "", body)
+			return
+		}
+		h := r.app.wrap(full, r.wrapGroupSync(func(res *Response, req *Request) {
+			res.Send(200, "", body)
+		}))
+		r.app.inner.get(full, h)
+	default:
+		panic(fmt.Sprintf("gogo: unsupported Get target type %T for %q", target, full))
+	}
+}
+
+// Post registers a POST route under this Router.
+func (r *Router) Post(pattern string, handler Handler) {
+	validatePattern(pattern)
+	full := r.prefix + pattern
+	h := r.app.wrap(full, r.wrapGroupSync(handler))
+	r.app.inner.post(full, h)
+}
+
+// Any registers a route for every HTTP method under this Router.
+func (r *Router) Any(pattern string, handler Handler) {
+	validatePattern(pattern)
+	full := r.prefix + pattern
+	h := r.app.wrap(full, r.wrapGroupSync(handler))
+	r.app.inner.any(full, h)
+}
+
+// GetAsync registers a GET route under this Router that runs on a goroutine.
+// Uses the zero-cgo shared-memory dispatch path only when no sync middleware
+// (group or app) touches this route.
+func (r *Router) GetAsync(pattern string, handler AsyncHandler) {
+	validatePattern(pattern)
+	full := r.prefix + pattern
+
+	wrappedAsync := r.app.wrapAsync(full, r.wrapGroupAsync(handler))
+
+	if len(r.syncMW) == 0 && !r.app.hasMatchingMiddleware(full) {
+		r.app.inner.getShared(full, wrappedAsync)
+		return
+	}
+
+	syncEntry := func(res *Response, req *Request) {
+		snap := req.snapshotFromSync()
+		res.Async(func() {
+			snapReq := requestPool.Get().(*Request)
+			snapReq.snap = snap
+			wrappedAsync(res, snapReq)
+			snapReq.resetForPool()
+			requestPool.Put(snapReq)
+		})
+	}
+	h := r.app.wrap(full, r.wrapGroupSync(Handler(syncEntry)))
+	r.app.inner.get(full, h)
+}
+
+// PostAsync registers a POST route under this Router that collects the body
+// up to maxBodyBytes then runs handler on a goroutine. On bodies over the cap
+// the framework sends 413 and the handler is not called.
+func (r *Router) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandler) {
+	validatePattern(pattern)
+	full := r.prefix + pattern
+
+	finalAsync := AsyncHandler(func(res *Response, req *Request) {
+		handler(res, req, req.body)
+	})
+	wrappedAsync := r.app.wrapAsync(full, r.wrapGroupAsync(finalAsync))
+
+	syncEntry := func(res *Response, req *Request) {
+		snap := req.snapshotFromSync()
+		res.Body(maxBodyBytes, func(body []byte, err error) {
+			if err == ErrBodyTooLarge {
+				res.Send(413, "text/plain; charset=utf-8", "payload too large\n")
+				return
+			}
+			res.Async(func() {
+				snapReq := requestPool.Get().(*Request)
+				snapReq.snap = snap
+				snapReq.body = body
+				wrappedAsync(res, snapReq)
+				snapReq.resetForPool()
+				requestPool.Put(snapReq)
+			})
+		})
+	}
+	h := r.app.wrap(full, r.wrapGroupSync(Handler(syncEntry)))
+	r.app.inner.post(full, h)
+}
+
+// WebSocket registers a WebSocket route under this Router. Middleware does
+// not run around WebSocket upgrade — uWS does not expose a chain at the
+// upgrade boundary.
+func (r *Router) WebSocket(pattern string, behavior WebSocketBehavior) {
+	validatePattern(pattern)
+	full := r.prefix + pattern
+	r.app.inner.websocket(full, behavior)
 }
 
 // Listen binds the app to the given port and reports whether binding succeeded.
@@ -690,13 +1018,16 @@ type Response struct {
 	// End flushes the buffer back onto the loop with a single cork.
 	async *asyncState
 
-	// bodyPending is true after OnData/Body has been registered but the final
-	// chunk hasn't arrived yet. The sync uwsgoHandleHTTP wrapper checks this
-	// to keep the wrapper out of the pool — onData fires after the handler
-	// has already returned, and recycling here would corrupt the closure.
-	bodyPending bool
-
-	bodyRecycled bool
+	// refs is the wrapper's reference count. The wrapper is alive (in use,
+	// safe to dereference) while refs > 0. Each holder that may outlive
+	// the main HTTP handler — the body-collection callback chain, the
+	// Async goroutine, the shared-dispatch worker, etc. — increments refs
+	// when it takes ownership and decrements (via releaseRef) when it is
+	// done. The decrement that drops refs to zero returns the wrapper to
+	// its sync.Pool. This makes the wrapper lifecycle CAS-correct: a late-
+	// firing OnData callback and a fast Async goroutine can no longer race
+	// each other into double-recycling the same wrapper.
+	refs atomic.Int32
 }
 
 type asyncState struct {
@@ -826,6 +1157,7 @@ func (r *Response) Async(fn func()) {
 	a.status = "200 OK"
 	a.sent = false
 	r.async = a
+	r.acquireRef()
 
 	go func() {
 		defer func() {
@@ -840,9 +1172,7 @@ func (r *Response) Async(fn func()) {
 				// the best-effort 500 from being sent. Drop the response.
 				asyncCtxRelease(a.ctxHandle)
 			}
-			// Recycle the Response wrapper here, AFTER fn returns, so the wrapper
-			// isn't reused for another request while our goroutine is still alive.
-			r.recycleAsync(a)
+			r.finishAsync(a)
 		}()
 		fn()
 	}()
@@ -857,37 +1187,37 @@ func (r *Response) flushAsync() {
 	a.sent = true
 }
 
-// recycleAsync resets and returns the asyncState and Response wrappers to
-// their pools. Must be called only from the Async goroutine wrapper, after
-// fn has returned, to avoid handing out the Response while it is still in use.
-func (r *Response) recycleAsync(a *asyncState) {
-	r.async = nil
-	r.bodyPending = false
-	r.bodyRecycled = false
-	r.inner = responseNative{}
+// acquireRef adds one to the wrapper's refcount. Callers must pair every
+// acquireRef with exactly one releaseRef. Safe to call from any goroutine.
+func (r *Response) acquireRef() {
+	r.refs.Add(1)
+}
 
+// releaseRef drops one ref. The decrement that takes the count to zero is
+// the unique recycle point: it returns the wrapper's inner pointer to nil
+// and Puts the wrapper back into responsePool. Any later access via a stale
+// pointer is the caller's bug (they kept a ref past releaseRef).
+func (r *Response) releaseRef() {
+	if r.refs.Add(-1) != 0 {
+		return
+	}
+	r.inner = responseNative{}
+	r.async = nil
+	responsePool.Put(r)
+}
+
+// finishAsync returns the asyncState to its pool, then drops one wrapper
+// ref. Used by the Async goroutine after fn returns and by runSharedHandler
+// once the user-supplied AsyncHandler is done.
+func (r *Response) finishAsync(a *asyncState) {
 	a.loopPtr = 0
 	a.ctxHandle = 0
 	a.status = ""
 	a.contentType = ""
 	a.body.Reset()
 	a.sent = false
-
 	asyncStatePool.Put(a)
-	responsePool.Put(r)
-}
-
-// recycleSync returns a sync-mode Response wrapper to the pool. Called by the
-// OnData done callback when the user did not switch to Async mode and the
-// uwsgoHandleHTTP path skipped recycling because bodyPending was set.
-func (r *Response) recycleSync() {
-	if r.bodyRecycled {
-		return
-	}
-	r.bodyPending = false
-	r.bodyRecycled = true
-	r.inner = responseNative{}
-	responsePool.Put(r)
+	r.releaseRef()
 }
 
 // Loop returns the event loop that owns this response. Capture it inside the
@@ -920,18 +1250,23 @@ func (r *Response) Cork(fn func()) {
 //
 // Each chunk slice is freshly allocated; the caller owns it and may retain
 // references after fn returns.
+// OnData takes one wrapper ref at registration. The ref is released on
+// isLast — at which point the cgo handle for the lambda is also freed.
+// Body's onAborted handler releases this ref on early abort (when the last
+// chunk would never fire).
+// OnData registers a body-chunk callback. Each chunk is freshly allocated;
+// the caller owns it. fn runs on the loop thread.
+//
+// OnData takes one wrapper ref at registration and releases it on the
+// final chunk (isLast == true). When the connection aborts before isLast
+// fires the ref is held until the response is destroyed; for the
+// Body() collector that case is covered explicitly via its own onAborted.
 func (r *Response) OnData(fn func(chunk []byte, isLast bool)) {
-	r.bodyPending = true
+	r.acquireRef()
 	r.inner.onData(func(chunk []byte, isLast bool) {
-		if isLast {
-			r.bodyPending = false
-		}
 		fn(chunk, isLast)
-		if isLast && r.async == nil && !r.bodyRecycled {
-			// User did not switch to async mode in the done callback, so the
-			// sync wrapper that called OnData has already returned and the
-			// pool slot is waiting on us. Return the wrapper now.
-			r.recycleSync()
+		if isLast {
+			r.releaseRef()
 		}
 	})
 }
@@ -953,25 +1288,30 @@ func (r *Response) Body(maxBytes int, done func(body []byte, err error)) {
 	var buf []byte
 	var finished bool
 	aborted := &Aborted{}
+	// Body takes one wrapper ref that's released exactly once on whichever
+	// of these fires first: the final chunk, body-too-large, or abort.
+	// Going through r.inner.onData directly (instead of Response.OnData)
+	// keeps that release symmetric — Response.OnData would release on
+	// isLast on its own and double-release with us on bodyTooLarge/abort.
+	r.acquireRef()
+	release := func() {
+		if finished {
+			return
+		}
+		finished = true
+		r.releaseRef()
+	}
 	r.inner.onAborted(func() {
 		aborted.state.Store(true)
-		if !finished {
-			finished = true
-			if r.async == nil {
-				r.recycleSync()
-			}
-		}
+		release()
 	})
-	r.OnData(func(chunk []byte, isLast bool) {
+	r.inner.onData(func(chunk []byte, isLast bool) {
 		if finished || aborted.Load() {
 			return
 		}
 		if len(buf)+len(chunk) > maxBytes {
-			finished = true
 			done(nil, ErrBodyTooLarge)
-			if r.async == nil {
-				r.recycleSync()
-			}
+			release()
 			return
 		}
 		if buf == nil && len(chunk) > 0 {
@@ -979,8 +1319,8 @@ func (r *Response) Body(maxBytes int, done func(body []byte, err error)) {
 		}
 		buf = append(buf, chunk...)
 		if isLast {
-			finished = true
 			done(buf, nil)
+			release()
 		}
 	})
 }
@@ -1030,6 +1370,21 @@ type Request struct {
 	// the final handler. Lazy: nil until the first SetLocal. Cleared (but
 	// the map is reused) when the Request returns to the pool.
 	locals map[string]any
+
+	// syncURLPtr / syncURLLen point at the URL bytes uWS has already parsed
+	// for this request. The C++ bridge fills them at handler entry so
+	// URL() can materialize a Go string on first read without a cgo call.
+	// The pointer is valid only for the lifetime of the sync callback —
+	// resetForPool clears the fields before the wrapper is reused.
+	syncURLPtr unsafe.Pointer
+	syncURLLen int
+
+	// cachedURL is the materialized Go string, allocated lazily on the first
+	// URL() call. urlCached lets the empty string ("") be a valid cache
+	// value (request with empty URL — uWS rejects these, but the flag keeps
+	// the check explicit).
+	cachedURL string
+	urlCached bool
 }
 
 // requestSnapshot holds the Go-side captured copy of an HttpRequest, used by
@@ -1087,6 +1442,10 @@ func (r *Request) resetForPool() {
 	r.inner = requestNative{}
 	r.snap = nil
 	r.body = nil
+	r.syncURLPtr = nil
+	r.syncURLLen = 0
+	r.cachedURL = ""
+	r.urlCached = false
 	for k := range r.locals {
 		delete(r.locals, k)
 	}
@@ -1094,11 +1453,29 @@ func (r *Request) resetForPool() {
 
 // URL returns the request URL path. Query string is exposed separately via
 // Query(); URL() does not include it.
+//
+// In sync mode the bridge stashes the URL bytes uWS already parsed onto
+// the Request at handler entry, so the first call materializes a Go string
+// from those bytes (one allocation, no cgo). Subsequent calls return the
+// cached string. Async/shared handlers read from the captured snapshot.
 func (r *Request) URL() string {
 	if r.snap != nil {
 		return r.snap.url
 	}
-	return r.inner.url()
+	if r.urlCached {
+		return r.cachedURL
+	}
+	if r.syncURLPtr != nil {
+		r.cachedURL = goStringFromC(r.syncURLPtr, r.syncURLLen)
+		r.urlCached = true
+		return r.cachedURL
+	}
+	// Fallback: bridge did not pre-fill the URL (shouldn't happen for sync
+	// HTTP handlers, but the cgo path remains available for safety).
+	s := r.inner.url()
+	r.cachedURL = s
+	r.urlCached = true
+	return s
 }
 
 // Method returns the HTTP method ("get", "post", ...). uWS lower-cases it

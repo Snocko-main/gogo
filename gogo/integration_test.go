@@ -1588,3 +1588,540 @@ func TestHeaderInjectionRejected(t *testing.T) {
 		t.Fatalf("header injection not rejected: got %d %q", status, body)
 	}
 }
+
+// -----------------------------------------------------------------------------
+// Middleware-bypass coverage. These tests pin down the security-relevant fix
+// that landed alongside Group: scoped Use(prefix, mw) now matches the live
+// request URL via req.URL() instead of the registered route pattern string,
+// so dynamic / wildcard routes can no longer slip past path-scoped middleware.
+// -----------------------------------------------------------------------------
+
+// TestMiddlewareBypassParametricRoute is the canonical regression: a REST API
+// scopes auth to /api/admin via Use("/api/admin", ...) and serves a parametric
+// route Get("/api/:section"). The literal strings "/api/:section" and
+// "/api/admin" share no string prefix, so under the old pattern-string match
+// auth would never have wrapped the handler — but uWS still routes
+// GET /api/admin into it via :section="admin", silently bypassing auth.
+func TestMiddlewareBypassParametricRoute(t *testing.T) {
+	var authHits, handlerHits atomic.Int32
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use("/api/admin", func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				authHits.Add(1)
+				if req.Header("x-key") != "ok" {
+					res.Send(401, "text/plain", "denied")
+					return
+				}
+				next(res, req)
+			}
+		})
+		app.Get("/api/:section", func(res *gogo.Response, req *gogo.Request) {
+			handlerHits.Add(1)
+			res.Send(200, "text/plain", "section="+req.Parameter(0))
+		})
+	})
+	defer teardown()
+
+	// /api/admin must hit the auth gate (the bug: it wouldn't).
+	status, body := httpGet(t, port, "/api/admin")
+	if status != 401 || body != "denied" {
+		t.Fatalf("/api/admin without key: got %d %q, want 401 denied", status, body)
+	}
+	if authHits.Load() != 1 {
+		t.Fatalf("auth hit count for /api/admin = %d, want 1", authHits.Load())
+	}
+	if handlerHits.Load() != 0 {
+		t.Fatalf("handler ran for /api/admin without auth: hits=%d", handlerHits.Load())
+	}
+
+	// /api/users must NOT hit the auth gate (scope is /api/admin only).
+	status, body = httpGet(t, port, "/api/users")
+	if status != 200 || body != "section=users" {
+		t.Fatalf("/api/users: got %d %q", status, body)
+	}
+	if authHits.Load() != 1 {
+		t.Fatalf("auth wrongly ran for /api/users: hits=%d", authHits.Load())
+	}
+	if handlerHits.Load() != 1 {
+		t.Fatalf("handler not called for /api/users: hits=%d", handlerHits.Load())
+	}
+
+	// /api/admin with the key passes through.
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/api/admin", port), nil)
+	req.Header.Set("X-Key", "ok")
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("/api/admin authed: %v", err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || string(b) != "section=admin" {
+		t.Fatalf("/api/admin authed: got %d %q", resp.StatusCode, string(b))
+	}
+}
+
+// TestMiddlewareBypassWildcardFallback covers the second face of the bypass:
+// a path-scoped middleware on /admin/* plus a catch-all Any("/*", spa). Under
+// pattern-string match, the catch-all's pattern ("/*") has no prefix relation
+// to "/admin", so it wouldn't be wrapped — but uWS falls back to "/*" for
+// URLs like /admin/secret when no exact /admin/... route matches.
+func TestMiddlewareBypassWildcardFallback(t *testing.T) {
+	var adminHits, spaHits atomic.Int32
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use("/admin/*", func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				adminHits.Add(1)
+				if req.Header("x-admin") != "1" {
+					res.Send(401, "text/plain", "no admin")
+					return
+				}
+				next(res, req)
+			}
+		})
+		app.Get("/admin/users", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "users-list")
+		})
+		// SPA-style catch-all. Anything not matched above falls here.
+		app.Any("/*", func(res *gogo.Response, req *gogo.Request) {
+			spaHits.Add(1)
+			res.Send(200, "text/plain", "spa")
+		})
+	})
+	defer teardown()
+
+	// /admin/secret has no exact match → uWS falls back to /*. The bug:
+	// auth wouldn't wrap the /* handler, so the request would have hit
+	// spa with 200. Fixed: auth runs first because the URL is under /admin.
+	status, body := httpGet(t, port, "/admin/secret")
+	if status != 401 || body != "no admin" {
+		t.Fatalf("/admin/secret: got %d %q, want 401 no admin", status, body)
+	}
+	if spaHits.Load() != 0 {
+		t.Fatalf("spa fallback wrongly ran for /admin/secret: hits=%d", spaHits.Load())
+	}
+
+	// /random falls to spa and must NOT trigger admin auth.
+	status, body = httpGet(t, port, "/random")
+	if status != 200 || body != "spa" {
+		t.Fatalf("/random: got %d %q", status, body)
+	}
+	if adminHits.Load() != 1 {
+		t.Fatalf("admin mw wrongly ran for /random (cumulative hits=%d, want 1)", adminHits.Load())
+	}
+	if spaHits.Load() != 1 {
+		t.Fatalf("spa hit count = %d, want 1", spaHits.Load())
+	}
+}
+
+// TestAsyncMiddlewareBypassParametric mirrors TestMiddlewareBypassParametricRoute
+// for the async chain, which has its own wrapAsync path.
+func TestAsyncMiddlewareBypassParametric(t *testing.T) {
+	var authHits, handlerHits atomic.Int32
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.UseAsync("/api/admin", func(next gogo.AsyncHandler) gogo.AsyncHandler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				authHits.Add(1)
+				if req.Header("x-key") != "ok" {
+					res.Send(401, "text/plain", "denied")
+					return
+				}
+				next(res, req)
+			}
+		})
+		app.GetAsync("/api/:section", func(res *gogo.Response, req *gogo.Request) {
+			handlerHits.Add(1)
+			res.Send(200, "text/plain", "section="+req.Parameter(0))
+		})
+	})
+	defer teardown()
+
+	status, body := httpGet(t, port, "/api/admin")
+	if status != 401 || body != "denied" {
+		t.Fatalf("/api/admin without key: got %d %q", status, body)
+	}
+	if authHits.Load() != 1 {
+		t.Fatalf("async auth hits for /api/admin = %d, want 1", authHits.Load())
+	}
+	if handlerHits.Load() != 0 {
+		t.Fatalf("handler ran for /api/admin without async auth: hits=%d", handlerHits.Load())
+	}
+
+	status, body = httpGet(t, port, "/api/users")
+	if status != 200 || body != "section=users" {
+		t.Fatalf("/api/users: got %d %q", status, body)
+	}
+	if authHits.Load() != 1 {
+		t.Fatalf("async auth wrongly ran for /api/users: hits=%d", authHits.Load())
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Group / Router coverage.
+// -----------------------------------------------------------------------------
+
+// TestGroupBasicScopesMiddleware: routes registered through a Group are
+// wrapped by the Group's middleware; routes on the App directly are not.
+func TestGroupBasicScopesMiddleware(t *testing.T) {
+	var authHits atomic.Int32
+	port, teardown := startApp(t, func(app *gogo.App) {
+		api := app.Group("/api", func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				authHits.Add(1)
+				if req.Header("x-key") != "ok" {
+					res.Send(401, "text/plain", "no")
+					return
+				}
+				next(res, req)
+			}
+		})
+		api.Get("/users", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "users")
+		})
+		app.Get("/public", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "public")
+		})
+	})
+	defer teardown()
+
+	if status, body := httpGet(t, port, "/public"); status != 200 || body != "public" {
+		t.Fatalf("/public: got %d %q", status, body)
+	}
+	if authHits.Load() != 0 {
+		t.Fatalf("group mw wrongly ran for /public: hits=%d", authHits.Load())
+	}
+
+	if status, body := httpGet(t, port, "/api/users"); status != 401 || body != "no" {
+		t.Fatalf("/api/users no key: got %d %q", status, body)
+	}
+	if authHits.Load() != 1 {
+		t.Fatalf("group mw hits for /api/users = %d, want 1", authHits.Load())
+	}
+}
+
+// TestGroupCoversParametricRoute: the whole point of Group over Use(prefix).
+// A parametric route under a Group is wrapped by identity, not pattern, so
+// /api/admin via :section="admin" always hits the group's middleware.
+func TestGroupCoversParametricRoute(t *testing.T) {
+	var authHits atomic.Int32
+	port, teardown := startApp(t, func(app *gogo.App) {
+		api := app.Group("/api", func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				authHits.Add(1)
+				if req.Header("x-key") != "ok" {
+					res.Send(401, "text/plain", "denied")
+					return
+				}
+				next(res, req)
+			}
+		})
+		api.Get("/:section", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "section="+req.Parameter(0))
+		})
+	})
+	defer teardown()
+
+	for _, section := range []string{"admin", "users", "billing"} {
+		status, body := httpGet(t, port, "/api/"+section)
+		if status != 401 || body != "denied" {
+			t.Fatalf("/api/%s: got %d %q, want 401 denied", section, status, body)
+		}
+	}
+	if authHits.Load() != 3 {
+		t.Fatalf("group mw hits = %d, want 3 (one per request)", authHits.Load())
+	}
+}
+
+// TestGroupNestedMiddlewareOrder: parent group's middleware wraps child
+// group's middleware wraps the handler. Outermost-first.
+func TestGroupNestedMiddlewareOrder(t *testing.T) {
+	var trace []string
+	var traceMu sync.Mutex
+	record := func(s string) {
+		traceMu.Lock()
+		trace = append(trace, s)
+		traceMu.Unlock()
+	}
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				record("global")
+				next(res, req)
+			}
+		})
+		api := app.Group("/api", func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				record("api")
+				next(res, req)
+			}
+		})
+		admin := api.Group("/admin", func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				record("admin")
+				next(res, req)
+			}
+		})
+		admin.Get("/audit", func(res *gogo.Response, req *gogo.Request) {
+			record("handler")
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	httpGet(t, port, "/api/admin/audit")
+	traceMu.Lock()
+	got := strings.Join(trace, ",")
+	traceMu.Unlock()
+	if got != "global,api,admin,handler" {
+		t.Fatalf("trace: got %q, want global,api,admin,handler", got)
+	}
+}
+
+// TestRouterUseAddsMW: Router.Use accumulates middleware that wraps later
+// routes on that Router but not routes registered before the Use call.
+func TestRouterUseAddsMW(t *testing.T) {
+	var hits atomic.Int32
+	port, teardown := startApp(t, func(app *gogo.App) {
+		api := app.Group("/api")
+		api.Get("/early", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "early")
+		})
+		api.Use(func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				hits.Add(1)
+				next(res, req)
+			}
+		})
+		api.Get("/late", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "late")
+		})
+	})
+	defer teardown()
+
+	httpGet(t, port, "/api/early")
+	if hits.Load() != 0 {
+		t.Fatalf("mw ran for /api/early registered before Use: hits=%d", hits.Load())
+	}
+	httpGet(t, port, "/api/late")
+	if hits.Load() != 1 {
+		t.Fatalf("mw not invoked for /api/late: hits=%d", hits.Load())
+	}
+}
+
+// TestGroupUseAsyncOnGetAsync: Router.UseAsync wraps GetAsync handlers
+// registered through the router and passes Locals from middleware to handler.
+func TestGroupUseAsyncOnGetAsync(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		api := app.Group("/api")
+		api.UseAsync(func(next gogo.AsyncHandler) gogo.AsyncHandler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				if req.Header("authorization") == "" {
+					res.Send(401, "text/plain", "no token")
+					return
+				}
+				req.SetLocal("user", "alice")
+				next(res, req)
+			}
+		})
+		api.GetAsync("/me", func(res *gogo.Response, req *gogo.Request) {
+			user, _ := req.Local("user").(string)
+			res.Send(200, "text/plain", "hi "+user)
+		})
+	})
+	defer teardown()
+
+	status, body := httpGet(t, port, "/api/me")
+	if status != 401 || body != "no token" {
+		t.Fatalf("/api/me unauth: got %d %q", status, body)
+	}
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/api/me", port), nil)
+	req.Header.Set("Authorization", "Bearer x")
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("/api/me authed: %v", err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || string(b) != "hi alice" {
+		t.Fatalf("/api/me authed: got %d %q", resp.StatusCode, string(b))
+	}
+}
+
+// TestGroupPostAsyncBodyAndMW: Router.PostAsync collects the body, enforces
+// the cap, and runs through both sync group MW and the body handler.
+func TestGroupPostAsyncBodyAndMW(t *testing.T) {
+	var mwHits atomic.Int32
+	port, teardown := startApp(t, func(app *gogo.App) {
+		api := app.Group("/api", func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				mwHits.Add(1)
+				next(res, req)
+			}
+		})
+		api.PostAsync("/echo", 16, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			res.Send(200, "text/plain", "echo:"+string(body))
+		})
+	})
+	defer teardown()
+
+	resp, err := noKeepaliveClient.Post(
+		fmt.Sprintf("http://127.0.0.1:%d/api/echo", port),
+		"text/plain", bytes.NewReader([]byte("hello")))
+	if err != nil {
+		t.Fatalf("POST /api/echo: %v", err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || string(b) != "echo:hello" {
+		t.Fatalf("POST /api/echo: got %d %q", resp.StatusCode, string(b))
+	}
+	if mwHits.Load() != 1 {
+		t.Fatalf("group mw hits = %d, want 1", mwHits.Load())
+	}
+
+	// Body too large → 413 from framework, handler not called.
+	resp, err = noKeepaliveClient.Post(
+		fmt.Sprintf("http://127.0.0.1:%d/api/echo", port),
+		"text/plain", bytes.NewReader(bytes.Repeat([]byte("x"), 100)))
+	if err != nil {
+		t.Fatalf("POST /api/echo large: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 413 {
+		t.Fatalf("POST /api/echo large: got %d, want 413", resp.StatusCode)
+	}
+}
+
+// TestGroupGetAsyncFastPathWithoutMW confirms that GetAsync registered through
+// a Group with NO middleware still uses the zero-cgo shared-memory dispatch
+// path (no perf regression for the common case).
+func TestGroupGetAsyncFastPathWithoutMW(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		api := app.Group("/api")
+		api.GetAsync("/work", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "done")
+		})
+	})
+	defer teardown()
+
+	for i := 0; i < 5; i++ {
+		if status, body := httpGet(t, port, "/api/work"); status != 200 || body != "done" {
+			t.Fatalf("/api/work iter %d: got %d %q", i, status, body)
+		}
+	}
+}
+
+// TestGroupStaticReplyBypassesMWOnlyIfNoneRegistered: Reply / string / []byte
+// targets on a Router with NO middleware take the zero-cgo static path;
+// when MW is registered on the Router or App, the static body is wrapped
+// in a dynamic handler so middleware can run.
+func TestGroupStaticReplyWithoutMW(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		api := app.Group("/api")
+		api.Get("/health", gogo.Reply{Body: "ok"})
+	})
+	defer teardown()
+
+	if status, body := httpGet(t, port, "/api/health"); status != 200 || body != "ok" {
+		t.Fatalf("/api/health: got %d %q", status, body)
+	}
+}
+
+func TestGroupStaticReplyWithMW(t *testing.T) {
+	var hits atomic.Int32
+	port, teardown := startApp(t, func(app *gogo.App) {
+		api := app.Group("/api", func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				hits.Add(1)
+				next(res, req)
+			}
+		})
+		api.Get("/health", gogo.Reply{Status: 201, ContentType: "text/plain", Body: "ok"})
+	})
+	defer teardown()
+
+	resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/api/health", port))
+	if err != nil {
+		t.Fatalf("/api/health: %v", err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 201 || string(b) != "ok" {
+		t.Fatalf("/api/health: got %d %q", resp.StatusCode, string(b))
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("group mw hits for static target = %d, want 1", hits.Load())
+	}
+}
+
+// TestGroupPrefixNormalization: Group("/api/") and Group("/api") behave the
+// same; Group("/") is equivalent to no prefix; wildcards in Group prefix panic.
+func TestGroupPrefixNormalization(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		// Trailing slash stripped.
+		app.Group("/api/").Get("/users", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "users")
+		})
+		// Group("/") acts as global scope (no prefix).
+		app.Group("/").Get("/healthz", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "alive")
+		})
+	})
+	defer teardown()
+
+	if status, body := httpGet(t, port, "/api/users"); status != 200 || body != "users" {
+		t.Fatalf("/api/users: got %d %q", status, body)
+	}
+	if status, body := httpGet(t, port, "/healthz"); status != 200 || body != "alive" {
+		t.Fatalf("/healthz: got %d %q", status, body)
+	}
+}
+
+func TestGroupPrefixRejectsWildcard(t *testing.T) {
+	app, err := gogo.NewApp()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+
+	cases := []string{"/api/*", "/api/**", "/*"}
+	for _, p := range cases {
+		func() {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Errorf("Group(%q) did not panic", p)
+				}
+			}()
+			_ = app.Group(p)
+		}()
+	}
+}
+
+// TestGroupGlobalUseStillWraps: a global App.Use ALWAYS wraps routes
+// registered via a Group, regardless of the group's prefix.
+func TestGroupGlobalUseStillWraps(t *testing.T) {
+	var globalHits, groupHits atomic.Int32
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				globalHits.Add(1)
+				next(res, req)
+			}
+		})
+		api := app.Group("/api", func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				groupHits.Add(1)
+				next(res, req)
+			}
+		})
+		api.Get("/x", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "x")
+		})
+	})
+	defer teardown()
+
+	httpGet(t, port, "/api/x")
+	if globalHits.Load() != 1 || groupHits.Load() != 1 {
+		t.Fatalf("hits global=%d group=%d, want 1 each", globalHits.Load(), groupHits.Load())
+	}
+}

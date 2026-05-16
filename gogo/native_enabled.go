@@ -201,6 +201,7 @@ func runSharedHandler(handler AsyncHandler, ctxPtr uintptr) {
 
 	resWrap := responsePool.Get().(*Response)
 	resWrap.inner = responseNative{ptr: resPtr}
+	resWrap.refs.Store(1)
 
 	a := asyncStatePool.Get().(*asyncState)
 	a.loopPtr = loopPtrRaw
@@ -229,7 +230,7 @@ func runSharedHandler(handler AsyncHandler, ctxPtr uintptr) {
 		}
 		reqWrap.resetForPool()
 		requestPool.Put(reqWrap)
-		resWrap.recycleAsync(a)
+		resWrap.finishAsync(a)
 	}()
 
 	handler(resWrap, reqWrap)
@@ -563,13 +564,18 @@ func asyncSendShared(ctxHandle uintptr, statusLine, contentType, body string) bo
 	*(*uint32)(unsafe.Pointer(ctxHandle + shared.ctxCtLenOff)) = uint32(len(contentType))
 	*(*uint32)(unsafe.Pointer(ctxHandle + shared.ctxBodyLenOff)) = uint32(len(body))
 
-	// Read the App-specific pending ring this ctx targets. C++ stamps it
-	// onto the ctx at request-arrival time so multiple App instances each
-	// route responses to their own loop.
+	// Read the App-specific pending ring AND loop pointer this ctx targets
+	// BEFORE publishing the ctx onto the ring. C++ stamps both fields onto
+	// the ctx at request-arrival time and they don't change for the life of
+	// the ctx, so reading them now is fine — but the moment we publish (the
+	// seqAddr.Store below), the loop-thread consumer is free to drain the
+	// slot, send the response, and release the ctx. Any read off ctx after
+	// publish is a use-after-free hazard.
 	ringPtr := *(*uintptr)(unsafe.Pointer(ctxHandle + shared.ctxPendingRingOff))
 	if ringPtr == 0 {
 		return false
 	}
+	loopPtr := *(*uintptr)(unsafe.Pointer(ctxHandle + shared.ctxLoopOff))
 
 	// MPSC enqueue: claim a ready slot with CAS. If the response ring is full
 	// or heavily contended, return false so the caller can fall back to
@@ -608,9 +614,8 @@ claimed:
 	*(*uintptr)(unsafe.Pointer(slotBase + shared.slotCtxOffset)) = ctxHandle
 	seqAddr.Store(tail + 1)
 
-	// Wake the App's loop so it drains the ring immediately, passing the
-	// specific ring pointer so the drain runs on the right App's data.
-	loopPtr := *(*uintptr)(unsafe.Pointer(ctxHandle + shared.ctxLoopOff))
+	// Ctx is now owned by the consumer — do NOT touch it again. Use the
+	// cached loopPtr to wake the drain.
 	if loopPtr != 0 {
 		C.uwsgo_wake_drain(
 			(*C.uwsgo_loop_t)(unsafe.Pointer(loopPtr)),
@@ -669,6 +674,17 @@ func (r requestNative) headersAll() []byte {
 	return buf
 }
 
+// goStringFromC copies n bytes at ptr into a Go-owned string. Used by
+// Request.URL() to materialize the URL bytes uWS handed us at handler entry
+// without a cgo round-trip back into uWS. Returns "" when n <= 0 so callers
+// don't have to special-case the empty case.
+func goStringFromC(ptr unsafe.Pointer, n int) string {
+	if n <= 0 || ptr == nil {
+		return ""
+	}
+	return C.GoStringN((*C.char)(ptr), C.int(n))
+}
+
 func readNativeString(read func(*C.char, C.size_t) C.size_t) string {
 	size := read(nil, 0)
 	if size == 0 {
@@ -709,18 +725,27 @@ func (ws websocketNative) end(code int, message string) {
 }
 
 //export uwsgoHandleHTTP
-func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req_t) {
+func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req_t, urlPtr *C.char, urlLen C.size_t) {
 	handle := cgo.Handle(handlerID)
 	handler := handle.Value().(Handler)
 
 	reqWrap := requestPool.Get().(*Request)
 	reqWrap.inner = requestNative{ptr: req}
+	// uWS already had the URL parsed; the C++ side passed the std::string_view
+	// in alongside res/req so Request.URL() can serve it without a cgo round-
+	// trip. ptr is valid for the lifetime of this callback (i.e. the lifetime
+	// of reqWrap before it returns to the pool). Materialization is lazy in
+	// Request.URL(); we just record the source here.
+	reqWrap.syncURLPtr = unsafe.Pointer(urlPtr)
+	reqWrap.syncURLLen = int(urlLen)
 
 	resWrap := responsePool.Get().(*Response)
 	resWrap.inner = responseNative{ptr: res}
 	resWrap.async = nil
-	resWrap.bodyPending = false
-	resWrap.bodyRecycled = false
+	// One ref for the main handler. Body() and Async() each take their own
+	// additional ref; the wrapper is returned to the pool by whichever
+	// releaseRef drops the count to zero.
+	resWrap.refs.Store(1)
 
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -732,15 +757,7 @@ func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req
 
 		reqWrap.resetForPool()
 		requestPool.Put(reqWrap)
-
-		// Sync responses are done with resWrap by now. We must NOT recycle if:
-		//   - async is set: a goroutine still uses the wrapper
-		//   - bodyPending is set: onData hasn't received the final chunk yet
-		// Both paths take responsibility for their own recycle.
-		if resWrap.async == nil && !resWrap.bodyPending && !resWrap.bodyRecycled {
-			resWrap.inner = responseNative{}
-			responsePool.Put(resWrap)
-		}
+		resWrap.releaseRef()
 	}()
 
 	handler(resWrap, reqWrap)
