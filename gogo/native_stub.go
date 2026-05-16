@@ -2,7 +2,12 @@
 
 package gogo
 
-import "errors"
+import (
+	"errors"
+	"unsafe"
+)
+
+func goStringFromC(_ unsafe.Pointer, _ int) string { return "" }
 
 var errNativeDisabled = errors.New("gogo native binding disabled: build with CGO_ENABLED=1 and -tags gogo")
 

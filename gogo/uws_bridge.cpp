@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-extern "C" void uwsgoHandleHTTP(uintptr_t handler_id, uwsgo_res_t *res, uwsgo_req_t *req);
+extern "C" void uwsgoHandleHTTP(uintptr_t handler_id, uwsgo_res_t *res, uwsgo_req_t *req, const char *url, size_t url_len);
 extern "C" void uwsgoHandleWSOpen(uintptr_t handler_id, uwsgo_ws_t *ws);
 extern "C" void uwsgoHandleWSMessage(uintptr_t handler_id, uwsgo_ws_t *ws, const char *message, size_t message_len, int opcode);
 extern "C" void uwsgoHandleWSClose(uintptr_t handler_id, uwsgo_ws_t *ws, int code, const char *message, size_t message_len);
@@ -142,7 +142,14 @@ extern "C" void uwsgo_app_free(uwsgo_app_t *app) {
 
 extern "C" void uwsgo_app_get(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id) {
     app->app->get(pattern, [handler_id](auto *res, auto *req) {
-        uwsgoHandleHTTP(handler_id, reinterpret_cast<uwsgo_res_t *>(res), reinterpret_cast<uwsgo_req_t *>(req));
+        // Pre-fetch URL on the C++ side and pass it to Go inline so Go's
+        // Request.URL() (used by the path-scoped middleware guard on dynamic
+        // routes) is a cache hit instead of a two-call cgo round-trip.
+        auto url = req->getUrl();
+        uwsgoHandleHTTP(handler_id,
+            reinterpret_cast<uwsgo_res_t *>(res),
+            reinterpret_cast<uwsgo_req_t *>(req),
+            url.data(), url.size());
     });
 }
 
@@ -170,13 +177,21 @@ extern "C" void uwsgo_app_get_static(uwsgo_app_t *app, const char *pattern,
 
 extern "C" void uwsgo_app_post(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id) {
     app->app->post(pattern, [handler_id](auto *res, auto *req) {
-        uwsgoHandleHTTP(handler_id, reinterpret_cast<uwsgo_res_t *>(res), reinterpret_cast<uwsgo_req_t *>(req));
+        auto url = req->getUrl();
+        uwsgoHandleHTTP(handler_id,
+            reinterpret_cast<uwsgo_res_t *>(res),
+            reinterpret_cast<uwsgo_req_t *>(req),
+            url.data(), url.size());
     });
 }
 
 extern "C" void uwsgo_app_any(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id) {
     app->app->any(pattern, [handler_id](auto *res, auto *req) {
-        uwsgoHandleHTTP(handler_id, reinterpret_cast<uwsgo_res_t *>(res), reinterpret_cast<uwsgo_req_t *>(req));
+        auto url = req->getUrl();
+        uwsgoHandleHTTP(handler_id,
+            reinterpret_cast<uwsgo_res_t *>(res),
+            reinterpret_cast<uwsgo_req_t *>(req),
+            url.data(), url.size());
     });
 }
 

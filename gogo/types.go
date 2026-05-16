@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 )
 
 // commonStatusLines caches the formatted status line for codes likely to
@@ -1372,6 +1373,21 @@ type Request struct {
 	// the final handler. Lazy: nil until the first SetLocal. Cleared (but
 	// the map is reused) when the Request returns to the pool.
 	locals map[string]any
+
+	// syncURLPtr / syncURLLen point at the URL bytes uWS has already parsed
+	// for this request. The C++ bridge fills them at handler entry so
+	// URL() can materialize a Go string on first read without a cgo call.
+	// The pointer is valid only for the lifetime of the sync callback —
+	// resetForPool clears the fields before the wrapper is reused.
+	syncURLPtr unsafe.Pointer
+	syncURLLen int
+
+	// cachedURL is the materialized Go string, allocated lazily on the first
+	// URL() call. urlCached lets the empty string ("") be a valid cache
+	// value (request with empty URL — uWS rejects these, but the flag keeps
+	// the check explicit).
+	cachedURL string
+	urlCached bool
 }
 
 // requestSnapshot holds the Go-side captured copy of an HttpRequest, used by
@@ -1429,6 +1445,10 @@ func (r *Request) resetForPool() {
 	r.inner = requestNative{}
 	r.snap = nil
 	r.body = nil
+	r.syncURLPtr = nil
+	r.syncURLLen = 0
+	r.cachedURL = ""
+	r.urlCached = false
 	for k := range r.locals {
 		delete(r.locals, k)
 	}
@@ -1436,11 +1456,29 @@ func (r *Request) resetForPool() {
 
 // URL returns the request URL path. Query string is exposed separately via
 // Query(); URL() does not include it.
+//
+// In sync mode the bridge stashes the URL bytes uWS already parsed onto
+// the Request at handler entry, so the first call materializes a Go string
+// from those bytes (one allocation, no cgo). Subsequent calls return the
+// cached string. Async/shared handlers read from the captured snapshot.
 func (r *Request) URL() string {
 	if r.snap != nil {
 		return r.snap.url
 	}
-	return r.inner.url()
+	if r.urlCached {
+		return r.cachedURL
+	}
+	if r.syncURLPtr != nil {
+		r.cachedURL = goStringFromC(r.syncURLPtr, r.syncURLLen)
+		r.urlCached = true
+		return r.cachedURL
+	}
+	// Fallback: bridge did not pre-fill the URL (shouldn't happen for sync
+	// HTTP handlers, but the cgo path remains available for safety).
+	s := r.inner.url()
+	r.cachedURL = s
+	r.urlCached = true
+	return s
 }
 
 // Method returns the HTTP method ("get", "post", ...). uWS lower-cases it

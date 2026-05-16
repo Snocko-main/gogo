@@ -669,6 +669,17 @@ func (r requestNative) headersAll() []byte {
 	return buf
 }
 
+// goStringFromC copies n bytes at ptr into a Go-owned string. Used by
+// Request.URL() to materialize the URL bytes uWS handed us at handler entry
+// without a cgo round-trip back into uWS. Returns "" when n <= 0 so callers
+// don't have to special-case the empty case.
+func goStringFromC(ptr unsafe.Pointer, n int) string {
+	if n <= 0 || ptr == nil {
+		return ""
+	}
+	return C.GoStringN((*C.char)(ptr), C.int(n))
+}
+
 func readNativeString(read func(*C.char, C.size_t) C.size_t) string {
 	size := read(nil, 0)
 	if size == 0 {
@@ -709,12 +720,19 @@ func (ws websocketNative) end(code int, message string) {
 }
 
 //export uwsgoHandleHTTP
-func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req_t) {
+func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req_t, urlPtr *C.char, urlLen C.size_t) {
 	handle := cgo.Handle(handlerID)
 	handler := handle.Value().(Handler)
 
 	reqWrap := requestPool.Get().(*Request)
 	reqWrap.inner = requestNative{ptr: req}
+	// uWS already had the URL parsed; the C++ side passed the std::string_view
+	// in alongside res/req so Request.URL() can serve it without a cgo round-
+	// trip. ptr is valid for the lifetime of this callback (i.e. the lifetime
+	// of reqWrap before it returns to the pool). Materialization is lazy in
+	// Request.URL(); we just record the source here.
+	reqWrap.syncURLPtr = unsafe.Pointer(urlPtr)
+	reqWrap.syncURLLen = int(urlLen)
 
 	resWrap := responsePool.Get().(*Response)
 	resWrap.inner = responseNative{ptr: res}
