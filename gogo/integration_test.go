@@ -11,7 +11,9 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/textproto"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -3978,3 +3980,280 @@ func TestParseBodyDirect(t *testing.T) {
 		t.Errorf("got %+v, want {Name:x}", f)
 	}
 }
+
+// TestMultipartIterate: ParseMultipart yields each part with the
+// expected Name / FileName / ContentType / Data.
+func TestMultipartIterate(t *testing.T) {
+	type seen struct {
+		name, fileName, contentType, data string
+	}
+	type result struct {
+		mu    sync.Mutex
+		parts []seen
+		err   error
+	}
+	collected := &result{}
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.PostAsync("/upload", 1<<20, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			err := req.Multipart(func(p *gogo.MultipartPart) error {
+				collected.mu.Lock()
+				collected.parts = append(collected.parts, seen{
+					name: p.Name, fileName: p.FileName,
+					contentType: p.ContentType, data: string(p.Data),
+				})
+				collected.mu.Unlock()
+				return nil
+			})
+			if err != nil {
+				collected.mu.Lock()
+				collected.err = err
+				collected.mu.Unlock()
+				res.Send(400, "text/plain", err.Error())
+				return
+			}
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	mw.WriteField("title", "hello")
+	mw.WriteField("note", "world")
+	fw, _ := mw.CreateFormFile("attachment", "report.txt")
+	fw.Write([]byte("file body 1"))
+	imgWriter, _ := mw.CreatePart(textproto.MIMEHeader{
+		"Content-Disposition": []string{`form-data; name="image"; filename="pic.png"`},
+		"Content-Type":        []string{"image/png"},
+	})
+	imgWriter.Write([]byte("\x89PNG\r\n\x1a\nfake"))
+	mw.Close()
+
+	status, respBody := httpPost(t, port, "/upload", mw.FormDataContentType(), body.Bytes())
+	if status != 200 || respBody != "ok" {
+		t.Fatalf("upload: got %d %q", status, respBody)
+	}
+
+	collected.mu.Lock()
+	defer collected.mu.Unlock()
+	if collected.err != nil {
+		t.Fatalf("Multipart returned err: %v", collected.err)
+	}
+	if len(collected.parts) != 4 {
+		t.Fatalf("got %d parts, want 4: %+v", len(collected.parts), collected.parts)
+	}
+	// Value parts come without a filename.
+	if collected.parts[0] != (seen{name: "title", data: "hello"}) {
+		t.Errorf("part 0: %+v", collected.parts[0])
+	}
+	if collected.parts[1] != (seen{name: "note", data: "world"}) {
+		t.Errorf("part 1: %+v", collected.parts[1])
+	}
+	// File parts carry FileName + Content-Type sniffed by the framework
+	// (defaults to application/octet-stream for the generic file).
+	if collected.parts[2].name != "attachment" || collected.parts[2].fileName != "report.txt" ||
+		collected.parts[2].data != "file body 1" {
+		t.Errorf("part 2: %+v", collected.parts[2])
+	}
+	if collected.parts[3].name != "image" || collected.parts[3].fileName != "pic.png" ||
+		collected.parts[3].contentType != "image/png" {
+		t.Errorf("part 3: %+v", collected.parts[3])
+	}
+}
+
+// TestMultipartSaveInto: SaveInto writes file parts under a directory
+// using the basename of FileName, ignoring path components in the
+// supplied name.
+func TestMultipartSaveInto(t *testing.T) {
+	dir := t.TempDir()
+	savedPath := make(chan string, 1)
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.PostAsync("/u", 1<<20, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			err := req.Multipart(func(p *gogo.MultipartPart) error {
+				if !p.IsFile() {
+					return nil
+				}
+				path, err := p.SaveInto(dir)
+				if err != nil {
+					return err
+				}
+				savedPath <- path
+				return nil
+			})
+			if err != nil {
+				res.Send(400, "text/plain", err.Error())
+				return
+			}
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	fw, _ := mw.CreateFormFile("up", "evil.txt")
+	fw.Write([]byte("hello disk"))
+	mw.Close()
+
+	status, _ := httpPost(t, port, "/u", mw.FormDataContentType(), body.Bytes())
+	if status != 200 {
+		t.Fatalf("save: status %d", status)
+	}
+	path := <-savedPath
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read saved: %v", err)
+	}
+	if string(got) != "hello disk" {
+		t.Errorf("file contents: got %q, want %q", got, "hello disk")
+	}
+	if filepath.Dir(path) != dir {
+		t.Errorf("saved outside dir: got %s, want under %s", path, dir)
+	}
+}
+
+// TestMultipartSaveIntoRejectsTraversal: SaveInto strips path
+// components from FileName so a "../../etc/passwd"-style filename
+// can't escape the target directory.
+func TestMultipartSaveIntoRejectsTraversal(t *testing.T) {
+	dir := t.TempDir()
+	type saveResult struct {
+		path string
+		err  error
+	}
+	resultCh := make(chan saveResult, 1)
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.PostAsync("/u", 1<<20, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			err := req.Multipart(func(p *gogo.MultipartPart) error {
+				if !p.IsFile() {
+					return nil
+				}
+				path, err := p.SaveInto(dir)
+				resultCh <- saveResult{path: path, err: err}
+				return nil
+			})
+			if err != nil {
+				res.Send(500, "text/plain", err.Error())
+				return
+			}
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	part, _ := mw.CreatePart(textproto.MIMEHeader{
+		"Content-Disposition": []string{`form-data; name="up"; filename="../../escape.txt"`},
+	})
+	part.Write([]byte("nope"))
+	mw.Close()
+
+	status, _ := httpPost(t, port, "/u", mw.FormDataContentType(), body.Bytes())
+	if status != 200 {
+		t.Fatalf("status %d", status)
+	}
+	r := <-resultCh
+	if r.err != nil {
+		t.Fatalf("SaveInto err: %v", r.err)
+	}
+	// Basename of "../../escape.txt" is "escape.txt" — SaveInto writes
+	// to dir/escape.txt, not to the traversed location.
+	wantPath := filepath.Join(dir, "escape.txt")
+	if r.path != wantPath {
+		t.Errorf("savedPath: got %q, want %q", r.path, wantPath)
+	}
+	if _, err := os.Stat(wantPath); err != nil {
+		t.Errorf("expected file at %s: %v", wantPath, err)
+	}
+}
+
+// TestMultipartCallbackError: returning a non-nil error from the
+// callback stops iteration and surfaces verbatim.
+func TestMultipartCallbackError(t *testing.T) {
+	stopErr := errors.New("user stop")
+	errCh := make(chan error, 1)
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.PostAsync("/u", 1<<20, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			seen := 0
+			err := req.Multipart(func(p *gogo.MultipartPart) error {
+				seen++
+				if seen == 2 {
+					return stopErr
+				}
+				return nil
+			})
+			errCh <- err
+			if err != nil {
+				res.Send(400, "text/plain", err.Error())
+				return
+			}
+			res.Send(200, "text/plain", fmt.Sprintf("seen=%d", seen))
+		})
+	})
+	defer teardown()
+
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	mw.WriteField("a", "1")
+	mw.WriteField("b", "2")
+	mw.WriteField("c", "3")
+	mw.Close()
+
+	status, respBody := httpPost(t, port, "/u", mw.FormDataContentType(), body.Bytes())
+	if status != 400 || respBody != "user stop" {
+		t.Fatalf("stop: got %d %q", status, respBody)
+	}
+	if got := <-errCh; !errors.Is(got, stopErr) {
+		t.Errorf("ParseMultipart err: %v, want %v", got, stopErr)
+	}
+}
+
+// TestMultipartUnsupportedMediaType: a non-multipart Content-Type
+// surfaces ErrUnsupportedMediaType — callers map to 415.
+func TestMultipartUnsupportedMediaType(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.PostAsync("/u", 1024, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			err := req.Multipart(func(p *gogo.MultipartPart) error { return nil })
+			if errors.Is(err, gogo.ErrUnsupportedMediaType) {
+				res.Send(415, "text/plain", "unsupported")
+				return
+			}
+			res.Send(500, "text/plain", "unexpected: "+fmt.Sprint(err))
+		})
+	})
+	defer teardown()
+
+	status, _ := httpPost(t, port, "/u", "application/json", []byte(`{}`))
+	if status != 415 {
+		t.Errorf("unsupported: status %d, want 415", status)
+	}
+}
+
+// TestParseMultipartDirect: package-level helper works without a
+// Request, for sync handlers that collect the body via Response.Body.
+func TestParseMultipartDirect(t *testing.T) {
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	mw.WriteField("k", "v")
+	fw, _ := mw.CreateFormFile("file", "x.bin")
+	fw.Write([]byte("BIN"))
+	mw.Close()
+
+	var parts []string
+	err := gogo.ParseMultipart(mw.FormDataContentType(), body.Bytes(), func(p *gogo.MultipartPart) error {
+		parts = append(parts, fmt.Sprintf("%s=%s(%q)", p.Name, p.FileName, p.Data))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ParseMultipart: %v", err)
+	}
+	if len(parts) != 2 {
+		t.Fatalf("parts: %d, want 2: %v", len(parts), parts)
+	}
+}
+
