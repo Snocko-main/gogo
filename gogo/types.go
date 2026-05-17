@@ -770,6 +770,48 @@ func (a *App) Any(pattern string, handler Handler) {
 	a.inner.any(pattern, a.wrap(pattern, handler))
 }
 
+// Put registers a PUT route. PUT requests carry bodies and are subject
+// to BodyLimit, like Post.
+func (a *App) Put(pattern string, handler Handler) {
+	validatePattern(pattern)
+	a.trackRouteMethod("put", pattern)
+	a.inner.put(pattern, a.wrap(pattern, handler))
+}
+
+// Patch registers a PATCH route. PATCH requests carry bodies and are
+// subject to BodyLimit, like Post.
+func (a *App) Patch(pattern string, handler Handler) {
+	validatePattern(pattern)
+	a.trackRouteMethod("patch", pattern)
+	a.inner.patch(pattern, a.wrap(pattern, handler))
+}
+
+// Delete registers a DELETE route. DELETE may carry a body per
+// RFC 9110 §9.3.5 and is subject to BodyLimit.
+func (a *App) Delete(pattern string, handler Handler) {
+	validatePattern(pattern)
+	a.trackRouteMethod("delete", pattern)
+	a.inner.deleteM(pattern, a.wrap(pattern, handler))
+}
+
+// Options registers an OPTIONS route. OPTIONS is bodyless and skips
+// the BodyLimit check.
+func (a *App) Options(pattern string, handler Handler) {
+	validatePattern(pattern)
+	a.trackRouteMethod("options", pattern)
+	a.inner.options(pattern, a.wrap(pattern, handler))
+}
+
+// Head registers a HEAD route. HEAD is bodyless and skips the
+// BodyLimit check. Per RFC 9110, HEAD responses must omit the body;
+// the framework does not enforce this — handlers should call res.End("")
+// after writing the headers.
+func (a *App) Head(pattern string, handler Handler) {
+	validatePattern(pattern)
+	a.trackRouteMethod("head", pattern)
+	a.inner.head(pattern, a.wrap(pattern, handler))
+}
+
 // WebSocket registers a WebSocket route.
 func (a *App) WebSocket(pattern string, behavior WebSocketBehavior) {
 	validatePattern(pattern)
@@ -946,6 +988,51 @@ func (r *Router) Any(pattern string, handler Handler) {
 	full := r.prefix + pattern
 	h := r.app.wrap(full, r.wrapGroupSync(handler))
 	r.app.inner.any(full, h)
+}
+
+// Put registers a PUT route under this Router.
+func (r *Router) Put(pattern string, handler Handler) {
+	validatePattern(pattern)
+	full := r.prefix + pattern
+	r.app.trackRouteMethod("put", full)
+	h := r.app.wrap(full, r.wrapGroupSync(handler))
+	r.app.inner.put(full, h)
+}
+
+// Patch registers a PATCH route under this Router.
+func (r *Router) Patch(pattern string, handler Handler) {
+	validatePattern(pattern)
+	full := r.prefix + pattern
+	r.app.trackRouteMethod("patch", full)
+	h := r.app.wrap(full, r.wrapGroupSync(handler))
+	r.app.inner.patch(full, h)
+}
+
+// Delete registers a DELETE route under this Router.
+func (r *Router) Delete(pattern string, handler Handler) {
+	validatePattern(pattern)
+	full := r.prefix + pattern
+	r.app.trackRouteMethod("delete", full)
+	h := r.app.wrap(full, r.wrapGroupSync(handler))
+	r.app.inner.deleteM(full, h)
+}
+
+// Options registers an OPTIONS route under this Router.
+func (r *Router) Options(pattern string, handler Handler) {
+	validatePattern(pattern)
+	full := r.prefix + pattern
+	r.app.trackRouteMethod("options", full)
+	h := r.app.wrap(full, r.wrapGroupSync(handler))
+	r.app.inner.options(full, h)
+}
+
+// Head registers a HEAD route under this Router.
+func (r *Router) Head(pattern string, handler Handler) {
+	validatePattern(pattern)
+	full := r.prefix + pattern
+	r.app.trackRouteMethod("head", full)
+	h := r.app.wrap(full, r.wrapGroupSync(handler))
+	r.app.inner.head(full, h)
 }
 
 // GetAsync registers a GET route under this Router that runs on a goroutine.

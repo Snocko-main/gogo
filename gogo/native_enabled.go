@@ -307,6 +307,36 @@ func (a *appNative) any(pattern string, handler Handler) {
 	C.uwsgo_app_any(a.ptr, cpattern, C.uintptr_t(handle))
 }
 
+func (a *appNative) put(pattern string, handler Handler) {
+	cpattern, handle := a.prepareRoute(pattern, handler)
+	defer C.free(unsafe.Pointer(cpattern))
+	C.uwsgo_app_put(a.ptr, cpattern, C.uintptr_t(handle))
+}
+
+func (a *appNative) patch(pattern string, handler Handler) {
+	cpattern, handle := a.prepareRoute(pattern, handler)
+	defer C.free(unsafe.Pointer(cpattern))
+	C.uwsgo_app_patch(a.ptr, cpattern, C.uintptr_t(handle))
+}
+
+func (a *appNative) deleteM(pattern string, handler Handler) {
+	cpattern, handle := a.prepareRoute(pattern, handler)
+	defer C.free(unsafe.Pointer(cpattern))
+	C.uwsgo_app_delete(a.ptr, cpattern, C.uintptr_t(handle))
+}
+
+func (a *appNative) options(pattern string, handler Handler) {
+	cpattern, handle := a.prepareRoute(pattern, handler)
+	defer C.free(unsafe.Pointer(cpattern))
+	C.uwsgo_app_options(a.ptr, cpattern, C.uintptr_t(handle))
+}
+
+func (a *appNative) head(pattern string, handler Handler) {
+	cpattern, handle := a.prepareRoute(pattern, handler)
+	defer C.free(unsafe.Pointer(cpattern))
+	C.uwsgo_app_head(a.ptr, cpattern, C.uintptr_t(handle))
+}
+
 func (a *appNative) websocket(pattern string, behavior WebSocketBehavior) {
 	cpattern := C.CString(pattern)
 	defer C.free(unsafe.Pointer(cpattern))

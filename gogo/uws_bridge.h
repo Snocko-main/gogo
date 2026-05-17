@@ -32,6 +32,14 @@ void uwsgo_app_set_capture_peer_ip(uwsgo_app_t *app, int enable);
 void uwsgo_app_get(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);
 void uwsgo_app_post(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);
 void uwsgo_app_any(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);
+// Method helpers — same semantics as uwsgo_app_get / _post; PUT, PATCH,
+// and DELETE go through body_limit_rejects so the Content-Length cap
+// applies; OPTIONS and HEAD are bodyless and skip the check.
+void uwsgo_app_put(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);
+void uwsgo_app_patch(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);
+void uwsgo_app_delete(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);
+void uwsgo_app_options(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);
+void uwsgo_app_head(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);
 // uwsgo_app_ws registers a WebSocket endpoint with per-route limits
 // forwarded to the uWS WebSocketBehavior template (max payload, idle
 // timeout in seconds, backpressure cap, automatic ping/pong toggle).

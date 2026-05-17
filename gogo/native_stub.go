@@ -27,6 +27,11 @@ func (appNative) getStatic(string, string, string, string) {}
 func (appNative) getShared(string, AsyncHandler)           {}
 func (appNative) post(string, Handler)                     {}
 func (appNative) any(string, Handler)                      {}
+func (appNative) put(string, Handler)                      {}
+func (appNative) patch(string, Handler)                    {}
+func (appNative) deleteM(string, Handler)                  {}
+func (appNative) options(string, Handler)                  {}
+func (appNative) head(string, Handler)                     {}
 func (appNative) websocket(string, WebSocketBehavior)      {}
 func (appNative) listen(string, int) bool                  { return false }
 func (appNative) setBodyLimit(int)                         {}
