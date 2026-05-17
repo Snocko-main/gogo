@@ -2392,6 +2392,9 @@ func TestWebSocketBehaviorAcceptsLimits(t *testing.T) {
 // shared-dispatch path. IP comes from the loopback peer (127.0.0.1)
 // in the test harness; IPs is X-Forwarded-For; Hostname comes from
 // the Host header (port stripped).
+//
+// CapturePeerIP is enabled so async / shared paths populate the IP
+// snapshot. The default (off) is exercised by TestPeerIPDefaultOff.
 func TestRequestIntrospection(t *testing.T) {
 	type captured struct {
 		ip       string
@@ -2402,7 +2405,7 @@ func TestRequestIntrospection(t *testing.T) {
 		secure   bool
 	}
 	var sync, async, shared atomic.Pointer[captured]
-	port, teardown := startApp(t, func(app *gogo.App) {
+	port, teardown := startAppCfg(t, gogo.Config{CapturePeerIP: true}, func(app *gogo.App) {
 		app.Get("/sync", func(res *gogo.Response, req *gogo.Request) {
 			sync.Store(&captured{
 				ip:       req.IP(),
@@ -2488,6 +2491,49 @@ func TestRequestIntrospection(t *testing.T) {
 	check("sync", sync.Load())
 	check("async-snap", async.Load())
 	check("shared", shared.Load())
+}
+
+// TestPeerIPDefaultOff: with the default Config (CapturePeerIP=false),
+// shared-dispatch and sync-wrapper-async handlers see req.IP() == "".
+// Sync handlers still get the live IP — their lookup goes through the
+// res pointer directly and isn't tied to the snapshot.
+func TestPeerIPDefaultOff(t *testing.T) {
+	var syncIP, asyncIP, sharedIP atomic.Pointer[string]
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/sync", func(res *gogo.Response, req *gogo.Request) {
+			ip := req.IP()
+			syncIP.Store(&ip)
+			res.Send(200, "text/plain", "ok")
+		})
+		app.Use("/snap/*", func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) { next(res, req) }
+		})
+		app.GetAsync("/snap/x", func(res *gogo.Response, req *gogo.Request) {
+			ip := req.IP()
+			asyncIP.Store(&ip)
+			res.Send(200, "text/plain", "ok")
+		})
+		app.GetAsync("/shared", func(res *gogo.Response, req *gogo.Request) {
+			ip := req.IP()
+			sharedIP.Store(&ip)
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	httpGet(t, port, "/sync")
+	httpGet(t, port, "/snap/x")
+	httpGet(t, port, "/shared")
+
+	if v := syncIP.Load(); v == nil || *v == "" {
+		t.Errorf("sync handler IP empty with CapturePeerIP=false; live res lookup should still work, got %v", v)
+	}
+	if v := asyncIP.Load(); v == nil || *v != "" {
+		t.Errorf("async (snapshot) IP should be empty by default, got %q", *v)
+	}
+	if v := sharedIP.Load(); v == nil || *v != "" {
+		t.Errorf("shared-dispatch IP should be empty by default, got %q", *v)
+	}
 }
 
 // TestResponseRedirect: status defaults to 302; Location header is set;

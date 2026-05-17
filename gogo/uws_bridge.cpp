@@ -130,6 +130,13 @@ struct uwsgo_app_t {
     // Content-Length header at request arrival before dispatching to Go.
     // 0 disables the check.
     size_t body_limit = 0;
+
+    // capture_peer_ip toggles whether snapshot_request copies the
+    // formatted peer IP into the AsyncCtx ip[] buffer. Off by default
+    // — Go's Config.CapturePeerIP flips it. Skipping the copy saves
+    // a string_view format + ~50-byte memcpy per shared-dispatch
+    // request, which measures at ~2-3% on small-response routes.
+    bool capture_peer_ip = false;
 };
 
 static size_t copy_string_view(std::string_view value, char *buffer, size_t buffer_len) {
@@ -259,6 +266,10 @@ extern "C" void uwsgo_app_any(uwsgo_app_t *app, const char *pattern, uintptr_t h
 
 extern "C" void uwsgo_app_set_body_limit(uwsgo_app_t *app, size_t limit) {
     app->body_limit = limit;
+}
+
+extern "C" void uwsgo_app_set_capture_peer_ip(uwsgo_app_t *app, int enable) {
+    app->capture_peer_ip = enable != 0;
 }
 
 extern "C" void uwsgo_app_ws(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id,
@@ -641,7 +652,7 @@ extern "C" void uwsgo_shared_layout(uwsgo_shared_layout_t *out) {
 // snapshot_request copies the fields of the live uWS HttpRequest into the
 // AsyncCtx so the async goroutine can read them after uWS frees the request.
 // Anything that doesn't fit the fixed buffers is truncated.
-static void snapshot_request(AsyncCtx *ctx, uWS::HttpResponse<false> *res, uWS::HttpRequest *req) {
+static void snapshot_request(uwsgo_app_t *app, AsyncCtx *ctx, uWS::HttpResponse<false> *res, uWS::HttpRequest *req) {
     bool truncated = false;
     auto copy_view = [&truncated](char *dst, size_t cap, std::string_view src) -> uint32_t {
         size_t n = std::min(cap, src.size());
@@ -654,9 +665,15 @@ static void snapshot_request(AsyncCtx *ctx, uWS::HttpResponse<false> *res, uWS::
     // getUrl returns the path; getQuery returns query string sans '?'.
     ctx->url_len = copy_view(ctx->url, SNAP_URL_CAP, req->getUrl());
     ctx->query_len = copy_view(ctx->query, SNAP_QUERY_CAP, req->getQuery());
-    // Snapshot the peer IP now while res is still valid — async / shared
-    // handlers run after uWS may have freed it.
-    ctx->ip_len = copy_view(ctx->ip, SNAP_IP_CAP, res->getRemoteAddressAsText());
+    // Peer IP is opt-in (Config.CapturePeerIP). Skipping the format +
+    // memcpy saves ~2-3% on small-response shared-dispatch routes;
+    // when off, snap.ip is empty and req.IP() returns "" in the
+    // worker.
+    if (app->capture_peer_ip) {
+        ctx->ip_len = copy_view(ctx->ip, SNAP_IP_CAP, res->getRemoteAddressAsText());
+    } else {
+        ctx->ip_len = 0;
+    }
 
     // Route parameters: walk indices until uWS returns empty.
     uint32_t param_count = 0;
@@ -702,7 +719,7 @@ extern "C" void uwsgo_app_get_shared(uwsgo_app_t *app, const char *pattern, uint
         // Snapshot before any cgo / Go work — uWS HttpRequest is live only
         // inside this lambda. Reject oversized snapshots instead of handing
         // security-sensitive middleware silently truncated request data.
-        snapshot_request(ctx, res, req);
+        snapshot_request(app, ctx, res, req);
         if (ctx->truncated) {
             ctx->release();
             res->writeStatus("431 Request Header Fields Too Large");

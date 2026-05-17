@@ -24,6 +24,11 @@ void uwsgo_app_free(uwsgo_app_t *app);
 // ...) themselves for protection. Pass 0 to disable.
 void uwsgo_app_set_body_limit(uwsgo_app_t *app, size_t limit);
 
+// uwsgo_app_set_capture_peer_ip toggles whether snapshot_request copies
+// the formatted peer IP into AsyncCtx for shared-dispatch / async paths.
+// Off by default — see Go-side Config.CapturePeerIP for the trade-off.
+void uwsgo_app_set_capture_peer_ip(uwsgo_app_t *app, int enable);
+
 void uwsgo_app_get(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);
 void uwsgo_app_post(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);
 void uwsgo_app_any(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);

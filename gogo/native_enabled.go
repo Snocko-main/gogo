@@ -355,6 +355,14 @@ func (a appNative) setBodyLimit(limit int) {
 	C.uwsgo_app_set_body_limit(a.ptr, C.size_t(limit))
 }
 
+func (a appNative) setCapturePeerIP(enable bool) {
+	v := C.int(0)
+	if enable {
+		v = 1
+	}
+	C.uwsgo_app_set_capture_peer_ip(a.ptr, v)
+}
+
 func (a appNative) run() {
 	C.uwsgo_app_run(a.ptr)
 }

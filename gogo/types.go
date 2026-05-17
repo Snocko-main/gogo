@@ -265,6 +265,22 @@ type Config struct {
 	// "all interfaces" (uWS default 0.0.0.0). Use "127.0.0.1" for a
 	// localhost-only service. Applied at Listen time.
 	BindAddr string
+
+	// CapturePeerIP enables snapshotting the peer IP on the C++ side
+	// before shared-dispatch / async handlers run. When false (default),
+	// req.IP() in shared-dispatch GetAsync handlers and in async handlers
+	// that fell through to the snapshot path will return "". Sync
+	// handlers always get a usable req.IP() — the lookup is lazy and
+	// only pays cgo when actually called, so the flag has no effect
+	// there.
+	//
+	// Cost when enabled: one std::string_view format + ~50-byte memcpy
+	// per shared-dispatch request, plus 64 extra bytes on every
+	// AsyncCtx. Measured at roughly 2–3% throughput on small responses
+	// (e.g. /db at ~75K rps); negligible on routes with significant
+	// per-request work. Enable it when handlers behind GetAsync need to
+	// read the peer IP; otherwise leave it off.
+	CapturePeerIP bool
 }
 
 // App is a uWebSockets HTTP application.
@@ -301,6 +317,7 @@ func NewApp(cfg ...Config) (*App, error) {
 	}
 	c = defaultConfig(c)
 	inner.setBodyLimit(c.BodyLimit)
+	inner.setCapturePeerIP(c.CapturePeerIP)
 	return &App{inner: inner, cfg: c}, nil
 }
 
@@ -652,7 +669,7 @@ func (a *App) GetAsync(pattern string, handler AsyncHandler) {
 	a.inner.get(pattern, a.wrap(pattern, func(res *Response, req *Request) {
 		// Capture req fields before the sync wrapper returns — uWS frees the
 		// underlying HttpRequest the moment we return from this cgo callback.
-		snap := req.snapshotFromSync()
+		snap := req.snapshotFromSync(a.cfg.CapturePeerIP)
 		res.Async(func() {
 			snapReq := requestPool.Get().(*Request)
 			snapReq.snap = snap
@@ -695,7 +712,7 @@ func (a *App) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandl
 		// Snapshot the request before its lifetime ends. Body collection
 		// happens via onData callbacks fired after we return, by which time
 		// req would be invalid; the snapshot survives.
-		snap := req.snapshotFromSync()
+		snap := req.snapshotFromSync(a.cfg.CapturePeerIP)
 		res.Body(maxBodyBytes, func(body []byte, err error) {
 			if err == ErrBodyTooLarge {
 				res.Send(413, "text/plain; charset=utf-8", "payload too large\n")
@@ -912,7 +929,7 @@ func (r *Router) GetAsync(pattern string, handler AsyncHandler) {
 	}
 
 	syncEntry := func(res *Response, req *Request) {
-		snap := req.snapshotFromSync()
+		snap := req.snapshotFromSync(r.app.cfg.CapturePeerIP)
 		res.Async(func() {
 			snapReq := requestPool.Get().(*Request)
 			snapReq.snap = snap
@@ -938,7 +955,7 @@ func (r *Router) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHa
 	wrappedAsync := r.app.wrapAsync(full, r.wrapGroupAsync(finalAsync))
 
 	syncEntry := func(res *Response, req *Request) {
-		snap := req.snapshotFromSync()
+		snap := req.snapshotFromSync(r.app.cfg.CapturePeerIP)
 		res.Body(maxBodyBytes, func(body []byte, err error) {
 			if err == ErrBodyTooLarge {
 				res.Send(413, "text/plain; charset=utf-8", "payload too large\n")
@@ -1918,7 +1935,9 @@ func bytesEqualLower(b []byte, lower string) bool {
 // snapshotFromSync materializes a snapshot from a sync-mode Request so the
 // data survives past the cgo callback's return. The middleware-fallback path
 // in GetAsync/PostAsync calls this before spawning the async goroutine.
-func (r *Request) snapshotFromSync() *requestSnapshot {
+// capturePeerIP=false skips the cgo getRemoteAddressAsText lookup; the
+// resulting snap.ip is empty and req.IP() in the async goroutine returns "".
+func (r *Request) snapshotFromSync(capturePeerIP bool) *requestSnapshot {
 	if r.snap != nil {
 		return r.snap
 	}
@@ -1926,8 +1945,10 @@ func (r *Request) snapshotFromSync() *requestSnapshot {
 		method:  r.inner.method(),
 		url:     r.inner.url(),
 		query:   r.inner.query(),
-		ip:      remoteAddrFromPtr(r.syncResPtr),
 		headers: r.inner.headersAll(),
+	}
+	if capturePeerIP {
+		snap.ip = remoteAddrFromPtr(r.syncResPtr)
 	}
 	for i := 0; i < 8; i++ {
 		p := r.inner.parameter(i)
