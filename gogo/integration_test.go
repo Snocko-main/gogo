@@ -5,8 +5,10 @@ package gogo_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"os"
@@ -3776,5 +3778,203 @@ func TestHTTPMethodHelpersBodyLimit(t *testing.T) {
 		if resp.StatusCode != 413 {
 			t.Errorf("%s /r over limit: status %d, want 413", method, resp.StatusCode)
 		}
+	}
+}
+
+// TestBodyParserJSON: PostAsync receives the body, BodyParser unmarshals
+// JSON into a typed struct.
+func TestBodyParserJSON(t *testing.T) {
+	type user struct {
+		Name  string   `json:"name"`
+		Age   int      `json:"age"`
+		Tags  []string `json:"tags"`
+	}
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.PostAsync("/u", 64*1024, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			var u user
+			if err := req.BodyParser(&u); err != nil {
+				res.Send(400, "text/plain", err.Error())
+				return
+			}
+			res.Send(200, "text/plain",
+				fmt.Sprintf("name=%s age=%d tags=%v", u.Name, u.Age, u.Tags))
+		})
+	})
+	defer teardown()
+
+	payload := []byte(`{"name":"alice","age":30,"tags":["a","b"]}`)
+	status, body := httpPost(t, port, "/u", "application/json", payload)
+	if status != 200 || body != "name=alice age=30 tags=[a b]" {
+		t.Fatalf("JSON parse: got %d %q", status, body)
+	}
+
+	// Charset parameter — should still match application/json.
+	status, body = httpPost(t, port, "/u", "application/json; charset=utf-8", payload)
+	if status != 200 || body != "name=alice age=30 tags=[a b]" {
+		t.Fatalf("JSON+charset: got %d %q", status, body)
+	}
+
+	// Bad JSON — surface the parse error.
+	status, _ = httpPost(t, port, "/u", "application/json", []byte(`{not json}`))
+	if status != 400 {
+		t.Errorf("bad JSON: status %d, want 400", status)
+	}
+}
+
+// TestBodyParserForm: application/x-www-form-urlencoded into a struct
+// with `form:"name"` tags. Covers scalars, slice, bool aliases, and
+// pointer-to-int.
+func TestBodyParserForm(t *testing.T) {
+	type filters struct {
+		Q       string   `form:"q"`
+		Page    int      `form:"page"`
+		Active  bool     `form:"active"`
+		Tags    []string `form:"tag"`
+		MinAge  *int     `form:"min_age"`
+		Limit   int64    `form:"limit"`
+		Ratio   float64  `form:"ratio"`
+		Skipped string   `form:"-"`
+		Unset   *bool    `form:"unset"`
+	}
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.PostAsync("/f", 64*1024, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			var f filters
+			if err := req.BodyParser(&f); err != nil {
+				res.Send(400, "text/plain", err.Error())
+				return
+			}
+			minAge := "<nil>"
+			if f.MinAge != nil {
+				minAge = strconv.Itoa(*f.MinAge)
+			}
+			unset := "<nil>"
+			if f.Unset != nil {
+				unset = strconv.FormatBool(*f.Unset)
+			}
+			res.Send(200, "text/plain", fmt.Sprintf(
+				"q=%s page=%d active=%t tags=%v min_age=%s limit=%d ratio=%.2f unset=%s",
+				f.Q, f.Page, f.Active, f.Tags, minAge, f.Limit, f.Ratio, unset))
+		})
+	})
+	defer teardown()
+
+	body := []byte("q=hello&page=2&active=yes&tag=a&tag=b&min_age=18&limit=200&ratio=1.5&skipped=x")
+	status, respBody := httpPost(t, port, "/f", "application/x-www-form-urlencoded", body)
+	want := "q=hello page=2 active=true tags=[a b] min_age=18 limit=200 ratio=1.50 unset=<nil>"
+	if status != 200 || respBody != want {
+		t.Fatalf("form: got %d %q\n want %q", status, respBody, want)
+	}
+
+	// Bad int — surface as 400.
+	bad := []byte("q=x&page=notanumber")
+	status, _ = httpPost(t, port, "/f", "application/x-www-form-urlencoded", bad)
+	if status != 400 {
+		t.Errorf("bad form int: status %d, want 400", status)
+	}
+}
+
+// TestBodyParserMultipart: multipart/form-data — non-file parts are
+// surfaced as form values; file parts are ignored by BodyParser.
+func TestBodyParserMultipart(t *testing.T) {
+	type form struct {
+		Name string `form:"name"`
+		Age  int    `form:"age"`
+	}
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.PostAsync("/m", 1<<20, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			var f form
+			if err := req.BodyParser(&f); err != nil {
+				res.Send(400, "text/plain", err.Error())
+				return
+			}
+			res.Send(200, "text/plain", fmt.Sprintf("name=%s age=%d", f.Name, f.Age))
+		})
+	})
+	defer teardown()
+
+	// Build a multipart body by hand to control the boundary exactly.
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	_ = mw.WriteField("name", "bob")
+	_ = mw.WriteField("age", "42")
+	fw, _ := mw.CreateFormFile("upload", "f.txt")
+	fw.Write([]byte("file content goes here"))
+	mw.Close()
+
+	status, respBody := httpPost(t, port, "/m", mw.FormDataContentType(), body.Bytes())
+	if status != 200 || respBody != "name=bob age=42" {
+		t.Fatalf("multipart: got %d %q", status, respBody)
+	}
+}
+
+// TestBodyParserNoBody: sync handlers reach BodyParser without
+// collecting the body first → ErrNoBody.
+func TestBodyParserNoBody(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Post("/x", func(res *gogo.Response, req *gogo.Request) {
+			var v map[string]any
+			err := req.BodyParser(&v)
+			if !errors.Is(err, gogo.ErrNoBody) {
+				res.Send(500, "text/plain", "wrong err: "+fmt.Sprint(err))
+				return
+			}
+			res.Send(200, "text/plain", "no-body")
+		})
+	})
+	defer teardown()
+
+	status, body := httpPost(t, port, "/x", "application/json", []byte(`{"a":1}`))
+	if status != 200 || body != "no-body" {
+		t.Errorf("sync no-body: got %d %q", status, body)
+	}
+}
+
+// TestBodyParserUnsupportedMediaType: a non-JSON / non-form content
+// type returns ErrUnsupportedMediaType.
+func TestBodyParserUnsupportedMediaType(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.PostAsync("/u", 1024, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			var v any
+			err := req.BodyParser(&v)
+			if errors.Is(err, gogo.ErrUnsupportedMediaType) {
+				res.Send(415, "text/plain", "unsupported")
+				return
+			}
+			res.Send(500, "text/plain", "unexpected: "+fmt.Sprint(err))
+		})
+	})
+	defer teardown()
+
+	status, _ := httpPost(t, port, "/u", "application/xml", []byte("<x/>"))
+	if status != 415 {
+		t.Errorf("unsupported: status %d, want 415", status)
+	}
+}
+
+// TestParseBodyDirect: the free helper ParseBody works without a
+// Request, for sync handlers that collect the body via Response.Body.
+func TestParseBodyDirect(t *testing.T) {
+	type pt struct {
+		X int `json:"x"`
+		Y int `json:"y"`
+	}
+	var p pt
+	if err := gogo.ParseBody("application/json", []byte(`{"x":3,"y":4}`), &p); err != nil {
+		t.Fatalf("ParseBody: %v", err)
+	}
+	if p.X != 3 || p.Y != 4 {
+		t.Errorf("got %+v, want {X:3, Y:4}", p)
+	}
+
+	// Form variant — direct helper.
+	type form struct {
+		Name string `form:"name"`
+	}
+	var f form
+	if err := gogo.ParseBody("application/x-www-form-urlencoded", []byte("name=x"), &f); err != nil {
+		t.Fatalf("ParseBody form: %v", err)
+	}
+	if f.Name != "x" {
+		t.Errorf("got %+v, want {Name:x}", f)
 	}
 }
