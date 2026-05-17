@@ -3517,6 +3517,193 @@ func TestHTTPMethodHelpers(t *testing.T) {
 	check("HEAD", "", 200, [2]string{"X-Probe", "ok"})
 }
 
+// TestQueryAndParamConversion: QueryInt / QueryInt64 / QueryBool /
+// ParamInt / ParamInt64 each parse the named value or fall back to the
+// supplied default.
+func TestQueryAndParamConversion(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/q", func(res *gogo.Response, req *gogo.Request) {
+			page := req.QueryInt("page", 1)
+			limit := req.QueryInt64("limit", 50)
+			active := req.QueryBool("active", false)
+			res.Send(200, "text/plain",
+				fmt.Sprintf("page=%d limit=%d active=%t", page, limit, active))
+		})
+		app.Get("/items/:id", func(res *gogo.Response, req *gogo.Request) {
+			id := req.ParamInt(0, -1)
+			res.Send(200, "text/plain", fmt.Sprintf("id=%d", id))
+		})
+		app.Get("/items64/:id", func(res *gogo.Response, req *gogo.Request) {
+			id := req.ParamInt64(0, -1)
+			res.Send(200, "text/plain", fmt.Sprintf("id=%d", id))
+		})
+	})
+	defer teardown()
+
+	cases := []struct {
+		path string
+		want string
+	}{
+		// Defaults when params are missing.
+		{"/q", "page=1 limit=50 active=false"},
+		// Parsed values.
+		{"/q?page=3&limit=200&active=true", "page=3 limit=200 active=true"},
+		// Bool aliases.
+		{"/q?active=1", "page=1 limit=50 active=true"},
+		{"/q?active=yes", "page=1 limit=50 active=true"},
+		{"/q?active=on", "page=1 limit=50 active=true"},
+		{"/q?active=0", "page=1 limit=50 active=false"},
+		{"/q?active=off", "page=1 limit=50 active=false"},
+		// Garbage falls back to default (true here).
+		{"/q?active=banana", "page=1 limit=50 active=false"},
+		// Negative int — accepted.
+		{"/q?page=-5", "page=-5 limit=50 active=false"},
+		// Non-numeric falls back to default.
+		{"/q?page=oops", "page=1 limit=50 active=false"},
+		// Route param.
+		{"/items/42", "id=42"},
+		{"/items/abc", "id=-1"},
+		{"/items64/9999999999", "id=9999999999"},
+	}
+	for _, tc := range cases {
+		status, body := httpGet(t, port, tc.path)
+		if status != 200 {
+			t.Errorf("%s: status %d, want 200", tc.path, status)
+		}
+		if body != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.path, body, tc.want)
+		}
+	}
+}
+
+// TestResponseAppend: Append emits multiple header lines with the same
+// key; the client sees both values.
+func TestResponseAppend(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/h", func(res *gogo.Response, req *gogo.Request) {
+			res.Append("X-Multi", "first")
+			res.Append("X-Multi", "second")
+			res.Header("Set-Cookie", "a=1; Path=/")
+			res.Header("Set-Cookie", "b=2; Path=/")
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/h", port))
+	if err != nil {
+		t.Fatalf("GET /h: %v", err)
+	}
+	resp.Body.Close()
+	if vs := resp.Header.Values("X-Multi"); len(vs) != 2 || vs[0] != "first" || vs[1] != "second" {
+		t.Errorf("X-Multi: got %v, want [first second]", vs)
+	}
+	if vs := resp.Header.Values("Set-Cookie"); len(vs) != 2 {
+		t.Errorf("Set-Cookie count: got %d, want 2 (values: %v)", len(vs), vs)
+	}
+}
+
+// TestProtocolDefault: without Config.TrustProxy, Protocol() always
+// returns "http" — X-Forwarded-Proto is ignored so a malicious client
+// can't spoof its way to appearing as https.
+func TestProtocolDefault(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/p", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", fmt.Sprintf("%s:%t", req.Protocol(), req.Secure()))
+		})
+	})
+	defer teardown()
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/p", port), nil)
+	req.Header.Set("X-Forwarded-Proto", "https")
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /p: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "http:false" {
+		t.Errorf("default: got %q, want %q (X-Forwarded-Proto must be ignored)", body, "http:false")
+	}
+}
+
+// TestProtocolTrustProxy: with Config.TrustProxy enabled, Protocol()
+// honors X-Forwarded-Proto. Comma-separated lists keep the first value.
+func TestProtocolTrustProxy(t *testing.T) {
+	port := freePort(t)
+	ready := make(chan *gogo.App, 1)
+	runDone := make(chan struct{})
+
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+
+		app, err := gogo.NewApp(gogo.Config{TrustProxy: true})
+		if err != nil {
+			t.Errorf("NewApp: %v", err)
+			close(runDone)
+			return
+		}
+		app.Get("/p", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", fmt.Sprintf("%s:%t", req.Protocol(), req.Secure()))
+		})
+		if !app.Listen(port) {
+			t.Errorf("Listen :%d failed", port)
+			app.Close()
+			close(runDone)
+			return
+		}
+		ready <- app
+		app.Run()
+		app.Close()
+		close(runDone)
+	}()
+	var app *gogo.App
+	select {
+	case app = <-ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("setup timeout")
+	}
+	for i := 0; i < 50; i++ {
+		c, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err == nil {
+			c.Close()
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	defer func() {
+		app.Shutdown()
+		<-runDone
+	}()
+
+	cases := []struct {
+		hdr  string
+		want string
+	}{
+		{"https", "https:true"},
+		{"HTTPS", "https:true"},
+		{"http", "http:false"},
+		{"https, http", "https:true"},
+		{"", "http:false"},
+	}
+	for _, tc := range cases {
+		req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/p", port), nil)
+		if tc.hdr != "" {
+			req.Header.Set("X-Forwarded-Proto", tc.hdr)
+		}
+		resp, err := noKeepaliveClient.Do(req)
+		if err != nil {
+			t.Fatalf("Forwarded-Proto=%q: %v", tc.hdr, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if string(body) != tc.want {
+			t.Errorf("Forwarded-Proto=%q: got %q, want %q", tc.hdr, body, tc.want)
+		}
+	}
+}
+
 // TestHTTPMethodHelpersBodyLimit: PUT, PATCH, DELETE all honor
 // App.Config.BodyLimit just like POST. OPTIONS and HEAD are bodyless and
 // bypass the limit.
