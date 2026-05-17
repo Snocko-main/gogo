@@ -49,6 +49,8 @@ func (responseNative) remoteAddr() string          { return "" }
 
 func (loopNative) defer_(func()) {}
 
+func loopFromUintptr(uintptr) *Loop { return &Loop{} }
+
 func (appNative) startSharedDrain(int)                     {}
 func initSharedLayout()                                    {}
 func asyncSendShared(uintptr, string, string, string) bool { return false }
