@@ -345,6 +345,39 @@ extern "C" void uwsgo_app_any(uwsgo_app_t *app, const char *pattern, uintptr_t h
     });
 }
 
+extern "C" void uwsgo_app_put(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id) {
+    app->app->put(pattern, [app, handler_id](auto *res, auto *req) {
+        if (body_limit_rejects(app, res, req)) return;
+        dispatch_sync(handler_id, res, req);
+    });
+}
+
+extern "C" void uwsgo_app_patch(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id) {
+    app->app->patch(pattern, [app, handler_id](auto *res, auto *req) {
+        if (body_limit_rejects(app, res, req)) return;
+        dispatch_sync(handler_id, res, req);
+    });
+}
+
+extern "C" void uwsgo_app_delete(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id) {
+    app->app->del(pattern, [app, handler_id](auto *res, auto *req) {
+        if (body_limit_rejects(app, res, req)) return;
+        dispatch_sync(handler_id, res, req);
+    });
+}
+
+extern "C" void uwsgo_app_options(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id) {
+    app->app->options(pattern, [handler_id](auto *res, auto *req) {
+        dispatch_sync(handler_id, res, req);
+    });
+}
+
+extern "C" void uwsgo_app_head(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id) {
+    app->app->head(pattern, [handler_id](auto *res, auto *req) {
+        dispatch_sync(handler_id, res, req);
+    });
+}
+
 extern "C" void uwsgo_app_set_body_limit(uwsgo_app_t *app, size_t limit) {
     app->body_limit = limit;
 }

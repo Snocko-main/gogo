@@ -285,6 +285,20 @@ type Config struct {
 	// per-request work. Enable it when handlers behind GetAsync need to
 	// read the peer IP; otherwise leave it off.
 	CapturePeerIP bool
+
+	// TrustProxy declares that the server sits behind a trusted reverse
+	// proxy (e.g. nginx, an L7 load balancer, a CDN), so X-Forwarded-* /
+	// X-Real-IP / Forwarded headers from the client are safe to surface
+	// to the application:
+	//
+	//   - req.Protocol() / req.Secure() honor X-Forwarded-Proto.
+	//   - req.IPs() and the head of the X-Forwarded-For chain are
+	//     already exposed; this flag does not enable them.
+	//
+	// Leave OFF when the server is directly internet-facing — otherwise
+	// any client can spoof their apparent protocol / origin by sending
+	// X-Forwarded-* headers. Default false.
+	TrustProxy bool
 }
 
 // App is a uWebSockets HTTP application.
@@ -463,8 +477,19 @@ func mwMatches(prefix, routePattern string) bool {
 // old scheme because the literal strings "/api/:section" and "/api/admin"
 // do not share a prefix).
 func (a *App) wrap(routePattern string, h Handler) Handler {
+	trustProxy := a.cfg.TrustProxy
 	if len(a.middlewares) == 0 {
-		return h
+		if !trustProxy {
+			return h
+		}
+		// Wrap only to stamp the trustProxy flag so Protocol() /
+		// Secure() can honor X-Forwarded-Proto. One extra call frame
+		// per request — paid only when Config.TrustProxy is enabled.
+		inner := h
+		return func(res *Response, req *Request) {
+			req.trustProxy = true
+			inner(res, req)
+		}
 	}
 	hasScoped := false
 	for _, e := range a.middlewares {
@@ -477,12 +502,22 @@ func (a *App) wrap(routePattern string, h Handler) Handler {
 		for i := len(a.middlewares) - 1; i >= 0; i-- {
 			h = a.middlewares[i].mw(h)
 		}
-		return h
+		if !trustProxy {
+			return h
+		}
+		inner := h
+		return func(res *Response, req *Request) {
+			req.trustProxy = true
+			inner(res, req)
+		}
 	}
 	entries := make([]middlewareEntry, len(a.middlewares))
 	copy(entries, a.middlewares)
 	inner := h
 	return func(res *Response, req *Request) {
+		if trustProxy {
+			req.trustProxy = true
+		}
 		url := req.URL()
 		chain := inner
 		for i := len(entries) - 1; i >= 0; i-- {
@@ -770,6 +805,48 @@ func (a *App) Any(pattern string, handler Handler) {
 	a.inner.any(pattern, a.wrap(pattern, handler))
 }
 
+// Put registers a PUT route. PUT requests carry bodies and are subject
+// to BodyLimit, like Post.
+func (a *App) Put(pattern string, handler Handler) {
+	validatePattern(pattern)
+	a.trackRouteMethod("put", pattern)
+	a.inner.put(pattern, a.wrap(pattern, handler))
+}
+
+// Patch registers a PATCH route. PATCH requests carry bodies and are
+// subject to BodyLimit, like Post.
+func (a *App) Patch(pattern string, handler Handler) {
+	validatePattern(pattern)
+	a.trackRouteMethod("patch", pattern)
+	a.inner.patch(pattern, a.wrap(pattern, handler))
+}
+
+// Delete registers a DELETE route. DELETE may carry a body per
+// RFC 9110 §9.3.5 and is subject to BodyLimit.
+func (a *App) Delete(pattern string, handler Handler) {
+	validatePattern(pattern)
+	a.trackRouteMethod("delete", pattern)
+	a.inner.deleteM(pattern, a.wrap(pattern, handler))
+}
+
+// Options registers an OPTIONS route. OPTIONS is bodyless and skips
+// the BodyLimit check.
+func (a *App) Options(pattern string, handler Handler) {
+	validatePattern(pattern)
+	a.trackRouteMethod("options", pattern)
+	a.inner.options(pattern, a.wrap(pattern, handler))
+}
+
+// Head registers a HEAD route. HEAD is bodyless and skips the
+// BodyLimit check. Per RFC 9110, HEAD responses must omit the body;
+// the framework does not enforce this — handlers should call res.End("")
+// after writing the headers.
+func (a *App) Head(pattern string, handler Handler) {
+	validatePattern(pattern)
+	a.trackRouteMethod("head", pattern)
+	a.inner.head(pattern, a.wrap(pattern, handler))
+}
+
 // WebSocket registers a WebSocket route.
 func (a *App) WebSocket(pattern string, behavior WebSocketBehavior) {
 	validatePattern(pattern)
@@ -946,6 +1023,51 @@ func (r *Router) Any(pattern string, handler Handler) {
 	full := r.prefix + pattern
 	h := r.app.wrap(full, r.wrapGroupSync(handler))
 	r.app.inner.any(full, h)
+}
+
+// Put registers a PUT route under this Router.
+func (r *Router) Put(pattern string, handler Handler) {
+	validatePattern(pattern)
+	full := r.prefix + pattern
+	r.app.trackRouteMethod("put", full)
+	h := r.app.wrap(full, r.wrapGroupSync(handler))
+	r.app.inner.put(full, h)
+}
+
+// Patch registers a PATCH route under this Router.
+func (r *Router) Patch(pattern string, handler Handler) {
+	validatePattern(pattern)
+	full := r.prefix + pattern
+	r.app.trackRouteMethod("patch", full)
+	h := r.app.wrap(full, r.wrapGroupSync(handler))
+	r.app.inner.patch(full, h)
+}
+
+// Delete registers a DELETE route under this Router.
+func (r *Router) Delete(pattern string, handler Handler) {
+	validatePattern(pattern)
+	full := r.prefix + pattern
+	r.app.trackRouteMethod("delete", full)
+	h := r.app.wrap(full, r.wrapGroupSync(handler))
+	r.app.inner.deleteM(full, h)
+}
+
+// Options registers an OPTIONS route under this Router.
+func (r *Router) Options(pattern string, handler Handler) {
+	validatePattern(pattern)
+	full := r.prefix + pattern
+	r.app.trackRouteMethod("options", full)
+	h := r.app.wrap(full, r.wrapGroupSync(handler))
+	r.app.inner.options(full, h)
+}
+
+// Head registers a HEAD route under this Router.
+func (r *Router) Head(pattern string, handler Handler) {
+	validatePattern(pattern)
+	full := r.prefix + pattern
+	r.app.trackRouteMethod("head", full)
+	h := r.app.wrap(full, r.wrapGroupSync(handler))
+	r.app.inner.head(full, h)
 }
 
 // GetAsync registers a GET route under this Router that runs on a goroutine.
@@ -1421,6 +1543,11 @@ func (r *Response) Status(code int) *Response {
 
 // Header writes a response header.
 //
+// Each Header call appends to the wire output; calling Header twice with
+// the same key emits two header lines (no replace semantic — uWS does
+// not support that). For multi-value headers (Set-Cookie, Vary, Link)
+// call Header / Append repeatedly with the same key.
+//
 // In async mode only Content-Type is supported via the fast path. Setting any
 // other header from inside Async panics; use Loop.Defer + Cork directly to
 // build multi-header responses asynchronously.
@@ -1435,6 +1562,16 @@ func (r *Response) Header(key, value string) *Response {
 	}
 	r.inner.header(key, value)
 	return r
+}
+
+// Append adds a header value without replacing existing ones. Identical
+// in effect to Header — included for parity with fiber/express idiom
+// where Set replaces and Append accumulates. uWS doesn't support
+// replace, so both helpers do the same thing.
+//
+// Use for multi-value headers: Set-Cookie, Vary, Link, etc.
+func (r *Response) Append(key, value string) *Response {
+	return r.Header(key, value)
 }
 
 // Write appends a response chunk without ending the response.
@@ -2143,6 +2280,13 @@ type Request struct {
 	// this pointer.
 	syncResPtr unsafe.Pointer
 
+	// trustProxy is set by the App.wrap closure when Config.TrustProxy is
+	// enabled, so Protocol() / Secure() know to honor X-Forwarded-Proto.
+	// Default false: in the common direct-exposed deployment the
+	// X-Forwarded-* family is client-controllable and must not be
+	// believed.
+	trustProxy bool
+
 	// cached{URL,Method,Query,Params,IP} hold the materialized Go strings
 	// allocated lazily on the first accessor call. The corresponding
 	// *Cached field is true once the cache slot is valid (the empty
@@ -2234,6 +2378,7 @@ func (r *Request) resetForPool() {
 	r.paramCached = [4]bool{}
 	r.cachedIP = ""
 	r.ipCached = false
+	r.trustProxy = false
 	for k := range r.locals {
 		delete(r.locals, k)
 	}
@@ -2318,18 +2463,31 @@ func (r *Request) Hostname() string {
 	return host
 }
 
-// Protocol returns "http" or "https" depending on whether the App was
-// created via NewApp (plaintext) or a future TLS variant. Until TLS lands
-// this always returns "http".
+// Protocol returns "http" or "https". The framework itself only speaks
+// plaintext — gogo is intended to run behind a TLS-terminating gateway
+// such as nginx, an L7 load balancer, or a CDN. When Config.TrustProxy
+// is enabled the X-Forwarded-Proto header from the gateway is honored
+// so the application sees the original client protocol; otherwise the
+// answer is always "http" so an untrusted client can't spoof its way
+// to appearing as https.
 func (r *Request) Protocol() string {
-	// TLS support is a separate PR; harded to plaintext for now. Switch
-	// to a per-Request flag (set by the bridge for SSLApp) when SSLApp
-	// lands so the answer reflects the actual socket type.
+	if r.trustProxy {
+		if v := r.Header("x-forwarded-proto"); v != "" {
+			// First value of a comma-separated list per RFC 7239.
+			if i := strings.IndexByte(v, ','); i >= 0 {
+				v = v[:i]
+			}
+			v = strings.TrimSpace(v)
+			if strings.EqualFold(v, "https") {
+				return "https"
+			}
+		}
+	}
 	return "http"
 }
 
 // Secure reports whether the connection is encrypted (TLS / HTTPS).
-// Always false until the SSLApp branch lands.
+// Honors X-Forwarded-Proto only when Config.TrustProxy is enabled.
 func (r *Request) Secure() bool {
 	return r.Protocol() == "https"
 }
@@ -2453,6 +2611,82 @@ func (r *Request) QueryParam(name string) string {
 // paths.
 func (r *Request) Truncated() bool {
 	return r.snap != nil && r.snap.truncated
+}
+
+// QueryInt parses the named query parameter as a base-10 int and
+// returns it. Missing or non-numeric values fall back to def. Negative
+// values are accepted.
+func (r *Request) QueryInt(name string, def int) int {
+	v := r.QueryParam(name)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+// QueryInt64 parses the named query parameter as a base-10 int64.
+// Missing or non-numeric values fall back to def.
+func (r *Request) QueryInt64(name string, def int64) int64 {
+	v := r.QueryParam(name)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+// QueryBool parses the named query parameter as a boolean. Accepts
+// "1", "true", "t", "yes", "y", "on" as true and "0", "false", "f",
+// "no", "n", "off" as false (all case-insensitive). Missing or
+// unrecognized values fall back to def. Empty string ("?flag&") is
+// treated as missing — pass def=true if you want the bare-flag idiom.
+func (r *Request) QueryBool(name string, def bool) bool {
+	v := r.QueryParam(name)
+	if v == "" {
+		return def
+	}
+	switch strings.ToLower(v) {
+	case "1", "true", "t", "yes", "y", "on":
+		return true
+	case "0", "false", "f", "no", "n", "off":
+		return false
+	}
+	return def
+}
+
+// ParamInt parses route parameter at index as a base-10 int. Missing
+// or non-numeric values fall back to def.
+func (r *Request) ParamInt(index int, def int) int {
+	v := r.Parameter(index)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+// ParamInt64 parses route parameter at index as a base-10 int64.
+// Missing or non-numeric values fall back to def.
+func (r *Request) ParamInt64(index int, def int64) int64 {
+	v := r.Parameter(index)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return def
+	}
+	return n
 }
 
 // lookupHeader scans the raw "name\0value\0..." buffer for a matching key.

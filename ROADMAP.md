@@ -137,14 +137,56 @@ Effort: trivial.
 
 Without these, gogo is hard to deploy in real production environments.
 
-### P1-1. TLS / HTTPS
+### P1-1. TLS / HTTPS — **Won't Fix**
 
-Out of scope per current README, but every production deployment needs
-HTTPS. uWS has `uWS::SSLApp`; mirroring the existing `uWS::App` work for
-SSL is a clear path. Cert reloading, mTLS, SNI are stretch goals.
+**Status: deferred indefinitely.** Production deployments terminate TLS
+at a gateway (Kubernetes Ingress, AWS ALB / NLB, GCP LB, Cloudflare /
+Fastly edge, or self-hosted nginx / Envoy / Caddy / HAProxy). Those
+edge proxies do cert automation (Let's Encrypt / ACME), SNI, OCSP
+stapling, HTTP/2 + HTTP/3, and crypto throughput optimization better
+than an in-process implementation can.
 
-**Plan:** parallel `NewTLSApp(cert, key)` + new `tlsAppNative` shim;
-share Router/Handler types. Effort: large (bridge + tests).
+Forwarding to a backend over plain HTTP on a trusted network is the
+dominant pattern. fiber and express are deployed this way the vast
+majority of the time. gogo is the *upstream* — it should be excellent
+at that and not duplicate edge proxy work.
+
+The framework supports the gateway flow:
+
+- `Config.TrustProxy` (added in this same PR) — opt-in flag that lets
+  `req.Protocol()` and `req.Secure()` honor `X-Forwarded-Proto` from a
+  trusted gateway. Leave OFF when directly internet-facing so clients
+  can't spoof.
+- `req.IPs()` already parses `X-Forwarded-For` (P1-6).
+- `req.Hostname()` reads the Host header so virtual hosting works.
+
+If a future deployment scenario genuinely needs in-process TLS
+(no gateway available, certain embedded use cases) this entry will
+reopen. Until then the cost — `~600-1500` lines of templated C++
+refactor plus ongoing maintenance burden (cert reload, SNI, TLS 1.3
+ciphers, OCSP) — buys less value than other roadmap items.
+
+**Example nginx config in front of gogo:**
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name api.example.com;
+    ssl_certificate     /etc/letsencrypt/live/api.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+Enable `Config{TrustProxy: true}` in the app so `req.Secure()` returns
+true and `req.IP()` surfaces the real client IP.
 
 ### P1-2. App-level `Config` struct
 
@@ -354,15 +396,16 @@ P0-1 through P0-9. Each is small. Land as a single PR per group:
 
 ### 1.0 — production-ready (2–6 weeks)
 
-P1-1 through P1-7. TLS is the biggest item; everything else is
-config-struct work.
+P1-2 through P1-7. P1-1 (TLS) is **won't fix** — see the section above.
 
 - **PR E**: `App.Config{}` baseline (P1-2) + graceful shutdown timeout
   (P1-3) + hooks (P1-4).
 - **PR F**: Not-found / method-not-allowed handlers (P1-5).
 - **PR G**: Request introspection helpers (P1-6).
 - **PR H**: Redirect / SendFile / Download (P1-7).
-- **PR I**: TLS / SSLApp (P1-1).
+- **PR I**: HTTP method helpers (`Put`/`Patch`/`Delete`/`Options`/`Head`)
+  + `Config.TrustProxy` + `req.QueryInt` / `ParamInt` / `QueryBool` +
+  `res.Append` — quick wins before P2.
 
 ### 1.x — feature parity (1–3 months)
 
