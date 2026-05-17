@@ -33,6 +33,7 @@ func (appNative) setBodyLimit(int)                         {}
 func (appNative) setCapturePeerIP(bool)                    {}
 func (appNative) run()                                     {}
 func (appNative) stop()                                    {}
+func (appNative) closeListen()                             {}
 func (appNative) close()                                   {}
 
 func (responseNative) status(string)               {}

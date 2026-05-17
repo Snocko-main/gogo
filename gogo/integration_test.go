@@ -2650,3 +2650,169 @@ func TestNotFoundWrapsWithGlobalMiddleware(t *testing.T) {
 		t.Fatalf("global mw missed NotFound handler: hits=%d", mwHits.Load())
 	}
 }
+
+// TestShutdownGracefullyDrainsInFlight: an in-flight slow request must
+// complete after the listen socket is closed; new TCP dials after
+// the shutdown fail. The graceful timeout cap should be high enough
+// that the existing connection wins the race.
+func TestShutdownGracefullyDrainsInFlight(t *testing.T) {
+	requestStarted := make(chan struct{})
+	requestFinish := make(chan struct{})
+
+	port := freePort(t)
+	ready := make(chan *gogo.App, 1)
+	runDone := make(chan struct{})
+
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		app, err := gogo.NewApp()
+		if err != nil {
+			t.Errorf("NewApp: %v", err)
+			close(runDone)
+			return
+		}
+		// Async so the loop thread keeps spinning while the handler
+		// blocks on requestFinish; a sync handler would freeze the loop
+		// and ShutdownGracefully's defer would never run.
+		app.GetAsync("/slow", func(res *gogo.Response, req *gogo.Request) {
+			close(requestStarted)
+			<-requestFinish
+			res.Send(200, "text/plain", "done")
+		})
+		if !app.Listen(port) {
+			t.Errorf("Listen :%d failed", port)
+			app.Close()
+			close(runDone)
+			return
+		}
+		ready <- app
+		app.Run()
+		app.Close()
+		close(runDone)
+	}()
+
+	app := <-ready
+	// Wait for the listener to accept.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 50*time.Millisecond)
+		if err == nil {
+			c.Close()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Start one slow request; wait until the handler is on the wire.
+	respCh := make(chan *http.Response, 1)
+	go func() {
+		resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/slow", port))
+		if err != nil {
+			t.Errorf("slow GET: %v", err)
+			respCh <- nil
+			return
+		}
+		respCh <- resp
+	}()
+	<-requestStarted
+
+	// Begin graceful shutdown with a generous timeout — the in-flight
+	// request should finish well before it fires.
+	app.ShutdownGracefully(5 * time.Second)
+
+	// New dials should fail (listen socket closed). Give the loop a
+	// beat to process the close.
+	time.Sleep(100 * time.Millisecond)
+	if c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond); err == nil {
+		c.Close()
+		t.Errorf("new TCP dial succeeded after ShutdownGracefully — listen socket should be closed")
+	}
+
+	// Release the in-flight handler and read the response.
+	close(requestFinish)
+	resp := <-respCh
+	if resp == nil {
+		t.Fatal("in-flight response lost during graceful shutdown")
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || string(body) != "done" {
+		t.Fatalf("in-flight response: got %d %q, want 200 done", resp.StatusCode, string(body))
+	}
+
+	// Loop should now exit naturally.
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not exit after graceful drain")
+	}
+}
+
+// TestShutdownGracefullyForceCloseTimeout: a hung handler that never
+// finishes must be force-closed when the timeout fires.
+func TestShutdownGracefullyForceCloseTimeout(t *testing.T) {
+	port := freePort(t)
+	ready := make(chan *gogo.App, 1)
+	runDone := make(chan struct{})
+	hold := make(chan struct{}) // never closed — handler blocks forever
+
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		app, err := gogo.NewApp()
+		if err != nil {
+			t.Errorf("NewApp: %v", err)
+			close(runDone)
+			return
+		}
+		// Async, otherwise the sync handler would freeze the loop thread
+		// and the force-close timeout would have nothing to fire on.
+		app.GetAsync("/hang", func(res *gogo.Response, req *gogo.Request) {
+			<-hold
+			res.Send(200, "text/plain", "never")
+		})
+		if !app.Listen(port) {
+			t.Errorf("Listen :%d failed", port)
+			app.Close()
+			close(runDone)
+			return
+		}
+		ready <- app
+		app.Run()
+		app.Close()
+		close(runDone)
+	}()
+
+	app := <-ready
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 50*time.Millisecond)
+		if err == nil {
+			c.Close()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Fire the hung request and don't wait for it.
+	go noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/hang", port))
+	time.Sleep(100 * time.Millisecond) // let the handler start
+
+	start := time.Now()
+	app.ShutdownGracefully(500 * time.Millisecond)
+
+	select {
+	case <-runDone:
+		elapsed := time.Since(start)
+		if elapsed < 400*time.Millisecond {
+			t.Errorf("Run returned before timeout fired: %v", elapsed)
+		}
+		if elapsed > 2*time.Second {
+			t.Errorf("Run returned too late after force timeout: %v", elapsed)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not exit after force timeout fired")
+	}
+	close(hold) // unblock any leftover handler goroutine
+}

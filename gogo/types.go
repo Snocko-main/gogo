@@ -1019,16 +1019,35 @@ func (a *App) Run() {
 	a.inner.run()
 }
 
-// Shutdown initiates a graceful stop: the listen socket is closed so the
-// loop stops accepting new connections, and worker goroutines that drain
-// the shared request ring see the shutdown flag and exit once the queue
-// drains. In-flight requests already accepted finish normally. Safe to
-// call from any goroutine; idempotent.
+// Shutdown stops the app immediately: the listen socket and every
+// active connection are closed at once. Run returns as soon as the
+// loop drains. In-flight responses are dropped — use ShutdownGracefully
+// when you need to wait for active clients to finish.
 //
-// Shutdown does NOT block — call Close after Run returns to free native
-// resources.
+// Safe to call from any goroutine; idempotent. Returns immediately —
+// call Close after Run returns to free native resources.
 func (a *App) Shutdown() {
 	a.inner.stop()
+}
+
+// ShutdownGracefully closes only the listen socket so no new connections
+// arrive, then waits up to timeout for the already-accepted connections
+// to finish their in-flight responses naturally. If the timeout fires
+// before everything drains, the remaining sockets are force-closed via
+// Shutdown so the loop can exit. timeout = 0 disables the force-close
+// (wait indefinitely).
+//
+// Returns immediately — the wait + force-close run on a background
+// goroutine. Call Close after Run returns.
+func (a *App) ShutdownGracefully(timeout time.Duration) {
+	a.inner.closeListen()
+	if timeout <= 0 {
+		return
+	}
+	go func() {
+		time.Sleep(timeout)
+		a.inner.stop()
+	}()
 }
 
 // Close frees native resources. Call it only after Run has returned, or before

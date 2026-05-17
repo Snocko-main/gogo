@@ -54,6 +54,13 @@ int uwsgo_app_listen(uwsgo_app_t *app, const char *host, int port);
 void uwsgo_app_run(uwsgo_app_t *app);
 void uwsgo_app_stop(uwsgo_app_t *app);
 
+// uwsgo_app_close_listen closes only the listen socket and the drain
+// timer, leaving active connections untouched so they can complete
+// their in-flight responses naturally. The uWS loop returns from run()
+// only after every remaining socket closes itself (or the caller
+// follows up with uwsgo_app_stop to force the rest).
+void uwsgo_app_close_listen(uwsgo_app_t *app);
+
 void uwsgo_res_write_status(uwsgo_res_t *res, const char *status, size_t status_len);
 void uwsgo_res_write_header(uwsgo_res_t *res, const char *key, size_t key_len, const char *value, size_t value_len);
 void uwsgo_res_write(uwsgo_res_t *res, const char *body, size_t body_len);
