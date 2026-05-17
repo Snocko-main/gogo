@@ -360,6 +360,79 @@ Operators love this and most Go frameworks ship it as an afterthought.
 
 ---
 
+## Perf tune-ups (deferred follow-ups)
+
+Optimizations identified during reviews but not yet acted on. Each is
+scoped tightly enough to land as its own small PR with a focused
+benchmark, separately from the feature work that surfaced it.
+
+### T-1. Batch `flushPendingHeaders` into a single cgo crossing
+
+PR #8 buffers `Response.Header` calls Go-side so middleware doesn't
+race uWS's auto-`200`-on-first-`writeHeader` quirk. Today the flush
+loop calls `r.inner.header(...)` once per buffered header — one cgo
+crossing each. With CORS adding 3-4 headers per request that is
+3-4 × ~80 ns = ~300 ns/req of avoidable cgo overhead.
+
+**Plan:** add `uwsgo_res_write_headers_batch(res, packed_buf, count)`
+to the C bridge. Go serializes pendingHeaders into a single
+`"key1\0val1\0key2\0val2\0..."` buffer and crosses once; C++ iterates
+inside the same call. Saves `(N-1)` cgo crossings per request with
+N buffered headers.
+
+**Expected impact:** ~3 % CPU on a CORS-enabled `/plain`-ish route at
+100 k RPS, scaling linearly with RPS. The current bench harness
+(`/plain`, `/db` without middleware) won't show it — needs a
+CORS-on `/plain` bench to measure.
+
+**Effort:** small (one new bridge function, one Go helper).
+
+### T-2. Pre-lowercase CORS `AllowOrigins` at construction
+
+`middleware.matchOrigin` uses `strings.EqualFold` for case-insensitive
+match. Cheaper to lowercase the configured patterns once at
+construction and `strings.ToLower(origin)` once per request, then
+direct `==`. Saves ~30-50 ns/req with CORS enabled.
+
+**Effort:** trivial.
+
+### T-3. Faster `RequestID` generator option
+
+`crypto/rand.Read` is ~1 µs per call — the dominant cost of
+`middleware.RequestID` on requests that don't carry an incoming
+header. Drop-in alternative: seed a `math/rand/v2.ChaCha8` from
+crypto/rand once, then 50 ns per ID. Still strong enough for tracing
+IDs that aren't security tokens.
+
+**Plan:** add `middleware.FastRequestIDGenerator` (or document the
+recipe under `RequestIDOptions.Generator`) so users can opt-in
+without abandoning the safe default.
+
+**Effort:** small.
+
+### T-4. Pre-grow `Response.pendingHeaders` capacity
+
+Each Response wrapper's `pendingHeaders` slice starts at `cap=0`;
+typical middleware (CORS) appends 3-4 entries, triggering 2-3
+small reallocs on the first request through that wrapper. The
+backing array is then retained across `sync.Pool` recycles so this is
+amortized — but a one-time `make([]responseHeader, 0, 8)` on
+wrapper creation eliminates even the first-request cost.
+
+**Effort:** trivial. Marginal impact (mostly amortized already).
+
+### T-5. CORS Origin via header prefetch (shared-dispatch only)
+
+Sync-path `req.Header("origin")` is a cgo crossing per request even
+when no Origin is sent. Pre-caching `Origin` alongside the existing
+prefetched fields (method / URL / query / first-4 params) would
+eliminate it. Bridge ABI change — defer until D-1 lands, since that
+work already touches the same prefetch path.
+
+**Effort:** medium (bridge ABI bump). Coordinates with D-1.
+
+---
+
 ## Performance targets (1.0)
 
 Hardware reference: 4 vCPU @ 2.10 GHz, single-thread wrk.
