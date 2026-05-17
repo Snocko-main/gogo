@@ -366,6 +366,12 @@ extern "C" void uwsgo_res_send(
     r->end(std::string_view(body, body_len));
 }
 
+extern "C" size_t uwsgo_res_remote_addr(uwsgo_res_t *res, char *buffer, size_t buffer_len) {
+    auto *r = reinterpret_cast<uWS::HttpResponse<false> *>(res);
+    auto addr = r->getRemoteAddressAsText();
+    return copy_string_view(addr, buffer, buffer_len);
+}
+
 extern "C" uwsgo_loop_t *uwsgo_res_get_loop(uwsgo_res_t * /*res*/) {
     // uWS loops are thread-local; calling from a route handler returns the
     // loop that runs the response.
@@ -439,6 +445,9 @@ constexpr size_t SNAP_URL_CAP = 256;
 constexpr size_t SNAP_QUERY_CAP = 512;
 constexpr size_t SNAP_PARAM_CAP = 64;
 constexpr size_t SNAP_PARAM_MAX = 8;
+// IPv4 needs ~15 chars; IPv6 ~45 chars; 64 leaves headroom for bracketed
+// forms and the trailing null without bloating AsyncCtx.
+constexpr size_t SNAP_IP_CAP = 64;
 // Headers are encoded as "name\0value\0..." back-to-back so Go can parse on
 // access without knowing the count up front. 4 KB fits the typical request.
 constexpr size_t SNAP_HEADERS_CAP = 4096;
@@ -479,10 +488,12 @@ struct AsyncCtx {
     uint32_t param_count = 0;
     uint32_t headers_len = 0;
     uint32_t truncated = 0;
+    uint32_t ip_len = 0;
     uint32_t param_lens[SNAP_PARAM_MAX] = {0};
     char method[SNAP_METHOD_CAP];
     char url[SNAP_URL_CAP];
     char query[SNAP_QUERY_CAP];
+    char ip[SNAP_IP_CAP];
     char params[SNAP_PARAM_MAX][SNAP_PARAM_CAP];
     char headers[SNAP_HEADERS_CAP];
 
@@ -609,11 +620,14 @@ extern "C" void uwsgo_shared_layout(uwsgo_shared_layout_t *out) {
     out->ctx_method_offset = offsetof(AsyncCtx, method);
     out->ctx_url_offset = offsetof(AsyncCtx, url);
     out->ctx_query_offset = offsetof(AsyncCtx, query);
+    out->ctx_ip_len_offset = offsetof(AsyncCtx, ip_len);
+    out->ctx_ip_offset = offsetof(AsyncCtx, ip);
     out->ctx_params_offset = offsetof(AsyncCtx, params);
     out->ctx_headers_offset = offsetof(AsyncCtx, headers);
     out->ctx_snap_method_cap = SNAP_METHOD_CAP;
     out->ctx_snap_url_cap = SNAP_URL_CAP;
     out->ctx_snap_query_cap = SNAP_QUERY_CAP;
+    out->ctx_snap_ip_cap = SNAP_IP_CAP;
     out->ctx_snap_param_cap = SNAP_PARAM_CAP;
     out->ctx_snap_param_max = SNAP_PARAM_MAX;
     out->ctx_snap_headers_cap = SNAP_HEADERS_CAP;
@@ -627,7 +641,7 @@ extern "C" void uwsgo_shared_layout(uwsgo_shared_layout_t *out) {
 // snapshot_request copies the fields of the live uWS HttpRequest into the
 // AsyncCtx so the async goroutine can read them after uWS frees the request.
 // Anything that doesn't fit the fixed buffers is truncated.
-static void snapshot_request(AsyncCtx *ctx, uWS::HttpRequest *req) {
+static void snapshot_request(AsyncCtx *ctx, uWS::HttpResponse<false> *res, uWS::HttpRequest *req) {
     bool truncated = false;
     auto copy_view = [&truncated](char *dst, size_t cap, std::string_view src) -> uint32_t {
         size_t n = std::min(cap, src.size());
@@ -640,6 +654,9 @@ static void snapshot_request(AsyncCtx *ctx, uWS::HttpRequest *req) {
     // getUrl returns the path; getQuery returns query string sans '?'.
     ctx->url_len = copy_view(ctx->url, SNAP_URL_CAP, req->getUrl());
     ctx->query_len = copy_view(ctx->query, SNAP_QUERY_CAP, req->getQuery());
+    // Snapshot the peer IP now while res is still valid — async / shared
+    // handlers run after uWS may have freed it.
+    ctx->ip_len = copy_view(ctx->ip, SNAP_IP_CAP, res->getRemoteAddressAsText());
 
     // Route parameters: walk indices until uWS returns empty.
     uint32_t param_count = 0;
@@ -685,7 +702,7 @@ extern "C" void uwsgo_app_get_shared(uwsgo_app_t *app, const char *pattern, uint
         // Snapshot before any cgo / Go work — uWS HttpRequest is live only
         // inside this lambda. Reject oversized snapshots instead of handing
         // security-sensitive middleware silently truncated request data.
-        snapshot_request(ctx, req);
+        snapshot_request(ctx, res, req);
         if (ctx->truncated) {
             ctx->release();
             res->writeStatus("431 Request Header Fields Too Large");

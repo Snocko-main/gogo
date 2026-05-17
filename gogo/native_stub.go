@@ -7,7 +7,8 @@ import (
 	"unsafe"
 )
 
-func goStringFromC(_ unsafe.Pointer, _ int) string { return "" }
+func goStringFromC(_ unsafe.Pointer, _ int) string  { return "" }
+func remoteAddrFromPtr(_ unsafe.Pointer) string     { return "" }
 
 var errNativeDisabled = errors.New("gogo native binding disabled: build with CGO_ENABLED=1 and -tags gogo")
 
@@ -42,6 +43,7 @@ func (responseNative) loop() loopNative            { return loopNative{} }
 func (responseNative) onAborted(any)               {}
 func (responseNative) cork(func())                 {}
 func (responseNative) onData(func([]byte, bool))   {}
+func (responseNative) remoteAddr() string          { return "" }
 
 func (loopNative) defer_(func()) {}
 

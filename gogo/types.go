@@ -1524,18 +1524,27 @@ type Request struct {
 	syncParamPtrs [4]unsafe.Pointer
 	syncParamLens [4]int
 
-	// cached{URL,Method,Query,Params} hold the materialized Go strings
+	// syncResPtr is the live uWS response pointer for sync-mode handlers.
+	// req.IP() uses it to lazily fetch the peer address via cgo on demand
+	// (most handlers don't read IP, so pre-caching would be wasted work).
+	// Async / shared snapshots carry the IP in r.snap.ip and don't need
+	// this pointer.
+	syncResPtr unsafe.Pointer
+
+	// cached{URL,Method,Query,Params,IP} hold the materialized Go strings
 	// allocated lazily on the first accessor call. The corresponding
 	// *Cached field is true once the cache slot is valid (the empty
 	// string is a legitimate cached value).
-	cachedURL          string
-	urlCached          bool
-	cachedMethod       string
-	methodCached       bool
-	cachedQuery        string
-	queryCached        bool
-	cachedParams       [4]string
-	paramCached        [4]bool
+	cachedURL    string
+	urlCached    bool
+	cachedMethod string
+	methodCached bool
+	cachedQuery  string
+	queryCached  bool
+	cachedParams [4]string
+	paramCached  [4]bool
+	cachedIP     string
+	ipCached     bool
 }
 
 // requestSnapshot holds the Go-side captured copy of an HttpRequest, used by
@@ -1547,6 +1556,7 @@ type requestSnapshot struct {
 	method    string
 	url       string
 	query     string
+	ip        string
 	params    []string
 	truncated bool
 	// headers is the raw "name\0value\0name\0value\0..." buffer captured from
@@ -1601,6 +1611,7 @@ func (r *Request) resetForPool() {
 	r.syncQueryLen = 0
 	r.syncParamPtrs = [4]unsafe.Pointer{}
 	r.syncParamLens = [4]int{}
+	r.syncResPtr = nil
 	r.cachedURL = ""
 	r.urlCached = false
 	r.cachedMethod = ""
@@ -1609,6 +1620,8 @@ func (r *Request) resetForPool() {
 	r.queryCached = false
 	r.cachedParams = [4]string{}
 	r.paramCached = [4]bool{}
+	r.cachedIP = ""
+	r.ipCached = false
 	for k := range r.locals {
 		delete(r.locals, k)
 	}
@@ -1707,6 +1720,27 @@ func (r *Request) Protocol() string {
 // Always false until the SSLApp branch lands.
 func (r *Request) Secure() bool {
 	return r.Protocol() == "https"
+}
+
+// IP returns the formatted peer IP for this connection. For routes
+// behind a proxy use IPs() and pick from the X-Forwarded-For chain
+// instead — this returns the immediate TCP peer, which will be the
+// proxy itself.
+//
+// Sync handlers lazily cgo into uWS on first read and cache the result
+// for subsequent reads. Async / shared handlers serve from the
+// snapshot captured at request arrival.
+func (r *Request) IP() string {
+	if r.ipCached {
+		return r.cachedIP
+	}
+	if r.snap != nil {
+		r.cachedIP = r.snap.ip
+	} else if r.syncResPtr != nil {
+		r.cachedIP = remoteAddrFromPtr(r.syncResPtr)
+	}
+	r.ipCached = true
+	return r.cachedIP
 }
 
 // IPs parses the X-Forwarded-For header into a slice of IPs in the order
@@ -1871,6 +1905,7 @@ func (r *Request) snapshotFromSync() *requestSnapshot {
 		method:  r.inner.method(),
 		url:     r.inner.url(),
 		query:   r.inner.query(),
+		ip:      remoteAddrFromPtr(r.syncResPtr),
 		headers: r.inner.headersAll(),
 	}
 	for i := 0; i < 8; i++ {
