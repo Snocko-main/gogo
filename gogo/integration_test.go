@@ -2551,3 +2551,56 @@ func TestResponseRedirect(t *testing.T) {
 		t.Errorf("CRLF injection not rejected: %d %q", resp.StatusCode, string(b))
 	}
 }
+
+// TestNotFoundHandler: customizing the 404 body via App.NotFound. Routes
+// the user registers explicitly still win — only unmatched paths fall
+// through to the NotFound handler.
+func TestNotFoundHandler(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/exists", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "hi")
+		})
+		app.NotFound(func(res *gogo.Response, req *gogo.Request) {
+			res.Send(404, "application/json", `{"err":"not found","path":"`+req.URL()+`"}`)
+		})
+	})
+	defer teardown()
+
+	// Explicit route still 200.
+	status, body := httpGet(t, port, "/exists")
+	if status != 200 || body != "hi" {
+		t.Fatalf("/exists: got %d %q", status, body)
+	}
+
+	// Unmatched path → custom 404.
+	status, body = httpGet(t, port, "/nope")
+	if status != 404 || !strings.Contains(body, `"err":"not found"`) || !strings.Contains(body, `/nope`) {
+		t.Fatalf("/nope: got %d %q", status, body)
+	}
+}
+
+// TestNotFoundWrapsWithGlobalMiddleware: middleware registered before
+// Listen wraps the NotFound handler the same as any other route, so a
+// global logger / request-ID middleware still observes 404s.
+func TestNotFoundWrapsWithGlobalMiddleware(t *testing.T) {
+	var mwHits atomic.Int32
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				mwHits.Add(1)
+				next(res, req)
+			}
+		})
+		app.NotFound(func(res *gogo.Response, req *gogo.Request) {
+			res.Send(404, "text/plain", "missing")
+		})
+	})
+	defer teardown()
+
+	if status, body := httpGet(t, port, "/whatever"); status != 404 || body != "missing" {
+		t.Fatalf("got %d %q", status, body)
+	}
+	if mwHits.Load() != 1 {
+		t.Fatalf("global mw missed NotFound handler: hits=%d", mwHits.Load())
+	}
+}

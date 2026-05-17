@@ -273,6 +273,7 @@ type App struct {
 	middlewares      []middlewareEntry
 	asyncMiddlewares []asyncMiddlewareEntry
 	cfg              Config
+	notFoundHandler  Handler
 }
 
 // defaultConfig fills in safe production defaults for any zero Config
@@ -966,10 +967,30 @@ func (r *Router) WebSocket(pattern string, behavior WebSocketBehavior) {
 	r.app.inner.websocket(full, behavior)
 }
 
+// NotFound sets the fallback handler for requests that don't match any
+// registered route. The framework registers it as the lowest-priority
+// catch-all (any-method /*) just before Listen binds — explicit user
+// routes always win. Without a registered NotFound handler uWS falls
+// back to its built-in 404 reply, which has no body and no
+// customisation. Calling NotFound(nil) clears the handler.
+//
+// Middleware registered before Listen wraps the NotFound handler the
+// same way it wraps any other dynamic route.
+func (a *App) NotFound(h Handler) {
+	a.notFoundHandler = h
+}
+
 // Listen binds the app to the given port and reports whether binding
 // succeeded. The bind interface comes from Config.BindAddr; an empty
 // BindAddr keeps the uWS default of all interfaces (0.0.0.0).
+//
+// If a NotFound handler is registered, Listen wires it as the catch-all
+// route immediately before binding so user-registered routes retain
+// precedence.
 func (a *App) Listen(port int) bool {
+	if a.notFoundHandler != nil {
+		a.inner.any("/*", a.wrap("/*", a.notFoundHandler))
+	}
 	return a.inner.listen(a.cfg.BindAddr, port)
 }
 
