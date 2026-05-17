@@ -427,6 +427,27 @@ extern "C" void uwsgo_app_stop(uwsgo_app_t *app) {
     });
 }
 
+// uwsgo_app_close_listen closes only the listen socket and the drain
+// timer. Active sockets stay open until they finish their own response
+// and the client (or HTTP keep-alive timeout) closes them, at which
+// point the uWS loop's fd count drops to zero and run() returns. Calling
+// uwsgo_app_stop afterwards force-closes any remaining stragglers.
+extern "C" void uwsgo_app_close_listen(uwsgo_app_t *app) {
+    if (app->loop == nullptr) {
+        return;
+    }
+    app->loop->defer([app]() {
+        if (app->listen_socket) {
+            us_listen_socket_close(0, app->listen_socket);
+            app->listen_socket = nullptr;
+        }
+        if (app->drain_timer != nullptr) {
+            us_timer_close(app->drain_timer);
+            app->drain_timer = nullptr;
+        }
+    });
+}
+
 extern "C" void uwsgo_res_write_status(uwsgo_res_t *res, const char *status, size_t status_len) {
     reinterpret_cast<uWS::HttpResponse<false> *>(res)->writeStatus(std::string_view(status, status_len));
 }

@@ -2650,3 +2650,359 @@ func TestNotFoundWrapsWithGlobalMiddleware(t *testing.T) {
 		t.Fatalf("global mw missed NotFound handler: hits=%d", mwHits.Load())
 	}
 }
+
+// TestShutdownGracefullyDrainsInFlight: an in-flight slow request must
+// complete after the listen socket is closed; new TCP dials after
+// the shutdown fail. The graceful timeout cap should be high enough
+// that the existing connection wins the race.
+func TestShutdownGracefullyDrainsInFlight(t *testing.T) {
+	requestStarted := make(chan struct{})
+	requestFinish := make(chan struct{})
+
+	port := freePort(t)
+	ready := make(chan *gogo.App, 1)
+	runDone := make(chan struct{})
+
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		app, err := gogo.NewApp()
+		if err != nil {
+			t.Errorf("NewApp: %v", err)
+			close(runDone)
+			return
+		}
+		// Async so the loop thread keeps spinning while the handler
+		// blocks on requestFinish; a sync handler would freeze the loop
+		// and ShutdownGracefully's defer would never run.
+		app.GetAsync("/slow", func(res *gogo.Response, req *gogo.Request) {
+			close(requestStarted)
+			<-requestFinish
+			res.Send(200, "text/plain", "done")
+		})
+		if !app.Listen(port) {
+			t.Errorf("Listen :%d failed", port)
+			app.Close()
+			close(runDone)
+			return
+		}
+		ready <- app
+		app.Run()
+		app.Close()
+		close(runDone)
+	}()
+
+	app := <-ready
+	// Wait for the listener to accept.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 50*time.Millisecond)
+		if err == nil {
+			c.Close()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Start one slow request; wait until the handler is on the wire.
+	respCh := make(chan *http.Response, 1)
+	go func() {
+		resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/slow", port))
+		if err != nil {
+			t.Errorf("slow GET: %v", err)
+			respCh <- nil
+			return
+		}
+		respCh <- resp
+	}()
+	<-requestStarted
+
+	// Begin graceful shutdown with a generous timeout — the in-flight
+	// request should finish well before it fires.
+	app.ShutdownGracefully(5 * time.Second)
+
+	// New dials should fail (listen socket closed). Give the loop a
+	// beat to process the close.
+	time.Sleep(100 * time.Millisecond)
+	if c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond); err == nil {
+		c.Close()
+		t.Errorf("new TCP dial succeeded after ShutdownGracefully — listen socket should be closed")
+	}
+
+	// Release the in-flight handler and read the response.
+	close(requestFinish)
+	resp := <-respCh
+	if resp == nil {
+		t.Fatal("in-flight response lost during graceful shutdown")
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || string(body) != "done" {
+		t.Fatalf("in-flight response: got %d %q, want 200 done", resp.StatusCode, string(body))
+	}
+
+	// Loop should now exit naturally.
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not exit after graceful drain")
+	}
+}
+
+// TestShutdownGracefullyForceCloseTimeout: a hung handler that never
+// finishes must be force-closed when the timeout fires.
+func TestShutdownGracefullyForceCloseTimeout(t *testing.T) {
+	port := freePort(t)
+	ready := make(chan *gogo.App, 1)
+	runDone := make(chan struct{})
+	hold := make(chan struct{}) // never closed — handler blocks forever
+
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		app, err := gogo.NewApp()
+		if err != nil {
+			t.Errorf("NewApp: %v", err)
+			close(runDone)
+			return
+		}
+		// Async, otherwise the sync handler would freeze the loop thread
+		// and the force-close timeout would have nothing to fire on.
+		app.GetAsync("/hang", func(res *gogo.Response, req *gogo.Request) {
+			<-hold
+			res.Send(200, "text/plain", "never")
+		})
+		if !app.Listen(port) {
+			t.Errorf("Listen :%d failed", port)
+			app.Close()
+			close(runDone)
+			return
+		}
+		ready <- app
+		app.Run()
+		app.Close()
+		close(runDone)
+	}()
+
+	app := <-ready
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 50*time.Millisecond)
+		if err == nil {
+			c.Close()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Fire the hung request and don't wait for it.
+	go noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/hang", port))
+	time.Sleep(100 * time.Millisecond) // let the handler start
+
+	start := time.Now()
+	app.ShutdownGracefully(500 * time.Millisecond)
+
+	select {
+	case <-runDone:
+		elapsed := time.Since(start)
+		if elapsed < 400*time.Millisecond {
+			t.Errorf("Run returned before timeout fired: %v", elapsed)
+		}
+		if elapsed > 2*time.Second {
+			t.Errorf("Run returned too late after force timeout: %v", elapsed)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not exit after force timeout fired")
+	}
+	close(hold) // unblock any leftover handler goroutine
+}
+
+// TestLifecycleHooks: OnListen fires once after Listen succeeds with
+// the bound port; OnShutdown fires synchronously when Shutdown is
+// invoked. Multiple hooks run in registration order.
+func TestLifecycleHooks(t *testing.T) {
+	var listenSeen atomic.Pointer[int]
+	var shutdownOrder []string
+	var shutdownMu sync.Mutex
+	recordShutdown := func(name string) {
+		shutdownMu.Lock()
+		shutdownOrder = append(shutdownOrder, name)
+		shutdownMu.Unlock()
+	}
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.OnListen(func(p int) {
+			pp := p
+			listenSeen.Store(&pp)
+		})
+		app.OnShutdown(func() { recordShutdown("first") })
+		app.OnShutdown(func() { recordShutdown("second") })
+		app.Get("/x", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+
+	// OnListen should have fired by the time the listener accepts.
+	if p := listenSeen.Load(); p == nil || *p != port {
+		t.Fatalf("OnListen port=%v, want %d", p, port)
+	}
+	if status, _ := httpGet(t, port, "/x"); status != 200 {
+		t.Fatalf("post-OnListen request failed: %d", status)
+	}
+
+	teardown() // triggers Shutdown
+
+	shutdownMu.Lock()
+	got := strings.Join(shutdownOrder, ",")
+	shutdownMu.Unlock()
+	if got != "first,second" {
+		t.Fatalf("OnShutdown order: got %q, want first,second", got)
+	}
+}
+
+// TestShutdownHooksFireOnGraceful: same hooks fire from
+// ShutdownGracefully as from Shutdown.
+func TestShutdownHooksFireOnGraceful(t *testing.T) {
+	fired := make(chan struct{}, 1)
+
+	port := freePort(t)
+	ready := make(chan *gogo.App, 1)
+	runDone := make(chan struct{})
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		app, err := gogo.NewApp()
+		if err != nil {
+			t.Errorf("NewApp: %v", err)
+			close(runDone)
+			return
+		}
+		app.OnShutdown(func() { fired <- struct{}{} })
+		if !app.Listen(port) {
+			t.Errorf("Listen :%d failed", port)
+			app.Close()
+			close(runDone)
+			return
+		}
+		ready <- app
+		app.Run()
+		app.Close()
+		close(runDone)
+	}()
+	app := <-ready
+
+	app.ShutdownGracefully(100 * time.Millisecond)
+
+	select {
+	case <-fired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnShutdown hook never fired on graceful path")
+	}
+	<-runDone
+}
+
+// TestMethodNotAllowed: a path with registered methods returns 405 +
+// Allow header for unregistered methods; the handler can customize the
+// response body. Parametric paths fall to NotFound instead.
+func TestMethodNotAllowed(t *testing.T) {
+	var notAllowedHits atomic.Int32
+	var capturedApp *gogo.App
+	port, teardown := startApp(t, func(app *gogo.App) {
+		capturedApp = app
+		app.Get("/users", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "list")
+		})
+		app.Post("/users", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(201, "text/plain", "create")
+		})
+		app.Get("/api/:section", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "section="+req.Parameter(0))
+		})
+		app.NotFound(func(res *gogo.Response, req *gogo.Request) {
+			res.Send(404, "text/plain", "missing:"+req.URL())
+		})
+		app.MethodNotAllowed(func(res *gogo.Response, req *gogo.Request) {
+			notAllowedHits.Add(1)
+			// uWS requires status before every header write, so the
+			// canonical sequence for a 405 with Allow is
+			// Status → Header(Allow) → Header(CT) → End. res.Send
+			// would emit a default 200 status line before the
+			// user's Allow header.
+			allow := strings.Join(capturedApp.AllowedMethods(req.URL()), ", ")
+			res.Status(405)
+			res.Header("Allow", allow)
+			res.Header("Content-Type", "text/plain; charset=utf-8")
+			res.End("no:" + req.URL())
+		})
+	})
+	defer teardown()
+
+	// Allowed method → 200.
+	if status, body := httpGet(t, port, "/users"); status != 200 || body != "list" {
+		t.Fatalf("GET /users: got %d %q", status, body)
+	}
+
+	// Unregistered method on a literal path → 405 with Allow header.
+	req, _ := http.NewRequest("DELETE", fmt.Sprintf("http://127.0.0.1:%d/users", port), nil)
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("DELETE /users: %v", err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 405 || string(b) != "no:/users" {
+		t.Fatalf("DELETE /users: got %d %q", resp.StatusCode, string(b))
+	}
+	if allow := resp.Header.Get("Allow"); allow != "GET, POST" {
+		t.Errorf("Allow header: got %q, want GET, POST", allow)
+	}
+	if notAllowedHits.Load() != 1 {
+		t.Errorf("MethodNotAllowed hits = %d, want 1", notAllowedHits.Load())
+	}
+
+	// Unknown path → NotFound handler.
+	status, body := httpGet(t, port, "/nope")
+	if status != 404 || body != "missing:/nope" {
+		t.Fatalf("/nope: got %d %q", status, body)
+	}
+
+	// Parametric path with wrong method → falls to NotFound (documented).
+	req, _ = http.NewRequest("DELETE", fmt.Sprintf("http://127.0.0.1:%d/api/admin", port), nil)
+	resp, err = noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("DELETE /api/admin: %v", err)
+	}
+	b, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 404 {
+		t.Fatalf("parametric wrong-method: got %d %q (want 404 per documented limitation)", resp.StatusCode, string(b))
+	}
+}
+
+// TestMethodNotAllowedDefault405: with no handler, the framework still
+// emits a default 405 + Allow header when only NotFound is registered
+// (the catch-all is shared between both fallbacks).
+func TestMethodNotAllowedDefault405(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/users", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "list")
+		})
+		app.NotFound(func(res *gogo.Response, req *gogo.Request) {
+			res.Send(404, "text/plain", "missing")
+		})
+	})
+	defer teardown()
+
+	req, _ := http.NewRequest("POST", fmt.Sprintf("http://127.0.0.1:%d/users", port), nil)
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /users: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 405 {
+		t.Fatalf("default 405: got %d, want 405", resp.StatusCode)
+	}
+	if allow := resp.Header.Get("Allow"); allow != "GET" {
+		t.Errorf("Allow: got %q, want GET", allow)
+	}
+}

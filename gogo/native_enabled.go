@@ -371,6 +371,10 @@ func (a appNative) stop() {
 	C.uwsgo_app_stop(a.ptr)
 }
 
+func (a appNative) closeListen() {
+	C.uwsgo_app_close_listen(a.ptr)
+}
+
 func (a *appNative) close() {
 	if a.ptr == nil {
 		return
