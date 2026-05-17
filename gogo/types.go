@@ -1236,6 +1236,44 @@ func (r *Response) JSON(code int, v any) {
 	r.Send(code, "application/json", string(data))
 }
 
+// Redirect sends an HTTP redirect to location with the given status code.
+// Standard codes: 301 (moved permanently), 302 (found / temporary, common
+// default), 303 (see other — POST → GET), 307 (temp, preserves method),
+// 308 (permanent, preserves method). Status 0 defaults to 302.
+//
+// The location string is validated against CRLF / NUL injection before
+// being written into the Location header.
+//
+// In async mode this schedules a Cork on the loop so the status, Location
+// header, and empty body go out as a single packet; do not call Send /
+// End on the same response afterwards.
+func (r *Response) Redirect(location string, code int) {
+	if code == 0 {
+		code = 302
+	}
+	validateHeaderValue("Location", location)
+	line := statusLine(code)
+	if r.async != nil && !r.async.sent {
+		r.async.sent = true
+		inner := r.inner
+		loop := r.Loop()
+		ctx := r.async.ctxHandle
+		loc := location
+		loop.Defer(func() {
+			defer asyncCtxRelease(ctx)
+			inner.cork(func() {
+				inner.status(line)
+				inner.header("Location", loc)
+				inner.end("")
+			})
+		})
+		return
+	}
+	r.inner.status(line)
+	r.inner.header("Location", location)
+	r.inner.end("")
+}
+
 // Async marks the response for asynchronous handling and runs fn on a new
 // goroutine. After calling Async, subsequent Status/Header/Write calls buffer
 // Go-side and End flushes the buffered response back onto the event loop with
@@ -1634,6 +1672,69 @@ func (r *Request) Header(name string) string {
 		return r.snap.lookupHeader(name)
 	}
 	return r.inner.header(name)
+}
+
+// Get is an alias for Header (case-insensitive header lookup). Mirrors the
+// req.get(name) helper that fiber / express users reach for first.
+func (r *Request) Get(name string) string {
+	return r.Header(name)
+}
+
+// Hostname returns the host portion of the Host header, with any ":port"
+// suffix stripped. Returns "" if the request has no Host header.
+func (r *Request) Hostname() string {
+	host := r.Header("host")
+	if host == "" {
+		return ""
+	}
+	if i := strings.IndexByte(host, ':'); i >= 0 {
+		return host[:i]
+	}
+	return host
+}
+
+// Protocol returns "http" or "https" depending on whether the App was
+// created via NewApp (plaintext) or a future TLS variant. Until TLS lands
+// this always returns "http".
+func (r *Request) Protocol() string {
+	// TLS support is a separate PR; harded to plaintext for now. Switch
+	// to a per-Request flag (set by the bridge for SSLApp) when SSLApp
+	// lands so the answer reflects the actual socket type.
+	return "http"
+}
+
+// Secure reports whether the connection is encrypted (TLS / HTTPS).
+// Always false until the SSLApp branch lands.
+func (r *Request) Secure() bool {
+	return r.Protocol() == "https"
+}
+
+// IPs parses the X-Forwarded-For header into a slice of IPs in the order
+// the proxies appended them (leftmost = original client). Returns nil if
+// the header is absent or empty. Trim trailing whitespace and strip the
+// optional port suffix on each entry.
+func (r *Request) IPs() []string {
+	xff := r.Header("x-forwarded-for")
+	if xff == "" {
+		return nil
+	}
+	parts := strings.Split(xff, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		// Strip ":port" if present (IPv4-only — IPv6 needs bracket parsing).
+		if i := strings.LastIndexByte(p, ':'); i >= 0 && strings.IndexByte(p, '.') >= 0 {
+			p = p[:i]
+		}
+		out = append(out, p)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // Parameter returns a route parameter by index. Returns "" for negative or
