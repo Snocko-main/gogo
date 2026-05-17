@@ -1517,6 +1517,23 @@ type Response struct {
 	// firing OnData callback and a fast Async goroutine can no longer race
 	// each other into double-recycling the same wrapper.
 	refs atomic.Int32
+
+	// statusCode is the last status code passed to Status, Send, or
+	// JSON. Zero means "never set" — StatusCode() returns 200 in that
+	// case to match uWS's default. Exists so middleware can inspect
+	// what the handler responded with (e.g. for logging).
+	statusCode int
+
+	// pendingHeaders buffers Header calls until a status / end / send
+	// / write actually goes to the wire. uWS::HttpResponse::writeHeader
+	// auto-emits "200 OK" for the status line if nothing was written
+	// first, then locks the status — so if middleware writes a header
+	// before the handler picks its status code, the user-facing
+	// res.Send(404, ...) silently becomes 200. Buffering Go-side keeps
+	// the canonical write order (status → headers → body) regardless
+	// of the order the caller used. Sync path only; async mode uses
+	// asyncState's pre-built status/CT pair.
+	pendingHeaders []responseHeader
 }
 
 type asyncState struct {
@@ -1532,13 +1549,53 @@ type asyncState struct {
 // net/http is appended automatically (e.g. 200 → "200 OK", 404 → "404 Not
 // Found"); unknown codes are written as the bare number.
 func (r *Response) Status(code int) *Response {
+	r.statusCode = code
 	line := statusLine(code)
 	if r.async != nil {
 		r.async.status = line
 		return r
 	}
 	r.inner.status(line)
+	r.flushPendingHeaders()
 	return r
+}
+
+// flushPendingHeaders writes every buffered header to the wire via
+// cgo. Must be called after status was written (or auto-200'd). Resets
+// the buffer length to zero so the same response wrapper recycled
+// later doesn't re-emit stale headers. Cheap no-op when the slice is
+// empty (which is the common case — no buffered headers means no
+// middleware that added them).
+func (r *Response) flushPendingHeaders() {
+	if len(r.pendingHeaders) == 0 {
+		return
+	}
+	for _, h := range r.pendingHeaders {
+		r.inner.header(h.name, h.value)
+	}
+	r.pendingHeaders = r.pendingHeaders[:0]
+}
+
+// ensureStatusSync writes a 200 OK status line if none was set yet.
+// Lets End / Write own the order (status → buffered headers → body)
+// instead of letting uWS auto-emit "200 OK" via the first writeHeader
+// (which would lock the status before pendingHeaders flush).
+func (r *Response) ensureStatusSync() {
+	if r.statusCode == 0 {
+		r.statusCode = 200
+		r.inner.status("200 OK")
+	}
+}
+
+// StatusCode returns the last status code passed to Status / Send /
+// JSON. Returns 200 (the uWS default) if no status was ever set.
+// Useful from middleware that needs to observe how a handler
+// responded — e.g. a logger that records the final status.
+func (r *Response) StatusCode() int {
+	if r.statusCode == 0 {
+		return 200
+	}
+	return r.statusCode
 }
 
 // Header writes a response header.
@@ -1560,7 +1617,11 @@ func (r *Response) Header(key, value string) *Response {
 		r.async.contentType = value
 		return r
 	}
-	r.inner.header(key, value)
+	// Buffer Go-side and flush on the first Status / Send / End / Write
+	// so the order (status → headers → body) is preserved regardless of
+	// how the caller sequenced their calls. See pendingHeaders comment
+	// in Response for the uWS quirk this protects against.
+	r.pendingHeaders = append(r.pendingHeaders, responseHeader{key, value})
 	return r
 }
 
@@ -1580,6 +1641,8 @@ func (r *Response) Write(body string) *Response {
 		r.async.body.WriteString(body)
 		return r
 	}
+	r.ensureStatusSync()
+	r.flushPendingHeaders()
 	r.inner.write(body)
 	return r
 }
@@ -1591,6 +1654,8 @@ func (r *Response) End(body string) {
 		r.flushAsync()
 		return
 	}
+	r.ensureStatusSync()
+	r.flushPendingHeaders()
 	r.inner.end(body)
 }
 
@@ -1607,6 +1672,7 @@ func (r *Response) End(body string) {
 //
 // Pass an empty contentType to omit the header.
 func (r *Response) Send(code int, contentType, body string) {
+	r.statusCode = code
 	if contentType != "" {
 		validateHeaderValue("Content-Type", contentType)
 	}
@@ -1626,8 +1692,20 @@ func (r *Response) Send(code int, contentType, body string) {
 		return
 	}
 
-	// Sync mode: direct cgo call into uWS.
-	r.inner.send(line, contentType, body)
+	// Sync mode: fast path when no headers were buffered — one cgo
+	// crossing for status + Content-Type + body. When the caller (or
+	// middleware) added Headers, split into status → buffered headers
+	// → Content-Type → body so order is preserved.
+	if len(r.pendingHeaders) == 0 {
+		r.inner.send(line, contentType, body)
+		return
+	}
+	r.inner.status(line)
+	r.flushPendingHeaders()
+	if contentType != "" {
+		r.inner.header("Content-Type", contentType)
+	}
+	r.inner.end(body)
 }
 
 // JSON marshals v and sends it with Content-Type: application/json. If
@@ -1662,6 +1740,7 @@ func (r *Response) Redirect(location string, code int) {
 	if code == 0 {
 		code = 302
 	}
+	r.statusCode = code
 	validateHeaderValue("Location", location)
 	line := statusLine(code)
 	if r.async != nil && !r.async.sent {
@@ -1683,6 +1762,7 @@ func (r *Response) Redirect(location string, code int) {
 		return
 	}
 	r.inner.status(line)
+	r.flushPendingHeaders()
 	r.inner.header("Location", location)
 	r.inner.end("")
 }
@@ -1840,6 +1920,7 @@ func (r *Response) sendFile(req *Request, path, filename string, attachment bool
 // res.Loop() would return the wrong loop and the defer would never
 // fire.
 func (r *Response) sendBytes(code int, headers []responseHeader, body []byte) {
+	r.statusCode = code
 	line := statusLine(code)
 	if r.async != nil && !r.async.sent {
 		r.async.sent = true
@@ -1862,6 +1943,7 @@ func (r *Response) sendBytes(code int, headers []responseHeader, body []byte) {
 		return
 	}
 	r.inner.status(line)
+	r.flushPendingHeaders()
 	for _, h := range headers {
 		r.inner.header(h.name, h.value)
 	}
@@ -2086,6 +2168,10 @@ func (r *Response) releaseRef() {
 	}
 	r.inner = responseNative{}
 	r.async = nil
+	r.statusCode = 0
+	if r.pendingHeaders != nil {
+		r.pendingHeaders = r.pendingHeaders[:0]
+	}
 	responsePool.Put(r)
 }
 
