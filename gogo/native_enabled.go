@@ -423,6 +423,16 @@ func (r responseNative) loop() loopNative {
 	return loopNative{ptr: C.uwsgo_res_get_loop(r.ptr)}
 }
 
+// loopFromUintptr rebuilds a *Loop from a previously-cached pointer.
+// Use this in any code path that wants to schedule work onto the loop
+// without re-querying it via res.Loop() — required from worker
+// goroutines in the shared-dispatch path, where uWS::Loop::get() is
+// thread-local and returns the wrong loop (or none) when called from a
+// non-loop thread.
+func loopFromUintptr(p uintptr) *Loop {
+	return &Loop{inner: loopNative{ptr: (*C.uwsgo_loop_t)(unsafe.Pointer(p))}}
+}
+
 // remoteAddr returns the formatted peer IP for the connection underlying
 // this response. uWS caches the formatted string on its side; calling
 // this multiple times for the same request is a single allocation in Go

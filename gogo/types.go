@@ -2,9 +2,12 @@ package gogo
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"mime"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"sort"
@@ -1527,7 +1530,9 @@ func (r *Response) Redirect(location string, code int) {
 	if r.async != nil && !r.async.sent {
 		r.async.sent = true
 		inner := r.inner
-		loop := r.Loop()
+		// Cached pointer — see sendBytes for why we don't call res.Loop()
+		// from off-loop-thread.
+		loop := loopFromUintptr(r.async.loopPtr)
 		ctx := r.async.ctxHandle
 		loc := location
 		loop.Defer(func() {
@@ -1543,6 +1548,342 @@ func (r *Response) Redirect(location string, code int) {
 	r.inner.status(line)
 	r.inner.header("Location", location)
 	r.inner.end("")
+}
+
+// MaxSendFileBytes caps how large a file SendFile and Download will read
+// into memory before serving. Files larger than this return
+// ErrFileTooLarge without touching the response. Defaults to 100 MiB;
+// reassign at startup to raise the ceiling, or roll your own
+// Write-loop streaming for arbitrarily large blobs.
+var MaxSendFileBytes int64 = 100 << 20
+
+// ErrFileTooLarge is returned by SendFile / Download when the target
+// file is larger than MaxSendFileBytes.
+var ErrFileTooLarge = errors.New("gogo: file exceeds MaxSendFileBytes")
+
+// SendFile reads path from disk and writes it as the response body.
+// Content-Type is picked from the file extension via mime.TypeByExtension;
+// for unknown extensions the first 512 bytes are passed through
+// http.DetectContentType. Last-Modified and a weak ETag derived from
+// (size, mtime) are set automatically.
+//
+// Conditional requests are honored: If-None-Match against the ETag and
+// If-Modified-Since against the file mtime each short-circuit to 304
+// Not Modified with no body. Single-byte range requests on req
+// (`Range: bytes=start-end`, `bytes=start-`, `bytes=-suffix`) return
+// 206 Partial Content with the requested slice; multi-range and
+// non-bytes units fall through to the full 200.
+//
+// The helper refuses files larger than MaxSendFileBytes (default
+// 100 MiB) and returns ErrFileTooLarge. Returns an error when path is
+// missing, a directory, or unreadable; the response is left untouched
+// in that case so the caller can decide what to send.
+//
+// Reads block the calling goroutine. Call SendFile from a GetAsync
+// handler (or wrap a sync call in Response.Async) to avoid stalling
+// the uWS loop on disk I/O.
+func (r *Response) SendFile(req *Request, path string) error {
+	return r.sendFile(req, path, "", false)
+}
+
+// Download is SendFile plus Content-Disposition: attachment, which
+// prompts browsers to save the body to disk instead of rendering it
+// inline. filename overrides the suggested name in the header; pass ""
+// to default to filepath.Base(path). The filename is wrapped in
+// quoted-string form with quote / backslash escaped per RFC 6266;
+// non-ASCII filenames receive an RFC 5987 filename* parameter so
+// non-Latin-1 names survive transport.
+func (r *Response) Download(req *Request, path, filename string) error {
+	if filename == "" {
+		filename = filepath.Base(path)
+	}
+	return r.sendFile(req, path, filename, true)
+}
+
+type responseHeader struct {
+	name, value string
+}
+
+func (r *Response) sendFile(req *Request, path, filename string, attachment bool) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return fmt.Errorf("gogo: SendFile: %s is a directory", path)
+	}
+	size := info.Size()
+	if size > MaxSendFileBytes {
+		return ErrFileTooLarge
+	}
+	mtime := info.ModTime().UTC()
+	etag := fmt.Sprintf(`W/"%x-%x"`, size, mtime.UnixNano())
+	lastMod := mtime.Format(http.TimeFormat)
+
+	// Conditional GET — 304 short-circuit. If-None-Match wins over
+	// If-Modified-Since per RFC 7232 §6. Header names are lowercased
+	// because the sync Request.Header path passes them straight to uWS,
+	// which stores headers in lower-case form on parse.
+	if req != nil {
+		if inm := req.Header("if-none-match"); inm != "" {
+			if etagMatch(inm, etag) {
+				r.sendBytes(304, []responseHeader{{"ETag", etag}}, nil)
+				return nil
+			}
+		} else if ims := req.Header("if-modified-since"); ims != "" {
+			if t, err := http.ParseTime(ims); err == nil &&
+				!mtime.Truncate(time.Second).After(t) {
+				r.sendBytes(304, []responseHeader{{"ETag", etag}}, nil)
+				return nil
+			}
+		}
+	}
+
+	// Content-Type — extension lookup first, sniff fallback.
+	ctype := mime.TypeByExtension(filepath.Ext(path))
+	if ctype == "" {
+		var sniff [512]byte
+		n, _ := f.ReadAt(sniff[:], 0)
+		ctype = http.DetectContentType(sniff[:n])
+	}
+
+	rangeHeader := ""
+	if req != nil {
+		rangeHeader = req.Header("range")
+	}
+
+	headers := []responseHeader{
+		{"Content-Type", ctype},
+		{"Accept-Ranges", "bytes"},
+		{"Last-Modified", lastMod},
+		{"ETag", etag},
+	}
+	if attachment {
+		headers = append(headers, responseHeader{"Content-Disposition", buildDisposition(filename, true)})
+	}
+
+	var body []byte
+	status := 200
+	if start, end, ok := parseSingleByteRange(rangeHeader, size); ok {
+		sliceLen := end - start + 1
+		body = make([]byte, sliceLen)
+		if _, err := f.ReadAt(body, start); err != nil {
+			return err
+		}
+		status = 206
+		headers = append(headers, responseHeader{
+			"Content-Range",
+			fmt.Sprintf("bytes %d-%d/%d", start, end, size),
+		})
+	} else if size > 0 {
+		body = make([]byte, size)
+		if _, err := f.ReadAt(body, 0); err != nil {
+			return err
+		}
+	}
+
+	r.sendBytes(status, headers, body)
+	return nil
+}
+
+// sendBytes writes a complete response (status + N headers + body) from
+// any handler mode. Sync mode: direct cgo calls. Async mode: defers a
+// corked write onto the loop. The body slice is captured by reference;
+// callers must not mutate it after handing it over.
+//
+// The async path uses the loop pointer cached in asyncState rather than
+// querying res.Loop() — uWS::Loop::get() is thread-local, and worker
+// goroutines (shared-dispatch GetAsync) are not on the loop thread, so
+// res.Loop() would return the wrong loop and the defer would never
+// fire.
+func (r *Response) sendBytes(code int, headers []responseHeader, body []byte) {
+	line := statusLine(code)
+	if r.async != nil && !r.async.sent {
+		r.async.sent = true
+		loop := loopFromUintptr(r.async.loopPtr)
+		inner := r.inner
+		ctx := r.async.ctxHandle
+		hs := headers
+		bs := body
+		loop.Defer(func() {
+			defer asyncCtxRelease(ctx)
+			inner.cork(func() {
+				inner.status(line)
+				for _, h := range hs {
+					inner.header(h.name, h.value)
+				}
+				inner.end(bytesAsString(bs))
+			})
+			runtime.KeepAlive(bs)
+		})
+		return
+	}
+	r.inner.status(line)
+	for _, h := range headers {
+		r.inner.header(h.name, h.value)
+	}
+	r.inner.end(bytesAsString(body))
+	runtime.KeepAlive(body)
+}
+
+// bytesAsString aliases body as a Go string without copying. The string
+// is only safe to use while body remains alive; pair with runtime.KeepAlive
+// when crossing into cgo. Returns "" for the empty/nil slice.
+func bytesAsString(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	return unsafe.String(unsafe.SliceData(body), len(body))
+}
+
+// etagMatch reports whether the If-None-Match header value matches etag.
+// Handles the "*" wildcard and comma-separated lists. Strong and weak
+// forms ("W/" prefix) compare equivalent for SendFile's purposes.
+func etagMatch(inm, etag string) bool {
+	inm = strings.TrimSpace(inm)
+	if inm == "*" {
+		return true
+	}
+	target := strings.TrimPrefix(etag, "W/")
+	for _, candidate := range strings.Split(inm, ",") {
+		candidate = strings.TrimSpace(candidate)
+		candidate = strings.TrimPrefix(candidate, "W/")
+		if candidate == target {
+			return true
+		}
+	}
+	return false
+}
+
+// parseSingleByteRange parses a Range header value with a single byte
+// range. Returns (start, end, true) on success; (0, 0, false) on any
+// parse error, multi-range request, non-bytes unit, or out-of-bounds
+// range. end is inclusive. Accepted forms:
+//
+//	bytes=start-end      — explicit range
+//	bytes=start-         — start through size-1
+//	bytes=-suffix        — last `suffix` bytes
+//
+// Per RFC 7233, malformed Range headers are ignored — the caller falls
+// through to a normal 200 response with the full body.
+func parseSingleByteRange(h string, size int64) (start, end int64, ok bool) {
+	if h == "" || size == 0 {
+		return 0, 0, false
+	}
+	const prefix = "bytes="
+	if !strings.HasPrefix(h, prefix) {
+		return 0, 0, false
+	}
+	spec := h[len(prefix):]
+	if strings.Contains(spec, ",") {
+		return 0, 0, false
+	}
+	dash := strings.IndexByte(spec, '-')
+	if dash < 0 {
+		return 0, 0, false
+	}
+	sStr := strings.TrimSpace(spec[:dash])
+	eStr := strings.TrimSpace(spec[dash+1:])
+	if sStr == "" {
+		if eStr == "" {
+			return 0, 0, false
+		}
+		suffix, err := strconv.ParseInt(eStr, 10, 64)
+		if err != nil || suffix <= 0 {
+			return 0, 0, false
+		}
+		if suffix > size {
+			suffix = size
+		}
+		return size - suffix, size - 1, true
+	}
+	sVal, err := strconv.ParseInt(sStr, 10, 64)
+	if err != nil || sVal < 0 || sVal >= size {
+		return 0, 0, false
+	}
+	if eStr == "" {
+		return sVal, size - 1, true
+	}
+	eVal, err := strconv.ParseInt(eStr, 10, 64)
+	if err != nil || eVal < sVal {
+		return 0, 0, false
+	}
+	if eVal >= size {
+		eVal = size - 1
+	}
+	return sVal, eVal, true
+}
+
+// buildDisposition builds a Content-Disposition header value per RFC 6266.
+// filename is wrapped in quoted-string with " and \ escaped. Non-ASCII
+// filenames also carry an RFC 5987 filename* parameter so clients that
+// honor it can recover the original UTF-8 name. Control characters in
+// the filename are dropped.
+func buildDisposition(filename string, attachment bool) string {
+	dispType := "inline"
+	if attachment {
+		dispType = "attachment"
+	}
+	if filename == "" {
+		return dispType
+	}
+	var sb strings.Builder
+	sb.WriteString(dispType)
+	sb.WriteString(`; filename="`)
+	asciiOnly := true
+	for _, c := range filename {
+		if c < 0x20 || c == 0x7f {
+			continue
+		}
+		if c == '"' || c == '\\' {
+			sb.WriteByte('\\')
+		}
+		if c < 0x80 {
+			sb.WriteRune(c)
+		} else {
+			asciiOnly = false
+			sb.WriteByte('_')
+		}
+	}
+	sb.WriteByte('"')
+	if !asciiOnly {
+		sb.WriteString(`; filename*=UTF-8''`)
+		sb.WriteString(percentEncodeRFC5987(filename))
+	}
+	return sb.String()
+}
+
+// percentEncodeRFC5987 percent-encodes s per RFC 5987 ext-value rules:
+// ALPHA / DIGIT and a small set of punctuation pass through verbatim;
+// every other byte (including all multi-byte UTF-8 continuation bytes)
+// is percent-encoded.
+func percentEncodeRFC5987(s string) string {
+	var sb strings.Builder
+	sb.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case (c >= 'A' && c <= 'Z') ||
+			(c >= 'a' && c <= 'z') ||
+			(c >= '0' && c <= '9') ||
+			c == '!' || c == '#' || c == '$' || c == '&' ||
+			c == '+' || c == '-' || c == '.' || c == '^' ||
+			c == '_' || c == '`' || c == '|' || c == '~':
+			sb.WriteByte(c)
+		default:
+			const hex = "0123456789ABCDEF"
+			sb.WriteByte('%')
+			sb.WriteByte(hex[c>>4])
+			sb.WriteByte(hex[c&0x0F])
+		}
+	}
+	return sb.String()
 }
 
 // Async marks the response for asynchronous handling and runs fn on a new

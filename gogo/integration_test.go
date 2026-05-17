@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -3004,5 +3005,457 @@ func TestMethodNotAllowedDefault405(t *testing.T) {
 	}
 	if allow := resp.Header.Get("Allow"); allow != "GET" {
 		t.Errorf("Allow: got %q, want GET", allow)
+	}
+}
+
+// writeTempFile drops content at a temp path with the given extension
+// and returns the path. The file is removed via t.Cleanup.
+func writeTempFile(t *testing.T, ext string, content []byte) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := dir + "/sendfile" + ext
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+	return path
+}
+
+// TestSendFileBasic: SendFile returns 200 with the file body and a
+// sniffed Content-Type. Last-Modified, ETag, and Accept-Ranges are
+// populated.
+func TestSendFileBasic(t *testing.T) {
+	path := writeTempFile(t, ".txt", []byte("hello sendfile"))
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/file", func(res *gogo.Response, req *gogo.Request) {
+			if err := res.SendFile(req, path); err != nil {
+				t.Errorf("SendFile: %v", err)
+			}
+		})
+	})
+	defer teardown()
+
+	resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/file", port))
+	if err != nil {
+		t.Fatalf("GET /file: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+	if string(body) != "hello sendfile" {
+		t.Fatalf("body: got %q, want %q", body, "hello sendfile")
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Errorf("Content-Type: got %q, want text/plain*", ct)
+	}
+	if ar := resp.Header.Get("Accept-Ranges"); ar != "bytes" {
+		t.Errorf("Accept-Ranges: got %q, want bytes", ar)
+	}
+	if resp.Header.Get("ETag") == "" {
+		t.Error("ETag is empty")
+	}
+	if resp.Header.Get("Last-Modified") == "" {
+		t.Error("Last-Modified is empty")
+	}
+}
+
+// TestSendFileContentTypeSniff: files with an unknown extension fall
+// back to http.DetectContentType, which can identify PNG / JPEG headers
+// even without an extension.
+func TestSendFileContentTypeSniff(t *testing.T) {
+	// PNG magic: 89 50 4E 47 0D 0A 1A 0A
+	pngBytes := []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0}
+	path := writeTempFile(t, ".unknownext", pngBytes)
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/png", func(res *gogo.Response, req *gogo.Request) {
+			_ = res.SendFile(req, path)
+		})
+	})
+	defer teardown()
+
+	resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/png", port))
+	if err != nil {
+		t.Fatalf("GET /png: %v", err)
+	}
+	resp.Body.Close()
+	if ct := resp.Header.Get("Content-Type"); ct != "image/png" {
+		t.Errorf("sniffed Content-Type: got %q, want image/png", ct)
+	}
+}
+
+// TestSendFileRange: a single-byte Range request returns 206 with the
+// requested slice and a matching Content-Range header.
+func TestSendFileRange(t *testing.T) {
+	content := []byte("0123456789abcdef")
+	path := writeTempFile(t, ".bin", content)
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/r", func(res *gogo.Response, req *gogo.Request) {
+			_ = res.SendFile(req, path)
+		})
+	})
+	defer teardown()
+
+	cases := []struct {
+		hdr     string
+		want    string
+		wantCR  string
+		wantSt  int
+	}{
+		{"bytes=0-3", "0123", "bytes 0-3/16", 206},
+		{"bytes=10-", "abcdef", "bytes 10-15/16", 206},
+		{"bytes=-4", "cdef", "bytes 12-15/16", 206},
+		{"bytes=5-100", "56789abcdef", "bytes 5-15/16", 206},
+	}
+	for _, tc := range cases {
+		req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/r", port), nil)
+		req.Header.Set("Range", tc.hdr)
+		resp, err := noKeepaliveClient.Do(req)
+		if err != nil {
+			t.Fatalf("Range %q: %v", tc.hdr, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != tc.wantSt {
+			t.Errorf("Range %q: status %d, want %d", tc.hdr, resp.StatusCode, tc.wantSt)
+		}
+		if string(body) != tc.want {
+			t.Errorf("Range %q: body %q, want %q", tc.hdr, body, tc.want)
+		}
+		if cr := resp.Header.Get("Content-Range"); cr != tc.wantCR {
+			t.Errorf("Range %q: Content-Range %q, want %q", tc.hdr, cr, tc.wantCR)
+		}
+	}
+}
+
+// TestSendFileMalformedRange: malformed Range headers are ignored per
+// RFC 7233; the full file goes out with status 200.
+func TestSendFileMalformedRange(t *testing.T) {
+	content := []byte("abcdefgh")
+	path := writeTempFile(t, ".txt", content)
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/r", func(res *gogo.Response, req *gogo.Request) {
+			_ = res.SendFile(req, path)
+		})
+	})
+	defer teardown()
+
+	for _, bad := range []string{"items=0-3", "bytes=0-3,5-7", "bytes=banana", "bytes=", "bytes=100-200"} {
+		req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/r", port), nil)
+		req.Header.Set("Range", bad)
+		resp, err := noKeepaliveClient.Do(req)
+		if err != nil {
+			t.Fatalf("Range %q: %v", bad, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Errorf("Range %q: status %d, want 200 (ignored)", bad, resp.StatusCode)
+		}
+		if string(body) != string(content) {
+			t.Errorf("Range %q: body %q, want %q", bad, body, content)
+		}
+	}
+}
+
+// TestSendFileConditionalETag: If-None-Match matching the response ETag
+// returns 304 Not Modified with no body.
+func TestSendFileConditionalETag(t *testing.T) {
+	path := writeTempFile(t, ".txt", []byte("conditional"))
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/c", func(res *gogo.Response, req *gogo.Request) {
+			_ = res.SendFile(req, path)
+		})
+	})
+	defer teardown()
+
+	// First request — grab the ETag.
+	resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/c", port))
+	if err != nil {
+		t.Fatalf("first GET: %v", err)
+	}
+	resp.Body.Close()
+	etag := resp.Header.Get("ETag")
+	if etag == "" {
+		t.Fatal("expected ETag on first response")
+	}
+
+	// Second request with If-None-Match — should be 304.
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/c", port), nil)
+	req.Header.Set("If-None-Match", etag)
+	resp, err = noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("conditional GET: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 304 {
+		t.Errorf("status: got %d, want 304", resp.StatusCode)
+	}
+	if len(body) != 0 {
+		t.Errorf("body: got %q, want empty", body)
+	}
+
+	// Wildcard If-None-Match also triggers 304.
+	req, _ = http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/c", port), nil)
+	req.Header.Set("If-None-Match", "*")
+	resp, err = noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("wildcard GET: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 304 {
+		t.Errorf("wildcard status: got %d, want 304", resp.StatusCode)
+	}
+}
+
+// TestSendFileConditionalIMS: If-Modified-Since at or after the file's
+// mtime returns 304; earlier values pass through to 200.
+func TestSendFileConditionalIMS(t *testing.T) {
+	path := writeTempFile(t, ".txt", []byte("ims test"))
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/c", func(res *gogo.Response, req *gogo.Request) {
+			_ = res.SendFile(req, path)
+		})
+	})
+	defer teardown()
+
+	// Future IMS → 304.
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/c", port), nil)
+	req.Header.Set("If-Modified-Since", time.Now().Add(24*time.Hour).UTC().Format(http.TimeFormat))
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("future IMS: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 304 {
+		t.Errorf("future IMS: got %d, want 304", resp.StatusCode)
+	}
+
+	// Past IMS → 200.
+	req, _ = http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/c", port), nil)
+	req.Header.Set("If-Modified-Since", time.Now().Add(-24*time.Hour).UTC().Format(http.TimeFormat))
+	resp, err = noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("past IMS: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("past IMS: got %d, want 200", resp.StatusCode)
+	}
+}
+
+// TestSendFileMissing: SendFile returns an error for a missing path and
+// does not touch the response. The handler can then send its own 404.
+func TestSendFileMissing(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/x", func(res *gogo.Response, req *gogo.Request) {
+			if err := res.SendFile(req, "/nonexistent/path/file.txt"); err != nil {
+				res.Send(404, "text/plain", "not found")
+				return
+			}
+			res.Send(500, "text/plain", "should not reach")
+		})
+	})
+	defer teardown()
+
+	status, body := httpGet(t, port, "/x")
+	if status != 404 || body != "not found" {
+		t.Errorf("missing file: got %d %q, want 404 %q", status, body, "not found")
+	}
+}
+
+// TestSendFileDirectory: SendFile on a directory returns an error
+// without writing to the response.
+func TestSendFileDirectory(t *testing.T) {
+	dir := t.TempDir()
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/d", func(res *gogo.Response, req *gogo.Request) {
+			if err := res.SendFile(req, dir); err != nil {
+				res.Send(400, "text/plain", "is dir")
+				return
+			}
+			res.Send(500, "text/plain", "should not reach")
+		})
+	})
+	defer teardown()
+
+	status, body := httpGet(t, port, "/d")
+	if status != 400 || body != "is dir" {
+		t.Errorf("dir: got %d %q, want 400 %q", status, body, "is dir")
+	}
+}
+
+// TestSendFileTooLarge: a file above MaxSendFileBytes returns
+// ErrFileTooLarge without sending a body.
+func TestSendFileTooLarge(t *testing.T) {
+	// Temporarily lower the ceiling for the duration of this test.
+	orig := gogo.MaxSendFileBytes
+	gogo.MaxSendFileBytes = 16
+	t.Cleanup(func() { gogo.MaxSendFileBytes = orig })
+
+	path := writeTempFile(t, ".bin", make([]byte, 64))
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/big", func(res *gogo.Response, req *gogo.Request) {
+			err := res.SendFile(req, path)
+			if err == nil {
+				res.Send(500, "text/plain", "should have failed")
+				return
+			}
+			if err != gogo.ErrFileTooLarge {
+				res.Send(500, "text/plain", "wrong err: "+err.Error())
+				return
+			}
+			res.Send(413, "text/plain", "too large")
+		})
+	})
+	defer teardown()
+
+	status, body := httpGet(t, port, "/big")
+	if status != 413 || body != "too large" {
+		t.Errorf("too large: got %d %q, want 413 %q", status, body, "too large")
+	}
+}
+
+// TestDownload: sets Content-Disposition: attachment with the
+// requested filename quoted per RFC 6266.
+func TestDownload(t *testing.T) {
+	path := writeTempFile(t, ".dat", []byte("download body"))
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/dl", func(res *gogo.Response, req *gogo.Request) {
+			if err := res.Download(req, path, "report.dat"); err != nil {
+				t.Errorf("Download: %v", err)
+			}
+		})
+		app.Get("/dl-default", func(res *gogo.Response, req *gogo.Request) {
+			_ = res.Download(req, path, "")
+		})
+		app.Get("/dl-unicode", func(res *gogo.Response, req *gogo.Request) {
+			_ = res.Download(req, path, "รายงาน.dat")
+		})
+		app.Get("/dl-quote", func(res *gogo.Response, req *gogo.Request) {
+			_ = res.Download(req, path, `weird"name\.dat`)
+		})
+	})
+	defer teardown()
+
+	// Custom filename.
+	resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/dl", port))
+	if err != nil {
+		t.Fatalf("GET /dl: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "download body" {
+		t.Errorf("body: got %q", body)
+	}
+	cd := resp.Header.Get("Content-Disposition")
+	if cd != `attachment; filename="report.dat"` {
+		t.Errorf("Content-Disposition: got %q", cd)
+	}
+
+	// Default filename from path basename.
+	resp, err = noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/dl-default", port))
+	if err != nil {
+		t.Fatalf("GET /dl-default: %v", err)
+	}
+	resp.Body.Close()
+	cd = resp.Header.Get("Content-Disposition")
+	if !strings.HasPrefix(cd, `attachment; filename="sendfile.dat"`) {
+		t.Errorf("default filename Content-Disposition: got %q", cd)
+	}
+
+	// Non-ASCII filename — gets filename* with UTF-8 percent encoding.
+	resp, err = noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/dl-unicode", port))
+	if err != nil {
+		t.Fatalf("GET /dl-unicode: %v", err)
+	}
+	resp.Body.Close()
+	cd = resp.Header.Get("Content-Disposition")
+	if !strings.Contains(cd, `filename*=UTF-8''`) {
+		t.Errorf("unicode filename missing filename*: got %q", cd)
+	}
+
+	// Embedded quote/backslash in the filename get escaped.
+	resp, err = noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/dl-quote", port))
+	if err != nil {
+		t.Fatalf("GET /dl-quote: %v", err)
+	}
+	resp.Body.Close()
+	cd = resp.Header.Get("Content-Disposition")
+	if !strings.Contains(cd, `\"`) || !strings.Contains(cd, `\\`) {
+		t.Errorf("quote escaping in Content-Disposition: got %q", cd)
+	}
+}
+
+// TestSendFileAsync: SendFile works from an async handler — the body is
+// streamed through the loop.Defer + cork path.
+func TestSendFileAsync(t *testing.T) {
+	path := writeTempFile(t, ".txt", []byte("async file body"))
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.GetAsync("/a", func(res *gogo.Response, req *gogo.Request) {
+			if err := res.SendFile(req, path); err != nil {
+				t.Errorf("SendFile async: %v", err)
+			}
+		})
+	})
+	defer teardown()
+
+	resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/a", port))
+	if err != nil {
+		t.Fatalf("GET /a: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("async status: got %d, want 200", resp.StatusCode)
+	}
+	if string(body) != "async file body" {
+		t.Errorf("async body: got %q, want %q", body, "async file body")
+	}
+	if resp.Header.Get("ETag") == "" {
+		t.Error("async ETag empty")
+	}
+}
+
+// TestRedirectFromGetAsync locks in the fix for the latent loop-pointer
+// bug: res.Loop() reads thread-local uWS::Loop::get(), which from a
+// shared-dispatch worker goroutine returns the wrong loop (or null).
+// Before the fix, Redirect from a GetAsync handler hung indefinitely
+// because the deferred cork was queued on a loop that never iterated.
+func TestRedirectFromGetAsync(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.GetAsync("/r", func(res *gogo.Response, req *gogo.Request) {
+			res.Redirect("/elsewhere", 301)
+		})
+	})
+	defer teardown()
+
+	// Disable redirect-following so we see the 301 itself.
+	client := &http.Client{
+		Transport:     &http.Transport{DisableKeepAlives: true},
+		Timeout:       3 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/r", port))
+	if err != nil {
+		t.Fatalf("GET /r: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 301 {
+		t.Errorf("status: got %d, want 301", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "/elsewhere" {
+		t.Errorf("Location: got %q, want /elsewhere", loc)
 	}
 }
