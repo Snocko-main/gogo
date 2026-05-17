@@ -2386,3 +2386,267 @@ func TestWebSocketBehaviorAcceptsLimits(t *testing.T) {
 		t.Fatalf("/ping after WS register: got %d %q", status, body)
 	}
 }
+
+// TestRequestIntrospection covers the P1 request helpers — IP, IPs,
+// Hostname, Get, Protocol, Secure — across sync, async, and the
+// shared-dispatch path. IP comes from the loopback peer (127.0.0.1)
+// in the test harness; IPs is X-Forwarded-For; Hostname comes from
+// the Host header (port stripped).
+//
+// CapturePeerIP is enabled so async / shared paths populate the IP
+// snapshot. The default (off) is exercised by TestPeerIPDefaultOff.
+func TestRequestIntrospection(t *testing.T) {
+	type captured struct {
+		ip       string
+		ips      []string
+		host     string
+		get      string
+		protocol string
+		secure   bool
+	}
+	var sync, async, shared atomic.Pointer[captured]
+	port, teardown := startAppCfg(t, gogo.Config{CapturePeerIP: true}, func(app *gogo.App) {
+		app.Get("/sync", func(res *gogo.Response, req *gogo.Request) {
+			sync.Store(&captured{
+				ip:       req.IP(),
+				ips:      req.IPs(),
+				host:     req.Hostname(),
+				get:      req.Get("x-custom"),
+				protocol: req.Protocol(),
+				secure:   req.Secure(),
+			})
+			res.Send(200, "text/plain", "sync")
+		})
+		// Force the sync-wrapper async path by attaching a middleware.
+		app.Use("/async/*", func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) { next(res, req) }
+		})
+		app.GetAsync("/async/snap", func(res *gogo.Response, req *gogo.Request) {
+			async.Store(&captured{
+				ip:       req.IP(),
+				ips:      req.IPs(),
+				host:     req.Hostname(),
+				get:      req.Get("x-custom"),
+				protocol: req.Protocol(),
+				secure:   req.Secure(),
+			})
+			res.Send(200, "text/plain", "async")
+		})
+		// No middleware → shared-dispatch zero-cgo path.
+		app.GetAsync("/shared", func(res *gogo.Response, req *gogo.Request) {
+			shared.Store(&captured{
+				ip:       req.IP(),
+				ips:      req.IPs(),
+				host:     req.Hostname(),
+				get:      req.Get("x-custom"),
+				protocol: req.Protocol(),
+				secure:   req.Secure(),
+			})
+			res.Send(200, "text/plain", "shared")
+		})
+	})
+	defer teardown()
+
+	doRequest := func(path string) {
+		req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d%s", port, path), nil)
+		req.Header.Set("Host", fmt.Sprintf("api.example:%d", port))
+		req.Header.Set("X-Forwarded-For", "203.0.113.5, 198.51.100.7:443")
+		req.Header.Set("X-Custom", "hi")
+		resp, err := noKeepaliveClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		resp.Body.Close()
+	}
+	doRequest("/sync")
+	doRequest("/async/snap")
+	doRequest("/shared")
+
+	check := func(name string, c *captured) {
+		t.Helper()
+		if c == nil {
+			t.Fatalf("%s handler did not record", name)
+		}
+		if c.ip == "" || (!strings.HasPrefix(c.ip, "127.0.0.1") && c.ip != "::1") {
+			t.Errorf("%s: ip=%q, want loopback", name, c.ip)
+		}
+		// Go's http client overrides Host from the URL; just verify a
+		// non-empty hostname with no ":port".
+		if c.host == "" || strings.ContainsRune(c.host, ':') {
+			t.Errorf("%s: host=%q, want hostname with port stripped", name, c.host)
+		}
+		if c.get != "hi" {
+			t.Errorf("%s: Get(x-custom)=%q, want hi", name, c.get)
+		}
+		if c.protocol != "http" {
+			t.Errorf("%s: protocol=%q, want http", name, c.protocol)
+		}
+		if c.secure {
+			t.Errorf("%s: secure=true on plaintext app", name)
+		}
+		if len(c.ips) != 2 || c.ips[0] != "203.0.113.5" || c.ips[1] != "198.51.100.7" {
+			t.Errorf("%s: ips=%v, want [203.0.113.5 198.51.100.7]", name, c.ips)
+		}
+	}
+	check("sync", sync.Load())
+	check("async-snap", async.Load())
+	check("shared", shared.Load())
+}
+
+// TestPeerIPDefaultOff: with the default Config (CapturePeerIP=false),
+// shared-dispatch and sync-wrapper-async handlers see req.IP() == "".
+// Sync handlers still get the live IP — their lookup goes through the
+// res pointer directly and isn't tied to the snapshot.
+func TestPeerIPDefaultOff(t *testing.T) {
+	var syncIP, asyncIP, sharedIP atomic.Pointer[string]
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/sync", func(res *gogo.Response, req *gogo.Request) {
+			ip := req.IP()
+			syncIP.Store(&ip)
+			res.Send(200, "text/plain", "ok")
+		})
+		app.Use("/snap/*", func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) { next(res, req) }
+		})
+		app.GetAsync("/snap/x", func(res *gogo.Response, req *gogo.Request) {
+			ip := req.IP()
+			asyncIP.Store(&ip)
+			res.Send(200, "text/plain", "ok")
+		})
+		app.GetAsync("/shared", func(res *gogo.Response, req *gogo.Request) {
+			ip := req.IP()
+			sharedIP.Store(&ip)
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	httpGet(t, port, "/sync")
+	httpGet(t, port, "/snap/x")
+	httpGet(t, port, "/shared")
+
+	if v := syncIP.Load(); v == nil || *v == "" {
+		t.Errorf("sync handler IP empty with CapturePeerIP=false; live res lookup should still work, got %v", v)
+	}
+	if v := asyncIP.Load(); v == nil || *v != "" {
+		t.Errorf("async (snapshot) IP should be empty by default, got %q", *v)
+	}
+	if v := sharedIP.Load(); v == nil || *v != "" {
+		t.Errorf("shared-dispatch IP should be empty by default, got %q", *v)
+	}
+}
+
+// TestResponseRedirect: status defaults to 302; Location header is set;
+// body is empty. CRLF in location panics at the validation gate.
+func TestResponseRedirect(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/r1", func(res *gogo.Response, req *gogo.Request) {
+			res.Redirect("/dest", 0) // → 302
+		})
+		app.Get("/r2", func(res *gogo.Response, req *gogo.Request) {
+			res.Redirect("/perm", 301)
+		})
+		app.Get("/inject", func(res *gogo.Response, req *gogo.Request) {
+			defer func() {
+				if r := recover(); r != nil {
+					res.Send(400, "text/plain", "rejected")
+				}
+			}()
+			res.Redirect("/x\r\nX-Bad: 1", 302)
+		})
+	})
+	defer teardown()
+
+	// Disable auto-redirect so we can inspect the Location header.
+	client := &http.Client{
+		Transport: &http.Transport{DisableKeepAlives: true},
+		Timeout:   5 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/r1", port))
+	if err != nil {
+		t.Fatalf("/r1: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 302 {
+		t.Errorf("/r1: status=%d, want 302", resp.StatusCode)
+	}
+	if resp.Header.Get("Location") != "/dest" {
+		t.Errorf("/r1: Location=%q, want /dest", resp.Header.Get("Location"))
+	}
+
+	resp, err = client.Get(fmt.Sprintf("http://127.0.0.1:%d/r2", port))
+	if err != nil {
+		t.Fatalf("/r2: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 301 || resp.Header.Get("Location") != "/perm" {
+		t.Errorf("/r2: got %d %q", resp.StatusCode, resp.Header.Get("Location"))
+	}
+
+	resp, err = client.Get(fmt.Sprintf("http://127.0.0.1:%d/inject", port))
+	if err != nil {
+		t.Fatalf("/inject: %v", err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 400 || !strings.Contains(string(b), "rejected") {
+		t.Errorf("CRLF injection not rejected: %d %q", resp.StatusCode, string(b))
+	}
+}
+
+// TestNotFoundHandler: customizing the 404 body via App.NotFound. Routes
+// the user registers explicitly still win — only unmatched paths fall
+// through to the NotFound handler.
+func TestNotFoundHandler(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/exists", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "hi")
+		})
+		app.NotFound(func(res *gogo.Response, req *gogo.Request) {
+			res.Send(404, "application/json", `{"err":"not found","path":"`+req.URL()+`"}`)
+		})
+	})
+	defer teardown()
+
+	// Explicit route still 200.
+	status, body := httpGet(t, port, "/exists")
+	if status != 200 || body != "hi" {
+		t.Fatalf("/exists: got %d %q", status, body)
+	}
+
+	// Unmatched path → custom 404.
+	status, body = httpGet(t, port, "/nope")
+	if status != 404 || !strings.Contains(body, `"err":"not found"`) || !strings.Contains(body, `/nope`) {
+		t.Fatalf("/nope: got %d %q", status, body)
+	}
+}
+
+// TestNotFoundWrapsWithGlobalMiddleware: middleware registered before
+// Listen wraps the NotFound handler the same as any other route, so a
+// global logger / request-ID middleware still observes 404s.
+func TestNotFoundWrapsWithGlobalMiddleware(t *testing.T) {
+	var mwHits atomic.Int32
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				mwHits.Add(1)
+				next(res, req)
+			}
+		})
+		app.NotFound(func(res *gogo.Response, req *gogo.Request) {
+			res.Send(404, "text/plain", "missing")
+		})
+	})
+	defer teardown()
+
+	if status, body := httpGet(t, port, "/whatever"); status != 404 || body != "missing" {
+		t.Fatalf("got %d %q", status, body)
+	}
+	if mwHits.Load() != 1 {
+		t.Fatalf("global mw missed NotFound handler: hits=%d", mwHits.Load())
+	}
+}

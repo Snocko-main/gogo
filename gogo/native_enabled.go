@@ -243,6 +243,7 @@ func newSnapshotFromCtx(ctxPtr uintptr) *requestSnapshot {
 	methodLen := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxMethodLenOff))
 	urlLen := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxURLLenOff))
 	queryLen := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxQueryLenOff))
+	ipLen := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxIPLenOff))
 	paramCount := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxParamCountOff))
 	headersLen := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxHeadersLenOff))
 	truncated := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxTruncatedOff)) != 0
@@ -251,6 +252,7 @@ func newSnapshotFromCtx(ctxPtr uintptr) *requestSnapshot {
 		method:    copyAt(ctxPtr+shared.ctxMethodOff, int(methodLen)),
 		url:       copyAt(ctxPtr+shared.ctxURLOff, int(urlLen)),
 		query:     copyAt(ctxPtr+shared.ctxQueryOff, int(queryLen)),
+		ip:        copyAt(ctxPtr+shared.ctxIPOff, int(ipLen)),
 		truncated: truncated,
 	}
 
@@ -353,6 +355,14 @@ func (a appNative) setBodyLimit(limit int) {
 	C.uwsgo_app_set_body_limit(a.ptr, C.size_t(limit))
 }
 
+func (a appNative) setCapturePeerIP(enable bool) {
+	v := C.int(0)
+	if enable {
+		v = 1
+	}
+	C.uwsgo_app_set_capture_peer_ip(a.ptr, v)
+}
+
 func (a appNative) run() {
 	C.uwsgo_app_run(a.ptr)
 }
@@ -407,6 +417,16 @@ func (r responseNative) send(status, contentType, body string) {
 
 func (r responseNative) loop() loopNative {
 	return loopNative{ptr: C.uwsgo_res_get_loop(r.ptr)}
+}
+
+// remoteAddr returns the formatted peer IP for the connection underlying
+// this response. uWS caches the formatted string on its side; calling
+// this multiple times for the same request is a single allocation in Go
+// plus a couple of memcpys in C++.
+func (r responseNative) remoteAddr() string {
+	return readNativeString(func(buf *C.char, n C.size_t) C.size_t {
+		return C.uwsgo_res_remote_addr(r.ptr, buf, n)
+	})
 }
 
 func (r responseNative) onAborted(callback any) {
@@ -481,6 +501,7 @@ type sharedLayout struct {
 	ctxMethodLenOff  uintptr
 	ctxURLLenOff     uintptr
 	ctxQueryLenOff   uintptr
+	ctxIPLenOff      uintptr
 	ctxParamCountOff uintptr
 	ctxHeadersLenOff uintptr
 	ctxTruncatedOff  uintptr
@@ -488,11 +509,13 @@ type sharedLayout struct {
 	ctxMethodOff     uintptr
 	ctxURLOff        uintptr
 	ctxQueryOff      uintptr
+	ctxIPOff         uintptr
 	ctxParamsOff     uintptr
 	ctxHeadersOff    uintptr
 	snapMethodCap    uintptr
 	snapURLCap       uintptr
 	snapQueryCap     uintptr
+	snapIPCap        uintptr
 	snapParamCap     uintptr
 	snapParamMax     uintptr
 	snapHeadersCap   uintptr
@@ -540,6 +563,7 @@ func initSharedLayoutOnce() {
 		ctxMethodLenOff:  uintptr(raw.ctx_method_len_offset),
 		ctxURLLenOff:     uintptr(raw.ctx_url_len_offset),
 		ctxQueryLenOff:   uintptr(raw.ctx_query_len_offset),
+		ctxIPLenOff:      uintptr(raw.ctx_ip_len_offset),
 		ctxParamCountOff: uintptr(raw.ctx_param_count_offset),
 		ctxHeadersLenOff: uintptr(raw.ctx_headers_len_offset),
 		ctxTruncatedOff:  uintptr(raw.ctx_truncated_offset),
@@ -547,11 +571,13 @@ func initSharedLayoutOnce() {
 		ctxMethodOff:     uintptr(raw.ctx_method_offset),
 		ctxURLOff:        uintptr(raw.ctx_url_offset),
 		ctxQueryOff:      uintptr(raw.ctx_query_offset),
+		ctxIPOff:         uintptr(raw.ctx_ip_offset),
 		ctxParamsOff:     uintptr(raw.ctx_params_offset),
 		ctxHeadersOff:    uintptr(raw.ctx_headers_offset),
 		snapMethodCap:    uintptr(raw.ctx_snap_method_cap),
 		snapURLCap:       uintptr(raw.ctx_snap_url_cap),
 		snapQueryCap:     uintptr(raw.ctx_snap_query_cap),
+		snapIPCap:        uintptr(raw.ctx_snap_ip_cap),
 		snapParamCap:     uintptr(raw.ctx_snap_param_cap),
 		snapParamMax:     uintptr(raw.ctx_snap_param_max),
 		snapHeadersCap:   uintptr(raw.ctx_snap_headers_cap),
@@ -740,6 +766,18 @@ func goStringFromC(ptr unsafe.Pointer, n int) string {
 	return C.GoStringN((*C.char)(ptr), C.int(n))
 }
 
+// remoteAddrFromPtr is the cgo-free-of-export Go wrapper around uWS's
+// HttpResponse::getRemoteAddressAsText. types.go's Request.IP() calls
+// this lazily because most handlers don't read the peer address —
+// paying a cgo round-trip on demand beats pre-caching it on every
+// request.
+func remoteAddrFromPtr(res unsafe.Pointer) string {
+	if res == nil {
+		return ""
+	}
+	return responseNative{ptr: (*C.uwsgo_res_t)(res)}.remoteAddr()
+}
+
 func readNativeString(read func(*C.char, C.size_t) C.size_t) string {
 	size := read(nil, 0)
 	if size == 0 {
@@ -812,6 +850,9 @@ func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req
 	reqWrap.syncParamLens[2] = int(p2Len)
 	reqWrap.syncParamPtrs[3] = unsafe.Pointer(p3Ptr)
 	reqWrap.syncParamLens[3] = int(p3Len)
+	// Store the live response pointer so req.IP() can lazily fetch the
+	// peer address via cgo on demand.
+	reqWrap.syncResPtr = unsafe.Pointer(res)
 
 	resWrap := responsePool.Get().(*Response)
 	resWrap.inner = responseNative{ptr: res}

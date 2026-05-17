@@ -7,7 +7,8 @@ import (
 	"unsafe"
 )
 
-func goStringFromC(_ unsafe.Pointer, _ int) string { return "" }
+func goStringFromC(_ unsafe.Pointer, _ int) string  { return "" }
+func remoteAddrFromPtr(_ unsafe.Pointer) string     { return "" }
 
 var errNativeDisabled = errors.New("gogo native binding disabled: build with CGO_ENABLED=1 and -tags gogo")
 
@@ -29,6 +30,7 @@ func (appNative) any(string, Handler)                      {}
 func (appNative) websocket(string, WebSocketBehavior)      {}
 func (appNative) listen(string, int) bool                  { return false }
 func (appNative) setBodyLimit(int)                         {}
+func (appNative) setCapturePeerIP(bool)                    {}
 func (appNative) run()                                     {}
 func (appNative) stop()                                    {}
 func (appNative) close()                                   {}
@@ -42,6 +44,7 @@ func (responseNative) loop() loopNative            { return loopNative{} }
 func (responseNative) onAborted(any)               {}
 func (responseNative) cork(func())                 {}
 func (responseNative) onData(func([]byte, bool))   {}
+func (responseNative) remoteAddr() string          { return "" }
 
 func (loopNative) defer_(func()) {}
 

@@ -112,6 +112,81 @@ struct PendingRing {
     }
 };
 
+// AsyncCtx pool sizing: enough to absorb realistic burst-concurrency
+// recycle traffic. 256 ctxs at ~13 KiB each = ~3.3 MiB per App, well
+// under the per-App request_ring + pending_ring storage. Above this
+// cap producers fall back to delete (and consumers fall back to new),
+// so the pool degrades gracefully under sustained over-allocation
+// rather than blocking.
+constexpr uint64_t CTX_POOL_SIZE = 256;
+constexpr uint64_t CTX_POOL_MASK = CTX_POOL_SIZE - 1;
+
+struct CtxPoolSlot {
+    std::atomic<uint64_t> sequence;
+    AsyncCtx *ctx;
+};
+
+// CtxPool is a per-App MPMC bounded queue of recycled AsyncCtx pointers.
+// Producers: multiple — loop-thread drain (drain_pending → release)
+// and worker goroutines (asyncCtxRelease) both push when the last ref
+// drops. Consumer: loop thread only (uwsgo_app_get_shared lambda pops
+// one ctx per incoming request before falling back to new AsyncCtx).
+// Uses Vyukov-style sequenced slots, identical machinery to PendingRing.
+struct CtxPool {
+    CtxPoolSlot slots[CTX_POOL_SIZE];
+    alignas(64) std::atomic<uint64_t> head;
+    alignas(64) std::atomic<uint64_t> tail;
+
+    void init() {
+        for (uint64_t i = 0; i < CTX_POOL_SIZE; i++) {
+            slots[i].sequence.store(i, std::memory_order_relaxed);
+            slots[i].ctx = nullptr;
+        }
+        head.store(0, std::memory_order_relaxed);
+        tail.store(0, std::memory_order_relaxed);
+    }
+
+    // push attempts to enqueue ctx for reuse. Returns false if the pool
+    // is full — caller should delete instead.
+    bool push(AsyncCtx *ctx) {
+        uint64_t pos = tail.load(std::memory_order_relaxed);
+        for (;;) {
+            CtxPoolSlot *slot = &slots[pos & CTX_POOL_MASK];
+            uint64_t seq = slot->sequence.load(std::memory_order_acquire);
+            int64_t diff = (int64_t)(seq - pos);
+            if (diff == 0) {
+                if (tail.compare_exchange_weak(pos, pos + 1,
+                        std::memory_order_relaxed, std::memory_order_relaxed)) {
+                    slot->ctx = ctx;
+                    slot->sequence.store(pos + 1, std::memory_order_release);
+                    return true;
+                }
+            } else if (diff < 0) {
+                return false;  // pool full — caller will delete
+            } else {
+                pos = tail.load(std::memory_order_relaxed);
+            }
+        }
+    }
+
+    // pop returns a recycled ctx or nullptr if the pool is empty.
+    // Single-consumer (loop thread) — no CAS on head needed.
+    AsyncCtx *pop() {
+        uint64_t pos = head.load(std::memory_order_relaxed);
+        CtxPoolSlot *slot = &slots[pos & CTX_POOL_MASK];
+        uint64_t seq = slot->sequence.load(std::memory_order_acquire);
+        int64_t diff = (int64_t)(seq - (pos + 1));
+        if (diff != 0) {
+            return nullptr;  // empty
+        }
+        AsyncCtx *ctx = slot->ctx;
+        slot->ctx = nullptr;
+        slot->sequence.store(pos + CTX_POOL_SIZE, std::memory_order_release);
+        head.store(pos + 1, std::memory_order_relaxed);
+        return ctx;
+    }
+};
+
 struct uwsgo_app_t {
     std::unique_ptr<uWS::App> app;
     uWS::Loop *loop = nullptr;
@@ -126,10 +201,22 @@ struct uwsgo_app_t {
     PendingRing *pending_ring = nullptr;
     struct us_timer_t *drain_timer = nullptr;
 
+    // ctx_pool recycles AsyncCtx blocks so the shared-dispatch hot path
+    // doesn't pay a fresh ~13 KiB allocation per request. See CtxPool
+    // for the producer/consumer threading model.
+    CtxPool *ctx_pool = nullptr;
+
     // body_limit is enforced for Post / Any routes by checking the
     // Content-Length header at request arrival before dispatching to Go.
     // 0 disables the check.
     size_t body_limit = 0;
+
+    // capture_peer_ip toggles whether snapshot_request copies the
+    // formatted peer IP into the AsyncCtx ip[] buffer. Off by default
+    // — Go's Config.CapturePeerIP flips it. Skipping the copy saves
+    // a string_view format + ~50-byte memcpy per shared-dispatch
+    // request, which measures at ~2-3% on small-response routes.
+    bool capture_peer_ip = false;
 };
 
 static size_t copy_string_view(std::string_view value, char *buffer, size_t buffer_len) {
@@ -150,15 +237,16 @@ extern "C" uwsgo_app_t *uwsgo_app_new(void) {
     // in the same process don't share state and don't contend on a global.
     a->pending_ring = new PendingRing;
     a->pending_ring->init();
+    // Allocate the per-App AsyncCtx recycle pool. Empty at start; fills
+    // as requests complete and ctx::release pushes back into it.
+    a->ctx_pool = new CtxPool;
+    a->ctx_pool->init();
     return a;
 }
 
-extern "C" void uwsgo_app_free(uwsgo_app_t *app) {
-    if (app->pending_ring) {
-        delete app->pending_ring;
-    }
-    delete app;
-}
+// uwsgo_app_free is defined below the AsyncCtx struct (the pool drain
+// needs the complete type to delete recycled ctxs).
+extern "C" void uwsgo_app_free(uwsgo_app_t *app);
 
 // dispatch_sync invokes uwsgoHandleHTTP with method / URL / query / the
 // first four route parameters already pulled out of the uWS request.
@@ -259,6 +347,10 @@ extern "C" void uwsgo_app_any(uwsgo_app_t *app, const char *pattern, uintptr_t h
 
 extern "C" void uwsgo_app_set_body_limit(uwsgo_app_t *app, size_t limit) {
     app->body_limit = limit;
+}
+
+extern "C" void uwsgo_app_set_capture_peer_ip(uwsgo_app_t *app, int enable) {
+    app->capture_peer_ip = enable != 0;
 }
 
 extern "C" void uwsgo_app_ws(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id,
@@ -366,6 +458,12 @@ extern "C" void uwsgo_res_send(
     r->end(std::string_view(body, body_len));
 }
 
+extern "C" size_t uwsgo_res_remote_addr(uwsgo_res_t *res, char *buffer, size_t buffer_len) {
+    auto *r = reinterpret_cast<uWS::HttpResponse<false> *>(res);
+    auto addr = r->getRemoteAddressAsText();
+    return copy_string_view(addr, buffer, buffer_len);
+}
+
 extern "C" uwsgo_loop_t *uwsgo_res_get_loop(uwsgo_res_t * /*res*/) {
     // uWS loops are thread-local; calling from a route handler returns the
     // loop that runs the response.
@@ -439,6 +537,9 @@ constexpr size_t SNAP_URL_CAP = 256;
 constexpr size_t SNAP_QUERY_CAP = 512;
 constexpr size_t SNAP_PARAM_CAP = 64;
 constexpr size_t SNAP_PARAM_MAX = 8;
+// IPv4 needs ~15 chars; IPv6 ~45 chars; 64 leaves headroom for bracketed
+// forms and the trailing null without bloating AsyncCtx.
+constexpr size_t SNAP_IP_CAP = 64;
 // Headers are encoded as "name\0value\0..." back-to-back so Go can parse on
 // access without knowing the count up front. 4 KB fits the typical request.
 constexpr size_t SNAP_HEADERS_CAP = 4096;
@@ -460,6 +561,7 @@ struct AsyncCtx {
     uWS::HttpResponse<false> *response;
     uWS::Loop *loop = nullptr;  // The loop that owns this response (set at creation time)
     PendingRing *pending_ring = nullptr;  // The response ring this ctx must be pushed onto
+    CtxPool *pool = nullptr;  // Per-App pool to push back into on release; null = always delete
     uint32_t handler_id = 0;  // Used by shared-dispatch path to pick which Go handler runs
 
     // Inline response slots populated by Go via shared-memory writes.
@@ -479,20 +581,78 @@ struct AsyncCtx {
     uint32_t param_count = 0;
     uint32_t headers_len = 0;
     uint32_t truncated = 0;
+    uint32_t ip_len = 0;
     uint32_t param_lens[SNAP_PARAM_MAX] = {0};
     char method[SNAP_METHOD_CAP];
     char url[SNAP_URL_CAP];
     char query[SNAP_QUERY_CAP];
+    char ip[SNAP_IP_CAP];
     char params[SNAP_PARAM_MAX][SNAP_PARAM_CAP];
     char headers[SNAP_HEADERS_CAP];
 
     void retain() { refcount.fetch_add(1, std::memory_order_relaxed); }
+
+    // reset_for_pool wipes mutable state so a recycled ctx is
+    // indistinguishable from a freshly-constructed one. Only the
+    // non-array members need resetting — char arrays carry length
+    // prefixes that are reset here, so any stale bytes are unreachable
+    // through the documented accessors. Refcount goes back to 1 so the
+    // next consumer sees the same starting state as `new AsyncCtx`.
+    void reset_for_pool() {
+        refcount.store(1, std::memory_order_relaxed);
+        aborted.store(0, std::memory_order_relaxed);
+        response = nullptr;
+        loop = nullptr;
+        pending_ring = nullptr;
+        handler_id = 0;
+        inline_status_len = 0;
+        inline_ct_len = 0;
+        inline_body_len = 0;
+        method_len = 0;
+        url_len = 0;
+        query_len = 0;
+        param_count = 0;
+        headers_len = 0;
+        truncated = 0;
+        ip_len = 0;
+        for (uint32_t i = 0; i < SNAP_PARAM_MAX; i++) param_lens[i] = 0;
+        // pool field is sticky across recycles — it points at the same
+        // App's pool for the entire lifetime of this object.
+    }
+
     void release() {
         if (refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            CtxPool *p = pool;  // load before reset clobbers anything
+            if (p) {
+                reset_for_pool();
+                if (p->push(this)) {
+                    return;  // recycled into pool
+                }
+            }
             delete this;
         }
     }
 };
+
+extern "C" void uwsgo_app_free(uwsgo_app_t *app) {
+    if (app->ctx_pool) {
+        // Drain whatever's left in the pool. Pop until empty and delete
+        // each ctx — at app teardown there are no producers, so no
+        // races. Bypass the recycle path (set pool=nullptr) so each
+        // delete really frees.
+        for (;;) {
+            AsyncCtx *ctx = app->ctx_pool->pop();
+            if (!ctx) break;
+            ctx->pool = nullptr;
+            delete ctx;
+        }
+        delete app->ctx_pool;
+    }
+    if (app->pending_ring) {
+        delete app->pending_ring;
+    }
+    delete app;
+}
 
 // RequestRing is shared across all App instances: C++ enqueues incoming
 // requests (as AsyncCtx*), Go worker goroutines dequeue and dispatch. Single
@@ -609,11 +769,14 @@ extern "C" void uwsgo_shared_layout(uwsgo_shared_layout_t *out) {
     out->ctx_method_offset = offsetof(AsyncCtx, method);
     out->ctx_url_offset = offsetof(AsyncCtx, url);
     out->ctx_query_offset = offsetof(AsyncCtx, query);
+    out->ctx_ip_len_offset = offsetof(AsyncCtx, ip_len);
+    out->ctx_ip_offset = offsetof(AsyncCtx, ip);
     out->ctx_params_offset = offsetof(AsyncCtx, params);
     out->ctx_headers_offset = offsetof(AsyncCtx, headers);
     out->ctx_snap_method_cap = SNAP_METHOD_CAP;
     out->ctx_snap_url_cap = SNAP_URL_CAP;
     out->ctx_snap_query_cap = SNAP_QUERY_CAP;
+    out->ctx_snap_ip_cap = SNAP_IP_CAP;
     out->ctx_snap_param_cap = SNAP_PARAM_CAP;
     out->ctx_snap_param_max = SNAP_PARAM_MAX;
     out->ctx_snap_headers_cap = SNAP_HEADERS_CAP;
@@ -627,7 +790,7 @@ extern "C" void uwsgo_shared_layout(uwsgo_shared_layout_t *out) {
 // snapshot_request copies the fields of the live uWS HttpRequest into the
 // AsyncCtx so the async goroutine can read them after uWS frees the request.
 // Anything that doesn't fit the fixed buffers is truncated.
-static void snapshot_request(AsyncCtx *ctx, uWS::HttpRequest *req) {
+static void snapshot_request(uwsgo_app_t *app, AsyncCtx *ctx, uWS::HttpResponse<false> *res, uWS::HttpRequest *req) {
     bool truncated = false;
     auto copy_view = [&truncated](char *dst, size_t cap, std::string_view src) -> uint32_t {
         size_t n = std::min(cap, src.size());
@@ -640,6 +803,15 @@ static void snapshot_request(AsyncCtx *ctx, uWS::HttpRequest *req) {
     // getUrl returns the path; getQuery returns query string sans '?'.
     ctx->url_len = copy_view(ctx->url, SNAP_URL_CAP, req->getUrl());
     ctx->query_len = copy_view(ctx->query, SNAP_QUERY_CAP, req->getQuery());
+    // Peer IP is opt-in (Config.CapturePeerIP). Skipping the format +
+    // memcpy saves ~2-3% on small-response shared-dispatch routes;
+    // when off, snap.ip is empty and req.IP() returns "" in the
+    // worker.
+    if (app->capture_peer_ip) {
+        ctx->ip_len = copy_view(ctx->ip, SNAP_IP_CAP, res->getRemoteAddressAsText());
+    } else {
+        ctx->ip_len = 0;
+    }
 
     // Route parameters: walk indices until uWS returns empty.
     uint32_t param_count = 0;
@@ -677,7 +849,15 @@ static void snapshot_request(AsyncCtx *ctx, uWS::HttpRequest *req) {
 
 extern "C" void uwsgo_app_get_shared(uwsgo_app_t *app, const char *pattern, uint32_t handler_id) {
     app->app->get(pattern, [app, handler_id](auto *res, auto *req) {
-        auto *ctx = new AsyncCtx;
+        // Try the App's recycle pool first; fall back to new AsyncCtx
+        // only when the pool is empty (cold start, burst beyond pool
+        // capacity, etc.). A pool hit skips the ~13 KiB allocation +
+        // initializer-list pass that new AsyncCtx pays.
+        AsyncCtx *ctx = app->ctx_pool ? app->ctx_pool->pop() : nullptr;
+        if (!ctx) {
+            ctx = new AsyncCtx;
+            ctx->pool = app->ctx_pool;  // bind once for the object's lifetime
+        }
         ctx->response = res;
         ctx->loop = uWS::Loop::get();
         ctx->pending_ring = app->pending_ring;
@@ -685,7 +865,7 @@ extern "C" void uwsgo_app_get_shared(uwsgo_app_t *app, const char *pattern, uint
         // Snapshot before any cgo / Go work — uWS HttpRequest is live only
         // inside this lambda. Reject oversized snapshots instead of handing
         // security-sensitive middleware silently truncated request data.
-        snapshot_request(ctx, req);
+        snapshot_request(app, ctx, res, req);
         if (ctx->truncated) {
             ctx->release();
             res->writeStatus("431 Request Header Fields Too Large");
