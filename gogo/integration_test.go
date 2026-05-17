@@ -2900,3 +2900,109 @@ func TestShutdownHooksFireOnGraceful(t *testing.T) {
 	}
 	<-runDone
 }
+
+// TestMethodNotAllowed: a path with registered methods returns 405 +
+// Allow header for unregistered methods; the handler can customize the
+// response body. Parametric paths fall to NotFound instead.
+func TestMethodNotAllowed(t *testing.T) {
+	var notAllowedHits atomic.Int32
+	var capturedApp *gogo.App
+	port, teardown := startApp(t, func(app *gogo.App) {
+		capturedApp = app
+		app.Get("/users", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "list")
+		})
+		app.Post("/users", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(201, "text/plain", "create")
+		})
+		app.Get("/api/:section", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "section="+req.Parameter(0))
+		})
+		app.NotFound(func(res *gogo.Response, req *gogo.Request) {
+			res.Send(404, "text/plain", "missing:"+req.URL())
+		})
+		app.MethodNotAllowed(func(res *gogo.Response, req *gogo.Request) {
+			notAllowedHits.Add(1)
+			// uWS requires status before every header write, so the
+			// canonical sequence for a 405 with Allow is
+			// Status → Header(Allow) → Header(CT) → End. res.Send
+			// would emit a default 200 status line before the
+			// user's Allow header.
+			allow := strings.Join(capturedApp.AllowedMethods(req.URL()), ", ")
+			res.Status(405)
+			res.Header("Allow", allow)
+			res.Header("Content-Type", "text/plain; charset=utf-8")
+			res.End("no:" + req.URL())
+		})
+	})
+	defer teardown()
+
+	// Allowed method → 200.
+	if status, body := httpGet(t, port, "/users"); status != 200 || body != "list" {
+		t.Fatalf("GET /users: got %d %q", status, body)
+	}
+
+	// Unregistered method on a literal path → 405 with Allow header.
+	req, _ := http.NewRequest("DELETE", fmt.Sprintf("http://127.0.0.1:%d/users", port), nil)
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("DELETE /users: %v", err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 405 || string(b) != "no:/users" {
+		t.Fatalf("DELETE /users: got %d %q", resp.StatusCode, string(b))
+	}
+	if allow := resp.Header.Get("Allow"); allow != "GET, POST" {
+		t.Errorf("Allow header: got %q, want GET, POST", allow)
+	}
+	if notAllowedHits.Load() != 1 {
+		t.Errorf("MethodNotAllowed hits = %d, want 1", notAllowedHits.Load())
+	}
+
+	// Unknown path → NotFound handler.
+	status, body := httpGet(t, port, "/nope")
+	if status != 404 || body != "missing:/nope" {
+		t.Fatalf("/nope: got %d %q", status, body)
+	}
+
+	// Parametric path with wrong method → falls to NotFound (documented).
+	req, _ = http.NewRequest("DELETE", fmt.Sprintf("http://127.0.0.1:%d/api/admin", port), nil)
+	resp, err = noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("DELETE /api/admin: %v", err)
+	}
+	b, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 404 {
+		t.Fatalf("parametric wrong-method: got %d %q (want 404 per documented limitation)", resp.StatusCode, string(b))
+	}
+}
+
+// TestMethodNotAllowedDefault405: with no handler, the framework still
+// emits a default 405 + Allow header when only NotFound is registered
+// (the catch-all is shared between both fallbacks).
+func TestMethodNotAllowedDefault405(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/users", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "list")
+		})
+		app.NotFound(func(res *gogo.Response, req *gogo.Request) {
+			res.Send(404, "text/plain", "missing")
+		})
+	})
+	defer teardown()
+
+	req, _ := http.NewRequest("POST", fmt.Sprintf("http://127.0.0.1:%d/users", port), nil)
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /users: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 405 {
+		t.Fatalf("default 405: got %d, want 405", resp.StatusCode)
+	}
+	if allow := resp.Header.Get("Allow"); allow != "GET" {
+		t.Errorf("Allow: got %q, want GET", allow)
+	}
+}

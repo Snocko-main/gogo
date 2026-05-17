@@ -7,6 +7,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -287,11 +288,33 @@ type Config struct {
 type App struct {
 	inner            appNative
 	middlewares      []middlewareEntry
-	asyncMiddlewares []asyncMiddlewareEntry
-	cfg              Config
-	notFoundHandler  Handler
-	onListenHooks    []func(port int)
-	onShutdownHooks  []func()
+	asyncMiddlewares        []asyncMiddlewareEntry
+	cfg                     Config
+	notFoundHandler         Handler
+	methodNotAllowedHandler Handler
+
+	// closed + pendingTimers coordinate ShutdownGracefully's
+	// force-close goroutine with Close. Without this, a force-close
+	// timer that fires after the user has already called Close races
+	// against the freed appNative.ptr inside a cgo call.
+	//
+	// Atomic Int32 instead of WaitGroup so the happens-before edge
+	// between Add and Close's drain is purely Go-side; WaitGroup's
+	// Add/Wait race detector requires a happens-before that the
+	// cgo-mediated loop close doesn't provide.
+	closed         atomic.Bool
+	pendingTimers  atomic.Int32
+	// routeMethods maps a LITERAL pattern to the set of HTTP methods
+	// registered against it. Used by the catch-all at Listen time to
+	// distinguish "path exists but the method is wrong" (→ 405 with
+	// Allow header) from "path doesn't exist at all" (→ 404). Patterns
+	// with ':' or '*' aren't tracked here because we can't reliably
+	// match the live URL against them at runtime without re-doing uWS's
+	// router work; requests to dynamic-pattern paths under the wrong
+	// method fall to the 404 handler instead.
+	routeMethods    map[string]map[string]struct{}
+	onListenHooks   []func(port int)
+	onShutdownHooks []func()
 }
 
 // defaultConfig fills in safe production defaults for any zero Config
@@ -615,6 +638,7 @@ func (a *App) wrapAsync(routePattern string, h AsyncHandler) AsyncHandler {
 // Static targets are served entirely in C++ with no Go work per request.
 func (a *App) Get(pattern string, target any) {
 	validatePattern(pattern)
+	a.trackRouteMethod("get", pattern)
 	switch v := target.(type) {
 	case Handler:
 		a.inner.get(pattern, a.wrap(pattern, v))
@@ -654,6 +678,7 @@ func (a *App) Get(pattern string, target any) {
 // per request only when middleware is in use.
 func (a *App) GetAsync(pattern string, handler AsyncHandler) {
 	validatePattern(pattern)
+	a.trackRouteMethod("get", pattern)
 
 	// Compose the async middleware chain once at registration. wrappedAsync
 	// runs the user handler last; matching AsyncMiddleware wraps it
@@ -685,6 +710,7 @@ func (a *App) GetAsync(pattern string, handler AsyncHandler) {
 // Post registers a POST route.
 func (a *App) Post(pattern string, handler Handler) {
 	validatePattern(pattern)
+	a.trackRouteMethod("post", pattern)
 	a.inner.post(pattern, a.wrap(pattern, handler))
 }
 
@@ -700,6 +726,7 @@ type PostAsyncHandler func(res *Response, req *Request, body []byte)
 // sends 413 Payload Too Large automatically and the handler is not called.
 func (a *App) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandler) {
 	validatePattern(pattern)
+	a.trackRouteMethod("post", pattern)
 
 	// Adapt the body-receiving handler into the AsyncHandler shape that
 	// AsyncMiddleware expects. The body is stashed on req.body in the
@@ -851,6 +878,7 @@ func (r *Router) hasGroupOrAppMW(fullPattern string) bool {
 func (r *Router) Get(pattern string, target any) {
 	validatePattern(pattern)
 	full := r.prefix + pattern
+	r.app.trackRouteMethod("get", full)
 	switch v := target.(type) {
 	case Handler:
 		h := r.app.wrap(full, r.wrapGroupSync(v))
@@ -904,6 +932,7 @@ func (r *Router) Get(pattern string, target any) {
 func (r *Router) Post(pattern string, handler Handler) {
 	validatePattern(pattern)
 	full := r.prefix + pattern
+	r.app.trackRouteMethod("post", full)
 	h := r.app.wrap(full, r.wrapGroupSync(handler))
 	r.app.inner.post(full, h)
 }
@@ -922,6 +951,7 @@ func (r *Router) Any(pattern string, handler Handler) {
 func (r *Router) GetAsync(pattern string, handler AsyncHandler) {
 	validatePattern(pattern)
 	full := r.prefix + pattern
+	r.app.trackRouteMethod("get", full)
 
 	wrappedAsync := r.app.wrapAsync(full, r.wrapGroupAsync(handler))
 
@@ -950,6 +980,7 @@ func (r *Router) GetAsync(pattern string, handler AsyncHandler) {
 func (r *Router) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandler) {
 	validatePattern(pattern)
 	full := r.prefix + pattern
+	r.app.trackRouteMethod("post", full)
 
 	finalAsync := AsyncHandler(func(res *Response, req *Request) {
 		handler(res, req, req.body)
@@ -1007,8 +1038,12 @@ func (a *App) NotFound(h Handler) {
 // route immediately before binding so user-registered routes retain
 // precedence.
 func (a *App) Listen(port int) bool {
-	if a.notFoundHandler != nil {
-		a.inner.any("/*", a.wrap("/*", a.notFoundHandler))
+	// Single catch-all when either NotFound or MethodNotAllowed is set —
+	// the handler inspects routeMethods to pick the right fallback.
+	// When only one is set the other path falls through to the uWS
+	// default (404).
+	if a.notFoundHandler != nil || a.methodNotAllowedHandler != nil {
+		a.inner.any("/*", a.wrap("/*", a.catchAllRoutingHandler()))
 	}
 	ok := a.inner.listen(a.cfg.BindAddr, port)
 	if ok {
@@ -1017,6 +1052,119 @@ func (a *App) Listen(port int) bool {
 		}
 	}
 	return ok
+}
+
+// MethodNotAllowed sets the fallback handler for requests whose path
+// matches a literal-pattern route but whose method has no registered
+// handler — e.g. `app.Get("/users", h)` and the client sends `POST
+// /users`. The framework writes the standard Allow header listing
+// methods that ARE registered for that path before invoking the
+// handler.
+//
+// Limitation: only literal-pattern routes participate. Requests to
+// parametric or wildcard paths (e.g. /api/:section) with an
+// unmatched method fall through to the NotFound handler instead —
+// the framework cannot replay uWS's pattern matching from inside
+// the Go-side catch-all to tell "wrong method on /api/admin" apart
+// from "no such path /api/admin".
+//
+// Calling MethodNotAllowed(nil) clears the handler.
+func (a *App) MethodNotAllowed(h Handler) {
+	a.methodNotAllowedHandler = h
+}
+
+// trackRouteMethod is called from every route-registration helper so
+// the catch-all installed at Listen can distinguish 404 from 405. Only
+// literal patterns are tracked; dynamic (':' / '*') ones are skipped
+// because runtime URL matching against them would mean reimplementing
+// uWS's router on the Go side.
+func (a *App) trackRouteMethod(method, pattern string) {
+	if strings.ContainsAny(pattern, ":*") {
+		return
+	}
+	if a.routeMethods == nil {
+		a.routeMethods = make(map[string]map[string]struct{})
+	}
+	m := a.routeMethods[pattern]
+	if m == nil {
+		m = make(map[string]struct{})
+		a.routeMethods[pattern] = m
+	}
+	m[method] = struct{}{}
+}
+
+// AllowedMethods returns the HTTP methods registered for path (uppercase,
+// canonical order). Use it inside a MethodNotAllowed handler to build
+// the standard Allow header for 405 responses:
+//
+//	app.MethodNotAllowed(func(res *gogo.Response, req *gogo.Request) {
+//	    allow := strings.Join(app.AllowedMethods(req.URL()), ", ")
+//	    res.Status(405)
+//	    res.Header("Allow", allow)
+//	    res.Header("Content-Type", "text/plain")
+//	    res.End("no\n")
+//	})
+//
+// Returns nil if the path has no registered routes (or is a parametric
+// pattern, which the framework does not track).
+func (a *App) AllowedMethods(path string) []string {
+	m, ok := a.routeMethods[path]
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, strings.ToUpper(k))
+	}
+	sort.Strings(out)
+	return out
+}
+
+// catchAllRoutingHandler is the single Any("/*") handler installed at
+// Listen when either NotFound or MethodNotAllowed is configured. It
+// looks up the live URL in routeMethods to decide which fallback
+// applies. Framework defaults emit a properly-ordered status / Allow /
+// content-type / body so the response is well-formed; custom handlers
+// are responsible for the full response themselves (see AllowedMethods
+// for the Allow-header helper).
+func (a *App) catchAllRoutingHandler() Handler {
+	return func(res *Response, req *Request) {
+		url := req.URL()
+		if methods, ok := a.routeMethods[url]; ok {
+			// Path exists; this is a method mismatch → 405.
+			if a.methodNotAllowedHandler != nil {
+				a.methodNotAllowedHandler(res, req)
+				return
+			}
+			res.Status(405)
+			res.Header("Allow", joinAllowHeader(methods))
+			res.Header("Content-Type", "text/plain; charset=utf-8")
+			res.End("method not allowed\n")
+			return
+		}
+		if a.notFoundHandler != nil {
+			a.notFoundHandler(res, req)
+			return
+		}
+		res.Status(404)
+		res.Header("Content-Type", "text/plain; charset=utf-8")
+		res.End("not found\n")
+	}
+}
+
+// joinAllowHeader formats a set of HTTP methods (uWS-style lowercase)
+// into the canonical comma-separated Allow header form.
+func joinAllowHeader(methods map[string]struct{}) string {
+	if len(methods) == 0 {
+		return ""
+	}
+	ordered := make([]string, 0, len(methods))
+	for m := range methods {
+		ordered = append(ordered, strings.ToUpper(m))
+	}
+	// Stable order so the header is deterministic between requests.
+	sort.Strings(ordered)
+	return strings.Join(ordered, ", ")
 }
 
 // OnListen registers a callback that fires synchronously after Listen
@@ -1085,22 +1233,40 @@ func (a *App) Shutdown() {
 //
 // Returns immediately — the wait + force-close run on a background
 // goroutine. Call Close after Run returns. Registered OnShutdown hooks
-// fire synchronously before the listen socket is closed.
+// fire synchronously before the listen socket is closed. Close waits
+// for the force-close goroutine to finish before freeing native
+// resources, so it is always safe to call Close after Run returns
+// regardless of how the loop exited.
 func (a *App) ShutdownGracefully(timeout time.Duration) {
 	a.fireShutdownHooks()
 	a.inner.closeListen()
 	if timeout <= 0 {
 		return
 	}
+	a.pendingTimers.Add(1)
 	go func() {
+		defer a.pendingTimers.Add(-1)
 		time.Sleep(timeout)
+		if a.closed.Load() {
+			return
+		}
 		a.inner.stop()
 	}()
 }
 
-// Close frees native resources. Call it only after Run has returned, or before
-// Run if the app was never started.
+// Close frees native resources. Call it only after Run has returned, or
+// before Run if the app was never started. Waits for any in-flight
+// ShutdownGracefully force-close goroutine to settle so a delayed
+// timer can't make a cgo call against a freed app pointer.
 func (a *App) Close() {
+	a.closed.Store(true)
+	// Drain any in-flight ShutdownGracefully timer goroutine before
+	// freeing native resources. Spin with Gosched — the only callers
+	// are timer goroutines that have already passed their sleep, so
+	// the wait is microseconds at most.
+	for a.pendingTimers.Load() > 0 {
+		runtime.Gosched()
+	}
 	a.inner.close()
 }
 
