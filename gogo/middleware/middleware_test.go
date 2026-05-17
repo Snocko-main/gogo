@@ -239,7 +239,7 @@ func TestLoggerSkipPaths(t *testing.T) {
 // echoes preflight requests with the default method/header list.
 func TestCORSPermissive(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
-		middleware.UseCORS(app)
+		app.Use(middleware.CORS())
 		app.Get("/api", func(res *gogo.Response, req *gogo.Request) {
 			res.Send(200, "text/plain", "ok")
 		})
@@ -284,11 +284,11 @@ func TestCORSPermissive(t *testing.T) {
 // origins and omits the Allow-Origin header for the rest.
 func TestCORSAllowList(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
-		middleware.UseCORS(app, middleware.CORSOptions{
+		app.Use(middleware.CORS(middleware.CORSOptions{
 			AllowOrigins:     []string{"https://app.example.com", "https://*.trusted.io"},
 			AllowCredentials: true,
 			MaxAge:           600,
-		})
+		}))
 		app.Get("/api", func(res *gogo.Response, req *gogo.Request) {
 			res.Send(200, "text/plain", "ok")
 		})
@@ -431,7 +431,7 @@ func TestStackedMiddleware(t *testing.T) {
 	buf := &safeBuf{}
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.Use(middleware.Logger(middleware.LoggerOptions{Output: buf}))
-		middleware.UseCORS(app, middleware.CORSOptions{AllowOrigins: []string{"*"}})
+		app.Use(middleware.CORS(middleware.CORSOptions{AllowOrigins: []string{"*"}}))
 		app.Use(middleware.RequestID())
 		app.Get("/api", func(res *gogo.Response, req *gogo.Request) {
 			id, _ := req.Local(middleware.RequestIDLocalKey).(string)

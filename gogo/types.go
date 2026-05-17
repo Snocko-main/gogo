@@ -310,6 +310,13 @@ type App struct {
 	notFoundHandler         Handler
 	methodNotAllowedHandler Handler
 
+	// userCatchAllRegistered is true when the user has already
+	// registered Any("/*") (or Get/Post/.../Options "/*") — in that
+	// case Listen does not install the framework's own catch-all on
+	// top, since uWS allows only one handler per (method, pattern)
+	// and the user's handler should win.
+	userCatchAllRegistered bool
+
 	// closed + pendingTimers coordinate ShutdownGracefully's
 	// force-close goroutine with Close. Without this, a force-close
 	// timer that fires after the user has already called Close races
@@ -802,6 +809,9 @@ func (a *App) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandl
 // Any registers a route for every HTTP method.
 func (a *App) Any(pattern string, handler Handler) {
 	validatePattern(pattern)
+	if pattern == "/*" {
+		a.userCatchAllRegistered = true
+	}
 	a.inner.any(pattern, a.wrap(pattern, handler))
 }
 
@@ -1163,11 +1173,21 @@ func (a *App) NotFound(h Handler) {
 // route immediately before binding so user-registered routes retain
 // precedence.
 func (a *App) Listen(port int) bool {
-	// Single catch-all when either NotFound or MethodNotAllowed is set —
-	// the handler inspects routeMethods to pick the right fallback.
-	// When only one is set the other path falls through to the uWS
-	// default (404).
-	if a.notFoundHandler != nil || a.methodNotAllowedHandler != nil {
+	// Single catch-all when any of these is set:
+	//   - NotFound or MethodNotAllowed → custom 404 / 405 bodies.
+	//   - Global middleware → fires for unmatched paths too, so that
+	//     things like CORS preflight (OPTIONS /unknown) and request
+	//     logging see every request the way express / fiber middleware
+	//     does. Without this, uWS short-circuits unmatched paths to
+	//     its built-in 404 before the middleware chain runs.
+	//
+	// User-registered routes always win specificity (literal >
+	// parametric > wildcard) so the catch-all only fires when nothing
+	// else matched.
+	needCatchAll := a.notFoundHandler != nil ||
+		a.methodNotAllowedHandler != nil ||
+		len(a.middlewares) > 0
+	if needCatchAll && !a.userCatchAllRegistered {
 		a.inner.any("/*", a.wrap("/*", a.catchAllRoutingHandler()))
 	}
 	ok := a.inner.listen(a.cfg.BindAddr, port)

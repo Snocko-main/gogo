@@ -51,45 +51,20 @@ type CORSOptions struct {
 var defaultAllowMethods = []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"}
 var defaultAllowHeaders = []string{"Content-Type", "Authorization"}
 
-// UseCORS installs CORS on app: registers the middleware globally
-// (so every response carries the appropriate Allow-Origin / Vary
-// headers) AND wires a catch-all OPTIONS handler at "/*" so preflight
-// requests reach the middleware chain even when no user route is
-// registered for OPTIONS on the specific path.
+// CORS returns a Middleware that sets the appropriate Access-Control-*
+// headers and short-circuits OPTIONS preflight requests with a 204.
+// Install it like any other middleware:
 //
-// Most users want this one-call setup. The lower-level CORS() helper
-// remains exposed for the case where you want to control route
-// registration yourself (e.g. you've already wired up your own
-// OPTIONS handlers and just want the cross-origin headers).
+//	app.Use(middleware.CORS(middleware.CORSOptions{
+//	    AllowOrigins: []string{"https://app.example.com"},
+//	    AllowCredentials: true,
+//	}))
 //
-// Must be called before any route registration that should be
-// covered by CORS. Per gogo's middleware model, Use only affects
-// routes registered AFTER it.
-func UseCORS(app *gogo.App, opts ...CORSOptions) {
-	mw := CORS(opts...)
-	app.Use(mw)
-	// Catch-all OPTIONS: any path without a more-specific OPTIONS
-	// handler ends up here. uWS routes by specificity (literal >
-	// parametric > wildcard), so user-registered OPTIONS routes still
-	// take precedence. The handler body is empty — the CORS middleware
-	// itself emits the 204 + headers before next() runs.
-	app.Options("/*", func(res *gogo.Response, req *gogo.Request) {
-		// If we got here, CORS didn't short-circuit (no Origin header
-		// or origin not allowed). Respond with the canonical 204 so
-		// the client at least gets a clean answer instead of a 404.
-		res.Status(204)
-		res.End("")
-	})
-}
-
-// CORS returns a middleware that sets the appropriate
-// Access-Control-* headers and short-circuits OPTIONS preflight
-// requests with a 204.
-//
-// For preflight to reach this middleware on routes that don't
-// register their own OPTIONS handler, also call UseCORS (the
-// one-call helper) or register a catch-all `app.Options("/*", ...)`
-// yourself before any other routes.
+// Preflight requests (OPTIONS + Access-Control-Request-Method header)
+// reach this middleware even when the path has no user-registered
+// OPTIONS handler — gogo's App.Listen auto-registers a global catch-all
+// route the moment any middleware is registered, so the middleware
+// chain fires on every URL the way express / fiber users expect.
 func CORS(opts ...CORSOptions) gogo.Middleware {
 	var opt CORSOptions
 	if len(opts) > 0 {
