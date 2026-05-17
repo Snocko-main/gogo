@@ -2816,3 +2816,87 @@ func TestShutdownGracefullyForceCloseTimeout(t *testing.T) {
 	}
 	close(hold) // unblock any leftover handler goroutine
 }
+
+// TestLifecycleHooks: OnListen fires once after Listen succeeds with
+// the bound port; OnShutdown fires synchronously when Shutdown is
+// invoked. Multiple hooks run in registration order.
+func TestLifecycleHooks(t *testing.T) {
+	var listenSeen atomic.Pointer[int]
+	var shutdownOrder []string
+	var shutdownMu sync.Mutex
+	recordShutdown := func(name string) {
+		shutdownMu.Lock()
+		shutdownOrder = append(shutdownOrder, name)
+		shutdownMu.Unlock()
+	}
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.OnListen(func(p int) {
+			pp := p
+			listenSeen.Store(&pp)
+		})
+		app.OnShutdown(func() { recordShutdown("first") })
+		app.OnShutdown(func() { recordShutdown("second") })
+		app.Get("/x", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+
+	// OnListen should have fired by the time the listener accepts.
+	if p := listenSeen.Load(); p == nil || *p != port {
+		t.Fatalf("OnListen port=%v, want %d", p, port)
+	}
+	if status, _ := httpGet(t, port, "/x"); status != 200 {
+		t.Fatalf("post-OnListen request failed: %d", status)
+	}
+
+	teardown() // triggers Shutdown
+
+	shutdownMu.Lock()
+	got := strings.Join(shutdownOrder, ",")
+	shutdownMu.Unlock()
+	if got != "first,second" {
+		t.Fatalf("OnShutdown order: got %q, want first,second", got)
+	}
+}
+
+// TestShutdownHooksFireOnGraceful: same hooks fire from
+// ShutdownGracefully as from Shutdown.
+func TestShutdownHooksFireOnGraceful(t *testing.T) {
+	fired := make(chan struct{}, 1)
+
+	port := freePort(t)
+	ready := make(chan *gogo.App, 1)
+	runDone := make(chan struct{})
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		app, err := gogo.NewApp()
+		if err != nil {
+			t.Errorf("NewApp: %v", err)
+			close(runDone)
+			return
+		}
+		app.OnShutdown(func() { fired <- struct{}{} })
+		if !app.Listen(port) {
+			t.Errorf("Listen :%d failed", port)
+			app.Close()
+			close(runDone)
+			return
+		}
+		ready <- app
+		app.Run()
+		app.Close()
+		close(runDone)
+	}()
+	app := <-ready
+
+	app.ShutdownGracefully(100 * time.Millisecond)
+
+	select {
+	case <-fired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnShutdown hook never fired on graceful path")
+	}
+	<-runDone
+}

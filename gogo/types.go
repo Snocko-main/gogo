@@ -290,6 +290,8 @@ type App struct {
 	asyncMiddlewares []asyncMiddlewareEntry
 	cfg              Config
 	notFoundHandler  Handler
+	onListenHooks    []func(port int)
+	onShutdownHooks  []func()
 }
 
 // defaultConfig fills in safe production defaults for any zero Config
@@ -1008,7 +1010,49 @@ func (a *App) Listen(port int) bool {
 	if a.notFoundHandler != nil {
 		a.inner.any("/*", a.wrap("/*", a.notFoundHandler))
 	}
-	return a.inner.listen(a.cfg.BindAddr, port)
+	ok := a.inner.listen(a.cfg.BindAddr, port)
+	if ok {
+		for _, fn := range a.onListenHooks {
+			fn(port)
+		}
+	}
+	return ok
+}
+
+// OnListen registers a callback that fires synchronously after Listen
+// binds the socket successfully, before Listen returns. Common uses:
+// logging the bound address, registering with a service discovery
+// agent, sending a "ready" signal to a supervisor. Hooks run in the
+// order they were registered and panic-recover at framework level so a
+// misbehaving hook can't block the rest. Safe to call before or after
+// route registration; not safe to call concurrently with Listen.
+func (a *App) OnListen(fn func(port int)) {
+	a.onListenHooks = append(a.onListenHooks, fn)
+}
+
+// OnShutdown registers a callback that fires synchronously at the start
+// of Shutdown / ShutdownGracefully (before the C++ close is dispatched
+// to the loop). Use it to flush logs, close DB pools, etc. Hooks run in
+// registration order and run on whatever goroutine called Shutdown.
+// Idempotent: a second Shutdown call still fires every hook again.
+func (a *App) OnShutdown(fn func()) {
+	a.onShutdownHooks = append(a.onShutdownHooks, fn)
+}
+
+// fireShutdownHooks runs every registered OnShutdown callback with
+// per-callback panic recovery so a buggy hook doesn't strand the
+// shutdown.
+func (a *App) fireShutdownHooks() {
+	for _, fn := range a.onShutdownHooks {
+		func(f func()) {
+			defer func() {
+				if r := recover(); r != nil {
+					reportPanic(r)
+				}
+			}()
+			f()
+		}(fn)
+	}
 }
 
 // Run starts the uWebSockets event loop and blocks. Before running, installs
@@ -1025,8 +1069,10 @@ func (a *App) Run() {
 // when you need to wait for active clients to finish.
 //
 // Safe to call from any goroutine; idempotent. Returns immediately —
-// call Close after Run returns to free native resources.
+// call Close after Run returns to free native resources. Registered
+// OnShutdown hooks fire synchronously before the close is dispatched.
 func (a *App) Shutdown() {
+	a.fireShutdownHooks()
 	a.inner.stop()
 }
 
@@ -1038,8 +1084,10 @@ func (a *App) Shutdown() {
 // (wait indefinitely).
 //
 // Returns immediately — the wait + force-close run on a background
-// goroutine. Call Close after Run returns.
+// goroutine. Call Close after Run returns. Registered OnShutdown hooks
+// fire synchronously before the listen socket is closed.
 func (a *App) ShutdownGracefully(timeout time.Duration) {
+	a.fireShutdownHooks()
 	a.inner.closeListen()
 	if timeout <= 0 {
 		return
