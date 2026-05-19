@@ -94,7 +94,14 @@ func validateHeaderValue(key, value string) {
 }
 
 var (
-	responsePool   = sync.Pool{New: func() any { return &Response{} }}
+	// Pre-grow pendingHeaders to a small capacity so middleware
+	// that buffers a handful of headers (CORS: 3-4, Helmet: ~10)
+	// doesn't trigger the first-request realloc storm. The backing
+	// array is retained across pool recycles, so the cost only
+	// fires once per wrapper's lifetime.
+	responsePool = sync.Pool{New: func() any {
+		return &Response{pendingHeaders: make([]responseHeader, 0, 8)}
+	}}
 	requestPool    = sync.Pool{New: func() any { return &Request{} }}
 	asyncStatePool = sync.Pool{New: func() any { return &asyncState{} }}
 )
@@ -1962,19 +1969,43 @@ func (r *Response) Status(code int) *Response {
 	return r
 }
 
-// flushPendingHeaders writes every buffered header to the wire via
-// cgo. Must be called after status was written (or auto-200'd). Resets
+// flushPendingHeaders writes every buffered header to the wire.
+// Must be called after status was written (or auto-200'd). Resets
 // the buffer length to zero so the same response wrapper recycled
-// later doesn't re-emit stale headers. Cheap no-op when the slice is
-// empty (which is the common case — no buffered headers means no
-// middleware that added them).
+// later doesn't re-emit stale headers. Cheap no-op when the slice
+// is empty (which is the common case — no buffered headers means
+// no middleware that added them).
+//
+// One-header fast path uses the single-call header() bridge (one
+// cgo crossing). Two-or-more-headers batches the writes via
+// headersBatch() — packs the headers into a single key\0value\0…
+// blob and crosses once for the whole set. With CORS adding 3–4
+// headers per request this saves (N-1) cgo crossings per response
+// at the cost of one strings.Builder Grow + N append loops.
 func (r *Response) flushPendingHeaders() {
-	if len(r.pendingHeaders) == 0 {
+	n := len(r.pendingHeaders)
+	if n == 0 {
 		return
 	}
-	for _, h := range r.pendingHeaders {
+	if n == 1 {
+		h := r.pendingHeaders[0]
 		r.inner.header(h.name, h.value)
+		r.pendingHeaders = r.pendingHeaders[:0]
+		return
 	}
+	// 2+ headers: pack once, cross once.
+	var b strings.Builder
+	// Each pair contributes name + value + 2 separator NULs;
+	// 32 chars per pair is a conservative typical lower bound
+	// (auth headers, cache directives, etc. tend to land here).
+	b.Grow(n * 32)
+	for _, h := range r.pendingHeaders {
+		b.WriteString(h.name)
+		b.WriteByte(0)
+		b.WriteString(h.value)
+		b.WriteByte(0)
+	}
+	r.inner.headersBatch(b.String(), n)
 	r.pendingHeaders = r.pendingHeaders[:0]
 }
 

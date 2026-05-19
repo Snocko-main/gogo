@@ -114,6 +114,17 @@ void uwsgo_app_close_listen(uwsgo_app_t *app);
 
 void uwsgo_res_write_status(uwsgo_res_t *res, const char *status, size_t status_len);
 void uwsgo_res_write_header(uwsgo_res_t *res, const char *key, size_t key_len, const char *value, size_t value_len);
+
+// uwsgo_res_write_headers_batch writes N headers in a single cgo
+// crossing. headers_blob is the packed `key\0value\0key\0value\0`
+// representation that flushPendingHeaders already produces for the
+// async defer path. count is the number of (key, value) pairs the
+// blob carries — the function reads exactly 2*count zero-terminated
+// runs starting at headers_blob. Saves (N-1) cgo crossings per
+// response when N >= 2 (CORS alone adds 3-4 headers).
+void uwsgo_res_write_headers_batch(uwsgo_res_t *res,
+    const char *headers_blob, size_t headers_len, size_t count);
+
 void uwsgo_res_write(uwsgo_res_t *res, const char *body, size_t body_len);
 void uwsgo_res_end(uwsgo_res_t *res, const char *body, size_t body_len);
 void uwsgo_res_send(

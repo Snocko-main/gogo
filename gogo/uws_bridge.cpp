@@ -641,6 +641,32 @@ extern "C" void uwsgo_res_write_header(uwsgo_res_t *res, const char *key, size_t
         std::string_view(value, value_len));
 }
 
+// Batch variant: walks the packed `key\0value\0key\0value\0` blob
+// emitting each pair as a single writeHeader. memchr keeps the
+// scan bounded by headers_len even if a malformed blob ever omits
+// a trailing NUL — same defensive walk as the async defer path's
+// header parser.
+extern "C" void uwsgo_res_write_headers_batch(uwsgo_res_t *res,
+    const char *headers_blob, size_t headers_len, size_t count) {
+    auto *r = reinterpret_cast<uWS::HttpResponse<false> *>(res);
+    const char *p = headers_blob;
+    const char *end = headers_blob + headers_len;
+    for (size_t i = 0; i < count && p < end; ++i) {
+        const char *name_end = static_cast<const char *>(
+            std::memchr(p, 0, static_cast<size_t>(end - p)));
+        if (name_end == nullptr) break;
+        std::string_view name(p, static_cast<size_t>(name_end - p));
+        p = name_end + 1;
+        if (p >= end) break;
+        const char *value_end = static_cast<const char *>(
+            std::memchr(p, 0, static_cast<size_t>(end - p)));
+        if (value_end == nullptr) break;
+        std::string_view value(p, static_cast<size_t>(value_end - p));
+        p = value_end + 1;
+        r->writeHeader(name, value);
+    }
+}
+
 extern "C" void uwsgo_res_write(uwsgo_res_t *res, const char *body, size_t body_len) {
     reinterpret_cast<uWS::HttpResponse<false> *>(res)->write(std::string_view(body, body_len));
 }
