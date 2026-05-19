@@ -3713,11 +3713,11 @@ func TestQueryAndParamConversion(t *testing.T) {
 				fmt.Sprintf("page=%d limit=%d active=%t", page, limit, active))
 		})
 		app.Get("/items/:id", func(res *gogo.Response, req *gogo.Request) {
-			id := req.ParamInt(0, -1)
+			id := req.ParameterInt(0, -1)
 			res.Send(200, "text/plain", fmt.Sprintf("id=%d", id))
 		})
 		app.Get("/items64/:id", func(res *gogo.Response, req *gogo.Request) {
-			id := req.ParamInt64(0, -1)
+			id := req.ParameterInt64(0, -1)
 			res.Send(200, "text/plain", fmt.Sprintf("id=%d", id))
 		})
 	})
