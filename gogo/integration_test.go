@@ -1099,15 +1099,17 @@ func TestAsyncMiddlewareOnPostAsync(t *testing.T) {
 }
 
 // TestUseAsyncRejectsBadArgs mirrors TestUseRejectsBadArgs for UseAsync.
+//
+// Cross-type middleware (gogo.Middleware passed to UseAsync, or
+// gogo.AsyncMiddleware passed to Use) is now accepted — see
+// TestUseAcceptsCrossTypeMiddleware. This test only covers genuinely
+// malformed arguments.
 func TestUseAsyncRejectsBadArgs(t *testing.T) {
 	cases := []struct {
 		name string
 		call func(app *gogo.App)
 	}{
 		{"int arg", func(app *gogo.App) { app.UseAsync(42) }},
-		{"sync mw passed to async", func(app *gogo.App) {
-			app.UseAsync(gogo.Middleware(func(next gogo.Handler) gogo.Handler { return next }))
-		}},
 		{"two strings", func(app *gogo.App) { app.UseAsync("/api/*", "/users") }},
 		{"prefix only no mw", func(app *gogo.App) { app.UseAsync("/api/*") }},
 	}
@@ -1125,6 +1127,55 @@ func TestUseAsyncRejectsBadArgs(t *testing.T) {
 			defer app.Close()
 			c.call(app)
 		})
+	}
+}
+
+// TestUseAcceptsCrossTypeMiddleware confirms App.Use and App.UseAsync
+// each accept the other family's middleware: Middleware and
+// AsyncMiddleware share the same func(*Response, *Request) shape and
+// the framework converts between them at registration time so the
+// bundled middleware can drop into either chain without an adapter.
+func TestUseAcceptsCrossTypeMiddleware(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		// AsyncMiddleware installed on the sync chain.
+		app.Use(gogo.AsyncMiddleware(func(next gogo.AsyncHandler) gogo.AsyncHandler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				res.Header("X-From-Async-MW", "1")
+				next(res, req)
+			}
+		}))
+		// Sync Middleware installed on the async chain.
+		app.UseAsync(gogo.Middleware(func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				res.Header("X-From-Sync-MW", "1")
+				next(res, req)
+			}
+		}))
+		app.Get("/sync", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "sync")
+		})
+		app.GetAsync("/async", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "async")
+		})
+	})
+	defer teardown()
+
+	r1, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/sync", port))
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	r1.Body.Close()
+	if r1.Header.Get("X-From-Async-MW") != "1" {
+		t.Errorf("sync route: missing async-typed middleware header")
+	}
+
+	r2, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/async", port))
+	if err != nil {
+		t.Fatalf("async: %v", err)
+	}
+	r2.Body.Close()
+	if r2.Header.Get("X-From-Sync-MW") != "1" {
+		t.Errorf("async route: missing sync-typed middleware header")
 	}
 }
 

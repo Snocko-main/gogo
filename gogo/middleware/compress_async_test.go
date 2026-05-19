@@ -59,12 +59,14 @@ func TestCompressAsyncResponseAsync(t *testing.T) {
 
 // TestCompressGetAsync exercises the GetAsync route path: the worker
 // goroutine runs the handler with the response wrapper in async
-// mode. Compress is installed via UseAsync(AsAsync(...)) so it
-// participates in the async middleware chain.
+// mode. Compress is installed via UseAsync so it participates in the
+// async middleware chain — UseAsync accepts a sync gogo.Middleware
+// directly (Middleware and AsyncMiddleware share their underlying
+// shape, the framework converts at registration time).
 func TestCompressGetAsync(t *testing.T) {
 	payload := strings.Repeat("getasync-payload ", 200)
 	port, teardown := startApp(t, func(app *gogo.App) {
-		app.UseAsync(middleware.AsAsync(middleware.Compress()))
+		app.UseAsync(middleware.Compress())
 		app.GetAsync("/", func(res *gogo.Response, req *gogo.Request) {
 			res.Send(200, "text/plain", payload)
 		})
@@ -101,7 +103,7 @@ func TestCompressGetAsync(t *testing.T) {
 func TestCompressAsyncLargeBody(t *testing.T) {
 	payload := strings.Repeat("X", 64*1024) // 64 KiB
 	port, teardown := startApp(t, func(app *gogo.App) {
-		app.UseAsync(middleware.AsAsync(middleware.Compress()))
+		app.UseAsync(middleware.Compress())
 		app.GetAsync("/", func(res *gogo.Response, req *gogo.Request) {
 			res.Send(200, "text/plain", payload)
 		})
@@ -134,7 +136,7 @@ func TestCompressAsyncLargeBody(t *testing.T) {
 func TestCompressAsyncSkipsWhenNoAcceptEncoding(t *testing.T) {
 	payload := strings.Repeat("plain ", 500)
 	port, teardown := startApp(t, func(app *gogo.App) {
-		app.UseAsync(middleware.AsAsync(middleware.Compress()))
+		app.UseAsync(middleware.Compress())
 		app.GetAsync("/", func(res *gogo.Response, req *gogo.Request) {
 			res.Send(200, "text/plain", payload)
 		})

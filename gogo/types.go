@@ -437,6 +437,21 @@ func (a *App) Use(args ...any) {
 			m = v
 		case func(next Handler) Handler:
 			m = Middleware(v)
+		case AsyncMiddleware:
+			// AsyncMiddleware and Middleware share the underlying
+			// func(next func(*Response, *Request)) shape — Go's
+			// named-type rules allow the conversion without losing
+			// any guarantees. Accepting both keeps the bundled
+			// middleware in this repo (and any user-written
+			// middleware that returns the wrong type by accident)
+			// usable on either App.Use or App.UseAsync.
+			m = Middleware(func(next Handler) Handler {
+				return Handler(v(AsyncHandler(next)))
+			})
+		case func(next AsyncHandler) AsyncHandler:
+			m = Middleware(func(next Handler) Handler {
+				return Handler(v(AsyncHandler(next)))
+			})
 		case string:
 			panic("gogo: Use: only the first argument may be a path pattern")
 		default:
@@ -597,6 +612,13 @@ func (a *App) hasMatchingMiddleware(routePattern string) bool {
 // (Get / Post / Any) never see it. If only async middleware matches a
 // GetAsync route, the framework still uses the zero-cgo shared-memory
 // dispatch path; the async chain composes inside the worker goroutine.
+//
+// UseAsync accepts either AsyncMiddleware or the bare sync Middleware
+// type — they share the same underlying func(*Response, *Request)
+// shape, and the framework converts between them at registration time.
+// That lets the bundled middleware in this repo (Logger, Helmet,
+// Compress, …) drop into UseAsync without an explicit adapter. The
+// mirror also holds: App.Use accepts AsyncMiddleware.
 func (a *App) UseAsync(args ...any) {
 	if len(args) == 0 {
 		return
@@ -627,6 +649,18 @@ func (a *App) UseAsync(args ...any) {
 			m = v
 		case func(next AsyncHandler) AsyncHandler:
 			m = AsyncMiddleware(v)
+		case Middleware:
+			// Mirror Use: accept the sync-typed middleware here
+			// too so the bundled middleware in this repo (Logger,
+			// Helmet, Compress, …) drops into UseAsync without an
+			// explicit adapter.
+			m = AsyncMiddleware(func(next AsyncHandler) AsyncHandler {
+				return AsyncHandler(v(Handler(next)))
+			})
+		case func(next Handler) Handler:
+			m = AsyncMiddleware(func(next AsyncHandler) AsyncHandler {
+				return AsyncHandler(v(Handler(next)))
+			})
 		case string:
 			panic("gogo: UseAsync: only the first argument may be a path pattern")
 		default:
@@ -1732,15 +1766,17 @@ func (r *Response) StatusCode() int {
 // not support that). For multi-value headers (Set-Cookie, Vary, Link)
 // call Header / Append repeatedly with the same key.
 //
-// In async mode only Content-Type is supported via the fast path. Setting any
-// other header from inside Async panics; use Loop.Defer + Cork directly to
-// build multi-header responses asynchronously.
+// In async mode Content-Type is short-circuited onto the async fast
+// path (stored on r.async directly), and any other header is buffered
+// in pendingHeaders. flushAsync routes pendingHeaders through
+// uwsgo_res_defer_send_with_headers, which writes them between the
+// status line and the body. That means the shared-memory fast path
+// (zero cgo) is only available for responses that set Content-Type
+// alone; the moment a handler attaches any extra header the response
+// goes through the cgo defer-send shim instead.
 func (r *Response) Header(key, value string) *Response {
 	validateHeaderValue(key, value)
-	if r.async != nil {
-		if key != "Content-Type" {
-			panic("gogo: Header in async mode only supports Content-Type; use Loop.Defer/Cork for multi-header async responses")
-		}
+	if r.async != nil && key == "Content-Type" {
 		r.async.contentType = value
 		return r
 	}
