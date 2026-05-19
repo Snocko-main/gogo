@@ -4160,6 +4160,67 @@ func TestWebSocketUnsubscribe(t *testing.T) {
 	}
 }
 
+// TestWebSocketPublishBatch covers the batched cross-thread publish
+// API: one cgo crossing for N messages, mixed topics + opcodes,
+// caller buffers reusable immediately. A subscriber registered to
+// two topics receives only the messages on its topics; the third
+// topic in the batch has no subscriber and is dropped silently.
+func TestWebSocketPublishBatch(t *testing.T) {
+	appCh := make(chan *gogo.App, 1)
+	port, teardown := startApp(t, func(app *gogo.App) {
+		appCh <- app
+		app.WebSocket("/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				ws.Subscribe("alerts")
+				ws.Subscribe("news")
+			},
+		})
+	})
+	defer teardown()
+	app := <-appCh
+
+	sub, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer sub.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	// Reusable buffer: PublishBatch must copy bytes before returning
+	// so we can mutate this immediately afterward without affecting
+	// the in-flight publish.
+	payload := []byte("first")
+	batch := []gogo.PublishMessage{
+		{Topic: "alerts", Message: payload, OpCode: gogo.Text},
+		{Topic: "news", Message: []byte("second"), OpCode: gogo.Text},
+		{Topic: "private", Message: []byte("dropped"), OpCode: gogo.Text}, // no subscribers
+	}
+	app.PublishBatch(batch)
+	// Mutate caller buffer right away — must NOT affect delivery.
+	for i := range payload {
+		payload[i] = 'X'
+	}
+
+	got1, err := sub.ReadText(2 * time.Second)
+	if err != nil {
+		t.Fatalf("read 1: %v", err)
+	}
+	got2, err := sub.ReadText(2 * time.Second)
+	if err != nil {
+		t.Fatalf("read 2: %v", err)
+	}
+	if got1 != "first" || got2 != "second" {
+		t.Errorf("batch delivery: got %q, %q; want \"first\", \"second\"", got1, got2)
+	}
+	if err := sub.expectNoMessage(300 * time.Millisecond); err != nil {
+		t.Errorf("unexpected extra message: %v", err)
+	}
+
+	// Empty batch is a no-op (no panic, no cgo crossing).
+	app.PublishBatch(nil)
+	app.PublishBatch([]gogo.PublishMessage{})
+}
+
 // TestWebSocketMultiTopic: a single socket can be subscribed to
 // multiple topics. Publishes route only to subscribers of the exact
 // topic string — uWS v20 has no wildcard support, so this also

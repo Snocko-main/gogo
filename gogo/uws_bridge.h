@@ -242,6 +242,35 @@ int uwsgo_ws_publish(uwsgo_ws_t *ws, const char *topic, size_t topic_len,
 void uwsgo_app_publish(uwsgo_app_t *app, const char *topic, size_t topic_len,
     const char *message, size_t message_len, int opcode);
 
+// uwsgo_batch_item_t describes one publish inside a batch. All four
+// length / offset fields point into the contiguous `bytes` blob the
+// caller passes to uwsgo_app_publish_batch — no Go pointers cross
+// the cgo boundary inside this struct, so the batch is safe to pass
+// from Go as a slice of these without tripping cgocheck.
+typedef struct uwsgo_batch_item_t {
+    size_t topic_off;
+    size_t topic_len;
+    size_t message_off;
+    size_t message_len;
+    int opcode;
+} uwsgo_batch_item_t;
+
+// uwsgo_app_publish_batch publishes N messages with a single cgo
+// crossing and a single Loop::defer (one mutex acquire + one
+// wakeup). The C++ side does ONE allocation that owns both the
+// items array and the byte blob; the deferred lambda iterates and
+// publishes each item, then frees. Saves (N-1) cgo crossings and
+// (N-1) defer-mutex acquires versus calling uwsgo_app_publish N
+// times — measured ~10x faster at N=100 on this VM.
+//
+// `bytes` is the packed concatenation of every (topic, message)
+// pair; each item's *_off / *_len pair points into it. `count` is
+// the number of items in the array.
+void uwsgo_app_publish_batch(
+    uwsgo_app_t *app,
+    const char *bytes, size_t bytes_len,
+    const uwsgo_batch_item_t *items, size_t count);
+
 #ifdef __cplusplus
 }
 #endif

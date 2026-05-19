@@ -883,6 +883,44 @@ func (a *appNative) publish(topic string, message []byte, opcode OpCode) {
 		C.int(opcode))
 }
 
+// publishBatch packs N (topic, message, opcode) tuples into one
+// contiguous byte buffer plus a parallel array of POD offset/length
+// items, then crosses into C++ once. The struct array contains only
+// integers (no Go pointers), so passing &items[0] to C doesn't
+// violate cgo's "Go pointer to Go memory that contains Go pointers"
+// rule.
+func (a *appNative) publishBatch(msgs []PublishMessage) {
+	if len(msgs) == 0 {
+		return
+	}
+	var totalBytes int
+	for i := range msgs {
+		totalBytes += len(msgs[i].Topic) + len(msgs[i].Message)
+	}
+	buf := make([]byte, totalBytes)
+	items := make([]C.uwsgo_batch_item_t, len(msgs))
+	off := 0
+	for i := range msgs {
+		items[i].topic_off = C.size_t(off)
+		items[i].topic_len = C.size_t(len(msgs[i].Topic))
+		copy(buf[off:], msgs[i].Topic)
+		off += len(msgs[i].Topic)
+		items[i].message_off = C.size_t(off)
+		items[i].message_len = C.size_t(len(msgs[i].Message))
+		copy(buf[off:], msgs[i].Message)
+		off += len(msgs[i].Message)
+		items[i].opcode = C.int(msgs[i].OpCode)
+	}
+	var bufPtr *C.char
+	if totalBytes > 0 {
+		bufPtr = (*C.char)(unsafe.Pointer(&buf[0]))
+	}
+	C.uwsgo_app_publish_batch(
+		a.ptr,
+		bufPtr, C.size_t(totalBytes),
+		(*C.uwsgo_batch_item_t)(unsafe.Pointer(&items[0])), C.size_t(len(items)))
+}
+
 //export uwsgoHandleHTTP
 func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req_t,
 	methodPtr *C.char, methodLen C.size_t,

@@ -80,4 +80,5 @@ func (websocketNative) subscribe(string) bool                { return false }
 func (websocketNative) unsubscribe(string) bool              { return false }
 func (websocketNative) publish(string, []byte, OpCode) bool  { return false }
 
-func (appNative) publish(string, []byte, OpCode) {}
+func (appNative) publish(string, []byte, OpCode)   {}
+func (appNative) publishBatch([]PublishMessage)     {}

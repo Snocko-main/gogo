@@ -1182,3 +1182,37 @@ extern "C" void uwsgo_app_publish(uwsgo_app_t *app, const char *topic, size_t to
         app->app->publish(t, m, op);
     });
 }
+
+extern "C" void uwsgo_app_publish_batch(
+        uwsgo_app_t *app,
+        const char *bytes, size_t bytes_len,
+        const uwsgo_batch_item_t *items, size_t count) {
+    if (count == 0) {
+        return;
+    }
+    // One alloc owns the items array + byte blob. The per-publish
+    // overhead the single-message path pays (mutex, wakeup, lambda
+    // heap-spill) gets amortized across `count` items, which is the
+    // whole point of this entry point — the slab-vs-large-alloc
+    // wash that pessimized the single-message rewrite doesn't apply
+    // here because we're saving N-1 of EVERY other cost too.
+    size_t items_bytes = count * sizeof(uwsgo_batch_item_t);
+    size_t total = items_bytes + bytes_len;
+    char *buf = static_cast<char *>(::operator new(total));
+    memcpy(buf, items, items_bytes);
+    if (bytes_len > 0) {
+        memcpy(buf + items_bytes, bytes, bytes_len);
+    }
+
+    app->loop->defer([app, buf, count]() {
+        const auto *items = reinterpret_cast<const uwsgo_batch_item_t *>(buf);
+        const char *bytes = buf + count * sizeof(uwsgo_batch_item_t);
+        for (size_t i = 0; i < count; i++) {
+            app->app->publish(
+                std::string_view(bytes + items[i].topic_off, items[i].topic_len),
+                std::string_view(bytes + items[i].message_off, items[i].message_len),
+                static_cast<uWS::OpCode>(items[i].opcode));
+        }
+        ::operator delete(buf);
+    });
+}
