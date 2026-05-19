@@ -1,0 +1,362 @@
+//go:build cgo && gogo
+
+package gogo_test
+
+import (
+	"encoding/json"
+	"expvar"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	gogo "uwebsockets-go/gogo"
+	"uwebsockets-go/gogo/middleware"
+)
+
+// TestTestServerBasic spins up a TestServer, hits a sync route,
+// closes cleanly.
+func TestTestServerBasic(t *testing.T) {
+	ts, err := gogo.NewTestServer(func(app *gogo.App) {
+		app.Get("/ping", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "pong")
+		})
+	})
+	if err != nil {
+		t.Fatalf("NewTestServer: %v", err)
+	}
+	defer ts.Close()
+
+	resp, err := ts.Get("/ping")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if string(body) != "pong" {
+		t.Errorf("body = %q, want pong", string(body))
+	}
+}
+
+// TestTestServerDo rewrites a httptest.NewRequest URL to point at
+// the running server and ships custom headers / body through Do.
+func TestTestServerDo(t *testing.T) {
+	ts, err := gogo.NewTestServer(func(app *gogo.App) {
+		app.Post("/echo", func(res *gogo.Response, req *gogo.Request) {
+			// Capture the Authorization header BEFORE res.Body
+			// — uWS frees the underlying HttpRequest the moment
+			// the sync callback returns, and Body's callback
+			// fires after that, so reading req.Header from
+			// inside it would dereference freed memory.
+			auth := req.Header("authorization")
+			res.Body(1<<16, func(body []byte, err error) {
+				if err != nil {
+					res.Send(400, "text/plain", err.Error())
+					return
+				}
+				res.Header("X-Saw-Auth", auth)
+				res.Send(200, "application/json", string(body))
+			})
+		})
+	})
+	if err != nil {
+		t.Fatalf("NewTestServer: %v", err)
+	}
+	defer ts.Close()
+
+	payload := []byte(`{"hello":"world"}`)
+	req := httptest.NewRequest("POST", "/echo", strings.NewReader(string(payload)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+	resp, err := ts.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if string(body) != string(payload) {
+		t.Errorf("body = %q, want %q", string(body), string(payload))
+	}
+	if got := resp.Header.Get("X-Saw-Auth"); got != "Bearer test-token" {
+		t.Errorf("X-Saw-Auth = %q, want Bearer test-token", got)
+	}
+}
+
+// TestTestServerExposesApp checks the App() accessor works for
+// post-setup configuration (e.g. publishing from a goroutine).
+func TestTestServerExposesApp(t *testing.T) {
+	ts, err := gogo.NewTestServer(func(app *gogo.App) {
+		app.Get("/", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	if err != nil {
+		t.Fatalf("NewTestServer: %v", err)
+	}
+	defer ts.Close()
+	if ts.App() == nil {
+		t.Errorf("App() returned nil")
+	}
+	if ts.URL() == "" || ts.Port() == 0 {
+		t.Errorf("URL/Port empty: url=%q port=%d", ts.URL(), ts.Port())
+	}
+}
+
+// TestTestServerSetupError covers the path where Listen fails (no
+// route registered + the user binds two TestServers to the same
+// port). NewTestServer should return the error, not panic.
+func TestTestServerNilSetup(t *testing.T) {
+	if _, err := gogo.NewTestServer(nil); err == nil {
+		t.Errorf("expected error on nil setup")
+	}
+}
+
+// TestTestServerWithMiddleware ensures the full middleware chain
+// (cookies, auth, logger) actually fires under the TestServer.
+func TestTestServerWithMiddleware(t *testing.T) {
+	const secret = "test-secret"
+	ts, err := gogo.NewTestServer(func(app *gogo.App) {
+		app.Use(middleware.Helmet())
+		app.Use(middleware.RequestID())
+		app.Get("/secret", func(res *gogo.Response, req *gogo.Request) {
+			res.SetCookieSigned(gogo.Cookie{Name: "s", Value: "alice"}, secret)
+			res.Send(200, "text/plain", "ok")
+		})
+		app.Get("/whoami", func(res *gogo.Response, req *gogo.Request) {
+			val, ok := req.CookieSigned("s", secret)
+			if !ok {
+				res.Send(401, "text/plain", "no session")
+				return
+			}
+			res.Send(200, "text/plain", val)
+		})
+	})
+	if err != nil {
+		t.Fatalf("NewTestServer: %v", err)
+	}
+	defer ts.Close()
+
+	resp, _ := ts.Get("/secret")
+	resp.Body.Close()
+	cookie := resp.Header.Get("Set-Cookie")
+	if !strings.Contains(cookie, "s=alice.") {
+		t.Errorf("Set-Cookie missing signed payload: %q", cookie)
+	}
+	if resp.Header.Get("X-Request-Id") == "" {
+		t.Errorf("middleware did not run (missing X-Request-Id)")
+	}
+	if !strings.Contains(resp.Header.Get("Strict-Transport-Security"), "max-age") {
+		t.Errorf("Helmet did not run (missing HSTS)")
+	}
+
+	// Round-trip: bring the cookie back in a second request and
+	// verify the route reads it via req.CookieSigned.
+	req2, _ := http.NewRequest("GET", "/whoami", nil)
+	req2.Header.Set("Cookie", cookie)
+	resp2, err := ts.Do(req2)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	body, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	if resp2.StatusCode != 200 || string(body) != "alice" {
+		t.Errorf("whoami: status=%d body=%q", resp2.StatusCode, string(body))
+	}
+}
+
+// TestHTTPAdapterBasic wraps a stdlib http.HandlerFunc and exposes
+// it as a gogo route.
+func TestHTTPAdapterBasic(t *testing.T) {
+	stdHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-From-Std", "yes")
+		w.WriteHeader(http.StatusTeapot)
+		io.WriteString(w, "I'm a teapot")
+	})
+
+	ts, err := gogo.NewTestServer(func(app *gogo.App) {
+		app.Get("/legacy", gogo.HTTPAdapter(stdHandler))
+	})
+	if err != nil {
+		t.Fatalf("NewTestServer: %v", err)
+	}
+	defer ts.Close()
+
+	resp, err := ts.Get("/legacy")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusTeapot {
+		t.Errorf("status = %d, want 418", resp.StatusCode)
+	}
+	if string(body) != "I'm a teapot" {
+		t.Errorf("body = %q", string(body))
+	}
+	if resp.Header.Get("X-From-Std") != "yes" {
+		t.Errorf("X-From-Std missing")
+	}
+}
+
+// TestHTTPAdapterHeadersIn ensures the wrapped handler sees the
+// inbound request's headers (the common-headers probe pulls them
+// out of the live Request even on sync routes).
+func TestHTTPAdapterHeadersIn(t *testing.T) {
+	stdHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Saw-Authorization", r.Header.Get("Authorization"))
+		w.Header().Set("X-Saw-Cookie", r.Header.Get("Cookie"))
+		w.Header().Set("X-Saw-UA", r.Header.Get("User-Agent"))
+		w.WriteHeader(200)
+	})
+
+	ts, err := gogo.NewTestServer(func(app *gogo.App) {
+		app.Get("/h", gogo.HTTPAdapter(stdHandler))
+	})
+	if err != nil {
+		t.Fatalf("NewTestServer: %v", err)
+	}
+	defer ts.Close()
+
+	req, _ := http.NewRequest("GET", "/h", nil)
+	req.Header.Set("Authorization", "Bearer abc")
+	req.Header.Set("Cookie", "session=xyz")
+	req.Header.Set("User-Agent", "gogo-test/1.0")
+	resp, err := ts.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	resp.Body.Close()
+	if got := resp.Header.Get("X-Saw-Authorization"); got != "Bearer abc" {
+		t.Errorf("Authorization passthrough: %q", got)
+	}
+	if got := resp.Header.Get("X-Saw-Cookie"); got != "session=xyz" {
+		t.Errorf("Cookie passthrough: %q", got)
+	}
+	if got := resp.Header.Get("X-Saw-UA"); got != "gogo-test/1.0" {
+		t.Errorf("User-Agent passthrough: %q", got)
+	}
+}
+
+// TestHTTPAdapterMethodAndURL confirms the wrapped handler sees
+// the original method (upper-cased) and URL (with the query
+// string).
+func TestHTTPAdapterMethodAndURL(t *testing.T) {
+	stdHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Method", r.Method)
+		w.Header().Set("X-URL", r.URL.RequestURI())
+		w.WriteHeader(200)
+	})
+
+	ts, err := gogo.NewTestServer(func(app *gogo.App) {
+		app.Get("/u", gogo.HTTPAdapter(stdHandler))
+	})
+	if err != nil {
+		t.Fatalf("NewTestServer: %v", err)
+	}
+	defer ts.Close()
+
+	resp, err := ts.Get("/u?x=1&y=two")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+	if resp.Header.Get("X-Method") != "GET" {
+		t.Errorf("Method = %q, want GET", resp.Header.Get("X-Method"))
+	}
+	if got := resp.Header.Get("X-URL"); got != "/u?x=1&y=two" {
+		t.Errorf("URL = %q, want /u?x=1&y=two", got)
+	}
+}
+
+// TestHTTPAdapterStdlibHandler plugs in expvar.Handler — a real
+// stdlib handler — and verifies it serves its JSON payload.
+func TestHTTPAdapterStdlibHandler(t *testing.T) {
+	// Register a known expvar so the JSON body has predictable
+	// content. Use Init to ignore re-registration panics across
+	// tests run in the same process.
+	v := expvar.NewString("gogo_test_marker")
+	v.Set("hello-from-test")
+
+	ts, err := gogo.NewTestServer(func(app *gogo.App) {
+		app.Get("/debug/vars", gogo.HTTPAdapter(expvar.Handler()))
+	})
+	if err != nil {
+		t.Fatalf("NewTestServer: %v", err)
+	}
+	defer ts.Close()
+
+	resp, err := ts.Get("/debug/vars")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("expvar response not JSON: %v\nbody=%s", err, string(body))
+	}
+	if got := decoded["gogo_test_marker"]; got != "hello-from-test" {
+		t.Errorf("expvar marker = %v, want hello-from-test", got)
+	}
+}
+
+// TestHTTPAdapterWithBody covers the bodied variant: wrap a
+// PostAsync route and pass the collected body into the stdlib
+// handler.
+func TestHTTPAdapterWithBody(t *testing.T) {
+	stdHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Echo back what the stdlib handler received.
+		b, _ := io.ReadAll(r.Body)
+		w.Header().Set("X-Echo-CT", r.Header.Get("Content-Type"))
+		w.WriteHeader(201)
+		w.Write(b)
+	})
+
+	ts, err := gogo.NewTestServer(func(app *gogo.App) {
+		app.PostAsync("/legacy", 1<<16, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			gogo.HTTPAdapterWithBody(stdHandler, body)(res, req)
+		})
+	})
+	if err != nil {
+		t.Fatalf("NewTestServer: %v", err)
+	}
+	defer ts.Close()
+
+	payload := `{"k":"v"}`
+	resp, err := ts.Post("/legacy", "application/json", strings.NewReader(payload))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 201 {
+		t.Errorf("status = %d, want 201", resp.StatusCode)
+	}
+	if string(body) != payload {
+		t.Errorf("body = %q, want %q", string(body), payload)
+	}
+	if resp.Header.Get("X-Echo-CT") != "application/json" {
+		t.Errorf("Content-Type round-trip: %q", resp.Header.Get("X-Echo-CT"))
+	}
+}
+
+// TestHTTPAdapterPanicsOnNil ensures HTTPAdapter(nil) panics
+// loudly rather than silently producing a broken route.
+func TestHTTPAdapterPanicsOnNil(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic on nil handler")
+		}
+	}()
+	gogo.HTTPAdapter(nil)
+}

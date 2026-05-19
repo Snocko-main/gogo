@@ -371,11 +371,22 @@ middleware imports but external code cannot.
 
 ### Testing
 
-- `App.Test(httpReq) (*httptest.ResponseRecorder, error)` — in-process
-  dispatch without a real socket. Requires a "fake" `responseNative`
-  shim.
-- `net/http.Handler` adapter — register an existing `http.Handler` as a
-  gogo route. Lets users migrate one route at a time.
+- `gogo.NewTestServer(setup)` — **DONE**. Spins up an App on a free
+  loopback port from inside a test, returns a `*TestServer` that
+  exposes `Do(req) / Get(path) / Post(path, ct, body) / URL() /
+  App() / Client() / Close()`. Loopback rather than synthetic
+  in-process dispatch — full fidelity of every cgo path (middleware
+  chains, sync wrap, snapshot-then-async dispatch, the zero-cgo
+  shared-memory ring) at the cost of ~50–100 µs per request vs ~1 µs
+  for an in-process shim. Synthetic dispatch can land as a follow-up
+  if/when the latency matters.
+- `gogo.HTTPAdapter(h http.Handler) gogo.Handler` — **DONE**. Wraps
+  a stdlib `http.Handler` so it can be registered on a gogo route.
+  Useful for migration (one handler at a time) and for serving
+  stdlib-shaped handlers (`expvar.Handler`, `net/http/pprof`, …)
+  through gogo. `gogo.HTTPAdapterWithBody(h, body)` is the variant
+  for `PostAsync` / bodied methods that need to ship the collected
+  body into the wrapped handler.
 
 ---
 
