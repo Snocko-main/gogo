@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"uwebsockets-go/gogo"
+	"uwebsockets-go/gogo/internal/mwhint"
 )
 
 // JWTLocalKey is the req.Local key carrying the verified token's
@@ -139,7 +140,7 @@ type JWTOptions struct {
 // custom verifier that resolves the key from your JWKS cache and
 // returns the validated claims — or write a thin middleware that
 // dispatches between multiple JWT instances keyed on `kid`.
-func JWT(opt JWTOptions) gogo.Middleware {
+func JWT(opt JWTOptions) mwhint.Hinted {
 	if opt.Algorithm == "" {
 		opt.Algorithm = JWTHS256
 	}
@@ -159,7 +160,7 @@ func JWT(opt JWTOptions) gogo.Middleware {
 	}
 	expectedAlg := string(opt.Algorithm)
 
-	return func(next gogo.Handler) gogo.Handler {
+	return mwhint.Hinted{Place: mwhint.Sync, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler {
 		return func(res *gogo.Response, req *gogo.Request) {
 			if opt.SkipFunc != nil && opt.SkipFunc(req) {
 				next(res, req)
@@ -182,7 +183,7 @@ func JWT(opt JWTOptions) gogo.Middleware {
 			req.SetLocal(opt.LocalKey, claims)
 			next(res, req)
 		}
-	}
+	})}
 }
 
 func jwtReject(res *gogo.Response, reason string) {

@@ -23,12 +23,13 @@ import (
 	"time"
 
 	gogo "uwebsockets-go/gogo"
+	"uwebsockets-go/gogo/middleware"
 )
 
 // freePort grabs an ephemeral port the kernel just handed us, then closes the
 // listener so the test server can rebind to it. Tiny race window but fine for
 // tests on localhost.
-func freePort(t *testing.T) int {
+func freePort(t testing.TB) int {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -42,7 +43,7 @@ func freePort(t *testing.T) int {
 // startApp boots an app on a free port, runs the loop on a dedicated OS-locked
 // goroutine (uWS loop is thread-local), waits until the server accepts a
 // connection, and returns a teardown func.
-func startApp(t *testing.T, configure func(app *gogo.App)) (port int, teardown func()) {
+func startApp(t testing.TB, configure func(app *gogo.App)) (port int, teardown func()) {
 	t.Helper()
 
 	port = freePort(t)
@@ -1130,22 +1131,138 @@ func TestUseAsyncRejectsBadArgs(t *testing.T) {
 	}
 }
 
+// TestPlaceBothFiresOnceAndKeepsFastPath registers a raw counter
+// middleware via App.Use. Raw middleware defaults to "both chains"
+// placement so both a sync and async route should observe exactly
+// one invocation each — proving that the dual-chain registration
+// does NOT cause double-execution. The async route should also keep
+// the zero-cgo dispatch path: alsoAsync entries in the sync chain
+// are skipped by hasMatchingMiddleware.
+func TestPlaceBothFiresOnceAndKeepsFastPath(t *testing.T) {
+	var syncCount atomic.Int32
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				syncCount.Add(1)
+				next(res, req)
+			}
+		})
+		app.Get("/sync", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "sync")
+		})
+		app.GetAsync("/async", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "async")
+		})
+	})
+	defer teardown()
+
+	r1, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/sync", port))
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	r1.Body.Close()
+	if got := syncCount.Load(); got != 1 {
+		t.Errorf("sync route: count=%d want 1", got)
+	}
+
+	syncCount.Store(0)
+	r2, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/async", port))
+	if err != nil {
+		t.Fatalf("async: %v", err)
+	}
+	r2.Body.Close()
+	if got := syncCount.Load(); got != 1 {
+		t.Errorf("async route: count=%d want 1 (double-fire would be 2)", got)
+	}
+}
+
+// TestSyncChainForcesSlowPath uses the bundled RateLimit middleware
+// (Place=Sync internally) on an async route and verifies the
+// middleware still fires — the framework takes the slow path
+// (sync wrap → snapshot → async dispatch) because at least one
+// sync-only middleware matches.
+func TestSyncChainForcesSlowPath(t *testing.T) {
+	var hits atomic.Int32
+	port, teardown := startApp(t, func(app *gogo.App) {
+		// RateLimit is internally placed in the sync chain so cheap
+		// rejecters can short-circuit before a goroutine spawns.
+		// Counter middleware composed below it observes invocation.
+		app.Use(middleware.RateLimit(middleware.RateLimitOptions{
+			Max:    1000000,
+			Window: time.Hour,
+		}))
+		app.Use(func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				hits.Add(1)
+				next(res, req)
+			}
+		})
+		app.GetAsync("/async", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/async", port))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+	if hits.Load() != 1 {
+		t.Errorf("sync-chain mw did not fire on async route")
+	}
+}
+
+// TestAsyncOnlyMiddlewareSkipsSyncRoute confirms that a middleware
+// wrapped via middleware.Async is invisible to sync routes.
+func TestAsyncOnlyMiddlewareSkipsSyncRoute(t *testing.T) {
+	var hits atomic.Int32
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.Async(func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				hits.Add(1)
+				next(res, req)
+			}
+		}))
+		app.Get("/sync", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "ok")
+		})
+		app.GetAsync("/async", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	r1, _ := http.Get(fmt.Sprintf("http://127.0.0.1:%d/sync", port))
+	r1.Body.Close()
+	if hits.Load() != 0 {
+		t.Errorf("Async-wrapped mw fired on sync route: %d", hits.Load())
+	}
+
+	r2, _ := http.Get(fmt.Sprintf("http://127.0.0.1:%d/async", port))
+	r2.Body.Close()
+	if hits.Load() != 1 {
+		t.Errorf("Async-wrapped mw did not fire on async route: %d", hits.Load())
+	}
+}
+
 // TestUseAcceptsCrossTypeMiddleware confirms App.Use and App.UseAsync
-// each accept the other family's middleware: Middleware and
-// AsyncMiddleware share the same func(*Response, *Request) shape and
-// the framework converts between them at registration time so the
-// bundled middleware can drop into either chain without an adapter.
+// App.Use accepts both Middleware and AsyncMiddleware shapes. After
+// the redesign:
+//   - Raw Middleware → both chains (sync routes fire it on the loop
+//     thread, async routes fire it in the worker).
+//   - Raw AsyncMiddleware → async chain only (signals "I want to
+//     run on the goroutine that runs the async handler"); sync
+//     routes do not see it.
 func TestUseAcceptsCrossTypeMiddleware(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
-		// AsyncMiddleware installed on the sync chain.
 		app.Use(gogo.AsyncMiddleware(func(next gogo.AsyncHandler) gogo.AsyncHandler {
 			return func(res *gogo.Response, req *gogo.Request) {
 				res.Header("X-From-Async-MW", "1")
 				next(res, req)
 			}
 		}))
-		// Sync Middleware installed on the async chain.
-		app.UseAsync(gogo.Middleware(func(next gogo.Handler) gogo.Handler {
+		app.Use(gogo.Middleware(func(next gogo.Handler) gogo.Handler {
 			return func(res *gogo.Response, req *gogo.Request) {
 				res.Header("X-From-Sync-MW", "1")
 				next(res, req)
@@ -1165,8 +1282,13 @@ func TestUseAcceptsCrossTypeMiddleware(t *testing.T) {
 		t.Fatalf("sync: %v", err)
 	}
 	r1.Body.Close()
-	if r1.Header.Get("X-From-Async-MW") != "1" {
-		t.Errorf("sync route: missing async-typed middleware header")
+	// AsyncMiddleware is async-only by default — sync route does NOT
+	// see it. The sync Middleware fires here (PlaceBoth default).
+	if r1.Header.Get("X-From-Async-MW") != "" {
+		t.Errorf("sync route: async-typed middleware should not fire")
+	}
+	if r1.Header.Get("X-From-Sync-MW") != "1" {
+		t.Errorf("sync route: missing sync-typed middleware header")
 	}
 
 	r2, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/async", port))
@@ -1174,6 +1296,12 @@ func TestUseAcceptsCrossTypeMiddleware(t *testing.T) {
 		t.Fatalf("async: %v", err)
 	}
 	r2.Body.Close()
+	// Async route: both fire (async-typed in async chain, sync-typed
+	// via the PlaceBoth dup in async chain — slow path is not active
+	// because no PlaceSync entry matches).
+	if r2.Header.Get("X-From-Async-MW") != "1" {
+		t.Errorf("async route: missing async-typed middleware header")
+	}
 	if r2.Header.Get("X-From-Sync-MW") != "1" {
 		t.Errorf("async route: missing sync-typed middleware header")
 	}

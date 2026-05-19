@@ -17,7 +17,7 @@
 // portion — the duration will be roughly zero. PostAsync /
 // AsyncMiddleware paths run inside their worker so they ARE timed
 // correctly when the middleware is registered as AsyncMiddleware via
-// app.UseAsync instead of app.Use.
+// app.Use instead of app.Use.
 package middleware
 
 import (
@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"uwebsockets-go/gogo"
+	"uwebsockets-go/gogo/internal/mwhint"
 )
 
 // LoggerOptions configures Logger. Zero value uses sensible defaults
@@ -80,7 +81,7 @@ func JSONFormat(e LogEntry) string {
 // returns. Safe to share across goroutines — writes are serialized
 // behind a sync.Mutex so concurrent log lines never interleave on the
 // output writer.
-func Logger(opts ...LoggerOptions) gogo.Middleware {
+func Logger(opts ...LoggerOptions) mwhint.Hinted {
 	var opt LoggerOptions
 	if len(opts) > 0 {
 		opt = opts[0]
@@ -100,7 +101,7 @@ func Logger(opts ...LoggerOptions) gogo.Middleware {
 	}
 
 	var mu sync.Mutex
-	return func(next gogo.Handler) gogo.Handler {
+	return mwhint.Hinted{Place: mwhint.Both, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler {
 		return func(res *gogo.Response, req *gogo.Request) {
 			url := req.URL()
 			if _, skipIt := skip[url]; skipIt {
@@ -122,7 +123,7 @@ func Logger(opts ...LoggerOptions) gogo.Middleware {
 			fmt.Fprintln(opt.Output, line)
 			mu.Unlock()
 		}
-	}
+	})}
 }
 
 // statusText avoids strconv allocations for the standard formatter — keep

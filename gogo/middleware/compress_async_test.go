@@ -66,7 +66,7 @@ func TestCompressAsyncResponseAsync(t *testing.T) {
 func TestCompressGetAsync(t *testing.T) {
 	payload := strings.Repeat("getasync-payload ", 200)
 	port, teardown := startApp(t, func(app *gogo.App) {
-		app.UseAsync(middleware.Compress())
+		app.Use(middleware.Compress())
 		app.GetAsync("/", func(res *gogo.Response, req *gogo.Request) {
 			res.Send(200, "text/plain", payload)
 		})
@@ -103,7 +103,7 @@ func TestCompressGetAsync(t *testing.T) {
 func TestCompressAsyncLargeBody(t *testing.T) {
 	payload := strings.Repeat("X", 64*1024) // 64 KiB
 	port, teardown := startApp(t, func(app *gogo.App) {
-		app.UseAsync(middleware.Compress())
+		app.Use(middleware.Compress())
 		app.GetAsync("/", func(res *gogo.Response, req *gogo.Request) {
 			res.Send(200, "text/plain", payload)
 		})
@@ -136,7 +136,7 @@ func TestCompressAsyncLargeBody(t *testing.T) {
 func TestCompressAsyncSkipsWhenNoAcceptEncoding(t *testing.T) {
 	payload := strings.Repeat("plain ", 500)
 	port, teardown := startApp(t, func(app *gogo.App) {
-		app.UseAsync(middleware.Compress())
+		app.Use(middleware.Compress())
 		app.GetAsync("/", func(res *gogo.Response, req *gogo.Request) {
 			res.Send(200, "text/plain", payload)
 		})

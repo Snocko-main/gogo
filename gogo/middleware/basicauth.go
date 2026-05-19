@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"uwebsockets-go/gogo"
+	"uwebsockets-go/gogo/internal/mwhint"
 )
 
 // BasicAuthLocalKey is the req.Local key carrying the authenticated
@@ -59,7 +60,7 @@ type BasicAuthOptions struct {
 // base64-encoded but otherwise in plaintext. The middleware does not
 // enforce HTTPS; configure that at the edge (load balancer, reverse
 // proxy) or via HSTS via Helmet.
-func BasicAuth(opt BasicAuthOptions) gogo.Middleware {
+func BasicAuth(opt BasicAuthOptions) mwhint.Hinted {
 	if opt.Validator == nil && len(opt.Users) == 0 {
 		panic("gogo/middleware: BasicAuth requires Users or Validator")
 	}
@@ -87,7 +88,7 @@ func BasicAuth(opt BasicAuthOptions) gogo.Middleware {
 		}
 	}
 
-	return func(next gogo.Handler) gogo.Handler {
+	return mwhint.Hinted{Place: mwhint.Sync, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler {
 		return func(res *gogo.Response, req *gogo.Request) {
 			if opt.SkipFunc != nil && opt.SkipFunc(req) {
 				next(res, req)
@@ -102,7 +103,7 @@ func BasicAuth(opt BasicAuthOptions) gogo.Middleware {
 			req.SetLocal(opt.LocalKey, user)
 			next(res, req)
 		}
-	}
+	})}
 }
 
 // parseBasicAuth pulls (user, pass) out of an Authorization header

@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"uwebsockets-go/gogo"
+	"uwebsockets-go/gogo/internal/mwhint"
 )
 
 // CompressOptions configures Compress. Zero value uses
@@ -61,7 +62,7 @@ type CompressOptions struct {
 // (e.g. github.com/andybalholm/brotli) and is left for callers who
 // want it to wire up via their own encoder. Use SetBodyEncoder
 // directly from a custom middleware for that.
-func Compress(opts ...CompressOptions) gogo.Middleware {
+func Compress(opts ...CompressOptions) mwhint.Hinted {
 	var opt CompressOptions
 	if len(opts) > 0 {
 		opt = opts[0]
@@ -79,7 +80,7 @@ func Compress(opts ...CompressOptions) gogo.Middleware {
 	gzipPool := newGzipWriterPool(opt.Level)
 	flatePool := newFlateWriterPool(opt.Level)
 
-	return func(next gogo.Handler) gogo.Handler {
+	return mwhint.Hinted{Place: mwhint.Both, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler {
 		return func(res *gogo.Response, req *gogo.Request) {
 			if opt.SkipFunc != nil && opt.SkipFunc(req) {
 				next(res, req)
@@ -107,7 +108,7 @@ func Compress(opts ...CompressOptions) gogo.Middleware {
 			})
 			next(res, req)
 		}
-	}
+	})}
 }
 
 // negotiateEncoding returns "gzip", "deflate", or "" — picking the

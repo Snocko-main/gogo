@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"uwebsockets-go/gogo"
+	"uwebsockets-go/gogo/internal/mwhint"
 )
 
 // HelmetOptions configures Helmet. Each field's zero value falls back
@@ -81,21 +82,21 @@ type HelmetOptions struct {
 //	    ContentSecurityPolicy: "default-src 'self'",
 //	    HSTS: "max-age=63072000; includeSubDomains; preload",
 //	}))
-func Helmet(opts ...HelmetOptions) gogo.Middleware {
+func Helmet(opts ...HelmetOptions) mwhint.Hinted {
 	var opt HelmetOptions
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
 	headers := buildHelmetHeaders(opt)
 
-	return func(next gogo.Handler) gogo.Handler {
+	return mwhint.Hinted{Place: mwhint.Both, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler {
 		return func(res *gogo.Response, req *gogo.Request) {
 			for _, h := range headers {
 				res.Header(h.key, h.value)
 			}
 			next(res, req)
 		}
-	}
+	})}
 }
 
 type helmetHeader struct{ key, value string }

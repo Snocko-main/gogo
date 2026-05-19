@@ -17,6 +17,8 @@ import (
 	"sync/atomic"
 	"time"
 	"unsafe"
+
+	"uwebsockets-go/gogo/internal/mwhint"
 )
 
 // commonStatusLines caches the formatted status line for codes likely to
@@ -242,12 +244,28 @@ type AsyncMiddleware func(next AsyncHandler) AsyncHandler
 type middlewareEntry struct {
 	prefix string
 	mw     Middleware
+	// alsoAsync marks entries that have a sibling copy in
+	// asyncMiddlewares (PlaceBoth registrations). The framework uses
+	// this to keep the zero-cgo shared-memory dispatch path for async
+	// routes: hasMatchingMiddleware ignores alsoAsync entries because
+	// their work is already going to fire from the async chain inside
+	// the worker. Without this flag, registering a perf-neutral
+	// middleware like Logger via PlaceBoth would force every GetAsync
+	// route off the fast path.
+	alsoAsync bool
 }
 
 // asyncMiddlewareEntry mirrors middlewareEntry for the async chain.
 type asyncMiddlewareEntry struct {
 	prefix string
 	mw     AsyncMiddleware
+	// alsoSync flags PlaceBoth registrations: this entry has a
+	// twin in the sync chain. When the framework takes the slow
+	// path for an async route (because some other PlaceSync entry
+	// matches), the sync wrapper already fires the twin — running
+	// it again from the async chain would double-execute the
+	// middleware. wrapAsyncForSlowPath filters these out.
+	alsoSync bool
 }
 
 // Config tunes per-App behavior. All fields are optional; the zero value
@@ -431,33 +449,66 @@ func (a *App) Use(args ...any) {
 	}
 
 	for i := startIndex; i < len(args); i++ {
-		var m Middleware
 		switch v := args[i].(type) {
+		case mwhint.Hinted:
+			a.registerHinted(prefix, v)
 		case Middleware:
-			m = v
+			// Raw middleware default = run in both chains. Sync
+			// routes fire it on the loop thread, async routes fire
+			// it inside the worker. Non-blocking middleware works
+			// everywhere; blocking middleware should be wrapped via
+			// middleware.Async before being passed here.
+			a.registerHinted(prefix, mwhint.Hinted{Mw: v, Place: mwhint.Both})
 		case func(next Handler) Handler:
-			m = Middleware(v)
+			a.registerHinted(prefix, mwhint.Hinted{Mw: Middleware(v), Place: mwhint.Both})
 		case AsyncMiddleware:
-			// AsyncMiddleware and Middleware share the underlying
-			// func(next func(*Response, *Request)) shape — Go's
-			// named-type rules allow the conversion without losing
-			// any guarantees. Accepting both keeps the bundled
-			// middleware in this repo (and any user-written
-			// middleware that returns the wrong type by accident)
-			// usable on either App.Use or App.UseAsync.
-			m = Middleware(func(next Handler) Handler {
+			// AsyncMiddleware shares the underlying function shape
+			// with Middleware; accept it for backward compatibility
+			// with code that named the type explicitly.
+			mw := Middleware(func(next Handler) Handler {
 				return Handler(v(AsyncHandler(next)))
 			})
+			a.registerHinted(prefix, mwhint.Hinted{Mw: mw, Place: mwhint.Async})
 		case func(next AsyncHandler) AsyncHandler:
-			m = Middleware(func(next Handler) Handler {
+			mw := Middleware(func(next Handler) Handler {
 				return Handler(v(AsyncHandler(next)))
 			})
+			a.registerHinted(prefix, mwhint.Hinted{Mw: mw, Place: mwhint.Async})
 		case string:
 			panic("gogo: Use: only the first argument may be a path pattern")
 		default:
 			panic(fmt.Sprintf("gogo: Use: unsupported argument type %T at index %d", v, i))
 		}
-		a.middlewares = append(a.middlewares, middlewareEntry{prefix: prefix, mw: m})
+	}
+}
+
+// registerHinted turns a mwhint.Hinted into one or two chain
+// insertions. The middleware is type-asserted back to gogo.Middleware
+// (mwhint stores it as `any` to avoid an import cycle).
+func (a *App) registerHinted(prefix string, h mwhint.Hinted) {
+	syncMw, ok := h.Mw.(Middleware)
+	if !ok {
+		// Allow the underlying func type too; values declared with
+		// the raw signature satisfy the assertion via a conversion.
+		if fn, fok := h.Mw.(func(next Handler) Handler); fok {
+			syncMw = Middleware(fn)
+		} else {
+			panic(fmt.Sprintf("gogo: registerHinted: unsupported Mw type %T", h.Mw))
+		}
+	}
+	asyncMw := AsyncMiddleware(func(next AsyncHandler) AsyncHandler {
+		return AsyncHandler(syncMw(Handler(next)))
+	})
+	switch h.Place {
+	case mwhint.Sync:
+		a.middlewares = append(a.middlewares, middlewareEntry{prefix: prefix, mw: syncMw})
+	case mwhint.Async:
+		a.asyncMiddlewares = append(a.asyncMiddlewares, asyncMiddlewareEntry{prefix: prefix, mw: asyncMw})
+	case mwhint.Both:
+		a.middlewares = append(a.middlewares, middlewareEntry{prefix: prefix, mw: syncMw, alsoAsync: true})
+		a.asyncMiddlewares = append(a.asyncMiddlewares, asyncMiddlewareEntry{prefix: prefix, mw: asyncMw, alsoSync: true})
+	default:
+		panic(fmt.Sprintf("gogo: invalid Placement %d", h.Place))
 	}
 }
 
@@ -561,19 +612,28 @@ func urlUnderPrefix(url, prefix string) bool {
 	return strings.HasPrefix(url, prefix+"/")
 }
 
-// hasMatchingMiddleware reports whether any registered sync middleware could
-// apply to a request that uWS will route to routePattern. Used by GetAsync
-// to choose between the zero-cgo shared path and the sync wrapper fallback.
+// hasMatchingMiddleware reports whether any registered sync-only
+// middleware could apply to a request that uWS will route to
+// routePattern. Used by GetAsync to choose between the zero-cgo
+// shared path and the sync wrapper fallback.
 //
-// Conservatively reports true when the pattern is dynamic (contains : or *)
-// and any scoped middleware exists, because the pattern string alone does
-// not tell us which URLs the route will actually serve.
+// Entries with alsoAsync=true (PlaceBoth) are ignored — their work
+// already happens inside the worker via the async chain, so the
+// fast path can keep running.
+//
+// Conservatively reports true when the pattern is dynamic (contains
+// : or *) and any scoped sync-only middleware exists, because the
+// pattern string alone does not tell us which URLs the route will
+// actually serve.
 func (a *App) hasMatchingMiddleware(routePattern string) bool {
 	if len(a.middlewares) == 0 {
 		return false
 	}
 	dynamic := strings.ContainsAny(routePattern, ":*")
 	for _, e := range a.middlewares {
+		if e.alsoAsync {
+			continue
+		}
 		if e.prefix == "" {
 			return true
 		}
@@ -587,87 +647,16 @@ func (a *App) hasMatchingMiddleware(routePattern string) bool {
 	return false
 }
 
-// UseAsync appends an async middleware to the chain that wraps GetAsync /
-// PostAsync handlers. The middleware runs on the goroutine that runs the
-// user handler, so it is free to block (DB queries, downstream HTTP).
+// UseAsync is retained as a thin alias for App.Use to keep existing
+// code compiling. App.Use now handles all middleware: bundled
+// middleware carries its own placement, raw AsyncMiddleware values
+// register in the async chain, and any custom middleware that must
+// block on I/O can be wrapped via middleware.Async(...).
 //
-// Like Use, the first argument may optionally be a path pattern:
-//
-//	app.UseAsync(loadUserMW)                         // every async route
-//	app.UseAsync("/api/*", loadUserMW)               // URLs under /api/
-//	app.UseAsync("/api/v2", rateLimitMW, loadMW)     // /api/v2 and children
-//
-// Trailing "/*" or "/**" is stripped. A pattern of "/", "/*", or no pattern
-// at all means "every async route".
-//
-// Scoped UseAsync matches the live request URL at request time (same fix as
-// scoped Use). Prefer App.Group(...).UseAsync(...) for new code to avoid the
-// per-request URL check.
-//
-// To pass values from middleware down to the handler (e.g. the loaded user),
-// store them on the Request via req.SetLocal; the handler reads them with
-// req.Local.
-//
-// Async middleware applies only to GetAsync / PostAsync — sync routes
-// (Get / Post / Any) never see it. If only async middleware matches a
-// GetAsync route, the framework still uses the zero-cgo shared-memory
-// dispatch path; the async chain composes inside the worker goroutine.
-//
-// UseAsync accepts either AsyncMiddleware or the bare sync Middleware
-// type — they share the same underlying func(*Response, *Request)
-// shape, and the framework converts between them at registration time.
-// That lets the bundled middleware in this repo (Logger, Helmet,
-// Compress, …) drop into UseAsync without an explicit adapter. The
-// mirror also holds: App.Use accepts AsyncMiddleware.
+// Prefer App.Use in new code — UseAsync exists only for backward
+// compatibility and will be removed once callers migrate.
 func (a *App) UseAsync(args ...any) {
-	if len(args) == 0 {
-		return
-	}
-
-	var (
-		prefix     string
-		hasPrefix  bool
-		startIndex int
-	)
-	if s, ok := args[0].(string); ok {
-		prefix = normalizeMWPrefix(s)
-		hasPrefix = true
-		startIndex = 1
-	}
-
-	if startIndex == len(args) {
-		if hasPrefix {
-			panic("gogo: UseAsync: path pattern given but no middleware passed")
-		}
-		return
-	}
-
-	for i := startIndex; i < len(args); i++ {
-		var m AsyncMiddleware
-		switch v := args[i].(type) {
-		case AsyncMiddleware:
-			m = v
-		case func(next AsyncHandler) AsyncHandler:
-			m = AsyncMiddleware(v)
-		case Middleware:
-			// Mirror Use: accept the sync-typed middleware here
-			// too so the bundled middleware in this repo (Logger,
-			// Helmet, Compress, …) drops into UseAsync without an
-			// explicit adapter.
-			m = AsyncMiddleware(func(next AsyncHandler) AsyncHandler {
-				return AsyncHandler(v(Handler(next)))
-			})
-		case func(next Handler) Handler:
-			m = AsyncMiddleware(func(next AsyncHandler) AsyncHandler {
-				return AsyncHandler(v(Handler(next)))
-			})
-		case string:
-			panic("gogo: UseAsync: only the first argument may be a path pattern")
-		default:
-			panic(fmt.Sprintf("gogo: UseAsync: unsupported argument type %T at index %d", v, i))
-		}
-		a.asyncMiddlewares = append(a.asyncMiddlewares, asyncMiddlewareEntry{prefix: prefix, mw: m})
-	}
+	a.Use(args...)
 }
 
 // wrapAsync composes registered async middleware around h. Mirrors wrap:
@@ -675,6 +664,15 @@ func (a *App) UseAsync(args ...any) {
 // request time against the live URL so dynamic routes can't bypass scoped
 // middleware via pattern/URL mismatch.
 func (a *App) wrapAsync(routePattern string, h AsyncHandler) AsyncHandler {
+	return a.wrapAsyncFiltered(routePattern, h, false)
+}
+
+// wrapAsyncFiltered behaves like wrapAsync but, when skipAlsoSync is
+// true, omits PlaceBoth entries (alsoSync == true). The slow path
+// for async routes calls this with skipAlsoSync=true because the
+// sync wrapper has already fired the twin entries — running them
+// again from the async chain would double-execute.
+func (a *App) wrapAsyncFiltered(routePattern string, h AsyncHandler, skipAlsoSync bool) AsyncHandler {
 	if len(a.asyncMiddlewares) == 0 {
 		return h
 	}
@@ -687,7 +685,11 @@ func (a *App) wrapAsync(routePattern string, h AsyncHandler) AsyncHandler {
 	}
 	if !hasScoped {
 		for i := len(a.asyncMiddlewares) - 1; i >= 0; i-- {
-			h = a.asyncMiddlewares[i].mw(h)
+			e := a.asyncMiddlewares[i]
+			if skipAlsoSync && e.alsoSync {
+				continue
+			}
+			h = e.mw(h)
 		}
 		return h
 	}
@@ -699,6 +701,9 @@ func (a *App) wrapAsync(routePattern string, h AsyncHandler) AsyncHandler {
 		chain := inner
 		for i := len(entries) - 1; i >= 0; i-- {
 			e := entries[i]
+			if skipAlsoSync && e.alsoSync {
+				continue
+			}
 			if e.prefix == "" || urlUnderPrefix(url, e.prefix) {
 				chain = e.mw(chain)
 			}
@@ -759,19 +764,21 @@ func (a *App) GetAsync(pattern string, handler AsyncHandler) {
 	validatePattern(pattern)
 	a.trackRouteMethod("get", pattern)
 
-	// Compose the async middleware chain once at registration. wrappedAsync
-	// runs the user handler last; matching AsyncMiddleware wraps it
-	// outermost-first.
-	wrappedAsync := a.wrapAsync(pattern, handler)
-
 	if !a.hasMatchingMiddleware(pattern) {
 		// No sync middleware matches → keep the zero-cgo shared-memory
 		// dispatch path. The async chain composes inside the worker
-		// goroutine alongside the user handler.
+		// goroutine alongside the user handler; PlaceBoth entries fire
+		// here because no sync wrapper is running.
+		wrappedAsync := a.wrapAsync(pattern, handler)
 		a.inner.getShared(pattern, wrappedAsync)
 		return
 	}
 
+	// Slow path: a sync wrap runs the sync chain on the loop thread
+	// before dispatching to the worker. PlaceBoth entries fire there,
+	// so the async chain composed below must SKIP their twins —
+	// otherwise the same middleware runs twice per request.
+	wrappedAsync := a.wrapAsyncFiltered(pattern, handler, true)
 	a.inner.get(pattern, a.wrap(pattern, func(res *Response, req *Request) {
 		// Capture req fields before the sync wrapper returns — uWS frees the
 		// underlying HttpRequest the moment we return from this cgo callback.
@@ -814,7 +821,10 @@ func (a *App) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandl
 	finalAsync := AsyncHandler(func(res *Response, req *Request) {
 		handler(res, req, req.body)
 	})
-	wrappedAsync := a.wrapAsync(pattern, finalAsync)
+	// PostAsync always runs the sync chain via a.wrap before
+	// dispatching the worker — PlaceBoth twins fire there, so the
+	// async chain composed inside res.Async must skip them.
+	wrappedAsync := a.wrapAsyncFiltered(pattern, finalAsync, true)
 
 	a.inner.post(pattern, a.wrap(pattern, func(res *Response, req *Request) {
 		// Snapshot the request before its lifetime ends. Body collection
@@ -1211,13 +1221,17 @@ func (r *Router) GetAsync(pattern string, handler AsyncHandler) {
 	full := r.prefix + pattern
 	r.app.trackRouteMethod("get", full)
 
-	wrappedAsync := r.app.wrapAsync(full, r.wrapGroupAsync(handler))
-
 	if len(r.syncMW) == 0 && !r.app.hasMatchingMiddleware(full) {
+		// Fast path — no sync wrapper fires, async chain owns all
+		// middleware including PlaceBoth twins.
+		wrappedAsync := r.app.wrapAsync(full, r.wrapGroupAsync(handler))
 		r.app.inner.getShared(full, wrappedAsync)
 		return
 	}
 
+	// Slow path: sync wrapper runs PlaceBoth twins on the loop
+	// thread, so the async chain must skip alsoSync entries.
+	wrappedAsync := r.app.wrapAsyncFiltered(full, r.wrapGroupAsync(handler), true)
 	syncEntry := func(res *Response, req *Request) {
 		snap := req.snapshotFromSync(r.app.cfg.CapturePeerIP)
 		res.Async(func() {
@@ -1243,7 +1257,9 @@ func (r *Router) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHa
 	finalAsync := AsyncHandler(func(res *Response, req *Request) {
 		handler(res, req, req.body)
 	})
-	wrappedAsync := r.app.wrapAsync(full, r.wrapGroupAsync(finalAsync))
+	// PostAsync always wraps with sync chain → skip PlaceBoth twins
+	// in the async chain to avoid double-firing the same middleware.
+	wrappedAsync := r.app.wrapAsyncFiltered(full, r.wrapGroupAsync(finalAsync), true)
 
 	syncEntry := func(res *Response, req *Request) {
 		snap := req.snapshotFromSync(r.app.cfg.CapturePeerIP)

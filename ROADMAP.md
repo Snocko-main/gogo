@@ -279,6 +279,29 @@ is large.
 
 ### Middleware ecosystem (bundle as `gogo/middleware/*`)
 
+The public middleware API is a single `app.Use(...)` call. Bundled
+middleware carries its own routing decision internally — the
+framework picks the right chain (loop thread for cheap rejecters,
+worker goroutine for blockers, both for stateless transformers) so
+callers never see Placement / Hint / WithPlacement in their code.
+
+- Rejecters that short-circuit cheaply (RateLimit, BasicAuth, JWT,
+  CSRF) ship pre-wired to fire on the uWS event-loop thread so the
+  goroutine never spawns on a denied request.
+- Stateless transformers (Logger, Helmet, Compress, CORS,
+  RequestID, in-memory Session) register in both chains. The async
+  entry carries a sentinel flag so the framework's "matching sync
+  MW forces slow path" check skips it, preserving the zero-cgo
+  async dispatch.
+- For custom middleware that blocks on I/O wrap with
+  `middleware.Async(...)` so it only runs inside the worker. Raw
+  non-blocking middleware can be passed to `app.Use` directly.
+
+Implementation detail (not user-visible): the placement metadata
+lives in `gogo/internal/mwhint`, an internal package that bundled
+middleware imports but external code cannot.
+
+
 - CORS. **DONE** — `middleware.CORS` (PR #8).
 - Compression (gzip/brotli) — uWS has native compression for WS, HTTP
   needs Go layer; consider C++ side gzip. **DONE (gzip + deflate, sync

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"uwebsockets-go/gogo"
+	"uwebsockets-go/gogo/internal/mwhint"
 )
 
 // SessionLocalKey is the req.Local key carrying the *Session for the
@@ -150,7 +151,7 @@ func (s *Session) Destroy() {
 // middleware in this package follow the bare-noun convention
 // (Helmet, CORS, …) but for sessions the struct name carries the
 // weight since handlers reference it constantly.
-func NewSession(opt SessionOptions) gogo.Middleware {
+func NewSession(opt SessionOptions) mwhint.Hinted {
 	if len(opt.Secret) == 0 {
 		panic("gogo/middleware: Session requires a Secret")
 	}
@@ -174,7 +175,13 @@ func NewSession(opt SessionOptions) gogo.Middleware {
 	}
 	maxAge := int(opt.TTL.Seconds())
 
-	return func(next gogo.Handler) gogo.Handler {
+	// Default placement registers Session in both chains — the
+	// in-memory store doesn't block, so the middleware is safe
+	// either on the loop thread (sync routes) or in the worker
+	// (async routes). Deployments with a DB-backed Store that does
+	// block should wrap the bare closure with middleware.Async so
+	// the middleware only runs in the worker goroutine.
+	return mwhint.Hinted{Place: mwhint.Both, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler {
 		return func(res *gogo.Response, req *gogo.Request) {
 			if opt.SkipFunc != nil && opt.SkipFunc(req) {
 				next(res, req)
@@ -185,7 +192,7 @@ func NewSession(opt SessionOptions) gogo.Middleware {
 			next(res, req)
 			persistSession(sess, opt)
 		}
-	}
+	})}
 }
 
 func loadOrCreateSession(req *gogo.Request, res *gogo.Response, opt SessionOptions, maxAge int) *Session {

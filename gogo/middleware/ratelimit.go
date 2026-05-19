@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"uwebsockets-go/gogo"
+	"uwebsockets-go/gogo/internal/mwhint"
 )
 
 // RateLimitOptions configures the in-memory fixed-window rate limiter.
@@ -67,10 +68,10 @@ type RateLimitStore interface {
 //
 // In-memory backing is single-process. For multi-instance fleets
 // supply a Store implementation that consults a shared backend.
-func RateLimit(opt RateLimitOptions) gogo.Middleware {
+func RateLimit(opt RateLimitOptions) mwhint.Hinted {
 	if opt.Max <= 0 || opt.Window <= 0 {
 		// No-op pass-through when not configured.
-		return func(next gogo.Handler) gogo.Handler { return next }
+		return mwhint.Hinted{Place: mwhint.Sync, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler { return next })}
 	}
 	if opt.KeyFunc == nil {
 		opt.KeyFunc = func(req *gogo.Request) string { return req.IP() }
@@ -80,7 +81,7 @@ func RateLimit(opt RateLimitOptions) gogo.Middleware {
 	}
 	maxStr := strconv.Itoa(opt.Max)
 
-	return func(next gogo.Handler) gogo.Handler {
+	return mwhint.Hinted{Place: mwhint.Sync, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler {
 		return func(res *gogo.Response, req *gogo.Request) {
 			if opt.SkipFunc != nil && opt.SkipFunc(req) {
 				next(res, req)
@@ -111,7 +112,7 @@ func RateLimit(opt RateLimitOptions) gogo.Middleware {
 			}
 			next(res, req)
 		}
-	}
+	})}
 }
 
 // MemoryRateLimitStore is the default in-memory backend for RateLimit.

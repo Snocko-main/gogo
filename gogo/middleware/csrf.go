@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"uwebsockets-go/gogo"
+	"uwebsockets-go/gogo/internal/mwhint"
 )
 
 // CSRFLocalKey is the req.Local key carrying the CSRF token for the
@@ -87,7 +88,7 @@ type CSRFOptions struct {
 // classic HTML form posts need to include the token in the X-CSRF-
 // Token header via fetch or set it via a custom hidden-field flow
 // the handler manages.
-func CSRF(opt CSRFOptions) gogo.Middleware {
+func CSRF(opt CSRFOptions) mwhint.Hinted {
 	if len(opt.Secret) == 0 {
 		panic("gogo/middleware: CSRF requires a Secret")
 	}
@@ -111,7 +112,7 @@ func CSRF(opt CSRFOptions) gogo.Middleware {
 	}
 	headerLookup := lowercaseAscii(opt.HeaderName)
 
-	return func(next gogo.Handler) gogo.Handler {
+	return mwhint.Hinted{Place: mwhint.Sync, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler {
 		return func(res *gogo.Response, req *gogo.Request) {
 			if opt.SkipFunc != nil && opt.SkipFunc(req) {
 				next(res, req)
@@ -155,7 +156,7 @@ func CSRF(opt CSRFOptions) gogo.Middleware {
 			req.SetLocal(opt.LocalKey, token)
 			next(res, req)
 		}
-	}
+	})}
 }
 
 func csrfIsUnsafe(method string) bool {

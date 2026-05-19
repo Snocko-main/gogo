@@ -75,7 +75,7 @@ func main() {
 	// Async user-loader scoped to /api/*: runs on the goroutine that runs
 	// the user handler, so the simulated DB lookup is free to block. The
 	// resolved user is stashed on the request via SetLocal for the handler.
-	app.UseAsync("/api/*", func(next gogo.AsyncHandler) gogo.AsyncHandler {
+	app.Use("/api/*", func(next gogo.AsyncHandler) gogo.AsyncHandler {
 		return func(res *gogo.Response, req *gogo.Request) {
 			user, err := fakeUserLookup(req.Header("authorization"))
 			if err != nil {
