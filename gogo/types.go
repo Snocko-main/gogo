@@ -895,10 +895,12 @@ func (a *App) WebSocket(pattern string, behavior WebSocketBehavior) {
 //   - From a worker goroutine, single message: App.Publish. Measures
 //     ~750 ns/op on this VM end-to-end including cgo + heap copy +
 //     Loop::defer mutex + wakeup.
-//   - From a worker goroutine, many messages at once (fan-out, batch
-//     notification): App.PublishBatch — one cgo crossing + one defer
-//     mutex for the whole batch. ~10x faster than a Publish loop at
-//     batch size 100.
+//   - From a worker goroutine, two or more messages at once (fan-out,
+//     batch notification): App.PublishBatch — one cgo crossing + one
+//     defer mutex for the whole batch. Crossover is at N=2 on this
+//     VM (PublishBatch beats a Publish loop from there up), climbing
+//     to ~8x faster at N=100. See PublishBatch's godoc for the full
+//     measured curve.
 func (a *App) Publish(topic string, message []byte, opcode OpCode) {
 	a.inner.publish(topic, message, opcode)
 }
@@ -926,10 +928,19 @@ type PublishMessage struct {
 // dashboards. App.Publish in a loop pays the cgo + defer-mutex cost
 // per call; PublishBatch pays it once for the whole batch.
 //
-// BenchmarkAppPublishBatch shows ~10x throughput over a Publish
-// loop at batch size 100 (worker → uWS). Below ~5 items the per-op
-// savings get eaten by the Go-side packing cost; for small batches
-// stick with Publish.
+// Measured speedup over the equivalent App.Publish loop on this VM
+// (128-byte payload, 5 counts each, median ns per batch):
+//
+//	N=1     0.67x  (batch SLOWER — packing overhead > savings)
+//	N=2     1.49x
+//	N=5     2.61x
+//	N=10    2.92x
+//	N=50    6.24x
+//	N=100   8.41x
+//
+// Crossover is at N=2 — below that, single App.Publish is faster.
+// Per-publish cost drops from ~750 ns (App.Publish) to ~86 ns at
+// N=100, so batching pays off hard for real fan-out workloads.
 //
 // Each PublishMessage's Topic and Message bytes are copied before
 // the loop sees them, so caller buffers can be reused immediately.

@@ -151,6 +151,51 @@ func BenchmarkAppPublishBatch100(b *testing.B) {
 	}
 }
 
+// BenchmarkAppPublishCrossover sweeps batch sizes to find the
+// crossover point where PublishBatch starts beating a Publish loop.
+// Run with -bench=BenchmarkAppPublishCrossover and inspect the
+// per-publish cost (ns/op divided by N). Below the crossover,
+// PublishBatch's fixed Go-side packing cost (one buf slice +
+// one items slice) outweighs the cgo + defer-mutex savings; above
+// it, batching dominates.
+//
+// Reports two numbers per N: "loop" = N individual Publish calls,
+// "batch" = one PublishBatch of N items. Same payload size in both.
+func BenchmarkAppPublishCrossover(b *testing.B) {
+	for _, n := range []int{1, 2, 5, 10, 50, 100} {
+		app, _, teardown := startAppB(b, func(app *gogo.App) {
+			app.WebSocket("/ws", gogo.WebSocketBehavior{})
+		})
+		payload := make([]byte, 128)
+		batch := make([]gogo.PublishMessage, n)
+		for i := range batch {
+			batch[i] = gogo.PublishMessage{
+				Topic:   "bench/topic",
+				Message: payload,
+				OpCode:  gogo.Text,
+			}
+		}
+
+		b.Run(fmt.Sprintf("loop/N=%d", n), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				for j := 0; j < n; j++ {
+					app.Publish("bench/topic", payload, gogo.Text)
+				}
+			}
+		})
+		b.Run(fmt.Sprintf("batch/N=%d", n), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				app.PublishBatch(batch)
+			}
+		})
+		teardown()
+	}
+}
+
 // BenchmarkAppPublish1Sub: one connected subscriber, real fan-out.
 // Catches regressions in the full path (publish enqueue + loop drain
 // + frame write). The subscriber drains in a background goroutine
