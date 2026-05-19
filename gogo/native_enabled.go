@@ -439,16 +439,21 @@ func (r responseNative) header(key, value string) {
 
 // headersBatch ships count (name,value) pairs to uWS in a single
 // cgo crossing using the packed `key\0value\0key\0value\0` blob
-// format. Used by flushPendingHeaders when 2+ headers are buffered
-// — at 1 header the per-call overhead of building the blob isn't
-// worth it vs. the single header() crossing.
-func (r responseNative) headersBatch(blob string, count int) {
+// format. Takes []byte (not string) so the caller can reuse a
+// pooled buffer across requests — eliminates the per-request
+// heap allocation that strings.Builder would otherwise produce
+// at high RPS.
+//
+// Used by flushPendingHeaders when 2+ headers are buffered — at
+// 1 header the per-call overhead of packing the blob isn't worth
+// it vs. the single header() crossing.
+func (r responseNative) headersBatch(blob []byte, count int) {
 	if count == 0 || len(blob) == 0 {
 		return
 	}
 	C.uwsgo_res_write_headers_batch(
 		r.ptr,
-		unsafeStringData(blob), C.size_t(len(blob)),
+		(*C.char)(unsafe.Pointer(&blob[0])), C.size_t(len(blob)),
 		C.size_t(count),
 	)
 }

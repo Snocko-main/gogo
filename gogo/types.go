@@ -1969,6 +1969,21 @@ func (r *Response) Status(code int) *Response {
 	return r
 }
 
+// headerBlobPool holds the packing buffer used by
+// flushPendingHeaders for the 2+ headers path. Pooling the buffer
+// eliminates the per-request heap allocation that strings.Builder
+// otherwise produced — at 70k RPS that was ~18 MB/sec of garbage
+// that swamped the cgo savings the batch path was meant to
+// capture. The pool's New function pre-grows each fresh buffer to
+// 512 bytes (8 headers × 64 bytes average — wide enough to absorb
+// Helmet-sized stacks without ever reallocating).
+var headerBlobPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 512)
+		return &b
+	},
+}
+
 // flushPendingHeaders writes every buffered header to the wire.
 // Must be called after status was written (or auto-200'd). Resets
 // the buffer length to zero so the same response wrapper recycled
@@ -1978,10 +1993,11 @@ func (r *Response) Status(code int) *Response {
 //
 // One-header fast path uses the single-call header() bridge (one
 // cgo crossing). Two-or-more-headers batches the writes via
-// headersBatch() — packs the headers into a single key\0value\0…
-// blob and crosses once for the whole set. With CORS adding 3–4
+// headersBatch() — packs the headers into a pooled key\0value\0…
+// buffer and crosses once for the whole set. With CORS adding 3–4
 // headers per request this saves (N-1) cgo crossings per response
-// at the cost of one strings.Builder Grow + N append loops.
+// at the cost of the append loop. The buffer comes from a
+// sync.Pool so the hot path allocates nothing.
 func (r *Response) flushPendingHeaders() {
 	n := len(r.pendingHeaders)
 	if n == 0 {
@@ -1993,19 +2009,23 @@ func (r *Response) flushPendingHeaders() {
 		r.pendingHeaders = r.pendingHeaders[:0]
 		return
 	}
-	// 2+ headers: pack once, cross once.
-	var b strings.Builder
-	// Each pair contributes name + value + 2 separator NULs;
-	// 32 chars per pair is a conservative typical lower bound
-	// (auth headers, cache directives, etc. tend to land here).
-	b.Grow(n * 32)
+	// 2+ headers: pack once, cross once. Buffer is pooled to
+	// avoid per-request heap churn under sustained load.
+	bufp := headerBlobPool.Get().(*[]byte)
+	buf := (*bufp)[:0]
 	for _, h := range r.pendingHeaders {
-		b.WriteString(h.name)
-		b.WriteByte(0)
-		b.WriteString(h.value)
-		b.WriteByte(0)
+		buf = append(buf, h.name...)
+		buf = append(buf, 0)
+		buf = append(buf, h.value...)
+		buf = append(buf, 0)
 	}
-	r.inner.headersBatch(b.String(), n)
+	r.inner.headersBatch(buf, n)
+	// Stash the (possibly grown) backing array back into the pool
+	// so the next request inherits the capacity. Empty the buffer
+	// before return so a recycled []byte never carries stale
+	// content past a Get / Put boundary.
+	*bufp = buf[:0]
+	headerBlobPool.Put(bufp)
 	r.pendingHeaders = r.pendingHeaders[:0]
 }
 
