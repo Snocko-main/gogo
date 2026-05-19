@@ -279,16 +279,29 @@ is large.
 
 ### Middleware ecosystem (bundle as `gogo/middleware/*`)
 
-- CORS.
+- CORS. **DONE** — `middleware.CORS` (PR #8).
 - Compression (gzip/brotli) — uWS has native compression for WS, HTTP
-  needs Go layer; consider C++ side gzip.
+  needs Go layer; consider C++ side gzip. **DONE (gzip + deflate)** —
+  `middleware.Compress` via the new `Response.SetBodyEncoder` hook.
+  Brotli left to callers that import a brotli encoder and install
+  their own encoder; sync handlers only (async path bypasses encoder).
 - Helmet-style security headers (HSTS, X-Frame-Options, CSP).
-- CSRF (sync + signed cookie).
-- Rate limiter (in-memory + Redis).
-- Request ID.
-- Logger (bundle the example from `examples/authmw`).
-- Basic Auth, JWT verification.
-- Session middleware (cookie, server-side store).
+  **DONE** — `middleware.Helmet`.
+- CSRF (sync + signed cookie). **DONE** — `middleware.CSRF`
+  (double-submit cookie with HMAC-bound tokens).
+- Rate limiter (in-memory + Redis). **DONE (in-memory)** —
+  `middleware.RateLimit` with a pluggable `RateLimitStore` interface;
+  Redis backend is a future Store implementation.
+- Request ID. **DONE** — `middleware.RequestID` (PR #8).
+- Logger (bundle the example from `examples/authmw`). **DONE** —
+  `middleware.Logger` (PR #8).
+- Basic Auth, JWT verification. **DONE** — `middleware.BasicAuth`
+  and `middleware.JWT` (HS256/384/512; asymmetric algorithms left
+  out by design — wire them with a custom middleware).
+- Session middleware (cookie, server-side store). **DONE** —
+  `middleware.NewSession` + `*middleware.Session` handle, with a
+  built-in `MemorySessionStore` and a `SessionStore` interface for
+  Redis / SQL backends.
 
 ### WebSocket
 

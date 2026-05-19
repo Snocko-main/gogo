@@ -1643,6 +1643,23 @@ type Response struct {
 	// of the order the caller used. Sync path only; async mode uses
 	// asyncState's pre-built status/CT pair.
 	pendingHeaders []responseHeader
+
+	// encoder, when non-nil, transforms the response body before it
+	// goes to uWS. Used by compression middleware (gzip / brotli) to
+	// buffer the handler's Write / End / Send / JSON output, compress
+	// the buffered bytes, and attach Content-Encoding before the
+	// status line is flushed. Sync path only — async handlers bypass
+	// the encoder because the cgo defer-send shim has no slot for
+	// arbitrary response headers.
+	encoder *bodyEncoder
+}
+
+// bodyEncoder is the staging buffer + transformer used to defer
+// response body emission until middleware can compress it.
+type bodyEncoder struct {
+	buf     strings.Builder
+	encode  func(body []byte, contentType string) (encoded []byte, contentEncoding string)
+	applied bool
 }
 
 type asyncState struct {
@@ -1750,6 +1767,10 @@ func (r *Response) Write(body string) *Response {
 		r.async.body.WriteString(body)
 		return r
 	}
+	if r.encoder != nil {
+		r.encoder.buf.WriteString(body)
+		return r
+	}
 	r.ensureStatusSync()
 	r.flushPendingHeaders()
 	r.inner.write(body)
@@ -1762,6 +1783,10 @@ func (r *Response) End(body string) {
 		r.async.body.WriteString(body)
 		r.flushAsync()
 		return
+	}
+	if r.encoder != nil && !r.encoder.applied {
+		r.encoder.buf.WriteString(body)
+		body = r.applyEncoder("")
 	}
 	r.ensureStatusSync()
 	r.flushPendingHeaders()
@@ -1786,6 +1811,11 @@ func (r *Response) Send(code int, contentType, body string) {
 		validateHeaderValue("Content-Type", contentType)
 	}
 	line := statusLine(code)
+
+	if r.encoder != nil && !r.encoder.applied && r.async == nil {
+		r.encoder.buf.WriteString(body)
+		body = r.applyEncoder(contentType)
+	}
 
 	// Async mode: try the zero-cgo shared-memory path first. Falls back
 	// to the cgo defer path when the body exceeds inline capacity.
@@ -2281,7 +2311,70 @@ func (r *Response) releaseRef() {
 	if r.pendingHeaders != nil {
 		r.pendingHeaders = r.pendingHeaders[:0]
 	}
+	r.encoder = nil
 	responsePool.Put(r)
+}
+
+// SetBodyEncoder installs a body transformer to apply right before
+// the response body is flushed to uWS. The encoder receives the
+// concatenated bytes from any Write / End / Send / JSON calls, and
+// returns the encoded body together with a Content-Encoding value to
+// attach (or empty string to skip encoding and emit the original
+// bytes unchanged).
+//
+// Compression middleware uses this hook to transparently gzip /
+// brotli the handler's output without requiring handlers to be aware
+// of the encoding. Setting an encoder is sync-only; async handlers
+// (Response.Async, PostAsync workers) bypass the encoder because the
+// shared-memory / cgo defer paths have no slot for arbitrary
+// response headers.
+//
+// Only one encoder per response — calling SetBodyEncoder a second
+// time replaces the first. Once the encoder has run (on End or Send)
+// it is consumed; subsequent writes go through the normal direct
+// path.
+func (r *Response) SetBodyEncoder(encode func(body []byte, contentType string) (encoded []byte, contentEncoding string)) {
+	if encode == nil {
+		r.encoder = nil
+		return
+	}
+	r.encoder = &bodyEncoder{encode: encode}
+}
+
+// applyEncoder runs the buffered body through the encoder, attaches
+// Content-Encoding and Vary headers if the encoder returned a
+// non-empty encoding, and returns the encoded body string ready to
+// hand to uWS. Marks the encoder as applied so a follow-up Write
+// after End (programmer error) takes the direct path instead of
+// double-encoding.
+//
+// contentTypeHint is the Content-Type passed inline to Send (which
+// goes straight to uWS, bypassing pendingHeaders). When empty,
+// applyEncoder scans pendingHeaders for an explicit Content-Type so
+// the encoder can decide compressibility from the MIME type.
+func (r *Response) applyEncoder(contentTypeHint string) string {
+	e := r.encoder
+	if e == nil || e.applied {
+		return ""
+	}
+	ct := contentTypeHint
+	if ct == "" {
+		for _, h := range r.pendingHeaders {
+			if strings.EqualFold(h.name, "Content-Type") {
+				ct = h.value
+				break
+			}
+		}
+	}
+	encoded, contentEncoding := e.encode([]byte(e.buf.String()), ct)
+	e.applied = true
+	if contentEncoding != "" {
+		r.pendingHeaders = append(r.pendingHeaders,
+			responseHeader{name: "Content-Encoding", value: contentEncoding},
+			responseHeader{name: "Vary", value: "Accept-Encoding"},
+		)
+	}
+	return string(encoded)
 }
 
 // finishAsync returns the asyncState to its pool, then drops one wrapper
