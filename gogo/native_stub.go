@@ -73,6 +73,11 @@ func (requestNative) query() string            { return "" }
 func (requestNative) queryParam(string) string { return "" }
 func (requestNative) headersAll() []byte       { return nil }
 
-func (websocketNative) send([]byte, OpCode) bool       { return false }
-func (websocketNative) sendString(string, OpCode) bool { return false }
-func (websocketNative) end(int, string)                {}
+func (websocketNative) send([]byte, OpCode) bool             { return false }
+func (websocketNative) sendString(string, OpCode) bool       { return false }
+func (websocketNative) end(int, string)                      {}
+func (websocketNative) subscribe(string) bool                { return false }
+func (websocketNative) unsubscribe(string) bool              { return false }
+func (websocketNative) publish(string, []byte, OpCode) bool  { return false }
+
+func (appNative) publish(string, []byte, OpCode) {}

@@ -863,6 +863,33 @@ func (a *App) WebSocket(pattern string, behavior WebSocketBehavior) {
 	a.inner.websocket(pattern, behavior)
 }
 
+// Publish broadcasts a WebSocket message to every subscriber of topic.
+// Use it from outside a WebSocket handler — typically a worker
+// goroutine that finished some work and wants to notify connected
+// clients — where calling WebSocket.Publish directly would touch
+// uWS's loop-thread-local TopicTree from the wrong thread.
+//
+// The publish is dispatched onto the App's loop, so it is safe to
+// call from any goroutine. The topic + message bytes are copied
+// before scheduling, so the caller's buffers can be reused or
+// reclaimed as soon as Publish returns.
+//
+// Topics are exact-match strings — uWS's TopicTree v20 does not
+// support MQTT-style "+" / "#" wildcards. Publish to the same string
+// each subscriber used in ws.Subscribe.
+//
+// opcode picks the WebSocket frame type (Text / Binary). For JSON
+// payloads use Text so browser clients receive them as strings via
+// onmessage.data.
+//
+// Returns immediately — delivery happens asynchronously on the loop.
+// There is no error / delivery-count return because the loop may not
+// have processed the publish yet when this returns; uWS itself does
+// not surface that count back to the publisher.
+func (a *App) Publish(topic string, message []byte, opcode OpCode) {
+	a.inner.publish(topic, message, opcode)
+}
+
 // Router scopes middleware and a path prefix to a subtree of routes. Created
 // by App.Group or Router.Group. Routes registered through a Router have the
 // Router's prefix prepended and inherit the Router's middleware stack on top
@@ -3070,4 +3097,41 @@ func (ws *WebSocket) SendText(message string) bool {
 // End closes the WebSocket connection.
 func (ws *WebSocket) End(code int, message string) {
 	ws.inner.end(code, message)
+}
+
+// Subscribe enrolls this WebSocket as a subscriber to topic. Future
+// App.Publish / WebSocket.Publish calls targeting the same topic
+// string deliver to this connection. Returns true when the
+// subscription is now active (either added by this call or already
+// in place).
+//
+// Topics are exact-match strings — uWS's TopicTree in v20 does not
+// support MQTT-style "+" / "#" wildcards. Build your own fan-out
+// scheme (e.g. subscribe to every relevant topic at connect time)
+// if you need pattern matching.
+//
+// Must be called from inside an Open / Message / Close handler — the
+// underlying TopicTree is loop-thread-local; calling Subscribe from
+// a worker goroutine corrupts uWS state.
+func (ws *WebSocket) Subscribe(topic string) bool {
+	return ws.inner.subscribe(topic)
+}
+
+// Unsubscribe removes this WebSocket's subscription to topic. Returns
+// true when a subscription existed and was removed. Like Subscribe,
+// must be called from a WebSocket handler.
+func (ws *WebSocket) Unsubscribe(topic string) bool {
+	return ws.inner.unsubscribe(topic)
+}
+
+// Publish broadcasts message to every subscriber of topic, including
+// this WebSocket if it is subscribed. opcode picks the WebSocket
+// frame type (Text or Binary). Returns true when the message was
+// queued for delivery to at least one subscriber.
+//
+// Use App.Publish to broadcast from outside a WebSocket handler
+// (e.g. from a worker goroutine that finished a long task). This
+// method must be called on the loop thread.
+func (ws *WebSocket) Publish(topic string, message []byte, opcode OpCode) bool {
+	return ws.inner.publish(topic, message, opcode)
 }

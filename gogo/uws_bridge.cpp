@@ -1142,3 +1142,35 @@ extern "C" int uwsgo_ws_send(uwsgo_ws_t *ws, const char *message, size_t message
 extern "C" void uwsgo_ws_end(uwsgo_ws_t *ws, int code, const char *message, size_t message_len) {
     reinterpret_cast<GoWebSocket *>(ws)->end(code, std::string_view(message, message_len));
 }
+
+extern "C" int uwsgo_ws_subscribe(uwsgo_ws_t *ws, const char *topic, size_t topic_len) {
+    return reinterpret_cast<GoWebSocket *>(ws)
+        ->subscribe(std::string_view(topic, topic_len)) ? 1 : 0;
+}
+
+extern "C" int uwsgo_ws_unsubscribe(uwsgo_ws_t *ws, const char *topic, size_t topic_len) {
+    return reinterpret_cast<GoWebSocket *>(ws)
+        ->unsubscribe(std::string_view(topic, topic_len)) ? 1 : 0;
+}
+
+extern "C" int uwsgo_ws_publish(uwsgo_ws_t *ws, const char *topic, size_t topic_len,
+        const char *message, size_t message_len, int opcode) {
+    return reinterpret_cast<GoWebSocket *>(ws)->publish(
+        std::string_view(topic, topic_len),
+        std::string_view(message, message_len),
+        static_cast<uWS::OpCode>(opcode)) ? 1 : 0;
+}
+
+extern "C" void uwsgo_app_publish(uwsgo_app_t *app, const char *topic, size_t topic_len,
+        const char *message, size_t message_len, int opcode) {
+    // Topic + message copied onto the heap because the cgo caller's
+    // buffers go out of scope as soon as this function returns; the
+    // deferred publish runs on the loop later. uWS::Loop::defer is
+    // thread-safe, so this function can be called from any goroutine.
+    std::string topic_copy(topic, topic_len);
+    std::string message_copy(message, message_len);
+    auto op = static_cast<uWS::OpCode>(opcode);
+    app->loop->defer([app, t = std::move(topic_copy), m = std::move(message_copy), op]() {
+        app->app->publish(t, m, op);
+    });
+}

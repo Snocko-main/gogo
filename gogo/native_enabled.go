@@ -861,6 +861,28 @@ func (ws websocketNative) end(code int, message string) {
 	C.uwsgo_ws_end(ws.ptr, C.int(code), unsafeStringData(message), C.size_t(len(message)))
 }
 
+func (ws websocketNative) subscribe(topic string) bool {
+	return C.uwsgo_ws_subscribe(ws.ptr, unsafeStringData(topic), C.size_t(len(topic))) != 0
+}
+
+func (ws websocketNative) unsubscribe(topic string) bool {
+	return C.uwsgo_ws_unsubscribe(ws.ptr, unsafeStringData(topic), C.size_t(len(topic))) != 0
+}
+
+func (ws websocketNative) publish(topic string, message []byte, opcode OpCode) bool {
+	return C.uwsgo_ws_publish(ws.ptr,
+		unsafeStringData(topic), C.size_t(len(topic)),
+		unsafeByteData(message), C.size_t(len(message)),
+		C.int(opcode)) != 0
+}
+
+func (a *appNative) publish(topic string, message []byte, opcode OpCode) {
+	C.uwsgo_app_publish(a.ptr,
+		unsafeStringData(topic), C.size_t(len(topic)),
+		unsafeByteData(message), C.size_t(len(message)),
+		C.int(opcode))
+}
+
 //export uwsgoHandleHTTP
 func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req_t,
 	methodPtr *C.char, methodLen C.size_t,
