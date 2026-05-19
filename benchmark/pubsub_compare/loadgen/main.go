@@ -185,11 +185,7 @@ func main() {
 
 	// Phase 2 — open conns
 	var counter atomic.Int64
-	type holder struct {
-		conn net.Conn
-	}
-	holders := make([]*holder, 0, *conns)
-	var hMu sync.Mutex
+	conns_ := make([]net.Conn, 0, *conns)
 
 	connectStart := time.Now()
 	var failed atomic.Int64
@@ -197,20 +193,20 @@ func main() {
 	// layer from getting buried under a burst of upgrades and gives
 	// each Open callback a tick to settle. Total connect time at
 	// 1000 conns is ~1.5 s on this VM, which is fine for a once-per
-	// run setup phase.
+	// run setup phase. Sequential also means no mutex on conns_.
 	for i := 0; i < *conns; i++ {
 		c, br, err := dialWS(*target, "/ws")
 		if err != nil {
 			failed.Add(1)
 			continue
 		}
-		holders = append(holders, &holder{conn: c})
+		conns_ = append(conns_, c)
 		go readFrames(br, &counter)
 		time.Sleep(1 * time.Millisecond)
 	}
 	connectElapsed := time.Since(connectStart)
 
-	established := len(holders)
+	established := len(conns_)
 	// Wait until the server's own conn counter stabilizes (Open
 	// handlers run async on the loop after the TCP handshake
 	// returns to the client). Poll /stat for up to 3s.
@@ -297,11 +293,9 @@ func main() {
 
 	// Close all conns gracefully so the server's RSS reflects the
 	// post-drain steady state on the next snapshot.
-	hMu.Lock()
-	for _, h := range holders {
-		h.conn.Close()
+	for _, c := range conns_ {
+		c.Close()
 	}
-	hMu.Unlock()
 	time.Sleep(500 * time.Millisecond)
 	postStat, _ := fetchStat(base)
 

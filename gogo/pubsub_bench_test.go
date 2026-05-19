@@ -104,53 +104,6 @@ func BenchmarkAppPublishNoSubs(b *testing.B) {
 	}
 }
 
-// BenchmarkAppPublishLoop100 publishes 100 messages via individual
-// app.Publish calls. Paired with BenchmarkAppPublishBatch100 to
-// quantify the batch-API speedup. ns/op is per BATCH (100
-// messages), so divide by 100 for per-publish cost.
-func BenchmarkAppPublishLoop100(b *testing.B) {
-	app, _, teardown := startAppB(b, func(app *gogo.App) {
-		app.WebSocket("/ws", gogo.WebSocketBehavior{})
-	})
-	b.Cleanup(teardown)
-
-	payload := make([]byte, 128)
-
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		for j := 0; j < 100; j++ {
-			app.Publish("bench/topic", payload, gogo.Text)
-		}
-	}
-}
-
-// BenchmarkAppPublishBatch100 publishes 100 messages via one
-// PublishBatch call. ns/op is per batch (100 messages); compare
-// against BenchmarkAppPublishLoop100 above.
-func BenchmarkAppPublishBatch100(b *testing.B) {
-	app, _, teardown := startAppB(b, func(app *gogo.App) {
-		app.WebSocket("/ws", gogo.WebSocketBehavior{})
-	})
-	b.Cleanup(teardown)
-
-	payload := make([]byte, 128)
-	batch := make([]gogo.PublishMessage, 100)
-	for i := range batch {
-		batch[i] = gogo.PublishMessage{
-			Topic:   "bench/topic",
-			Message: payload,
-			OpCode:  gogo.Text,
-		}
-	}
-
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		app.PublishBatch(batch)
-	}
-}
-
 // BenchmarkAppPublishCrossover sweeps batch sizes to find the
 // crossover point where PublishBatch starts beating a Publish loop.
 // Run with -bench=BenchmarkAppPublishCrossover and inspect the

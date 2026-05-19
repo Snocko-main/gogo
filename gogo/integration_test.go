@@ -4221,6 +4221,97 @@ func TestWebSocketPublishBatch(t *testing.T) {
 	app.PublishBatch([]gogo.PublishMessage{})
 }
 
+// TestWebSocketPublishConcurrent verifies the thread-safety claim
+// on App.Publish and App.PublishBatch: dozens of worker goroutines
+// can hammer them simultaneously without a race and every message
+// the workers issued reaches the subscriber. Run under -race to
+// catch any cgo/Loop::defer misuse that escapes the unit tests.
+//
+// A single subscriber subscribes to "concurrent". 50 goroutines
+// each issue 200 publishes (50 single + 50 batches of 3, mixed).
+// Expected delivery = 50 × (50 + 50*3) = 10000 messages.
+func TestWebSocketPublishConcurrent(t *testing.T) {
+	const (
+		workers          = 50
+		singlesPerWorker = 50
+		batchesPerWorker = 50
+		batchSize        = 3
+	)
+	expected := workers * (singlesPerWorker + batchesPerWorker*batchSize)
+
+	appCh := make(chan *gogo.App, 1)
+	port, teardown := startApp(t, func(app *gogo.App) {
+		appCh <- app
+		app.WebSocket("/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				ws.Subscribe("concurrent")
+			},
+			MaxBackpressure: 64 * 1024 * 1024,
+		})
+	})
+	defer teardown()
+	app := <-appCh
+
+	sub, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer sub.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	// Count messages as they arrive on the subscriber. The drain
+	// goroutine runs until it has seen the expected count or the
+	// 10 s safety deadline trips.
+	var received atomic.Int64
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for received.Load() < int64(expected) {
+			if _, err := sub.ReadText(10 * time.Second); err != nil {
+				return
+			}
+			received.Add(1)
+		}
+	}()
+
+	var startWg, doneWg sync.WaitGroup
+	startWg.Add(1)
+	doneWg.Add(workers)
+	for w := 0; w < workers; w++ {
+		w := w
+		go func() {
+			defer doneWg.Done()
+			startWg.Wait() // align starts to maximize contention
+			payload := []byte(fmt.Sprintf("w%d", w))
+			batch := make([]gogo.PublishMessage, batchSize)
+			for i := range batch {
+				batch[i] = gogo.PublishMessage{
+					Topic:   "concurrent",
+					Message: payload,
+					OpCode:  gogo.Text,
+				}
+			}
+			for i := 0; i < singlesPerWorker; i++ {
+				app.Publish("concurrent", payload, gogo.Text)
+			}
+			for i := 0; i < batchesPerWorker; i++ {
+				app.PublishBatch(batch)
+			}
+		}()
+	}
+	startWg.Done() // release all workers at once
+	doneWg.Wait()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timeout waiting for %d messages, got %d", expected, received.Load())
+	}
+	if got := received.Load(); got != int64(expected) {
+		t.Errorf("delivery mismatch: got %d, want %d", got, expected)
+	}
+}
+
 // TestWebSocketMultiTopic: a single socket can be subscribed to
 // multiple topics. Publishes route only to subscribers of the exact
 // topic string — uWS v20 has no wildcard support, so this also
