@@ -863,6 +863,95 @@ func (a *App) WebSocket(pattern string, behavior WebSocketBehavior) {
 	a.inner.websocket(pattern, behavior)
 }
 
+// Publish broadcasts a WebSocket message to every subscriber of topic.
+// Use it from outside a WebSocket handler — typically a worker
+// goroutine that finished some work and wants to notify connected
+// clients — where calling WebSocket.Publish directly would touch
+// uWS's loop-thread-local TopicTree from the wrong thread.
+//
+// The publish is dispatched onto the App's loop, so it is safe to
+// call from any goroutine. The topic + message bytes are copied
+// before scheduling, so the caller's buffers can be reused or
+// reclaimed as soon as Publish returns.
+//
+// Topics are exact-match strings — uWS's TopicTree v20 does not
+// support MQTT-style "+" / "#" wildcards. Publish to the same string
+// each subscriber used in ws.Subscribe.
+//
+// opcode picks the WebSocket frame type (Text / Binary). For JSON
+// payloads use Text so browser clients receive them as strings via
+// onmessage.data.
+//
+// Returns immediately — delivery happens asynchronously on the loop.
+// There is no error / delivery-count return because the loop may not
+// have processed the publish yet when this returns; uWS itself does
+// not surface that count back to the publisher.
+//
+// Performance — pick the right entry point:
+//   - Inside an Open/Message/Close handler (loop thread): prefer
+//     WebSocket.Publish. It bypasses the cross-thread defer mutex
+//     and message copy — the cost is just a cgo crossing plus uWS's
+//     own internal publish work.
+//   - From a worker goroutine, single message: App.Publish. Measures
+//     ~750 ns/op on this VM end-to-end including cgo + heap copy +
+//     Loop::defer mutex + wakeup.
+//   - From a worker goroutine, two or more messages at once (fan-out,
+//     batch notification): App.PublishBatch — one cgo crossing + one
+//     defer mutex for the whole batch. Crossover is at N=2 on this
+//     VM (PublishBatch beats a Publish loop from there up), climbing
+//     to ~8x faster at N=100. See PublishBatch's godoc for the full
+//     measured curve.
+func (a *App) Publish(topic string, message []byte, opcode OpCode) {
+	a.inner.publish(topic, message, opcode)
+}
+
+// PublishMessage is one entry in an App.PublishBatch call.
+//
+// Topic is the exact subscriber topic string (no wildcards — see
+// App.Publish). Message is the payload bytes. OpCode picks Text vs
+// Binary framing per-message, so a single batch can mix the two.
+type PublishMessage struct {
+	Topic   string
+	Message []byte
+	OpCode  OpCode
+}
+
+// PublishBatch broadcasts N WebSocket messages in a single cgo
+// crossing with one Loop::defer (one mutex acquire, one wakeup) on
+// the loop side. The whole batch is packed into one contiguous Go
+// buffer + a parallel POD-only metadata array, copied once into the
+// loop's heap, then iterated under the defer.
+//
+// Use this when a worker goroutine needs to push many messages at
+// once — for example, a fan-out notification that has to land on
+// multiple topics, or a periodic stats-tick that updates several
+// dashboards. App.Publish in a loop pays the cgo + defer-mutex cost
+// per call; PublishBatch pays it once for the whole batch.
+//
+// Measured speedup over the equivalent App.Publish loop on this VM
+// (128-byte payload, 5 counts each, median ns per batch):
+//
+//	N=1     0.67x  (batch SLOWER — packing overhead > savings)
+//	N=2     1.49x
+//	N=5     2.61x
+//	N=10    2.92x
+//	N=50    6.24x
+//	N=100   8.41x
+//
+// Crossover is at N=2 — below that, single App.Publish is faster.
+// Per-publish cost drops from ~750 ns (App.Publish) to ~86 ns at
+// N=100, so batching pays off hard for real fan-out workloads.
+//
+// Each PublishMessage's Topic and Message bytes are copied before
+// the loop sees them, so caller buffers can be reused immediately.
+// Mixed Text/Binary opcodes in one batch are fine.
+//
+// Returns immediately. Like Publish, delivery happens later on the
+// loop and there is no per-message delivery-count.
+func (a *App) PublishBatch(msgs []PublishMessage) {
+	a.inner.publishBatch(msgs)
+}
+
 // Router scopes middleware and a path prefix to a subtree of routes. Created
 // by App.Group or Router.Group. Routes registered through a Router have the
 // Router's prefix prepended and inherit the Router's middleware stack on top
@@ -3070,4 +3159,53 @@ func (ws *WebSocket) SendText(message string) bool {
 // End closes the WebSocket connection.
 func (ws *WebSocket) End(code int, message string) {
 	ws.inner.end(code, message)
+}
+
+// Subscribe enrolls this WebSocket as a subscriber to topic. Future
+// App.Publish / WebSocket.Publish calls targeting the same topic
+// string deliver to this connection. Returns true when the
+// subscription is now active (either added by this call or already
+// in place).
+//
+// Topics are exact-match strings — uWS's TopicTree in v20 does not
+// support MQTT-style "+" / "#" wildcards. Build your own fan-out
+// scheme (e.g. subscribe to every relevant topic at connect time)
+// if you need pattern matching.
+//
+// Must be called from inside an Open / Message / Close handler — the
+// underlying TopicTree is loop-thread-local; calling Subscribe from
+// a worker goroutine corrupts uWS state.
+func (ws *WebSocket) Subscribe(topic string) bool {
+	return ws.inner.subscribe(topic)
+}
+
+// Unsubscribe removes this WebSocket's subscription to topic. Returns
+// true when a subscription existed and was removed. Like Subscribe,
+// must be called from a WebSocket handler.
+func (ws *WebSocket) Unsubscribe(topic string) bool {
+	return ws.inner.unsubscribe(topic)
+}
+
+// Publish broadcasts message to every OTHER subscriber of topic.
+// uWS deliberately excludes the publishing socket from its own
+// broadcast — per WebSocket.h: "Publish as sender, does not receive
+// its own messages even if subscribed to relevant topics" — so if
+// you want every subscriber including the caller, use App.Publish
+// instead.
+//
+// opcode picks the WebSocket frame type (Text or Binary). Returns
+// true when the message was queued for delivery to at least one
+// subscriber.
+//
+// This is the fast path: no cross-thread defer, no message copy,
+// just a cgo crossing into uWS's TopicTree publish. Use it from
+// Open/Message/Close handlers wherever possible. App.Publish exists
+// specifically for the worker-goroutine case where you don't have
+// a live WebSocket pointer on the loop thread.
+//
+// Calling this from off the loop thread (e.g. a goroutine you
+// spawned from a handler) corrupts uWS state — the WebSocket
+// pointer is only valid on the loop.
+func (ws *WebSocket) Publish(topic string, message []byte, opcode OpCode) bool {
+	return ws.inner.publish(topic, message, opcode)
 }

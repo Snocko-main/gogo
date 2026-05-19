@@ -3981,7 +3981,387 @@ func TestParseBodyDirect(t *testing.T) {
 	}
 }
 
-// TestMultipartIterate: ParseMultipart yields each part with the
+// TestWebSocketSubscribePublish: when one socket publishes via
+// ws.Publish, every OTHER subscriber of the topic gets the message.
+// uWS deliberately excludes the publishing socket from its own
+// broadcast (per WebSocket.h: "Publish as sender, does not receive
+// its own messages even if subscribed to relevant topics") — the
+// non-publishing subscriber receives the message and the publisher
+// itself does not. Use App.Publish (covered separately) when the
+// caller wants the publishing socket to also receive the message.
+func TestWebSocketSubscribePublish(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.WebSocket("/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				ws.Subscribe("room")
+			},
+			Message: func(ws *gogo.WebSocket, msg []byte, op gogo.OpCode) {
+				ws.Publish("room", msg, op)
+			},
+		})
+	})
+	defer teardown()
+
+	a, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial a: %v", err)
+	}
+	defer a.Close()
+	b, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial b: %v", err)
+	}
+	defer b.Close()
+	// Let both Open handlers fire and subscribe before a publishes.
+	time.Sleep(50 * time.Millisecond)
+
+	if err := a.SendText("hello world"); err != nil {
+		t.Fatalf("a.SendText: %v", err)
+	}
+
+	// B (non-publisher subscriber) receives the broadcast.
+	gotB, err := b.ReadText(2 * time.Second)
+	if err != nil {
+		t.Fatalf("b.ReadText: %v", err)
+	}
+	if gotB != "hello world" {
+		t.Errorf("b received %q, want %q", gotB, "hello world")
+	}
+	// A (publisher) does NOT receive its own broadcast — uWS skips it.
+	if err := a.expectNoMessage(300 * time.Millisecond); err != nil {
+		t.Errorf("publisher should not receive its own publish: %v", err)
+	}
+}
+
+// TestWebSocketAppPublish: App.Publish from a Go worker goroutine
+// reaches every subscriber on the loop without the publisher ever
+// being on the loop thread.
+func TestWebSocketAppPublish(t *testing.T) {
+	type appPub struct {
+		app *gogo.App
+		mu  sync.Mutex
+	}
+	captured := &appPub{}
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		captured.mu.Lock()
+		captured.app = app
+		captured.mu.Unlock()
+		app.WebSocket("/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				ws.Subscribe("news")
+			},
+		})
+	})
+	defer teardown()
+
+	client, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+
+	// Give the Open handler a moment to run + subscribe before
+	// publishing — the subscribe happens on the loop and we don't
+	// have a sync signal otherwise.
+	time.Sleep(50 * time.Millisecond)
+
+	// Publish from a worker goroutine — App.Publish must be
+	// thread-safe.
+	done := make(chan struct{})
+	go func() {
+		captured.mu.Lock()
+		a := captured.app
+		captured.mu.Unlock()
+		a.Publish("news", []byte("broadcast 1"), gogo.Text)
+		a.Publish("news", []byte("broadcast 2"), gogo.Text)
+		close(done)
+	}()
+	<-done
+
+	got1, err := client.ReadText(2 * time.Second)
+	if err != nil {
+		t.Fatalf("read 1: %v", err)
+	}
+	if got1 != "broadcast 1" {
+		t.Errorf("msg 1: got %q, want %q", got1, "broadcast 1")
+	}
+	got2, err := client.ReadText(2 * time.Second)
+	if err != nil {
+		t.Fatalf("read 2: %v", err)
+	}
+	if got2 != "broadcast 2" {
+		t.Errorf("msg 2: got %q, want %q", got2, "broadcast 2")
+	}
+}
+
+// TestWebSocketUnsubscribe: after Unsubscribe, the connection no
+// longer receives messages on the topic.
+func TestWebSocketUnsubscribe(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.WebSocket("/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				ws.Subscribe("alerts")
+			},
+			Message: func(ws *gogo.WebSocket, msg []byte, op gogo.OpCode) {
+				switch string(msg) {
+				case "leave":
+					ws.Unsubscribe("alerts")
+					ws.Send([]byte("left"), gogo.Text)
+				case "ping":
+					ws.Publish("alerts", []byte("pong"), gogo.Text)
+				}
+			},
+		})
+	})
+	defer teardown()
+
+	subscriber, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial subscriber: %v", err)
+	}
+	defer subscriber.Close()
+	publisher, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial publisher: %v", err)
+	}
+	defer publisher.Close()
+
+	// Sanity: subscriber receives broadcasts.
+	if err := publisher.SendText("ping"); err != nil {
+		t.Fatalf("send ping: %v", err)
+	}
+	got, err := subscriber.ReadText(2 * time.Second)
+	if err != nil {
+		t.Fatalf("read pre-unsub: %v", err)
+	}
+	if got != "pong" {
+		t.Errorf("pre-unsub: got %q, want pong", got)
+	}
+
+	// Subscriber unsubscribes.
+	if err := subscriber.SendText("leave"); err != nil {
+		t.Fatalf("send leave: %v", err)
+	}
+	confirm, err := subscriber.ReadText(2 * time.Second)
+	if err != nil {
+		t.Fatalf("read leave-confirm: %v", err)
+	}
+	if confirm != "left" {
+		t.Errorf("leave confirm: got %q, want left", confirm)
+	}
+
+	// Publisher broadcasts again — subscriber should NOT receive.
+	if err := publisher.SendText("ping"); err != nil {
+		t.Fatalf("send ping 2: %v", err)
+	}
+	if err := subscriber.expectNoMessage(300 * time.Millisecond); err != nil {
+		t.Errorf("subscriber still receiving after unsub: %v", err)
+	}
+}
+
+// TestWebSocketPublishBatch covers the batched cross-thread publish
+// API: one cgo crossing for N messages, mixed topics + opcodes,
+// caller buffers reusable immediately. A subscriber registered to
+// two topics receives only the messages on its topics; the third
+// topic in the batch has no subscriber and is dropped silently.
+func TestWebSocketPublishBatch(t *testing.T) {
+	appCh := make(chan *gogo.App, 1)
+	port, teardown := startApp(t, func(app *gogo.App) {
+		appCh <- app
+		app.WebSocket("/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				ws.Subscribe("alerts")
+				ws.Subscribe("news")
+			},
+		})
+	})
+	defer teardown()
+	app := <-appCh
+
+	sub, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer sub.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	// Reusable buffer: PublishBatch must copy bytes before returning
+	// so we can mutate this immediately afterward without affecting
+	// the in-flight publish.
+	payload := []byte("first")
+	batch := []gogo.PublishMessage{
+		{Topic: "alerts", Message: payload, OpCode: gogo.Text},
+		{Topic: "news", Message: []byte("second"), OpCode: gogo.Text},
+		{Topic: "private", Message: []byte("dropped"), OpCode: gogo.Text}, // no subscribers
+	}
+	app.PublishBatch(batch)
+	// Mutate caller buffer right away — must NOT affect delivery.
+	for i := range payload {
+		payload[i] = 'X'
+	}
+
+	got1, err := sub.ReadText(2 * time.Second)
+	if err != nil {
+		t.Fatalf("read 1: %v", err)
+	}
+	got2, err := sub.ReadText(2 * time.Second)
+	if err != nil {
+		t.Fatalf("read 2: %v", err)
+	}
+	if got1 != "first" || got2 != "second" {
+		t.Errorf("batch delivery: got %q, %q; want \"first\", \"second\"", got1, got2)
+	}
+	if err := sub.expectNoMessage(300 * time.Millisecond); err != nil {
+		t.Errorf("unexpected extra message: %v", err)
+	}
+
+	// Empty batch is a no-op (no panic, no cgo crossing).
+	app.PublishBatch(nil)
+	app.PublishBatch([]gogo.PublishMessage{})
+}
+
+// TestWebSocketPublishConcurrent verifies the thread-safety claim
+// on App.Publish and App.PublishBatch: dozens of worker goroutines
+// can hammer them simultaneously without a race and every message
+// the workers issued reaches the subscriber. Run under -race to
+// catch any cgo/Loop::defer misuse that escapes the unit tests.
+//
+// A single subscriber subscribes to "concurrent". 50 goroutines
+// each issue 200 publishes (50 single + 50 batches of 3, mixed).
+// Expected delivery = 50 × (50 + 50*3) = 10000 messages.
+func TestWebSocketPublishConcurrent(t *testing.T) {
+	const (
+		workers          = 50
+		singlesPerWorker = 50
+		batchesPerWorker = 50
+		batchSize        = 3
+	)
+	expected := workers * (singlesPerWorker + batchesPerWorker*batchSize)
+
+	appCh := make(chan *gogo.App, 1)
+	port, teardown := startApp(t, func(app *gogo.App) {
+		appCh <- app
+		app.WebSocket("/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				ws.Subscribe("concurrent")
+			},
+			MaxBackpressure: 64 * 1024 * 1024,
+		})
+	})
+	defer teardown()
+	app := <-appCh
+
+	sub, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer sub.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	// Count messages as they arrive on the subscriber. The drain
+	// goroutine runs until it has seen the expected count or the
+	// 10 s safety deadline trips.
+	var received atomic.Int64
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for received.Load() < int64(expected) {
+			if _, err := sub.ReadText(10 * time.Second); err != nil {
+				return
+			}
+			received.Add(1)
+		}
+	}()
+
+	var startWg, doneWg sync.WaitGroup
+	startWg.Add(1)
+	doneWg.Add(workers)
+	for w := 0; w < workers; w++ {
+		w := w
+		go func() {
+			defer doneWg.Done()
+			startWg.Wait() // align starts to maximize contention
+			payload := []byte(fmt.Sprintf("w%d", w))
+			batch := make([]gogo.PublishMessage, batchSize)
+			for i := range batch {
+				batch[i] = gogo.PublishMessage{
+					Topic:   "concurrent",
+					Message: payload,
+					OpCode:  gogo.Text,
+				}
+			}
+			for i := 0; i < singlesPerWorker; i++ {
+				app.Publish("concurrent", payload, gogo.Text)
+			}
+			for i := 0; i < batchesPerWorker; i++ {
+				app.PublishBatch(batch)
+			}
+		}()
+	}
+	startWg.Done() // release all workers at once
+	doneWg.Wait()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timeout waiting for %d messages, got %d", expected, received.Load())
+	}
+	if got := received.Load(); got != int64(expected) {
+		t.Errorf("delivery mismatch: got %d, want %d", got, expected)
+	}
+}
+
+// TestWebSocketMultiTopic: a single socket can be subscribed to
+// multiple topics. Publishes route only to subscribers of the exact
+// topic string — uWS v20 has no wildcard support, so this also
+// guards against accidental cross-topic delivery.
+func TestWebSocketMultiTopic(t *testing.T) {
+	appCh := make(chan *gogo.App, 1)
+	port, teardown := startApp(t, func(app *gogo.App) {
+		appCh <- app
+		app.WebSocket("/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				ws.Subscribe("alerts")
+				ws.Subscribe("news")
+				// Deliberately NOT subscribed to "private".
+			},
+		})
+	})
+	defer teardown()
+	app := <-appCh
+
+	sub, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial sub: %v", err)
+	}
+	defer sub.Close()
+	// Wait for the Open handler to run and subscribe before publishing.
+	time.Sleep(50 * time.Millisecond)
+
+	app.Publish("alerts", []byte("alert 1"), gogo.Text)
+	app.Publish("news", []byte("news 1"), gogo.Text)
+	// Not subscribed — should not deliver.
+	app.Publish("private", []byte("nope"), gogo.Text)
+
+	got1, err := sub.ReadText(2 * time.Second)
+	if err != nil {
+		t.Fatalf("read 1: %v", err)
+	}
+	got2, err := sub.ReadText(2 * time.Second)
+	if err != nil {
+		t.Fatalf("read 2: %v", err)
+	}
+	// Both arrived (ordering is delivery order — assume FIFO per loop drain).
+	if got1 != "alert 1" || got2 != "news 1" {
+		t.Errorf("multi-topic delivery: got %q, %q; want \"alert 1\", \"news 1\"", got1, got2)
+	}
+	// "private" must NOT have been delivered.
+	if err := sub.expectNoMessage(300 * time.Millisecond); err != nil {
+		t.Errorf("unexpected message on non-subscribed topic: %v", err)
+	}
+}
+
 // expected Name / FileName / ContentType / Data.
 func TestMultipartIterate(t *testing.T) {
 	type seen struct {

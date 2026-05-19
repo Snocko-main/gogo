@@ -1142,3 +1142,77 @@ extern "C" int uwsgo_ws_send(uwsgo_ws_t *ws, const char *message, size_t message
 extern "C" void uwsgo_ws_end(uwsgo_ws_t *ws, int code, const char *message, size_t message_len) {
     reinterpret_cast<GoWebSocket *>(ws)->end(code, std::string_view(message, message_len));
 }
+
+extern "C" int uwsgo_ws_subscribe(uwsgo_ws_t *ws, const char *topic, size_t topic_len) {
+    return reinterpret_cast<GoWebSocket *>(ws)
+        ->subscribe(std::string_view(topic, topic_len)) ? 1 : 0;
+}
+
+extern "C" int uwsgo_ws_unsubscribe(uwsgo_ws_t *ws, const char *topic, size_t topic_len) {
+    return reinterpret_cast<GoWebSocket *>(ws)
+        ->unsubscribe(std::string_view(topic, topic_len)) ? 1 : 0;
+}
+
+extern "C" int uwsgo_ws_publish(uwsgo_ws_t *ws, const char *topic, size_t topic_len,
+        const char *message, size_t message_len, int opcode) {
+    return reinterpret_cast<GoWebSocket *>(ws)->publish(
+        std::string_view(topic, topic_len),
+        std::string_view(message, message_len),
+        static_cast<uWS::OpCode>(opcode)) ? 1 : 0;
+}
+
+extern "C" void uwsgo_app_publish(uwsgo_app_t *app, const char *topic, size_t topic_len,
+        const char *message, size_t message_len, int opcode) {
+    // Topic + message copied onto the heap because the cgo caller's
+    // buffers go out of scope as soon as this function returns; the
+    // deferred publish runs on the loop later. uWS::Loop::defer is
+    // thread-safe, so this function can be called from any goroutine.
+    //
+    // Perf note: two std::string copies + a heap-spilled std::function
+    // sounds wasteful, but BenchmarkAppPublishNoSubs measures ~700
+    // ns/op end-to-end (cgo crossing + defer mutex + wakeup included)
+    // and beat a flex-array single-allocation alternative by ~40 %.
+    // The libstdc++ slab allocator's hot path for sub-128-byte
+    // allocations is faster than one larger general-purpose alloc;
+    // don't "optimize" without re-running the benchmark.
+    std::string topic_copy(topic, topic_len);
+    std::string message_copy(message, message_len);
+    auto op = static_cast<uWS::OpCode>(opcode);
+    app->loop->defer([app, t = std::move(topic_copy), m = std::move(message_copy), op]() {
+        app->app->publish(t, m, op);
+    });
+}
+
+extern "C" void uwsgo_app_publish_batch(
+        uwsgo_app_t *app,
+        const char *bytes, size_t bytes_len,
+        const uwsgo_batch_item_t *items, size_t count) {
+    if (count == 0) {
+        return;
+    }
+    // One alloc owns the items array + byte blob. The per-publish
+    // overhead the single-message path pays (mutex, wakeup, lambda
+    // heap-spill) gets amortized across `count` items, which is the
+    // whole point of this entry point — the slab-vs-large-alloc
+    // wash that pessimized the single-message rewrite doesn't apply
+    // here because we're saving N-1 of EVERY other cost too.
+    size_t items_bytes = count * sizeof(uwsgo_batch_item_t);
+    size_t total = items_bytes + bytes_len;
+    char *buf = static_cast<char *>(::operator new(total));
+    memcpy(buf, items, items_bytes);
+    if (bytes_len > 0) {
+        memcpy(buf + items_bytes, bytes, bytes_len);
+    }
+
+    app->loop->defer([app, buf, count]() {
+        const auto *items = reinterpret_cast<const uwsgo_batch_item_t *>(buf);
+        const char *bytes = buf + count * sizeof(uwsgo_batch_item_t);
+        for (size_t i = 0; i < count; i++) {
+            app->app->publish(
+                std::string_view(bytes + items[i].topic_off, items[i].topic_len),
+                std::string_view(bytes + items[i].message_off, items[i].message_len),
+                static_cast<uWS::OpCode>(items[i].opcode));
+        }
+        ::operator delete(buf);
+    });
+}

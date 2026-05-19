@@ -218,6 +218,59 @@ size_t uwsgo_req_headers_all(uwsgo_req_t *req, char *buffer, size_t buffer_len);
 int uwsgo_ws_send(uwsgo_ws_t *ws, const char *message, size_t message_len, int opcode);
 void uwsgo_ws_end(uwsgo_ws_t *ws, int code, const char *message, size_t message_len);
 
+// WebSocket pub/sub. Subscribe / unsubscribe / publish must be called
+// from inside an Open / Message / Close handler (loop thread), where
+// the WebSocket pointer is live. uWS's TopicTree is loop-thread-local
+// — calling these from a worker goroutine is undefined behavior.
+//
+// uwsgo_ws_subscribe / unsubscribe return 1 on success, 0 on failure
+// (already in the requested state, or the connection is closing).
+// uwsgo_ws_publish returns 1 if the message was queued for delivery
+// to at least one subscriber (including the publishing socket itself).
+int uwsgo_ws_subscribe(uwsgo_ws_t *ws, const char *topic, size_t topic_len);
+int uwsgo_ws_unsubscribe(uwsgo_ws_t *ws, const char *topic, size_t topic_len);
+int uwsgo_ws_publish(uwsgo_ws_t *ws, const char *topic, size_t topic_len,
+    const char *message, size_t message_len, int opcode);
+
+// uwsgo_app_publish broadcasts to every subscriber of topic on the
+// app's WebSocket context. Thread-safe — the publish is internally
+// dispatched onto the app's loop, so this can be called from any
+// goroutine (typical use: a worker that just finished some work and
+// wants to push the result to clients). The message bytes are copied
+// onto the loop's heap before the deferred publish, so the caller's
+// buffer can be reclaimed as soon as this returns.
+void uwsgo_app_publish(uwsgo_app_t *app, const char *topic, size_t topic_len,
+    const char *message, size_t message_len, int opcode);
+
+// uwsgo_batch_item_t describes one publish inside a batch. All four
+// length / offset fields point into the contiguous `bytes` blob the
+// caller passes to uwsgo_app_publish_batch — no Go pointers cross
+// the cgo boundary inside this struct, so the batch is safe to pass
+// from Go as a slice of these without tripping cgocheck.
+typedef struct uwsgo_batch_item_t {
+    size_t topic_off;
+    size_t topic_len;
+    size_t message_off;
+    size_t message_len;
+    int opcode;
+} uwsgo_batch_item_t;
+
+// uwsgo_app_publish_batch publishes N messages with a single cgo
+// crossing and a single Loop::defer (one mutex acquire + one
+// wakeup). The C++ side does ONE allocation that owns both the
+// items array and the byte blob; the deferred lambda iterates and
+// publishes each item, then frees. Saves (N-1) cgo crossings and
+// (N-1) defer-mutex acquires versus calling uwsgo_app_publish N
+// times — measured ~10x faster at N=100 on this VM.
+//
+// `bytes` is the packed concatenation of every (topic, message)
+// pair; each item's *_off / *_len pair points into it. `count` is
+// the number of items in the array.
+void uwsgo_app_publish_batch(
+    uwsgo_app_t *app,
+    const char *bytes, size_t bytes_len,
+    const uwsgo_batch_item_t *items, size_t count);
+
 #ifdef __cplusplus
 }
 #endif
