@@ -1167,6 +1167,14 @@ extern "C" void uwsgo_app_publish(uwsgo_app_t *app, const char *topic, size_t to
     // buffers go out of scope as soon as this function returns; the
     // deferred publish runs on the loop later. uWS::Loop::defer is
     // thread-safe, so this function can be called from any goroutine.
+    //
+    // Perf note: two std::string copies + a heap-spilled std::function
+    // sounds wasteful, but BenchmarkAppPublishNoSubs measures ~700
+    // ns/op end-to-end (cgo crossing + defer mutex + wakeup included)
+    // and beat a flex-array single-allocation alternative by ~40 %.
+    // The libstdc++ slab allocator's hot path for sub-128-byte
+    // allocations is faster than one larger general-purpose alloc;
+    // don't "optimize" without re-running the benchmark.
     std::string topic_copy(topic, topic_len);
     std::string message_copy(message, message_len);
     auto op = static_cast<uWS::OpCode>(opcode);
