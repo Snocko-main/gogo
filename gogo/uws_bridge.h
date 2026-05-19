@@ -117,6 +117,26 @@ void uwsgo_res_defer_send(
     const char *content_type, size_t content_type_len,
     const char *body, size_t body_len);
 
+// defer_send_with_headers is the same as defer_send but also writes a list of
+// arbitrary HTTP response headers between the status line and the Content-Type
+// header. Used by middleware that needs to attach headers to an async response
+// (compression's Content-Encoding/Vary, request-id echoes set by sync
+// middleware before the handler called Async, etc.).
+//
+// headers_blob is a packed list of NUL-terminated name/value pairs:
+//
+//   name1\0value1\0name2\0value2\0...
+//
+// Pass headers_len = 0 (and headers_blob = NULL) to skip the extra headers,
+// in which case the call behaves identically to uwsgo_res_defer_send.
+void uwsgo_res_defer_send_with_headers(
+    uwsgo_loop_t *loop,
+    void *ctx,
+    const char *status, size_t status_len,
+    const char *content_type, size_t content_type_len,
+    const char *headers_blob, size_t headers_len,
+    const char *body, size_t body_len);
+
 // async_ctx_release drops Go's reference to ctx without sending a response.
 // Call this if a goroutine returns without invoking defer_send.
 void uwsgo_async_ctx_release(void *ctx);

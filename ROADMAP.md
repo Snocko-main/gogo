@@ -279,16 +279,59 @@ is large.
 
 ### Middleware ecosystem (bundle as `gogo/middleware/*`)
 
-- CORS.
+The public middleware API is a single `app.Use(...)` call. Bundled
+middleware carries its own routing decision internally — the
+framework picks the right chain (loop thread for cheap rejecters,
+worker goroutine for blockers, both for stateless transformers) so
+callers never see Placement / Hint / WithPlacement in their code.
+
+- Rejecters that short-circuit cheaply (RateLimit, BasicAuth, JWT,
+  CSRF) ship pre-wired to fire on the uWS event-loop thread so the
+  goroutine never spawns on a denied request.
+- Stateless transformers (Logger, Helmet, Compress, CORS,
+  RequestID, in-memory Session) register in both chains. The async
+  entry carries a sentinel flag so the framework's "matching sync
+  MW forces slow path" check skips it, preserving the zero-cgo
+  async dispatch.
+- For custom middleware that blocks on I/O wrap with
+  `middleware.Async(...)` so it only runs inside the worker. Raw
+  non-blocking middleware can be passed to `app.Use` directly.
+
+Implementation detail (not user-visible): the placement metadata
+lives in `gogo/internal/mwhint`, an internal package that bundled
+middleware imports but external code cannot.
+
+
+- CORS. **DONE** — `middleware.CORS` (PR #8).
 - Compression (gzip/brotli) — uWS has native compression for WS, HTTP
-  needs Go layer; consider C++ side gzip.
+  needs Go layer; consider C++ side gzip. **DONE (gzip + deflate, sync
+  + async)** — `middleware.Compress` via the new
+  `Response.SetBodyEncoder` hook. Async support routes through a new
+  `uwsgo_res_defer_send_with_headers` C shim that carries the
+  Content-Encoding/Vary headers alongside the body when the
+  zero-cgo shared-memory path can't (the shared path has no header
+  slot). Brotli left to callers that import a brotli encoder and
+  install their own encoder via SetBodyEncoder.
 - Helmet-style security headers (HSTS, X-Frame-Options, CSP).
-- CSRF (sync + signed cookie).
-- Rate limiter (in-memory + Redis).
-- Request ID.
-- Logger (bundle the example from `examples/authmw`).
-- Basic Auth, JWT verification.
-- Session middleware (cookie, server-side store).
+  **DONE** — `middleware.Helmet`.
+- CSRF (sync + signed cookie). **DONE** — `middleware.CSRF`
+  (double-submit cookie with HMAC-bound tokens).
+- Rate limiter (in-memory + Redis). **DONE (in-memory)** —
+  `middleware.RateLimit` with a pluggable `RateLimitStore` interface;
+  Redis backend is a future Store implementation.
+- Request ID. **DONE** — `middleware.RequestID` (PR #8).
+- Logger (bundle the example from `examples/authmw`). **DONE** —
+  `middleware.Logger` (PR #8).
+- Basic Auth, JWT verification. **DONE** — `middleware.BasicAuth`
+  and `middleware.JWT` (HS256/384/512, RS256/384/512,
+  PS256/384/512, ES256/384/512). PEM key parsers (`ParseRSAPublicKey`,
+  `ParseECPublicKey`) included. Algorithm is locked at middleware
+  construction so alg-confusion attacks (RS256 token forged with HS256
+  using the public key as HMAC secret) are rejected.
+- Session middleware (cookie, server-side store). **DONE** —
+  `middleware.NewSession` + `*middleware.Session` handle, with a
+  built-in `MemorySessionStore` and a `SessionStore` interface for
+  Redis / SQL backends.
 
 ### WebSocket
 

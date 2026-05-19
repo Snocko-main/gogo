@@ -1,0 +1,130 @@
+package middleware
+
+import (
+	"crypto/subtle"
+	"encoding/base64"
+	"strings"
+
+	"uwebsockets-go/gogo"
+	"uwebsockets-go/gogo/internal/mwhint"
+)
+
+// BasicAuthLocalKey is the req.Local key carrying the authenticated
+// username. Handlers retrieve it via:
+//
+//	user, _ := req.Local(middleware.BasicAuthLocalKey).(string)
+const BasicAuthLocalKey = "gogo.basicauth.user"
+
+// BasicAuthOptions configures BasicAuth. Provide either Users or
+// Validator (Validator wins if both are set).
+type BasicAuthOptions struct {
+	// Users is a static {username: password} map. Lookups use
+	// constant-time comparison so timing leaks of valid usernames
+	// are kept negligible. Intended for small fleets and CI;
+	// production credentials should live in Validator backed by a
+	// hashed-password store.
+	Users map[string]string
+
+	// Validator authenticates a (user, pass) pair. Return true to
+	// allow the request, false to reject with 401. Validator is
+	// called once per request — keep it fast (bcrypt only on the
+	// register / login path, not here).
+	Validator func(user, pass string) bool
+
+	// Realm appears in the WWW-Authenticate challenge header on a
+	// 401 response. Default "Restricted". Browsers use the realm
+	// string to namespace cached credentials.
+	Realm string
+
+	// LocalKey overrides the req.Local key used to stash the
+	// authenticated username. Default BasicAuthLocalKey.
+	LocalKey string
+
+	// SkipFunc, when non-nil and returning true, bypasses
+	// authentication for that request. Useful to expose /healthz
+	// without credentials while protecting the rest of the app.
+	SkipFunc func(*gogo.Request) bool
+}
+
+// BasicAuth returns a Middleware that enforces HTTP Basic
+// authentication (RFC 7617). Requests without a valid Authorization
+// header receive 401 Unauthorized with a WWW-Authenticate challenge;
+// authenticated requests have the username stashed at LocalKey for
+// downstream handlers.
+//
+//	app.Use(middleware.BasicAuth(middleware.BasicAuthOptions{
+//	    Users: map[string]string{"admin": "secret"},
+//	}))
+//
+// Always pair Basic auth with TLS — the credentials travel
+// base64-encoded but otherwise in plaintext. The middleware does not
+// enforce HTTPS; configure that at the edge (load balancer, reverse
+// proxy) or via HSTS via Helmet.
+func BasicAuth(opt BasicAuthOptions) mwhint.Hinted {
+	if opt.Validator == nil && len(opt.Users) == 0 {
+		panic("gogo/middleware: BasicAuth requires Users or Validator")
+	}
+	if opt.Realm == "" {
+		opt.Realm = "Restricted"
+	}
+	if opt.LocalKey == "" {
+		opt.LocalKey = BasicAuthLocalKey
+	}
+	challenge := `Basic realm="` + opt.Realm + `", charset="UTF-8"`
+
+	verify := opt.Validator
+	if verify == nil {
+		users := opt.Users
+		verify = func(u, p string) bool {
+			expected, ok := users[u]
+			if !ok {
+				// Run the compare anyway to keep the timing
+				// roughly constant across known vs. unknown
+				// usernames.
+				subtle.ConstantTimeCompare([]byte(p), []byte(p))
+				return false
+			}
+			return subtle.ConstantTimeCompare([]byte(p), []byte(expected)) == 1
+		}
+	}
+
+	return mwhint.Hinted{Place: mwhint.Sync, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler {
+		return func(res *gogo.Response, req *gogo.Request) {
+			if opt.SkipFunc != nil && opt.SkipFunc(req) {
+				next(res, req)
+				return
+			}
+			user, pass, ok := parseBasicAuth(req.Header("authorization"))
+			if !ok || !verify(user, pass) {
+				res.Header("WWW-Authenticate", challenge)
+				res.Send(401, "text/plain; charset=utf-8", "Unauthorized\n")
+				return
+			}
+			req.SetLocal(opt.LocalKey, user)
+			next(res, req)
+		}
+	})}
+}
+
+// parseBasicAuth pulls (user, pass) out of an Authorization header
+// value. Returns ok=false if the scheme is not Basic, the base64
+// payload is invalid, or the decoded payload has no ":" separator.
+func parseBasicAuth(auth string) (user, pass string, ok bool) {
+	const prefix = "Basic "
+	if len(auth) < len(prefix) {
+		return "", "", false
+	}
+	// Case-insensitive scheme check.
+	if !strings.EqualFold(auth[:len(prefix)], prefix) {
+		return "", "", false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(auth[len(prefix):]))
+	if err != nil {
+		return "", "", false
+	}
+	colon := strings.IndexByte(string(decoded), ':')
+	if colon < 0 {
+		return "", "", false
+	}
+	return string(decoded[:colon]), string(decoded[colon+1:]), true
+}

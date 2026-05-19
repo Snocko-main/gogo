@@ -107,7 +107,7 @@
 // resolve a user from a session token via a DB lookup, then hand the
 // loaded user to the handler.
 //
-//	app.UseAsync("/api/*", func(next gogo.AsyncHandler) gogo.AsyncHandler {
+//	app.Use("/api/*", func(next gogo.AsyncHandler) gogo.AsyncHandler {
 //	    return func(res *gogo.Response, req *gogo.Request) {
 //	        token := req.Header("authorization")
 //	        user, err := db.LoadUserByToken(token)   // blocking — ok

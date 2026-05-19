@@ -509,6 +509,27 @@ func asyncDeferSend(loopPtr, ctxHandle uintptr, status, contentType, body string
 	)
 }
 
+// asyncDeferSendWithHeaders is the variant that carries an extra packed
+// headers blob ("name\0value\0name\0value\0…"). Used by compression
+// middleware in async mode (Content-Encoding/Vary) and by any future
+// middleware that needs to attach response headers to an async response.
+// The shared-memory fast path has no slot for arbitrary headers, so this
+// always goes through the cgo defer-send shim.
+func asyncDeferSendWithHeaders(loopPtr, ctxHandle uintptr, status, contentType, headersBlob, body string) {
+	var headersPtr *C.char
+	if len(headersBlob) > 0 {
+		headersPtr = unsafeStringData(headersBlob)
+	}
+	C.uwsgo_res_defer_send_with_headers(
+		(*C.uwsgo_loop_t)(unsafe.Pointer(loopPtr)),
+		unsafe.Pointer(ctxHandle),
+		unsafeStringData(status), C.size_t(len(status)),
+		unsafeStringData(contentType), C.size_t(len(contentType)),
+		headersPtr, C.size_t(len(headersBlob)),
+		unsafeStringData(body), C.size_t(len(body)),
+	)
+}
+
 func asyncCtxRelease(ctxHandle uintptr) {
 	C.uwsgo_async_ctx_release(unsafe.Pointer(ctxHandle))
 }

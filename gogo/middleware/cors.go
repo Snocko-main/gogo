@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"uwebsockets-go/gogo"
+	"uwebsockets-go/gogo/internal/mwhint"
 )
 
 // CORSOptions configures the CORS middleware. Zero value is permissive
@@ -65,7 +66,7 @@ var defaultAllowHeaders = []string{"Content-Type", "Authorization"}
 // OPTIONS handler — gogo's App.Listen auto-registers a global catch-all
 // route the moment any middleware is registered, so the middleware
 // chain fires on every URL the way express / fiber users expect.
-func CORS(opts ...CORSOptions) gogo.Middleware {
+func CORS(opts ...CORSOptions) mwhint.Hinted {
 	var opt CORSOptions
 	if len(opts) > 0 {
 		opt = opts[0]
@@ -92,7 +93,7 @@ func CORS(opts ...CORSOptions) gogo.Middleware {
 	}
 	allowAny := len(opt.AllowOrigins) == 1 && opt.AllowOrigins[0] == "*"
 
-	return func(next gogo.Handler) gogo.Handler {
+	return mwhint.Hinted{Place: mwhint.Both, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler {
 		return func(res *gogo.Response, req *gogo.Request) {
 			origin := req.Header("origin")
 			allowed := ""
@@ -151,7 +152,7 @@ func CORS(opts ...CORSOptions) gogo.Middleware {
 
 			next(res, req)
 		}
-	}
+	})}
 }
 
 // matchOrigin reports whether origin is allowed by the patterns in

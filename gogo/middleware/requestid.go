@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 
 	"uwebsockets-go/gogo"
+	"uwebsockets-go/gogo/internal/mwhint"
 )
 
 // RequestIDLocalKey is the key used to stash the request ID into
@@ -38,7 +39,7 @@ type RequestIDOptions struct {
 //	id, _ := req.Local(middleware.RequestIDLocalKey).(string)
 //
 // Pair with Logger by extending LogEntry / Format to include the ID.
-func RequestID(opts ...RequestIDOptions) gogo.Middleware {
+func RequestID(opts ...RequestIDOptions) mwhint.Hinted {
 	var opt RequestIDOptions
 	if len(opts) > 0 {
 		opt = opts[0]
@@ -54,7 +55,7 @@ func RequestID(opts ...RequestIDOptions) gogo.Middleware {
 	// sync path. Use the lowercased form for the lookup.
 	lookupName := lowercaseAscii(opt.Header)
 
-	return func(next gogo.Handler) gogo.Handler {
+	return mwhint.Hinted{Place: mwhint.Both, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler {
 		return func(res *gogo.Response, req *gogo.Request) {
 			id := req.Header(lookupName)
 			if id == "" {
@@ -64,7 +65,7 @@ func RequestID(opts ...RequestIDOptions) gogo.Middleware {
 			res.Header(opt.Header, id)
 			next(res, req)
 		}
-	}
+	})}
 }
 
 // defaultRequestID generates 16 hex characters from 8 bytes of
