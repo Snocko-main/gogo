@@ -62,8 +62,9 @@ func asyncSendShared(uintptr, string, string, string) bool { return false }
 
 func (responseNative) beginAsync() (uintptr, uintptr) { return 0, 0 }
 
-func asyncDeferSend(uintptr, uintptr, string, string, string) {}
-func asyncCtxRelease(uintptr)                                 {}
+func asyncDeferSend(uintptr, uintptr, string, string, string)                {}
+func asyncDeferSendWithHeaders(uintptr, uintptr, string, string, string, string) {}
+func asyncCtxRelease(uintptr)                                                 {}
 
 func (requestNative) method() string           { return "" }
 func (requestNative) url() string              { return "" }

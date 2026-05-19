@@ -281,10 +281,14 @@ is large.
 
 - CORS. **DONE** — `middleware.CORS` (PR #8).
 - Compression (gzip/brotli) — uWS has native compression for WS, HTTP
-  needs Go layer; consider C++ side gzip. **DONE (gzip + deflate)** —
-  `middleware.Compress` via the new `Response.SetBodyEncoder` hook.
-  Brotli left to callers that import a brotli encoder and install
-  their own encoder; sync handlers only (async path bypasses encoder).
+  needs Go layer; consider C++ side gzip. **DONE (gzip + deflate, sync
+  + async)** — `middleware.Compress` via the new
+  `Response.SetBodyEncoder` hook. Async support routes through a new
+  `uwsgo_res_defer_send_with_headers` C shim that carries the
+  Content-Encoding/Vary headers alongside the body when the
+  zero-cgo shared-memory path can't (the shared path has no header
+  slot). Brotli left to callers that import a brotli encoder and
+  install their own encoder via SetBodyEncoder.
 - Helmet-style security headers (HSTS, X-Frame-Options, CSP).
   **DONE** — `middleware.Helmet`.
 - CSRF (sync + signed cookie). **DONE** — `middleware.CSRF`
@@ -296,8 +300,11 @@ is large.
 - Logger (bundle the example from `examples/authmw`). **DONE** —
   `middleware.Logger` (PR #8).
 - Basic Auth, JWT verification. **DONE** — `middleware.BasicAuth`
-  and `middleware.JWT` (HS256/384/512; asymmetric algorithms left
-  out by design — wire them with a custom middleware).
+  and `middleware.JWT` (HS256/384/512, RS256/384/512,
+  PS256/384/512, ES256/384/512). PEM key parsers (`ParseRSAPublicKey`,
+  `ParseECPublicKey`) included. Algorithm is locked at middleware
+  construction so alg-confusion attacks (RS256 token forged with HS256
+  using the public key as HMAC secret) are rejected.
 - Session middleware (cookie, server-side store). **DONE** —
   `middleware.NewSession` + `*middleware.Session` handle, with a
   built-in `MemorySessionStore` and a `SessionStore` interface for

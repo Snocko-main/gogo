@@ -44,17 +44,18 @@ type CompressOptions struct {
 // clients that advertise gzip / deflate support via Accept-Encoding.
 // The middleware buffers the handler's Write / End / Send / JSON
 // output via Response.SetBodyEncoder, then compresses on flush.
+// Both sync and async handlers (Response.Async, PostAsync) are
+// supported — when extra headers are present the async path
+// transparently falls back from the zero-cgo shared-memory path to
+// the defer-send-with-headers shim that carries Content-Encoding
+// and Vary alongside the body.
 //
 //	app.Use(middleware.Compress())
 //
 // Limitations
 //
-// Only sync handlers are compressed. Async handlers (Response.Async,
-// PostAsync workers) bypass the encoder because the framework's
-// async path has no slot for arbitrary response headers, and
-// Content-Encoding must accompany the body. SendFile is also not
-// compressed — the static-file path streams the file directly to
-// uWS without flowing through Write / End.
+// SendFile is not compressed — the static-file path streams the
+// file directly to uWS without flowing through Write / End.
 //
 // Brotli is not bundled: it requires a separate Go dependency
 // (e.g. github.com/andybalholm/brotli) and is left for callers who

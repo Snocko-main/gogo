@@ -1648,9 +1648,10 @@ type Response struct {
 	// goes to uWS. Used by compression middleware (gzip / brotli) to
 	// buffer the handler's Write / End / Send / JSON output, compress
 	// the buffered bytes, and attach Content-Encoding before the
-	// status line is flushed. Sync path only — async handlers bypass
-	// the encoder because the cgo defer-send shim has no slot for
-	// arbitrary response headers.
+	// status line is flushed. Works in both sync and async modes; the
+	// async path routes through uwsgo_res_defer_send_with_headers
+	// when the encoder added Content-Encoding/Vary, bypassing the
+	// shared-memory fast path which has no slot for extra headers.
 	encoder *bodyEncoder
 }
 
@@ -1763,12 +1764,12 @@ func (r *Response) Append(key, value string) *Response {
 
 // Write appends a response chunk without ending the response.
 func (r *Response) Write(body string) *Response {
-	if r.async != nil {
-		r.async.body.WriteString(body)
-		return r
-	}
 	if r.encoder != nil {
 		r.encoder.buf.WriteString(body)
+		return r
+	}
+	if r.async != nil {
+		r.async.body.WriteString(body)
 		return r
 	}
 	r.ensureStatusSync()
@@ -1779,14 +1780,14 @@ func (r *Response) Write(body string) *Response {
 
 // End finishes the response.
 func (r *Response) End(body string) {
+	if r.encoder != nil && !r.encoder.applied {
+		r.encoder.buf.WriteString(body)
+		body = r.applyEncoder("")
+	}
 	if r.async != nil {
 		r.async.body.WriteString(body)
 		r.flushAsync()
 		return
-	}
-	if r.encoder != nil && !r.encoder.applied {
-		r.encoder.buf.WriteString(body)
-		body = r.applyEncoder("")
 	}
 	r.ensureStatusSync()
 	r.flushPendingHeaders()
@@ -1812,17 +1813,23 @@ func (r *Response) Send(code int, contentType, body string) {
 	}
 	line := statusLine(code)
 
-	if r.encoder != nil && !r.encoder.applied && r.async == nil {
+	if r.encoder != nil && !r.encoder.applied {
 		r.encoder.buf.WriteString(body)
 		body = r.applyEncoder(contentType)
 	}
 
 	// Async mode: try the zero-cgo shared-memory path first. Falls back
-	// to the cgo defer path when the body exceeds inline capacity.
+	// to the cgo defer path when the body exceeds inline capacity OR when
+	// extra response headers were buffered (the shared path has no slot
+	// for headers beyond Content-Type, so compression's
+	// Content-Encoding/Vary or any middleware-buffered headers force the
+	// defer-send-with-headers route).
 	if r.async != nil && !r.async.sent {
-		if asyncSendShared(r.async.ctxHandle, line, contentType, body) {
-			r.async.sent = true
-			return
+		if len(r.pendingHeaders) == 0 {
+			if asyncSendShared(r.async.ctxHandle, line, contentType, body) {
+				r.async.sent = true
+				return
+			}
 		}
 		r.async.status = line
 		r.async.contentType = contentType
@@ -2287,7 +2294,24 @@ func (r *Response) flushAsync() {
 	if a.sent {
 		return
 	}
-	asyncDeferSend(a.loopPtr, a.ctxHandle, a.status, a.contentType, a.body.String())
+	if len(r.pendingHeaders) > 0 {
+		// Pack buffered headers as name\0value\0... and route through the
+		// defer-send-with-headers cgo shim. Used by Compress (which emits
+		// Content-Encoding + Vary) and by any pre-Async middleware that
+		// added headers via res.Header().
+		var b strings.Builder
+		for _, h := range r.pendingHeaders {
+			b.Grow(len(h.name) + len(h.value) + 2)
+			b.WriteString(h.name)
+			b.WriteByte(0)
+			b.WriteString(h.value)
+			b.WriteByte(0)
+		}
+		asyncDeferSendWithHeaders(a.loopPtr, a.ctxHandle, a.status, a.contentType, b.String(), a.body.String())
+		r.pendingHeaders = r.pendingHeaders[:0]
+	} else {
+		asyncDeferSend(a.loopPtr, a.ctxHandle, a.status, a.contentType, a.body.String())
+	}
 	a.sent = true
 }
 
@@ -2324,10 +2348,11 @@ func (r *Response) releaseRef() {
 //
 // Compression middleware uses this hook to transparently gzip /
 // brotli the handler's output without requiring handlers to be aware
-// of the encoding. Setting an encoder is sync-only; async handlers
-// (Response.Async, PostAsync workers) bypass the encoder because the
-// shared-memory / cgo defer paths have no slot for arbitrary
-// response headers.
+// of the encoding. The encoder runs in both sync and async modes;
+// when the encoder emits a Content-Encoding header, the response is
+// routed through the defer-send-with-headers C shim (async fast
+// shared-memory path is bypassed because it has no slot for extra
+// headers).
 //
 // Only one encoder per response — calling SetBodyEncoder a second
 // time replaces the first. Once the encoder has run (on End or Send)

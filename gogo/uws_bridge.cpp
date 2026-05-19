@@ -1078,6 +1078,95 @@ extern "C" void uwsgo_res_defer_send(
     });
 }
 
+// SendBufferWithHeaders carries the same fields as SendBuffer plus a
+// packed name\0value\0... blob of extra response headers written between
+// the status line and the Content-Type header.
+struct SendBufferWithHeaders {
+    char *status = nullptr;
+    size_t status_len = 0;
+    char *content_type = nullptr;
+    size_t content_type_len = 0;
+    char *headers_blob = nullptr;
+    size_t headers_len = 0;
+    char *body = nullptr;
+    size_t body_len = 0;
+
+    SendBufferWithHeaders() = default;
+    SendBufferWithHeaders(const SendBufferWithHeaders &) = delete;
+    SendBufferWithHeaders &operator=(const SendBufferWithHeaders &) = delete;
+    SendBufferWithHeaders(SendBufferWithHeaders &&o) noexcept :
+        status(o.status), status_len(o.status_len),
+        content_type(o.content_type), content_type_len(o.content_type_len),
+        headers_blob(o.headers_blob), headers_len(o.headers_len),
+        body(o.body), body_len(o.body_len) {
+        o.status = o.content_type = o.headers_blob = o.body = nullptr;
+    }
+    SendBufferWithHeaders &operator=(SendBufferWithHeaders &&) = delete;
+    ~SendBufferWithHeaders() {
+        std::free(status);
+        std::free(content_type);
+        std::free(headers_blob);
+        std::free(body);
+    }
+};
+
+extern "C" void uwsgo_res_defer_send_with_headers(
+    uwsgo_loop_t *loop,
+    void *ctx_handle,
+    const char *status, size_t status_len,
+    const char *content_type, size_t content_type_len,
+    const char *headers_blob, size_t headers_len,
+    const char *body, size_t body_len) {
+    auto *l = reinterpret_cast<uWS::Loop *>(loop);
+    auto *ctx = static_cast<AsyncCtx *>(ctx_handle);
+
+    SendBufferWithHeaders buf;
+    buf.status = dup_to_c_heap(status, status_len);
+    buf.status_len = status_len;
+    buf.content_type = dup_to_c_heap(content_type, content_type_len);
+    buf.content_type_len = content_type_len;
+    buf.headers_blob = dup_to_c_heap(headers_blob, headers_len);
+    buf.headers_len = headers_len;
+    buf.body = dup_to_c_heap(body, body_len);
+    buf.body_len = body_len;
+
+    l->defer([ctx, sb = std::move(buf)]() mutable {
+        if (ctx->aborted.load(std::memory_order_acquire)) {
+            ctx->release();
+            return;
+        }
+        auto *r = ctx->response;
+        r->cork([r, &sb]() {
+            r->writeStatus(std::string_view(sb.status, sb.status_len));
+            // Walk the packed name\0value\0... blob and emit each pair as
+            // a header. memchr keeps the scan bounded by headers_len even
+            // if a malformed blob ever lacks a trailing NUL.
+            const char *p = sb.headers_blob;
+            const char *end = sb.headers_blob + sb.headers_len;
+            while (p < end) {
+                const char *name_end = static_cast<const char *>(
+                    std::memchr(p, 0, static_cast<size_t>(end - p)));
+                if (name_end == nullptr) break;
+                std::string_view name(p, static_cast<size_t>(name_end - p));
+                p = name_end + 1;
+                if (p >= end) break;
+                const char *value_end = static_cast<const char *>(
+                    std::memchr(p, 0, static_cast<size_t>(end - p)));
+                if (value_end == nullptr) break;
+                std::string_view value(p, static_cast<size_t>(value_end - p));
+                p = value_end + 1;
+                r->writeHeader(name, value);
+            }
+            if (sb.content_type_len > 0) {
+                r->writeHeader(std::string_view("Content-Type", 12),
+                               std::string_view(sb.content_type, sb.content_type_len));
+            }
+            r->end(std::string_view(sb.body, sb.body_len));
+        });
+        ctx->release();
+    });
+}
+
 extern "C" size_t uwsgo_req_method(uwsgo_req_t *req, char *buffer, size_t buffer_len) {
     auto value = reinterpret_cast<uWS::HttpRequest *>(req)->getMethod();
     return copy_string_view(value, buffer, buffer_len);
