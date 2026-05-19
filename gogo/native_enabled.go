@@ -360,9 +360,14 @@ func (a *appNative) websocket(pattern string, behavior WebSocketBehavior) {
 	if behavior.DisablePings {
 		pings = 0
 	}
+	withUpgrade := 0
+	if behavior.Upgrade != nil {
+		withUpgrade = 1
+	}
 
 	C.uwsgo_app_ws(a.ptr, cpattern, C.uintptr_t(handle),
-		C.size_t(maxPayload), C.int(idleSec), C.size_t(maxBp), C.int(pings))
+		C.size_t(maxPayload), C.int(idleSec), C.size_t(maxBp), C.int(pings),
+		C.int(withUpgrade))
 }
 
 func (a *appNative) prepareRoute(pattern string, handler Handler) (*C.char, cgo.Handle) {
@@ -1084,6 +1089,11 @@ func uwsgoHandleWSMessage(handlerID C.uintptr_t, ws *C.uwsgo_ws_t, message *C.ch
 func uwsgoHandleWSClose(handlerID C.uintptr_t, ws *C.uwsgo_ws_t, code C.int, message *C.char, messageLen C.size_t) {
 	handle := cgo.Handle(handlerID)
 	behavior := handle.Value().(WebSocketBehavior)
+	wsWrap := &WebSocket{inner: websocketNative{ptr: ws}}
+	// Release any cgo.Handle that an Upgrade callback or
+	// SetUserData attached to this socket — once the connection is
+	// gone the held Go value can be garbage collected.
+	releaseUserDataOnClose(wsWrap)
 	if behavior.Close != nil {
 		defer func() {
 			if recovered := recover(); recovered != nil {
@@ -1091,11 +1101,73 @@ func uwsgoHandleWSClose(handlerID C.uintptr_t, ws *C.uwsgo_ws_t, code C.int, mes
 			}
 		}()
 		behavior.Close(
-			&WebSocket{inner: websocketNative{ptr: ws}},
+			wsWrap,
 			int(code),
 			C.GoBytes(unsafe.Pointer(message), C.int(messageLen)),
 		)
 	}
+}
+
+//export uwsgoHandleWSUpgrade
+func uwsgoHandleWSUpgrade(handlerID C.uintptr_t,
+	ctxPtr unsafe.Pointer,
+	method *C.char, methodLen C.size_t,
+	url *C.char, urlLen C.size_t,
+	query *C.char, queryLen C.size_t,
+	ip *C.char, ipLen C.size_t,
+	headersBlob *C.char, headersLen C.size_t,
+	secProtoOffered *C.char, secProtoLen C.size_t) {
+	handle := cgo.Handle(handlerID)
+	behavior := handle.Value().(WebSocketBehavior)
+
+	headerCopy := C.GoBytes(unsafe.Pointer(headersBlob), C.int(headersLen))
+	handleWSUpgradeFromCgo(
+		behavior,
+		uintptr(ctxPtr),
+		C.GoStringN(method, C.int(methodLen)),
+		C.GoStringN(url, C.int(urlLen)),
+		C.GoStringN(query, C.int(queryLen)),
+		C.GoStringN(ip, C.int(ipLen)),
+		headerCopy,
+		C.GoStringN(secProtoOffered, C.int(secProtoLen)),
+	)
+}
+
+// upgradeAccept and upgradeReject are the Go-side wrappers around
+// uwsgo_res_upgrade_{accept,reject}. The C++ side stores the
+// UpgradeCtx on the loop thread; these functions ferry the
+// parameters across cgo. Always called synchronously from inside
+// the upgrade callback (never from a worker goroutine).
+func upgradeAccept(ctxPtr uintptr, protocol string, userData uintptr) {
+	var protoPtr *C.char
+	if len(protocol) > 0 {
+		protoPtr = unsafeStringData(protocol)
+	}
+	C.uwsgo_res_upgrade_accept(
+		unsafe.Pointer(ctxPtr),
+		protoPtr, C.size_t(len(protocol)),
+		C.uintptr_t(userData),
+	)
+}
+
+func upgradeReject(ctxPtr uintptr, statusLine, body string) {
+	var bodyPtr *C.char
+	if len(body) > 0 {
+		bodyPtr = unsafeStringData(body)
+	}
+	C.uwsgo_res_upgrade_reject(
+		unsafe.Pointer(ctxPtr),
+		unsafeStringData(statusLine), C.size_t(len(statusLine)),
+		bodyPtr, C.size_t(len(body)),
+	)
+}
+
+func wsGetUserData(w *WebSocket) uintptr {
+	return uintptr(C.uwsgo_ws_user_data(w.inner.ptr))
+}
+
+func wsSetUserData(w *WebSocket, data uintptr) {
+	C.uwsgo_ws_set_user_data(w.inner.ptr, C.uintptr_t(data))
 }
 
 //export uwsgoHandleDefer

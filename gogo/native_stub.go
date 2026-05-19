@@ -67,6 +67,11 @@ func asyncDeferSendWithHeaders(uintptr, uintptr, string, string, string, string)
 func asyncDeferStreamStart(uintptr, uintptr, string, string, string)             {}
 func asyncDeferStreamWrite(uintptr, uintptr, string)                             {}
 func asyncDeferStreamEnd(uintptr, uintptr)                                       {}
+
+func upgradeAccept(uintptr, string, uintptr) {}
+func upgradeReject(uintptr, string, string)  {}
+func wsGetUserData(*WebSocket) uintptr       { return 0 }
+func wsSetUserData(*WebSocket, uintptr)      {}
 func asyncCtxRelease(uintptr)                                                    {}
 
 func (requestNative) method() string           { return "" }
