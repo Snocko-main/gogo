@@ -1167,6 +1167,117 @@ extern "C" void uwsgo_res_defer_send_with_headers(
     });
 }
 
+// uwsgo_res_defer_stream_start opens a streaming response. The
+// status line + headers go out together inside a cork so they land
+// as a single TCP packet; the lambda intentionally does NOT call
+// end(), leaving the response open for follow-up stream_write
+// chunks. The ctx must outlive every pending defer — we retain
+// here so the close-out (stream_end) can release symmetrically.
+extern "C" void uwsgo_res_defer_stream_start(
+    uwsgo_loop_t *loop,
+    void *ctx_handle,
+    const char *status, size_t status_len,
+    const char *content_type, size_t content_type_len,
+    const char *headers_blob, size_t headers_len) {
+    auto *l = reinterpret_cast<uWS::Loop *>(loop);
+    auto *ctx = static_cast<AsyncCtx *>(ctx_handle);
+    ctx->retain();
+
+    SendBufferWithHeaders buf;
+    buf.status = dup_to_c_heap(status, status_len);
+    buf.status_len = status_len;
+    buf.content_type = dup_to_c_heap(content_type, content_type_len);
+    buf.content_type_len = content_type_len;
+    buf.headers_blob = dup_to_c_heap(headers_blob, headers_len);
+    buf.headers_len = headers_len;
+    buf.body = nullptr;
+    buf.body_len = 0;
+
+    l->defer([ctx, sb = std::move(buf)]() mutable {
+        if (ctx->aborted.load(std::memory_order_acquire)) {
+            ctx->release();
+            return;
+        }
+        auto *r = ctx->response;
+        r->cork([r, &sb]() {
+            r->writeStatus(std::string_view(sb.status, sb.status_len));
+            const char *p = sb.headers_blob;
+            const char *end = sb.headers_blob + sb.headers_len;
+            while (p < end) {
+                const char *name_end = static_cast<const char *>(
+                    std::memchr(p, 0, static_cast<size_t>(end - p)));
+                if (name_end == nullptr) break;
+                std::string_view name(p, static_cast<size_t>(name_end - p));
+                p = name_end + 1;
+                if (p >= end) break;
+                const char *value_end = static_cast<const char *>(
+                    std::memchr(p, 0, static_cast<size_t>(end - p)));
+                if (value_end == nullptr) break;
+                std::string_view value(p, static_cast<size_t>(value_end - p));
+                p = value_end + 1;
+                r->writeHeader(name, value);
+            }
+            if (sb.content_type_len > 0) {
+                r->writeHeader(std::string_view("Content-Type", 12),
+                               std::string_view(sb.content_type, sb.content_type_len));
+            }
+            // Intentionally NO r->end(): defer_stream_end closes
+            // the response after all chunks have been written.
+        });
+        ctx->release();
+    });
+}
+
+// uwsgo_res_defer_stream_write queues a single body chunk. uWS's
+// HttpResponse::write() emits the chunk with HTTP/1.1
+// transfer-encoding: chunked framing whenever no Content-Length was
+// declared — which is the normal streaming case.
+extern "C" void uwsgo_res_defer_stream_write(
+    uwsgo_loop_t *loop,
+    void *ctx_handle,
+    const char *chunk, size_t chunk_len) {
+    auto *l = reinterpret_cast<uWS::Loop *>(loop);
+    auto *ctx = static_cast<AsyncCtx *>(ctx_handle);
+    ctx->retain();
+
+    char *chunk_copy = dup_to_c_heap(chunk, chunk_len);
+    size_t copy_len = chunk_len;
+
+    l->defer([ctx, chunk_copy, copy_len]() mutable {
+        if (ctx->aborted.load(std::memory_order_acquire)) {
+            if (chunk_copy) std::free(chunk_copy);
+            ctx->release();
+            return;
+        }
+        auto *r = ctx->response;
+        r->write(std::string_view(chunk_copy ? chunk_copy : "", copy_len));
+        if (chunk_copy) std::free(chunk_copy);
+        ctx->release();
+    });
+}
+
+// uwsgo_res_defer_stream_end closes the streaming response. uWS
+// emits the chunked-encoding terminator (0\r\n\r\n) and tears down
+// the HttpResponse; subsequent writes against this ctx would target
+// freed memory and are forbidden.
+extern "C" void uwsgo_res_defer_stream_end(
+    uwsgo_loop_t *loop,
+    void *ctx_handle) {
+    auto *l = reinterpret_cast<uWS::Loop *>(loop);
+    auto *ctx = static_cast<AsyncCtx *>(ctx_handle);
+    ctx->retain();
+
+    l->defer([ctx]() mutable {
+        if (ctx->aborted.load(std::memory_order_acquire)) {
+            ctx->release();
+            return;
+        }
+        auto *r = ctx->response;
+        r->end(std::string_view());
+        ctx->release();
+    });
+}
+
 extern "C" size_t uwsgo_req_method(uwsgo_req_t *req, char *buffer, size_t buffer_len) {
     auto value = reinterpret_cast<uWS::HttpRequest *>(req)->getMethod();
     return copy_string_view(value, buffer, buffer_len);

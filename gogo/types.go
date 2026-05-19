@@ -1,9 +1,11 @@
 package gogo
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"mime"
 	"net/http"
 	"os"
@@ -365,6 +367,12 @@ type App struct {
 	// reverse routing needs a path with params, and static replies
 	// don't carry them.
 	namedRoutes map[string]string
+
+	// templateEngine is the TemplateEngine installed via
+	// SetTemplateEngine. Read by Response.Render. nil means "no
+	// engine installed" — Render then responds 500 with an
+	// operator-visible error logged via reportPanic.
+	templateEngine TemplateEngine
 }
 
 // defaultConfig fills in safe production defaults for any zero Config
@@ -585,6 +593,19 @@ func (a *App) applyMeta(meta *routeMeta, h Handler) Handler {
 	}
 }
 
+// applyAppRefAsync wraps h so res.app points back to a before the
+// handler chain runs. Used by GetAsync's fast path where the
+// shared-memory dispatch into the worker bypasses the sync wrap
+// that normally stamps res.app. Without this Response.Render and
+// friends would see res.app == nil on every async-route request.
+func (a *App) applyAppRefAsync(h AsyncHandler) AsyncHandler {
+	app := a
+	return func(res *Response, req *Request) {
+		res.app = app
+		h(res, req)
+	}
+}
+
 // applyMetaAsync is the async-handler twin of applyMeta. Used by the
 // zero-cgo fast path for GetAsync, where the snapshot is built in C++
 // and never sees the sync-side preamble — the worker goroutine has to
@@ -613,15 +634,16 @@ func (a *App) applyMetaAsync(meta *routeMeta, h AsyncHandler) AsyncHandler {
 func (a *App) wrap(routePattern string, h Handler) Handler {
 	trustProxy := a.cfg.TrustProxy
 	if len(a.middlewares) == 0 {
-		if !trustProxy {
-			return h
-		}
-		// Wrap only to stamp the trustProxy flag so Protocol() /
-		// Secure() can honor X-Forwarded-Proto. One extra call frame
-		// per request — paid only when Config.TrustProxy is enabled.
+		// No middleware: still wrap so res.app gets the back-pointer
+		// (Response.Render and friends need it). One extra function
+		// frame per request is cheaper than a wider invariant ("only
+		// some handlers see res.app").
 		inner := h
 		return func(res *Response, req *Request) {
-			req.trustProxy = true
+			res.app = a
+			if trustProxy {
+				req.trustProxy = true
+			}
 			inner(res, req)
 		}
 	}
@@ -636,12 +658,12 @@ func (a *App) wrap(routePattern string, h Handler) Handler {
 		for i := len(a.middlewares) - 1; i >= 0; i-- {
 			h = a.middlewares[i].mw(h)
 		}
-		if !trustProxy {
-			return h
-		}
 		inner := h
 		return func(res *Response, req *Request) {
-			req.trustProxy = true
+			res.app = a
+			if trustProxy {
+				req.trustProxy = true
+			}
 			inner(res, req)
 		}
 	}
@@ -649,6 +671,7 @@ func (a *App) wrap(routePattern string, h Handler) Handler {
 	copy(entries, a.middlewares)
 	inner := h
 	return func(res *Response, req *Request) {
+		res.app = a
 		if trustProxy {
 			req.trustProxy = true
 		}
@@ -845,7 +868,7 @@ func (a *App) GetAsync(pattern string, handler AsyncHandler) {
 		// here because no sync wrapper is running. applyMetaAsync sets
 		// snap.paramNames and runs typed-param validation inside the
 		// worker (the snapshot built in C++ has no Go-side meta).
-		wrappedAsync := a.applyMetaAsync(meta, a.wrapAsync(uwsPattern, handler))
+		wrappedAsync := a.applyAppRefAsync(a.applyMetaAsync(meta, a.wrapAsync(uwsPattern, handler)))
 		a.inner.getShared(uwsPattern, wrappedAsync)
 		return
 	}
@@ -1292,8 +1315,9 @@ func (r *Router) GetAsync(pattern string, handler AsyncHandler) {
 	if len(r.syncMW) == 0 && !r.app.hasMatchingMiddleware(full) {
 		// Fast path — no sync wrapper fires, async chain owns all
 		// middleware. applyMetaAsync sets snap.paramNames and runs
-		// typed validation inside the worker.
-		wrappedAsync := r.app.applyMetaAsync(meta, r.app.wrapAsync(full, r.wrapGroupAsync(handler)))
+		// typed validation inside the worker; applyAppRefAsync sets
+		// res.app so Response.Render works on async fast-path routes.
+		wrappedAsync := r.app.applyAppRefAsync(r.app.applyMetaAsync(meta, r.app.wrapAsync(full, r.wrapGroupAsync(handler))))
 		r.app.inner.getShared(full, wrappedAsync)
 		return
 	}
@@ -1836,6 +1860,12 @@ func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, erro
 type Response struct {
 	inner responseNative
 
+	// app back-references the App this response belongs to. Set by
+	// the request wrapper before middleware / handler fire. Used by
+	// features that need App-scoped state (e.g. Response.Render
+	// looks up App.templateEngine). Reset to nil on pool return.
+	app *App
+
 	// async is non-nil after Async has been called. Subsequent Status/Header/
 	// Write/End calls buffer into it instead of touching the C++ response;
 	// End flushes the buffer back onto the loop with a single cork.
@@ -2096,6 +2126,184 @@ func (r *Response) JSON(code int, v any) {
 		return
 	}
 	r.Send(code, "application/json", string(data))
+}
+
+// Stream writes a chunked HTTP/1.1 response by handing the caller an
+// io.Writer that buffers each Write call onto the uWS loop's
+// deferred-write queue. Order is preserved (FIFO), so chunks reach
+// the wire in the same order the writer emits them.
+//
+// Stream is meant for Server-Sent Events, NDJSON feeds, log tails,
+// and similar long-running responses where you don't know the full
+// body up front and you don't want to materialize it before the
+// first byte goes out. Call it from a GetAsync / PostAsync handler.
+// On a sync route call res.Async() first; on a plain sync handler
+// streaming would block the event-loop thread, which is almost
+// never what you want.
+//
+//	app.GetAsync("/events", func(res *gogo.Response, req *gogo.Request) {
+//	    err := res.Stream(200, "text/event-stream", func(w io.Writer) error {
+//	        ticker := time.NewTicker(time.Second)
+//	        defer ticker.Stop()
+//	        for i := 0; i < 5; i++ {
+//	            <-ticker.C
+//	            if _, err := fmt.Fprintf(w, "data: tick %d\n\n", i); err != nil {
+//	                return err
+//	            }
+//	        }
+//	        return nil
+//	    })
+//	    if err != nil { /* logged via reportPanic */ }
+//	})
+//
+// Headers buffered via res.Header before Stream go out in the
+// initial response frame. After Stream returns, the response is
+// closed — do not call Send / End / Stream again on the same
+// response.
+//
+// uWS automatically applies HTTP/1.1 transfer-encoding: chunked
+// when no Content-Length is set, which is the expected mode for
+// streaming. If the client disconnects mid-stream the underlying
+// AsyncCtx is marked aborted and subsequent Write calls become
+// silent no-ops on the C side; the caller's loop will still run to
+// completion. (A future res.Aborted helper will let callers stop
+// early on disconnect.)
+func (r *Response) Stream(status int, contentType string, fn func(w io.Writer) error) error {
+	if r.async == nil {
+		panic("gogo: Stream requires an async response; call from GetAsync / PostAsync or use res.Async first")
+	}
+	if r.async.sent {
+		panic("gogo: Stream: response already sent")
+	}
+	if status == 0 {
+		status = 200
+	}
+	r.statusCode = status
+	line := statusLine(status)
+	if contentType != "" {
+		validateHeaderValue("Content-Type", contentType)
+	}
+
+	// Pack pendingHeaders for the initial frame so middleware-set
+	// headers (RequestID echo, CSP, etc.) ship with the status line
+	// instead of being stranded on the now-skipped flushAsync path.
+	var hb strings.Builder
+	for _, h := range r.pendingHeaders {
+		hb.Grow(len(h.name) + len(h.value) + 2)
+		hb.WriteString(h.name)
+		hb.WriteByte(0)
+		hb.WriteString(h.value)
+		hb.WriteByte(0)
+	}
+	r.pendingHeaders = r.pendingHeaders[:0]
+
+	// Mark sent so the normal async release path treats this
+	// response as complete — Stream owns its lifecycle from here.
+	r.async.sent = true
+
+	asyncDeferStreamStart(r.async.loopPtr, r.async.ctxHandle, line, contentType, hb.String())
+
+	sw := &streamWriter{r: r}
+	fnErr := fn(sw)
+	// Always close — even on user error — so the response doesn't
+	// hang the connection. The user's error is propagated back to
+	// the caller for logging / metrics.
+	asyncDeferStreamEnd(r.async.loopPtr, r.async.ctxHandle)
+	return fnErr
+}
+
+// streamWriter is the io.Writer handed to Stream's callback. Each
+// Write call schedules a defer to the uWS loop thread that calls
+// res->write(chunk); the cgo bridge dups the bytes before the defer
+// is queued so the caller may reuse the buffer immediately.
+type streamWriter struct {
+	r *Response
+}
+
+func (s *streamWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	asyncDeferStreamWrite(s.r.async.loopPtr, s.r.async.ctxHandle, string(p))
+	return len(p), nil
+}
+
+// JSONP writes a JSONP response — the JSON-encoded value v wrapped in
+// a function call named callback, served with Content-Type
+// application/javascript. Useful for cross-origin reads from older
+// clients that pre-date CORS; most modern apps should prefer JSON +
+// proper CORS configuration via middleware.CORS.
+//
+// The callback name is validated to contain only the JavaScript
+// identifier characters [A-Za-z0-9_$.] so an attacker can't slip
+// `</script>` or a closing parenthesis into the response and pivot
+// the JSONP payload into an XSS sink. An invalid callback (empty or
+// containing other characters) returns 400 with no body.
+//
+// The marshaled JSON is also escaped against U+2028 / U+2029 — line
+// separators that are legal in JSON but break JavaScript parsing
+// when not escaped (each becomes a literal newline outside a
+// string).
+//
+//	app.Get("/api/users", func(res *gogo.Response, req *gogo.Request) {
+//	    cb := req.QueryParam("callback")
+//	    res.JSONP(cb, []User{...})
+//	})
+func (r *Response) JSONP(callback string, v any) {
+	if !validJSONPCallback(callback) {
+		r.Send(400, "text/plain; charset=utf-8", "invalid jsonp callback\n")
+		return
+	}
+	data, err := json.Marshal(v)
+	if err != nil {
+		reportPanic(fmt.Errorf("gogo: JSONP marshal: %w", err))
+		r.Send(500, "text/plain; charset=utf-8", "Internal Server Error\n")
+		return
+	}
+	// Escape U+2028 / U+2029 so the JSON-as-JS payload parses across
+	// every browser. json.Marshal emits them as raw UTF-8 bytes; the
+	// JavaScript spec only forbade them as literal line terminators
+	// pre-ES2019 but enough deployed parsers still choke that the
+	// JSONP convention is to escape them defensively.
+	body := bytes.ReplaceAll(data, []byte{0xE2, 0x80, 0xA8}, []byte("\\u2028"))
+	body = bytes.ReplaceAll(body, []byte{0xE2, 0x80, 0xA9}, []byte("\\u2029"))
+
+	var b strings.Builder
+	b.Grow(len(callback) + len(body) + 4)
+	// Leading "/**/" defuses content-sniffing attacks where a browser
+	// would interpret a buffered JSONP response as something other
+	// than JS. The comment is harmless to actual JS parsers.
+	b.WriteString("/**/")
+	b.WriteString(callback)
+	b.WriteByte('(')
+	b.Write(body)
+	b.WriteString(");")
+	r.Send(200, "application/javascript; charset=utf-8", b.String())
+}
+
+// validJSONPCallback accepts only characters that can legally appear
+// in a JavaScript identifier or dotted member expression: letters,
+// digits, '_', '$', '.'. The first character must be a letter, '_',
+// or '$' (digit-leading idents are illegal). Empty is rejected.
+func validJSONPCallback(s string) bool {
+	if s == "" || len(s) > 128 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		isAlpha := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '$'
+		isDigit := c >= '0' && c <= '9'
+		if i == 0 {
+			if !isAlpha {
+				return false
+			}
+			continue
+		}
+		if !(isAlpha || isDigit || c == '.') {
+			return false
+		}
+	}
+	return true
 }
 
 // Redirect sends an HTTP redirect to location with the given status code.
@@ -2559,6 +2767,7 @@ func (r *Response) releaseRef() {
 	r.inner = responseNative{}
 	r.async = nil
 	r.statusCode = 0
+	r.app = nil
 	if r.pendingHeaders != nil {
 		r.pendingHeaders = r.pendingHeaders[:0]
 	}
@@ -2931,6 +3140,7 @@ func (r *Request) resetForPool() {
 		delete(r.locals, k)
 	}
 }
+
 
 // URL returns the request URL path. Query string is exposed separately via
 // Query(); URL() does not include it.

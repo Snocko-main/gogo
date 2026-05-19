@@ -288,9 +288,18 @@ is large.
 
 ### Response
 
-- Streaming chunked writer.
-- `JSONP`, `Render` (templates — html/template + pluggable engines).
-- `res.Append(key, val)` for multi-value headers.
+- Streaming chunked writer. **DONE** — `res.Stream(status, contentType, fn)`
+  hands the user an `io.Writer` that schedules deferred writes on the uWS loop
+  via three new C++ bridge helpers (`uwsgo_res_defer_stream_{start,write,end}`).
+  HTTP/1.1 chunked encoding via uWS's auto-framing when no Content-Length is
+  set. Intended for async routes only (panics on sync handler).
+- `JSONP`. **DONE** — `res.JSONP(callback, value)` with strict callback
+  validation (alpha + dotted; rejects HTML / JS metacharacters) and U+2028 /
+  U+2029 escaping for cross-browser parser safety.
+- `Render` (templates). **DONE** — pluggable `TemplateEngine` interface
+  + default `NewHTMLTemplateEngine` (html/template) with FuncMap, dev
+  Reload mode, recursive Root walk.
+- `res.Append(key, val)` for multi-value headers. **DONE** (PR #6).
 
 ### Middleware ecosystem (bundle as `gogo/middleware/*`)
 

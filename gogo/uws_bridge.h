@@ -137,6 +137,43 @@ void uwsgo_res_defer_send_with_headers(
     const char *headers_blob, size_t headers_len,
     const char *body, size_t body_len);
 
+// defer_stream_start writes the response status line and headers but
+// does NOT call end() — opening the door for incremental chunked
+// body bytes via defer_stream_write. uWS auto-emits HTTP/1.1
+// chunked transfer-encoding when Content-Length is absent, which is
+// the expected mode for these streaming helpers (don't set
+// Content-Length unless you know the total payload size in advance).
+//
+// Each of the stream_* functions retains the ctx before queuing the
+// loop defer, so the AsyncCtx outlives every pending write. Callers
+// must finish a stream with exactly one defer_stream_end; emitting
+// further chunks (or another end) afterwards is undefined behavior.
+void uwsgo_res_defer_stream_start(
+    uwsgo_loop_t *loop,
+    void *ctx,
+    const char *status, size_t status_len,
+    const char *content_type, size_t content_type_len,
+    const char *headers_blob, size_t headers_len);
+
+// defer_stream_write appends one body chunk to a streaming response
+// started by defer_stream_start. Calls are serialized on the loop
+// thread in FIFO order, so chunks reach the wire in the same order
+// the caller emitted them. The chunk bytes are duplicated to the C
+// heap before the defer is queued so the Go-side memory is free to
+// be reused or freed immediately.
+void uwsgo_res_defer_stream_write(
+    uwsgo_loop_t *loop,
+    void *ctx,
+    const char *chunk, size_t chunk_len);
+
+// defer_stream_end closes a streaming response with an empty body —
+// uWS emits the chunked-encoding terminator and tears down the
+// HttpResponse. After this returns, no further stream_* calls are
+// valid against the same ctx.
+void uwsgo_res_defer_stream_end(
+    uwsgo_loop_t *loop,
+    void *ctx);
+
 // async_ctx_release drops Go's reference to ctx without sending a response.
 // Call this if a goroutine returns without invoking defer_send.
 void uwsgo_async_ctx_release(void *ctx);

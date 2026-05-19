@@ -530,6 +530,51 @@ func asyncDeferSendWithHeaders(loopPtr, ctxHandle uintptr, status, contentType, 
 	)
 }
 
+// asyncDeferStreamStart kicks off a streaming response: status +
+// headers go out on the loop thread without closing the response.
+// Each subsequent chunk goes through asyncDeferStreamWrite, and
+// asyncDeferStreamEnd closes the response. See res.Stream for the
+// caller-facing wrapper.
+func asyncDeferStreamStart(loopPtr, ctxHandle uintptr, status, contentType, headersBlob string) {
+	var headersPtr *C.char
+	if len(headersBlob) > 0 {
+		headersPtr = unsafeStringData(headersBlob)
+	}
+	C.uwsgo_res_defer_stream_start(
+		(*C.uwsgo_loop_t)(unsafe.Pointer(loopPtr)),
+		unsafe.Pointer(ctxHandle),
+		unsafeStringData(status), C.size_t(len(status)),
+		unsafeStringData(contentType), C.size_t(len(contentType)),
+		headersPtr, C.size_t(len(headersBlob)),
+	)
+}
+
+// asyncDeferStreamWrite queues one chunk for the loop thread to
+// write. The C bridge dups the bytes to a heap copy before the
+// defer is queued, so the Go-side caller may reuse the buffer
+// immediately after this returns.
+func asyncDeferStreamWrite(loopPtr, ctxHandle uintptr, chunk string) {
+	var chunkPtr *C.char
+	if len(chunk) > 0 {
+		chunkPtr = unsafeStringData(chunk)
+	}
+	C.uwsgo_res_defer_stream_write(
+		(*C.uwsgo_loop_t)(unsafe.Pointer(loopPtr)),
+		unsafe.Pointer(ctxHandle),
+		chunkPtr, C.size_t(len(chunk)),
+	)
+}
+
+// asyncDeferStreamEnd closes the streaming response with an empty
+// body — uWS writes the chunked-encoding terminator and tears down
+// the HttpResponse.
+func asyncDeferStreamEnd(loopPtr, ctxHandle uintptr) {
+	C.uwsgo_res_defer_stream_end(
+		(*C.uwsgo_loop_t)(unsafe.Pointer(loopPtr)),
+		unsafe.Pointer(ctxHandle),
+	)
+}
+
 func asyncCtxRelease(ctxHandle uintptr) {
 	C.uwsgo_async_ctx_release(unsafe.Pointer(ctxHandle))
 }
