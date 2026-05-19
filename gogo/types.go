@@ -357,6 +357,14 @@ type App struct {
 	routeMethods    map[string]map[string]struct{}
 	onListenHooks   []func(port int)
 	onShutdownHooks []func()
+
+	// namedRoutes maps a user-chosen name to the uWS-stripped pattern
+	// so App.URL can do reverse routing (`URL("user.show", {"id":"42"})`
+	// → "/users/42"). Names are set via the Route returned from a
+	// dynamic Get/Post/etc; static-target routes can't be named because
+	// reverse routing needs a path with params, and static replies
+	// don't carry them.
+	namedRoutes map[string]string
 }
 
 // defaultConfig fills in safe production defaults for any zero Config
@@ -549,6 +557,59 @@ func mwMatches(prefix, routePattern string) bool {
 // /api/admin would not have triggered Use("/api/admin", auth) under the
 // old scheme because the literal strings "/api/:section" and "/api/admin"
 // do not share a prefix).
+// applyMeta wraps h with a preamble that populates Request.paramNames
+// from meta and validates each typed constraint. The preamble runs
+// BEFORE middleware so middleware can call req.Param(name), and a
+// failed constraint short-circuits with a 404 without running the
+// middleware chain or handler.
+//
+// meta == nil is the fast path: returns h unchanged.
+func (a *App) applyMeta(meta *routeMeta, h Handler) Handler {
+	if meta == nil {
+		return h
+	}
+	names := meta.paramNames
+	constraints := meta.constraints
+	inner := h
+	return func(res *Response, req *Request) {
+		if len(names) > 0 {
+			req.paramNames = names
+		}
+		for idx, c := range constraints {
+			if !c.check(req.Parameter(idx)) {
+				res.Send(404, "text/plain; charset=utf-8", "Not Found\n")
+				return
+			}
+		}
+		inner(res, req)
+	}
+}
+
+// applyMetaAsync is the async-handler twin of applyMeta. Used by the
+// zero-cgo fast path for GetAsync, where the snapshot is built in C++
+// and never sees the sync-side preamble — the worker goroutine has to
+// populate snap.paramNames itself and run constraints there.
+func (a *App) applyMetaAsync(meta *routeMeta, h AsyncHandler) AsyncHandler {
+	if meta == nil {
+		return h
+	}
+	names := meta.paramNames
+	constraints := meta.constraints
+	inner := h
+	return func(res *Response, req *Request) {
+		if len(names) > 0 && req.snap != nil {
+			req.snap.paramNames = names
+		}
+		for idx, c := range constraints {
+			if !c.check(req.Parameter(idx)) {
+				res.Send(404, "text/plain; charset=utf-8", "Not Found\n")
+				return
+			}
+		}
+		inner(res, req)
+	}
+}
+
 func (a *App) wrap(routePattern string, h Handler) Handler {
 	trustProxy := a.cfg.TrustProxy
 	if len(a.middlewares) == 0 {
@@ -721,13 +782,12 @@ func (a *App) wrapAsyncFiltered(routePattern string, h AsyncHandler, skipAlsoSyn
 //
 // Static targets are served entirely in C++ with no Go work per request.
 func (a *App) Get(pattern string, target any) {
-	validatePattern(pattern)
-	a.trackRouteMethod("get", pattern)
+	uwsPattern, meta := a.preRoute("get", pattern)
 	switch v := target.(type) {
 	case Handler:
-		a.inner.get(pattern, a.wrap(pattern, v))
+		a.inner.get(uwsPattern, a.applyMeta(meta, a.wrap(uwsPattern, v)))
 	case func(*Response, *Request):
-		a.inner.get(pattern, a.wrap(pattern, Handler(v)))
+		a.inner.get(uwsPattern, a.applyMeta(meta, a.wrap(uwsPattern, Handler(v))))
 	case Reply:
 		code := v.Status
 		if code == 0 {
@@ -736,14 +796,29 @@ func (a *App) Get(pattern string, target any) {
 		if v.ContentType != "" {
 			validateHeaderValue("Content-Type", v.ContentType)
 		}
-		a.inner.getStatic(pattern, statusLine(code), v.ContentType, v.Body)
+		a.inner.getStatic(uwsPattern, statusLine(code), v.ContentType, v.Body)
 	case string:
-		a.inner.getStatic(pattern, statusLine(200), "", v)
+		a.inner.getStatic(uwsPattern, statusLine(200), "", v)
 	case []byte:
-		a.inner.getStatic(pattern, statusLine(200), "", string(v))
+		a.inner.getStatic(uwsPattern, statusLine(200), "", string(v))
 	default:
 		panic(fmt.Sprintf("gogo: unsupported Get target type %T for %q", target, pattern))
 	}
+}
+
+// preRoute is the shared registration prelude: parse the user-facing
+// pattern (extracting typed-param annotations into a routeMeta and
+// stripping them to a uWS-compatible form), validate the stripped
+// pattern, and track the method-routing entry. Returns the
+// uWS-compatible pattern (for a.inner.* calls) and the meta (nil if
+// no named or typed params, so the wrapper hot path stays clean).
+func (a *App) preRoute(method, pattern string) (string, *routeMeta) {
+	uwsPattern, meta := parseRoutePattern(pattern)
+	validatePattern(uwsPattern)
+	if method != "" {
+		a.trackRouteMethod(method, uwsPattern)
+	}
+	return uwsPattern, meta
 }
 
 // GetAsync registers a GET route whose handler runs on a goroutine and
@@ -761,16 +836,17 @@ func (a *App) Get(pattern string, target any) {
 // and switches to async mode for the user handler. One extra cgo callback
 // per request only when middleware is in use.
 func (a *App) GetAsync(pattern string, handler AsyncHandler) {
-	validatePattern(pattern)
-	a.trackRouteMethod("get", pattern)
+	uwsPattern, meta := a.preRoute("get", pattern)
 
-	if !a.hasMatchingMiddleware(pattern) {
+	if !a.hasMatchingMiddleware(uwsPattern) {
 		// No sync middleware matches → keep the zero-cgo shared-memory
 		// dispatch path. The async chain composes inside the worker
 		// goroutine alongside the user handler; PlaceBoth entries fire
-		// here because no sync wrapper is running.
-		wrappedAsync := a.wrapAsync(pattern, handler)
-		a.inner.getShared(pattern, wrappedAsync)
+		// here because no sync wrapper is running. applyMetaAsync sets
+		// snap.paramNames and runs typed-param validation inside the
+		// worker (the snapshot built in C++ has no Go-side meta).
+		wrappedAsync := a.applyMetaAsync(meta, a.wrapAsync(uwsPattern, handler))
+		a.inner.getShared(uwsPattern, wrappedAsync)
 		return
 	}
 
@@ -778,10 +854,11 @@ func (a *App) GetAsync(pattern string, handler AsyncHandler) {
 	// before dispatching to the worker. PlaceBoth entries fire there,
 	// so the async chain composed below must SKIP their twins —
 	// otherwise the same middleware runs twice per request.
-	wrappedAsync := a.wrapAsyncFiltered(pattern, handler, true)
-	a.inner.get(pattern, a.wrap(pattern, func(res *Response, req *Request) {
-		// Capture req fields before the sync wrapper returns — uWS frees the
-		// underlying HttpRequest the moment we return from this cgo callback.
+	// applyMeta on the sync side sets req.paramNames + runs typed
+	// validation BEFORE the snapshot is built, so snapshotFromSync
+	// then carries paramNames into the worker automatically.
+	wrappedAsync := a.wrapAsyncFiltered(uwsPattern, handler, true)
+	a.inner.get(uwsPattern, a.applyMeta(meta, a.wrap(uwsPattern, func(res *Response, req *Request) {
 		snap := req.snapshotFromSync(a.cfg.CapturePeerIP)
 		res.Async(func() {
 			snapReq := requestPool.Get().(*Request)
@@ -790,14 +867,13 @@ func (a *App) GetAsync(pattern string, handler AsyncHandler) {
 			snapReq.resetForPool()
 			requestPool.Put(snapReq)
 		})
-	}))
+	})))
 }
 
 // Post registers a POST route.
 func (a *App) Post(pattern string, handler Handler) {
-	validatePattern(pattern)
-	a.trackRouteMethod("post", pattern)
-	a.inner.post(pattern, a.wrap(pattern, handler))
+	uwsPattern, meta := a.preRoute("post", pattern)
+	a.inner.post(uwsPattern, a.applyMeta(meta, a.wrap(uwsPattern, handler)))
 }
 
 // PostAsyncHandler is the handler signature for PostAsync routes. It receives
@@ -811,8 +887,7 @@ type PostAsyncHandler func(res *Response, req *Request, body []byte)
 // plus a request snapshot. On bodies that exceed maxBodyBytes the framework
 // sends 413 Payload Too Large automatically and the handler is not called.
 func (a *App) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandler) {
-	validatePattern(pattern)
-	a.trackRouteMethod("post", pattern)
+	uwsPattern, meta := a.preRoute("post", pattern)
 
 	// Adapt the body-receiving handler into the AsyncHandler shape that
 	// AsyncMiddleware expects. The body is stashed on req.body in the
@@ -824,9 +899,9 @@ func (a *App) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandl
 	// PostAsync always runs the sync chain via a.wrap before
 	// dispatching the worker — PlaceBoth twins fire there, so the
 	// async chain composed inside res.Async must skip them.
-	wrappedAsync := a.wrapAsyncFiltered(pattern, finalAsync, true)
+	wrappedAsync := a.wrapAsyncFiltered(uwsPattern, finalAsync, true)
 
-	a.inner.post(pattern, a.wrap(pattern, func(res *Response, req *Request) {
+	a.inner.post(uwsPattern, a.applyMeta(meta, a.wrap(uwsPattern, func(res *Response, req *Request) {
 		// Snapshot the request before its lifetime ends. Body collection
 		// happens via onData callbacks fired after we return, by which time
 		// req would be invalid; the snapshot survives.
@@ -847,48 +922,44 @@ func (a *App) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandl
 				requestPool.Put(snapReq)
 			})
 		})
-	}))
+	})))
 }
 
 // Any registers a route for every HTTP method.
 func (a *App) Any(pattern string, handler Handler) {
-	validatePattern(pattern)
-	if pattern == "/*" {
+	uwsPattern, meta := a.preRoute("", pattern)
+	if uwsPattern == "/*" {
 		a.userCatchAllRegistered = true
 	}
-	a.inner.any(pattern, a.wrap(pattern, handler))
+	a.inner.any(uwsPattern, a.applyMeta(meta, a.wrap(uwsPattern, handler)))
 }
 
 // Put registers a PUT route. PUT requests carry bodies and are subject
 // to BodyLimit, like Post.
 func (a *App) Put(pattern string, handler Handler) {
-	validatePattern(pattern)
-	a.trackRouteMethod("put", pattern)
-	a.inner.put(pattern, a.wrap(pattern, handler))
+	uwsPattern, meta := a.preRoute("put", pattern)
+	a.inner.put(uwsPattern, a.applyMeta(meta, a.wrap(uwsPattern, handler)))
 }
 
 // Patch registers a PATCH route. PATCH requests carry bodies and are
 // subject to BodyLimit, like Post.
 func (a *App) Patch(pattern string, handler Handler) {
-	validatePattern(pattern)
-	a.trackRouteMethod("patch", pattern)
-	a.inner.patch(pattern, a.wrap(pattern, handler))
+	uwsPattern, meta := a.preRoute("patch", pattern)
+	a.inner.patch(uwsPattern, a.applyMeta(meta, a.wrap(uwsPattern, handler)))
 }
 
 // Delete registers a DELETE route. DELETE may carry a body per
 // RFC 9110 §9.3.5 and is subject to BodyLimit.
 func (a *App) Delete(pattern string, handler Handler) {
-	validatePattern(pattern)
-	a.trackRouteMethod("delete", pattern)
-	a.inner.deleteM(pattern, a.wrap(pattern, handler))
+	uwsPattern, meta := a.preRoute("delete", pattern)
+	a.inner.deleteM(uwsPattern, a.applyMeta(meta, a.wrap(uwsPattern, handler)))
 }
 
 // Options registers an OPTIONS route. OPTIONS is bodyless and skips
 // the BodyLimit check.
 func (a *App) Options(pattern string, handler Handler) {
-	validatePattern(pattern)
-	a.trackRouteMethod("options", pattern)
-	a.inner.options(pattern, a.wrap(pattern, handler))
+	uwsPattern, meta := a.preRoute("options", pattern)
+	a.inner.options(uwsPattern, a.applyMeta(meta, a.wrap(uwsPattern, handler)))
 }
 
 // Head registers a HEAD route. HEAD is bodyless and skips the
@@ -896,9 +967,8 @@ func (a *App) Options(pattern string, handler Handler) {
 // the framework does not enforce this — handlers should call res.End("")
 // after writing the headers.
 func (a *App) Head(pattern string, handler Handler) {
-	validatePattern(pattern)
-	a.trackRouteMethod("head", pattern)
-	a.inner.head(pattern, a.wrap(pattern, handler))
+	uwsPattern, meta := a.preRoute("head", pattern)
+	a.inner.head(uwsPattern, a.applyMeta(meta, a.wrap(uwsPattern, handler)))
 }
 
 // WebSocket registers a WebSocket route.
@@ -1099,15 +1169,13 @@ func (r *Router) hasGroupOrAppMW(fullPattern string) bool {
 // touching this route; otherwise the static body is served by a synthetic
 // dynamic handler so middleware can intercept.
 func (r *Router) Get(pattern string, target any) {
-	validatePattern(pattern)
-	full := r.prefix + pattern
-	r.app.trackRouteMethod("get", full)
+	full, meta := r.preRoute("get", pattern)
 	switch v := target.(type) {
 	case Handler:
-		h := r.app.wrap(full, r.wrapGroupSync(v))
+		h := r.app.applyMeta(meta, r.app.wrap(full, r.wrapGroupSync(v)))
 		r.app.inner.get(full, h)
 	case func(*Response, *Request):
-		h := r.app.wrap(full, r.wrapGroupSync(Handler(v)))
+		h := r.app.applyMeta(meta, r.app.wrap(full, r.wrapGroupSync(Handler(v))))
 		r.app.inner.get(full, h)
 	case Reply:
 		code := v.Status
@@ -1122,9 +1190,9 @@ func (r *Router) Get(pattern string, target any) {
 			return
 		}
 		cType, body := v.ContentType, v.Body
-		h := r.app.wrap(full, r.wrapGroupSync(func(res *Response, req *Request) {
+		h := r.app.applyMeta(meta, r.app.wrap(full, r.wrapGroupSync(func(res *Response, req *Request) {
 			res.Send(code, cType, body)
-		}))
+		})))
 		r.app.inner.get(full, h)
 	case string:
 		if !r.hasGroupOrAppMW(full) {
@@ -1132,9 +1200,9 @@ func (r *Router) Get(pattern string, target any) {
 			return
 		}
 		body := v
-		h := r.app.wrap(full, r.wrapGroupSync(func(res *Response, req *Request) {
+		h := r.app.applyMeta(meta, r.app.wrap(full, r.wrapGroupSync(func(res *Response, req *Request) {
 			res.Send(200, "", body)
-		}))
+		})))
 		r.app.inner.get(full, h)
 	case []byte:
 		body := string(v)
@@ -1142,74 +1210,76 @@ func (r *Router) Get(pattern string, target any) {
 			r.app.inner.getStatic(full, statusLine(200), "", body)
 			return
 		}
-		h := r.app.wrap(full, r.wrapGroupSync(func(res *Response, req *Request) {
+		h := r.app.applyMeta(meta, r.app.wrap(full, r.wrapGroupSync(func(res *Response, req *Request) {
 			res.Send(200, "", body)
-		}))
+		})))
 		r.app.inner.get(full, h)
 	default:
 		panic(fmt.Sprintf("gogo: unsupported Get target type %T for %q", target, full))
 	}
 }
 
+// preRoute is the Router's twin of App.preRoute. The user pattern is
+// concatenated with the router's prefix and parsed as a single unit
+// so typed-param annotations anywhere along the full path are
+// recognized — e.g. a Group("/users/:userID<int>") with a child
+// Get("/posts/:postID<uuid>") yields a routeMeta covering both
+// names and both constraints.
+func (r *Router) preRoute(method, pattern string) (string, *routeMeta) {
+	full, meta := parseRoutePattern(r.prefix + pattern)
+	validatePattern(full)
+	if method != "" {
+		r.app.trackRouteMethod(method, full)
+	}
+	return full, meta
+}
+
 // Post registers a POST route under this Router.
 func (r *Router) Post(pattern string, handler Handler) {
-	validatePattern(pattern)
-	full := r.prefix + pattern
-	r.app.trackRouteMethod("post", full)
-	h := r.app.wrap(full, r.wrapGroupSync(handler))
+	full, meta := r.preRoute("post", pattern)
+	h := r.app.applyMeta(meta, r.app.wrap(full, r.wrapGroupSync(handler)))
 	r.app.inner.post(full, h)
 }
 
 // Any registers a route for every HTTP method under this Router.
 func (r *Router) Any(pattern string, handler Handler) {
-	validatePattern(pattern)
-	full := r.prefix + pattern
-	h := r.app.wrap(full, r.wrapGroupSync(handler))
+	full, meta := r.preRoute("", pattern)
+	h := r.app.applyMeta(meta, r.app.wrap(full, r.wrapGroupSync(handler)))
 	r.app.inner.any(full, h)
 }
 
 // Put registers a PUT route under this Router.
 func (r *Router) Put(pattern string, handler Handler) {
-	validatePattern(pattern)
-	full := r.prefix + pattern
-	r.app.trackRouteMethod("put", full)
-	h := r.app.wrap(full, r.wrapGroupSync(handler))
+	full, meta := r.preRoute("put", pattern)
+	h := r.app.applyMeta(meta, r.app.wrap(full, r.wrapGroupSync(handler)))
 	r.app.inner.put(full, h)
 }
 
 // Patch registers a PATCH route under this Router.
 func (r *Router) Patch(pattern string, handler Handler) {
-	validatePattern(pattern)
-	full := r.prefix + pattern
-	r.app.trackRouteMethod("patch", full)
-	h := r.app.wrap(full, r.wrapGroupSync(handler))
+	full, meta := r.preRoute("patch", pattern)
+	h := r.app.applyMeta(meta, r.app.wrap(full, r.wrapGroupSync(handler)))
 	r.app.inner.patch(full, h)
 }
 
 // Delete registers a DELETE route under this Router.
 func (r *Router) Delete(pattern string, handler Handler) {
-	validatePattern(pattern)
-	full := r.prefix + pattern
-	r.app.trackRouteMethod("delete", full)
-	h := r.app.wrap(full, r.wrapGroupSync(handler))
+	full, meta := r.preRoute("delete", pattern)
+	h := r.app.applyMeta(meta, r.app.wrap(full, r.wrapGroupSync(handler)))
 	r.app.inner.deleteM(full, h)
 }
 
 // Options registers an OPTIONS route under this Router.
 func (r *Router) Options(pattern string, handler Handler) {
-	validatePattern(pattern)
-	full := r.prefix + pattern
-	r.app.trackRouteMethod("options", full)
-	h := r.app.wrap(full, r.wrapGroupSync(handler))
+	full, meta := r.preRoute("options", pattern)
+	h := r.app.applyMeta(meta, r.app.wrap(full, r.wrapGroupSync(handler)))
 	r.app.inner.options(full, h)
 }
 
 // Head registers a HEAD route under this Router.
 func (r *Router) Head(pattern string, handler Handler) {
-	validatePattern(pattern)
-	full := r.prefix + pattern
-	r.app.trackRouteMethod("head", full)
-	h := r.app.wrap(full, r.wrapGroupSync(handler))
+	full, meta := r.preRoute("head", pattern)
+	h := r.app.applyMeta(meta, r.app.wrap(full, r.wrapGroupSync(handler)))
 	r.app.inner.head(full, h)
 }
 
@@ -1217,20 +1287,22 @@ func (r *Router) Head(pattern string, handler Handler) {
 // Uses the zero-cgo shared-memory dispatch path only when no sync middleware
 // (group or app) touches this route.
 func (r *Router) GetAsync(pattern string, handler AsyncHandler) {
-	validatePattern(pattern)
-	full := r.prefix + pattern
-	r.app.trackRouteMethod("get", full)
+	full, meta := r.preRoute("get", pattern)
 
 	if len(r.syncMW) == 0 && !r.app.hasMatchingMiddleware(full) {
 		// Fast path — no sync wrapper fires, async chain owns all
-		// middleware including PlaceBoth twins.
-		wrappedAsync := r.app.wrapAsync(full, r.wrapGroupAsync(handler))
+		// middleware. applyMetaAsync sets snap.paramNames and runs
+		// typed validation inside the worker.
+		wrappedAsync := r.app.applyMetaAsync(meta, r.app.wrapAsync(full, r.wrapGroupAsync(handler)))
 		r.app.inner.getShared(full, wrappedAsync)
 		return
 	}
 
 	// Slow path: sync wrapper runs PlaceBoth twins on the loop
-	// thread, so the async chain must skip alsoSync entries.
+	// thread, so the async chain must skip alsoSync entries. The
+	// sync side's applyMeta sets req.paramNames + runs typed
+	// validation before snapshotFromSync carries names into the
+	// worker.
 	wrappedAsync := r.app.wrapAsyncFiltered(full, r.wrapGroupAsync(handler), true)
 	syncEntry := func(res *Response, req *Request) {
 		snap := req.snapshotFromSync(r.app.cfg.CapturePeerIP)
@@ -1242,7 +1314,7 @@ func (r *Router) GetAsync(pattern string, handler AsyncHandler) {
 			requestPool.Put(snapReq)
 		})
 	}
-	h := r.app.wrap(full, r.wrapGroupSync(Handler(syncEntry)))
+	h := r.app.applyMeta(meta, r.app.wrap(full, r.wrapGroupSync(Handler(syncEntry))))
 	r.app.inner.get(full, h)
 }
 
@@ -1250,9 +1322,7 @@ func (r *Router) GetAsync(pattern string, handler AsyncHandler) {
 // up to maxBodyBytes then runs handler on a goroutine. On bodies over the cap
 // the framework sends 413 and the handler is not called.
 func (r *Router) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandler) {
-	validatePattern(pattern)
-	full := r.prefix + pattern
-	r.app.trackRouteMethod("post", full)
+	full, meta := r.preRoute("post", pattern)
 
 	finalAsync := AsyncHandler(func(res *Response, req *Request) {
 		handler(res, req, req.body)
@@ -1278,7 +1348,7 @@ func (r *Router) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHa
 			})
 		})
 	}
-	h := r.app.wrap(full, r.wrapGroupSync(Handler(syncEntry)))
+	h := r.app.applyMeta(meta, r.app.wrap(full, r.wrapGroupSync(Handler(syncEntry))))
 	r.app.inner.post(full, h)
 }
 
@@ -1302,6 +1372,111 @@ func (r *Router) WebSocket(pattern string, behavior WebSocketBehavior) {
 // same way it wraps any other dynamic route.
 func (a *App) NotFound(h Handler) {
 	a.notFoundHandler = h
+}
+
+// Name tags a previously-registered route pattern with a name so
+// App.URL can perform reverse routing. The pattern must be the same
+// (post-strip) form that the route was registered with — typically
+// the literal string you passed to Get / Post / etc., minus any
+// <type> annotations. The simplest usage:
+//
+//	app.Get("/users/:id", showUser)
+//	app.Name("user.show", "/users/:id")
+//
+//	url, _ := app.URL("user.show", map[string]string{"id": "42"})
+//	// url == "/users/42"
+//
+// Name overwrites any previous mapping for the same name.
+func (a *App) Name(name, pattern string) {
+	if name == "" {
+		panic("gogo: Name requires a non-empty name")
+	}
+	stripped, _ := parseRoutePattern(pattern)
+	if a.namedRoutes == nil {
+		a.namedRoutes = make(map[string]string)
+	}
+	a.namedRoutes[name] = stripped
+}
+
+// URL builds the path for a named route by substituting params into
+// each :name segment of the pattern. Wildcards (`*`, `**`) cannot be
+// reverse-routed — the function returns an error if the pattern
+// contains them.
+//
+//	app.Get("/users/:userID/posts/:postID", showPost)
+//	app.Name("post.show", "/users/:userID/posts/:postID")
+//
+//	url, err := app.URL("post.show", map[string]string{
+//	    "userID": "alice",
+//	    "postID": "42",
+//	})
+//	// url == "/users/alice/posts/42"
+//
+// Returns an error when:
+//   - the name is unknown,
+//   - the pattern references a :param missing from the params map,
+//   - the pattern contains a wildcard (* or **).
+func (a *App) URL(name string, params map[string]string) (string, error) {
+	pattern, ok := a.namedRoutes[name]
+	if !ok {
+		return "", fmt.Errorf("gogo: URL: no route named %q", name)
+	}
+	var out strings.Builder
+	out.Grow(len(pattern))
+	i := 0
+	for i < len(pattern) {
+		c := pattern[i]
+		switch c {
+		case '*':
+			return "", fmt.Errorf("gogo: URL: route %q has a wildcard %q and cannot be reverse-routed", name, pattern)
+		case ':':
+			start := i + 1
+			j := start
+			for j < len(pattern) && pattern[j] != '/' {
+				j++
+			}
+			pName := pattern[start:j]
+			val, ok := params[pName]
+			if !ok {
+				return "", fmt.Errorf("gogo: URL: route %q requires param %q", name, pName)
+			}
+			out.WriteString(val)
+			i = j
+		default:
+			out.WriteByte(c)
+			i++
+		}
+	}
+	return out.String(), nil
+}
+
+// Mount registers routes onto a sub-router rooted at prefix and runs
+// the provided callback against it. It is sugar over App.Group plus
+// the callback pattern that Express / Fiber users expect:
+//
+//	app.Mount("/api/v1", func(api *gogo.Router) {
+//	    api.Use(middleware.JWT(opts))
+//	    api.Get("/users", listUsers)
+//	    api.Post("/users", createUser)
+//	})
+//
+// Equivalent to:
+//
+//	api := app.Group("/api/v1")
+//	api.Use(middleware.JWT(opts))
+//	api.Get("/users", listUsers)
+//	api.Post("/users", createUser)
+//
+// Mount returns the Router in case the caller wants to register more
+// routes against it after the callback returns. Calling Mount twice
+// with the same prefix creates two independent Routers — there is no
+// merging across calls.
+func (a *App) Mount(prefix string, register func(r *Router)) *Router {
+	r := a.Group(prefix)
+	if register != nil {
+		register(r)
+	}
+	return r
 }
 
 // Listen binds the app to the given port and reports whether binding
@@ -2666,6 +2841,12 @@ type Request struct {
 	paramCached  [4]bool
 	cachedIP     string
 	ipCached     bool
+	// paramNames maps the route pattern's positional :params to their
+	// declared names. Set by the route wrapper before middleware
+	// runs; used by Request.Param(name) to translate a name back to
+	// an index lookup. Nil for routes that have no named params or
+	// for legacy code paths that bypass the wrapper.
+	paramNames []string
 }
 
 // requestSnapshot holds the Go-side captured copy of an HttpRequest, used by
@@ -2674,12 +2855,13 @@ type Request struct {
 // (shared path) or by the sync wrapper before spawning a goroutine
 // (middleware fallback path).
 type requestSnapshot struct {
-	method    string
-	url       string
-	query     string
-	ip        string
-	params    []string
-	truncated bool
+	method     string
+	url        string
+	query      string
+	ip         string
+	params     []string
+	paramNames []string
+	truncated  bool
 	// headers is the raw "name\0value\0name\0value\0..." buffer captured from
 	// C++; we parse on access rather than building a map up front so the hot
 	// path stays allocation-light when headers aren't read.
@@ -2744,6 +2926,7 @@ func (r *Request) resetForPool() {
 	r.cachedIP = ""
 	r.ipCached = false
 	r.trustProxy = false
+	r.paramNames = nil
 	for k := range r.locals {
 		delete(r.locals, k)
 	}
@@ -2931,6 +3114,47 @@ func (r *Request) Parameter(index int) string {
 	return r.inner.parameter(index)
 }
 
+// Param looks up a route parameter by name. The name is the identifier
+// written after ':' in the route pattern — e.g. for `/users/:id/posts/:postID`
+// the names are "id" and "postID".
+//
+// Returns "" if name was never declared in the route pattern (typo,
+// or registered via a code path that bypasses the framework's
+// wrapper). Use Parameter(index) for positional access when you know
+// the index ahead of time.
+//
+//	app.Get("/users/:id/posts/:postID", func(res *gogo.Response, req *gogo.Request) {
+//	    id := req.Param("id")
+//	    post := req.Param("postID")
+//	    ...
+//	})
+func (r *Request) Param(name string) string {
+	names := r.paramNames
+	if r.snap != nil {
+		names = r.snap.paramNames
+	}
+	for i, n := range names {
+		if n == name {
+			return r.Parameter(i)
+		}
+	}
+	return ""
+}
+
+// ParamInt parses Param(name) as a signed decimal integer. Returns
+// def when the param is missing or doesn't parse. Mirrors QueryInt.
+func (r *Request) ParamInt(name string, def int) int {
+	v := r.Param(name)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
 // Query returns the raw query string portion of the URL with the leading '?'
 // stripped. Returns "" if the request has no query string.
 //
@@ -3026,9 +3250,10 @@ func (r *Request) QueryBool(name string, def bool) bool {
 	return def
 }
 
-// ParamInt parses route parameter at index as a base-10 int. Missing
-// or non-numeric values fall back to def.
-func (r *Request) ParamInt(index int, def int) int {
+// ParameterInt parses the route parameter at index as a base-10 int.
+// Missing or non-numeric values fall back to def. Positional twin of
+// ParamInt(name, def); use whichever matches your access style.
+func (r *Request) ParameterInt(index int, def int) int {
 	v := r.Parameter(index)
 	if v == "" {
 		return def
@@ -3040,9 +3265,11 @@ func (r *Request) ParamInt(index int, def int) int {
 	return n
 }
 
-// ParamInt64 parses route parameter at index as a base-10 int64.
-// Missing or non-numeric values fall back to def.
-func (r *Request) ParamInt64(index int, def int64) int64 {
+// ParameterInt64 parses the route parameter at index as a base-10
+// int64. Missing or non-numeric values fall back to def. Positional
+// twin of ParamInt64 (not yet provided); call ParamInt64(name, def)
+// once a named variant lands. For now use this for int64.
+func (r *Request) ParameterInt64(index int, def int64) int64 {
 	v := r.Parameter(index)
 	if v == "" {
 		return def
@@ -3129,6 +3356,13 @@ func (r *Request) snapshotFromSync(capturePeerIP bool) *requestSnapshot {
 			break
 		}
 		snap.params = append(snap.params, p)
+	}
+	// Propagate the route's param names to the snapshot so async
+	// handlers (which see the snapshot, not the live request) can
+	// resolve req.Param(name) without re-parsing the pattern. The
+	// slice is owned by the route's closure — safe to share.
+	if r.paramNames != nil {
+		snap.paramNames = r.paramNames
 	}
 	return snap
 }

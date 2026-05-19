@@ -257,10 +257,21 @@ is large.
 ### Routing
 
 - HTTP method helpers: `Put`, `Patch`, `Delete`, `Options`, `Head`.
-- Route grouping already shipped via `Group`.
-- Sub-apps / mounting (`app.Mount("/api", subApp)`).
-- Regex / typed-param routes (`:id<int>`).
-- Reverse routing / named routes for redirects.
+  **DONE** (PR #6).
+- Route grouping already shipped via `Group` (PR #1).
+- Sub-apps / mounting. **DONE** — `app.Mount(prefix, func(r *gogo.Router))`
+  sugar over `App.Group`.
+- Regex / typed-param routes. **DONE** — pattern syntax
+  `:id<int>`, `:id<uuid>`, `:id<alnum>`, `:id<alpha>`, `:id<slug>`,
+  `:id<uint>` with `gogo.RegisterParamType(name, check)` for custom
+  constraints. Validation fires BEFORE middleware so cheap rejection
+  is preserved.
+- Named-parameter access. **DONE** — `req.Param("id")` (Express
+  style); legacy `req.Parameter(0)` still works. `ParamInt(name, def)`
+  is the named twin of `ParameterInt(index, def)`.
+- Reverse routing / named routes. **DONE** — `app.Name(name, pattern)`
+  + `app.URL(name, params)` substitutes `:param` segments back into
+  the path.
 
 ### Request
 
