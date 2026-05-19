@@ -280,7 +280,11 @@ is large.
 - Multipart upload helpers — iterate parts, save to disk, stream to S3.
 - Query-param type conversion (`ParamInt`, `QueryParamInt`, default
   values).
-- Cookie signing (HMAC) helpers.
+- Cookie signing (HMAC) helpers. **DONE** — `gogo.SignCookieValue`
+  / `gogo.VerifyCookieValue` standalone primitives, plus
+  `Response.SetCookieSigned` / `Request.CookieSigned` convenience
+  methods. HMAC-SHA256 + base64url. Multi-secret signatures for
+  seamless key rotation.
 
 ### Response
 
