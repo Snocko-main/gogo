@@ -43,9 +43,52 @@ void uwsgo_app_head(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id)
 // uwsgo_app_ws registers a WebSocket endpoint with per-route limits
 // forwarded to the uWS WebSocketBehavior template (max payload, idle
 // timeout in seconds, backpressure cap, automatic ping/pong toggle).
+//
+// with_upgrade != 0 registers an `upgrade` callback that bounces
+// every incoming handshake through Go before the connection is
+// established. The Go callback inspects request headers / URL /
+// peer IP and either calls uwsgo_res_upgrade_accept (to complete
+// the handshake, optionally negotiating a subprotocol and attaching
+// per-socket user data) or uwsgo_res_upgrade_reject (to refuse with
+// an HTTP status). When with_upgrade is 0 every request is
+// auto-upgraded by uWS's default path (matches the pre-flag
+// behavior).
 void uwsgo_app_ws(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id,
     size_t max_payload, int idle_seconds, size_t max_backpressure,
-    int send_pings_automatically);
+    int send_pings_automatically, int with_upgrade);
+
+// uwsgo_res_upgrade_accept completes a WebSocket handshake started
+// by a Go upgrade callback. ctx_ptr is the opaque UpgradeCtx passed
+// to Go from the C++ upgrade lambda. user_data (typically a Go
+// cgo.Handle stored as uintptr) is stashed on the WebSocket's
+// per-socket data so handlers can retrieve it later via ws.UserData.
+//
+// secProtocol picks the subprotocol echoed back to the client (must
+// be one the client offered, or empty for no negotiation). The
+// other Sec-WebSocket-* headers are passed through unchanged.
+void uwsgo_res_upgrade_accept(void *ctx_ptr,
+    const char *sec_protocol, size_t sec_protocol_len,
+    uintptr_t user_data);
+
+// uwsgo_res_upgrade_reject refuses a WebSocket upgrade started by a
+// Go upgrade callback. Writes a plain-text body with the given HTTP
+// status line and closes the response.
+void uwsgo_res_upgrade_reject(void *ctx_ptr,
+    const char *status, size_t status_len,
+    const char *body, size_t body_len);
+
+// uwsgo_ws_user_data returns the per-socket user-data handle that
+// the upgrade callback stored via uwsgo_res_upgrade_accept. Returns
+// 0 when no handle was attached. Safe to call from any WS callback
+// (open / message / close).
+uintptr_t uwsgo_ws_user_data(uwsgo_ws_t *ws);
+
+// uwsgo_ws_set_user_data overwrites the per-socket user-data handle
+// after the connection is established. Useful for routes that
+// authenticate inside the Open callback rather than at upgrade.
+// Callers are responsible for releasing the previous handle (if
+// any) before installing a new one.
+void uwsgo_ws_set_user_data(uwsgo_ws_t *ws, uintptr_t user_data);
 
 // Static GET: response is captured once at registration time and served by
 // the C++ event loop directly without any cgo callback per request. Status,

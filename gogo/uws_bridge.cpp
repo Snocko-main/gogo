@@ -26,6 +26,15 @@ extern "C" void uwsgoHandleHTTP(uintptr_t handler_id, uwsgo_res_t *res, uwsgo_re
 extern "C" void uwsgoHandleWSOpen(uintptr_t handler_id, uwsgo_ws_t *ws);
 extern "C" void uwsgoHandleWSMessage(uintptr_t handler_id, uwsgo_ws_t *ws, const char *message, size_t message_len, int opcode);
 extern "C" void uwsgoHandleWSClose(uintptr_t handler_id, uwsgo_ws_t *ws, int code, const char *message, size_t message_len);
+extern "C" void uwsgoHandleWSUpgrade(
+    uintptr_t handler_id,
+    void *ctx_ptr,
+    const char *method, size_t method_len,
+    const char *url, size_t url_len,
+    const char *query, size_t query_len,
+    const char *ip, size_t ip_len,
+    const char *headers_blob, size_t headers_len,
+    const char *sec_protocol_offered, size_t sec_protocol_len);
 extern "C" void uwsgoHandleDefer(uintptr_t callback_id);
 extern "C" void uwsgoHandleAborted(uintptr_t callback_id);
 extern "C" void uwsgoHandleCork(uintptr_t callback_id);
@@ -62,9 +71,39 @@ struct GoHandle {
 
 }  // namespace
 
-struct uwsgo_ws_data_t {};
+struct uwsgo_ws_data_t {
+    // go_user_data holds a Go cgo.Handle (cast to uintptr) that the
+    // Go-side upgrade callback attached to this WebSocket. Read by
+    // ws.UserData(), released by the Go close handler when the
+    // socket goes away.
+    uintptr_t go_user_data = 0;
+};
 
 using GoWebSocket = uWS::WebSocket<false, true, uwsgo_ws_data_t>;
+
+// UpgradeCtx is shared between the C++ upgrade lambda and the Go
+// callback. Lifetime is the duration of the lambda invocation —
+// pointers must NOT outlive the synchronous call into Go.
+struct UpgradeCtx {
+    uWS::HttpResponse<false> *res;
+    struct us_socket_context_t *context;
+    std::string sec_key;
+    std::string sec_protocol_offered;
+    std::string sec_extensions;
+    int done;  // 0 = pending, 1 = accept/reject already invoked
+};
+
+// UpgradeSnapshot holds the request-side strings the Go callback
+// reads via UpgradeContext methods. Built in the C++ lambda before
+// crossing into Go so the underlying HttpRequest is free to be
+// freed when the lambda returns.
+struct UpgradeSnapshot {
+    std::string method;
+    std::string url;
+    std::string query;
+    std::string ip;
+    std::string headers_blob;  // packed name\0value\0...
+};
 
 // StaticResponse holds the captured bytes for a route that the C++ event loop
 // can serve without crossing back into Go. Owned by the app for its lifetime.
@@ -388,13 +427,71 @@ extern "C" void uwsgo_app_set_capture_peer_ip(uwsgo_app_t *app, int enable) {
 
 extern "C" void uwsgo_app_ws(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id,
     size_t max_payload, int idle_seconds, size_t max_backpressure,
-    int send_pings_automatically) {
+    int send_pings_automatically, int with_upgrade) {
     uWS::App::WebSocketBehavior<uwsgo_ws_data_t> behavior = {};
 
     behavior.maxPayloadLength = static_cast<unsigned int>(max_payload);
     behavior.idleTimeout = static_cast<unsigned short>(idle_seconds);
     behavior.maxBackpressure = static_cast<unsigned int>(max_backpressure);
     behavior.sendPingsAutomatically = send_pings_automatically != 0;
+
+    if (with_upgrade != 0) {
+        behavior.upgrade = [handler_id](auto *res, auto *req, struct us_socket_context_t *context) {
+            // Snapshot every field the Go callback might read,
+            // including the headers blob, BEFORE we hand control
+            // off — uWS frees the underlying HttpRequest the
+            // moment the callback returns and Go runs synchronously
+            // here on the loop thread.
+            UpgradeCtx ctx;
+            ctx.res = res;
+            ctx.context = context;
+            ctx.sec_key = std::string(req->getHeader("sec-websocket-key"));
+            ctx.sec_protocol_offered = std::string(req->getHeader("sec-websocket-protocol"));
+            ctx.sec_extensions = std::string(req->getHeader("sec-websocket-extensions"));
+            ctx.done = 0;
+
+            // Pack the rest of the request snapshot the Go side
+            // exposes through UpgradeContext methods.
+            UpgradeSnapshot snap;
+            snap.method = std::string(req->getMethod());
+            snap.url = std::string(req->getUrl());
+            snap.query = std::string(req->getQuery());
+            // Headers as packed name\0value\0... blob to mirror the
+            // representation requestSnapshot uses for HTTP routes.
+            std::string headers_blob;
+            for (auto it = req->begin(); it != req->end(); ++it) {
+                auto pair = *it;
+                headers_blob.append(pair.first.data(), pair.first.size());
+                headers_blob.push_back(0);
+                headers_blob.append(pair.second.data(), pair.second.size());
+                headers_blob.push_back(0);
+            }
+            snap.headers_blob = std::move(headers_blob);
+
+            // Peer IP — uWS exposes a binary representation; mirror
+            // the format goRequestSnapshot uses elsewhere by going
+            // through getRemoteAddressAsText.
+            snap.ip = std::string(res->getRemoteAddressAsText());
+
+            uwsgoHandleWSUpgrade(
+                static_cast<uintptr_t>(handler_id),
+                &ctx,
+                snap.method.data(), snap.method.size(),
+                snap.url.data(), snap.url.size(),
+                snap.query.data(), snap.query.size(),
+                snap.ip.data(), snap.ip.size(),
+                snap.headers_blob.data(), snap.headers_blob.size(),
+                ctx.sec_protocol_offered.data(), ctx.sec_protocol_offered.size());
+
+            if (!ctx.done) {
+                // Defensive: the Go callback failed to call accept
+                // or reject. Refuse with 500 so the socket isn't
+                // leaked — better to fail loudly than hang.
+                res->writeStatus("500 Internal Server Error");
+                res->end("upgrade callback returned without accept/reject");
+            }
+        };
+    }
 
     behavior.open = [handler_id](auto *ws) {
         uwsgoHandleWSOpen(handler_id, reinterpret_cast<uwsgo_ws_t *>(ws));
@@ -419,6 +516,59 @@ extern "C" void uwsgo_app_ws(uwsgo_app_t *app, const char *pattern, uintptr_t ha
     };
 
     app->app->ws<uwsgo_ws_data_t>(pattern, std::move(behavior));
+}
+
+// UpgradeCtx + UpgradeSnapshot live next to uwsgo_app_ws because
+// they only exist for that function's upgrade callback. UpgradeCtx
+// is pointer-shared with Go; UpgradeSnapshot is just a scratch
+// buffer copied into the cgo call arguments and discarded when the
+// lambda returns.
+extern "C" void uwsgo_res_upgrade_accept(void *ctx_ptr,
+    const char *sec_protocol, size_t sec_protocol_len,
+    uintptr_t user_data) {
+    auto *ctx = static_cast<UpgradeCtx *>(ctx_ptr);
+    if (ctx->done) {
+        return;
+    }
+    ctx->done = 1;
+
+    uwsgo_ws_data_t user;
+    user.go_user_data = user_data;
+
+    // res->upgrade<UserData>(userData, secKey, secProtocol,
+    //                        secExtensions, context) consumes the
+    // response and produces a uWS::WebSocket; from here on the
+    // open/message/close handlers fire.
+    ctx->res->template upgrade<uwsgo_ws_data_t>(
+        std::move(user),
+        ctx->sec_key,
+        std::string_view(sec_protocol, sec_protocol_len),
+        ctx->sec_extensions,
+        ctx->context);
+}
+
+extern "C" void uwsgo_res_upgrade_reject(void *ctx_ptr,
+    const char *status, size_t status_len,
+    const char *body, size_t body_len) {
+    auto *ctx = static_cast<UpgradeCtx *>(ctx_ptr);
+    if (ctx->done) {
+        return;
+    }
+    ctx->done = 1;
+
+    ctx->res->writeStatus(std::string_view(status, status_len));
+    ctx->res->writeHeader("Content-Type", "text/plain; charset=utf-8");
+    ctx->res->end(std::string_view(body, body_len));
+}
+
+extern "C" uintptr_t uwsgo_ws_user_data(uwsgo_ws_t *ws) {
+    auto *socket = reinterpret_cast<GoWebSocket *>(ws);
+    return socket->getUserData()->go_user_data;
+}
+
+extern "C" void uwsgo_ws_set_user_data(uwsgo_ws_t *ws, uintptr_t user_data) {
+    auto *socket = reinterpret_cast<GoWebSocket *>(ws);
+    socket->getUserData()->go_user_data = user_data;
 }
 
 extern "C" int uwsgo_app_listen(uwsgo_app_t *app, const char *host, int port) {

@@ -207,6 +207,26 @@ type WebSocketBehavior struct {
 	// doesn't get reaped by NAT boxes; set true only if your client
 	// drives its own ping protocol.
 	DisablePings bool
+
+	// Upgrade, when non-nil, runs synchronously on the uWS loop
+	// thread for every incoming WebSocket handshake before the
+	// connection is established. The callback inspects request
+	// headers / query / peer IP / offered subprotocols and MUST
+	// call ctx.Accept(...) or ctx.Reject(...) before returning —
+	// failing to do either causes the framework to refuse the
+	// upgrade with a 500 (and log the misuse).
+	//
+	// Typical uses:
+	//
+	//   - subprotocol negotiation: pick one of ctx.Protocols()
+	//   - cookie / token auth at handshake time, with the resolved
+	//     identity stashed via ctx.SetUserData(user) for the rest
+	//     of the connection's lifetime
+	//   - rejecting based on origin / referrer / API quota
+	//
+	// If Upgrade is nil, uWS's default path accepts every request
+	// without subprotocol negotiation.
+	Upgrade func(*UpgradeContext)
 }
 
 // Middleware wraps a Handler with cross-cutting behavior (auth, logging,

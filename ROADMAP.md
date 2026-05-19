@@ -360,8 +360,14 @@ middleware imports but external code cannot.
 ### WebSocket
 
 - Pub/sub: `ws.Subscribe(topic)`, `ws.Publish(topic, msg)`, `ws.Unsubscribe`.
-  uWS has this natively, just expose.
-- Subprotocols / upgrade headers.
+  **DONE** (PR #10).
+- Subprotocols / upgrade headers. **DONE** —
+  `WebSocketBehavior.Upgrade(ctx)` runs synchronously on the loop
+  thread for every incoming handshake. The `UpgradeContext` exposes
+  request headers / URL / query / peer IP / offered subprotocols
+  and Accept / Reject. Per-connection state attaches via
+  `ctx.SetUserData(v)` + `ws.UserData()` (cgo.Handle stored on the
+  uwsgo_ws_data_t struct, released automatically on close).
 
 ### Testing
 
