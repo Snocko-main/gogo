@@ -24,15 +24,13 @@
 //
 //	go run -tags gogo ./benchmark/perfquickwins :8080
 //
+// Multi-core (matches fiber's default GOMAXPROCS-parallel model):
+//
+//	GOGO_CORES=4 go run -tags gogo ./benchmark/perfquickwins :8080
+//
 // Drive via wrk:
 //
-//	wrk -t 4 -c 64 -d 30s --latency http://127.0.0.1:8080/heavy
-//
-// For the /cors-match path, send the Origin header:
-//
-//	wrk -t 4 -c 64 -d 30s --latency \
-//	    -H 'Origin: https://admin.example.com' \
-//	    http://127.0.0.1:8080/cors
+//	wrk -t 4 -c 64 -d 30s --latency http://127.0.0.1:8080/heavy/x
 package main
 
 import (
@@ -41,6 +39,7 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"strconv"
 
 	gogo "uwebsockets-go/gogo"
 	"uwebsockets-go/gogo/middleware"
@@ -56,6 +55,27 @@ func main() {
 		log.Fatalf("usage: %s :PORT", os.Args[0])
 	}
 
+	cores := 1
+	if env := os.Getenv("GOGO_CORES"); env != "" {
+		if n, err := strconv.Atoi(env); err == nil && n > 0 {
+			cores = n
+		}
+	}
+
+	// Silence any panic noise from the framework so a misconfigured
+	// wrk run doesn't spam stdout.
+	gogo.SetPanicHandler(func(r any) {})
+
+	if cores > 1 {
+		handle, err := gogo.RunMultiCore(cores, port, setup)
+		if err != nil {
+			log.Fatalf("RunMultiCore: %v", err)
+		}
+		fmt.Fprintf(io.Discard, "gogo listening on %s (%d cores)\n", addr, cores)
+		handle.Wait()
+		return
+	}
+
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
@@ -63,7 +83,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("NewApp: %v", err)
 	}
+	setup(app)
+	if !app.Listen(port) {
+		log.Fatalf("Listen %s failed", addr)
+	}
+	fmt.Fprintf(io.Discard, "gogo listening on %s\n", addr)
+	app.Run()
+}
 
+func setup(app *gogo.App) {
 	// /plain — baseline, no middleware, no buffered headers.
 	app.Get("/plain", func(res *gogo.Response, req *gogo.Request) {
 		res.Send(200, "text/plain", "ok")
@@ -99,14 +127,4 @@ func main() {
 	app.Get("/heavy/x", func(res *gogo.Response, req *gogo.Request) {
 		res.Send(200, "text/plain", "ok")
 	})
-
-	// Silence the framework's default panic / 500 path so a
-	// misconfigured wrk run doesn't spam stdout.
-	gogo.SetPanicHandler(func(r any) {})
-
-	if !app.Listen(port) {
-		log.Fatalf("Listen %s failed", addr)
-	}
-	fmt.Fprintf(io.Discard, "listening on %s\n", addr)
-	app.Run()
 }
