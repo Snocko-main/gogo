@@ -93,6 +93,49 @@ func validateHeaderValue(key, value string) {
 	}
 }
 
+// validateHeaderName enforces the HTTP token grammar (RFC 7230 §3.2.6)
+// on response header field names. The framework writes header names
+// to the wire — and to the cgo bridge's null-terminated header blob —
+// so anything outside the token set risks:
+//
+//   - CR/LF in the name: response splitting on the wire.
+//   - NUL in the name: corrupts the bridge's pack-and-cross batching
+//     (headerBlobPool entries are framed name\0value\0...).
+//   - Space, colon: fragments the wire header line ("X-Foo : 1" sends
+//     two malformed lines).
+//   - Anything else outside RFC 7230 tchar: not a well-formed header
+//     per the grammar; likely a sign that user input or misconfig
+//     ended up at a Header(key, ...) call site.
+//
+// Empty names also panic — uWS would treat them as ": value" which is
+// useless to the client and a clear programmer error.
+func validateHeaderName(name string) {
+	if name == "" {
+		panic("gogo: header name is empty")
+	}
+	for i := 0; i < len(name); i++ {
+		if !isHTTPTokenChar(name[i]) {
+			panic(fmt.Sprintf("gogo: header name %q contains invalid byte 0x%02x (must be RFC 7230 tchar)", name, name[i]))
+		}
+	}
+}
+
+// isHTTPTokenChar reports whether c is a valid character in an HTTP
+// token (RFC 7230 §3.2.6):
+//
+//	tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" /
+//	        "." / "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
+func isHTTPTokenChar(c byte) bool {
+	if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
+		return true
+	}
+	switch c {
+	case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		return true
+	}
+	return false
+}
+
 // containsCtlForHeader is the panic-free twin of validateHeaderValue used
 // on code paths where the input typically comes from a request (so a
 // hostile peer should not be able to trigger a panic by simply sending
@@ -2105,6 +2148,7 @@ func (r *Response) StatusCode() int {
 // alone; the moment a handler attaches any extra header the response
 // goes through the cgo defer-send shim instead.
 func (r *Response) Header(key, value string) *Response {
+	validateHeaderName(key)
 	validateHeaderValue(key, value)
 	if r.async != nil && key == "Content-Type" {
 		r.async.contentType = value

@@ -3077,6 +3077,50 @@ func TestResponseRedirect(t *testing.T) {
 	}
 }
 
+// TestResponseHeaderNameValidation: response handlers that pass a
+// malformed header name (CRLF, NUL, colon, empty) panic at the
+// validation gate — never reach the wire. The framework's panic
+// handler then returns a 500 so the connection drops cleanly instead
+// of emitting a corrupted header frame. This guards against:
+//
+//   - response splitting (CR/LF in header name)
+//   - cgo bridge frame corruption (NUL terminator inside a packed
+//     name\0value\0 buffer)
+//   - malformed wire lines from spaces / colons in user-supplied
+//     header names
+func TestResponseHeaderNameValidation(t *testing.T) {
+	cases := []struct {
+		label string
+		name  string
+	}{
+		{"crlf-in-name", "X-Foo\r\nEvil"},
+		{"nul-in-name", "X-Foo\x00Bar"},
+		{"colon-in-name", "X-Foo:Bar"},
+		{"space-in-name", "X-Foo Bar"},
+		{"empty-name", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.label, func(t *testing.T) {
+			port, teardown := startApp(t, func(app *gogo.App) {
+				app.Get("/", func(res *gogo.Response, req *gogo.Request) {
+					res.Header(tc.name, "value")
+					res.Send(200, "text/plain", "should not reach the wire")
+				})
+			})
+			defer teardown()
+
+			resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/", port))
+			if err != nil {
+				t.Fatalf("GET: %v", err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != 500 {
+				t.Errorf("malformed name %q reached the wire: status=%d", tc.name, resp.StatusCode)
+			}
+		})
+	}
+}
+
 // TestNotFoundHandler: customizing the 404 body via App.NotFound. Routes
 // the user registers explicitly still win — only unmatched paths fall
 // through to the NotFound handler.

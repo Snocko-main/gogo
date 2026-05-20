@@ -110,6 +110,87 @@ func FuzzLookupHeader(f *testing.F) {
 	})
 }
 
+// TestValidateHeaderName covers the RFC 7230 token grammar enforcement
+// for response header names. Anything outside tchar must panic — empty
+// strings, control characters, separators (colon, space, parentheses),
+// and high-bit bytes are all rejected. Tchar characters all pass.
+func TestValidateHeaderName(t *testing.T) {
+	good := []string{
+		"Content-Type",
+		"X-Request-ID",
+		"Vary",
+		"X-Custom!#$%&'*+-.^_`|~",
+		"abc123",
+	}
+	for _, name := range good {
+		t.Run("valid/"+name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("valid header name %q panicked: %v", name, r)
+				}
+			}()
+			validateHeaderName(name)
+		})
+	}
+
+	bad := map[string]string{
+		"empty":             "",
+		"with CR":           "X-Foo\r",
+		"with LF":           "X-Foo\n",
+		"with NUL":          "X-Foo\x00",
+		"with colon":        "X-Foo:Bar",
+		"with space":        "X-Foo Bar",
+		"with high bit":     "X-Foo\x80",
+		"leading control":   "\x01X-Foo",
+		"parentheses":       "(X-Foo)",
+		"double quotes":     "\"X-Foo\"",
+		"forward slash":     "X/Foo",
+		"trailing tab":      "X-Foo\t",
+	}
+	for label, name := range bad {
+		t.Run("invalid/"+label, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Errorf("invalid header name %q (%s) did not panic", name, label)
+				}
+			}()
+			validateHeaderName(name)
+		})
+	}
+}
+
+// FuzzValidateHeaderName mirrors FuzzValidateHeaderValue for the name
+// validator — the validator must panic exactly when the input violates
+// the RFC 7230 token grammar.
+func FuzzValidateHeaderName(f *testing.F) {
+	f.Add("Content-Type")
+	f.Add("X-Trace-ID")
+	f.Add("")
+	f.Add("Bad: Name")
+	f.Add("Bad\r\nName")
+	f.Add("Bad\x00")
+	f.Add("X-Foo!#$%&'*+-.^_`|~")
+
+	f.Fuzz(func(t *testing.T, name string) {
+		valid := name != ""
+		for i := 0; valid && i < len(name); i++ {
+			if !isHTTPTokenChar(name[i]) {
+				valid = false
+			}
+		}
+		defer func() {
+			r := recover()
+			if !valid && r == nil {
+				t.Fatalf("name %q is invalid but validator allowed it", name)
+			}
+			if valid && r != nil {
+				t.Fatalf("name %q is valid but validator panicked: %v", name, r)
+			}
+		}()
+		validateHeaderName(name)
+	})
+}
+
 // FuzzValidateHeaderValue makes sure validateHeaderValue panics if and only
 // if the value contains CR/LF/NUL — fuzz catches sneaky-encoding bypasses.
 func FuzzValidateHeaderValue(f *testing.F) {
