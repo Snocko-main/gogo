@@ -33,7 +33,7 @@ DURATION="${DURATION:-15}"
 THREADS="${THREADS:-1 2 4 8}"
 CONN="${CONN:-500}"
 ENDPOINTS="${ENDPOINTS:-/hello /hello/inon /db}"
-FRAMEWORKS="${FRAMEWORKS:-gogo fiber uwsjs bun}"
+FRAMEWORKS="${FRAMEWORKS:-gogo fiber nethttp uwsjs bun}"
 MODES="${MODES:-single multi}"
 WARMUP="${WARMUP:-2}"
 RESULTS_DIR="${RESULTS_DIR:-benchmark/results}"
@@ -108,6 +108,16 @@ start_server() {
 	fiber:multi)
 		PORT=3004
 		( FIBER_PREFORK=1 go run ./benchmark/fiber >/tmp/bench-fiber.log 2>&1 ) &
+		SERVER_PID=$!
+		;;
+	nethttp:single)
+		PORT=3001
+		( GOMAXPROCS=1 go run ./benchmark/nethttp >/tmp/bench-nethttp.log 2>&1 ) &
+		SERVER_PID=$!
+		;;
+	nethttp:multi)
+		PORT=3001
+		( go run ./benchmark/nethttp >/tmp/bench-nethttp.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	uwsjs:single)

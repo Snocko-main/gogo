@@ -2,83 +2,83 @@
 Running 5s test @ http://127.0.0.1:3002/hello
   1 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     0.93ms  143.02us   6.64ms   95.81%
-    Req/Sec   279.80k    12.24k  292.07k    88.00%
+    Latency     1.03ms    1.61ms  38.66ms   99.25%
+    Req/Sec   277.88k    19.56k  293.93k    92.00%
   Latency Distribution
      50%    0.90ms
      75%    0.93ms
      90%    0.98ms
-     99%    1.43ms
-  1393124 requests in 5.00s, 193.97MB read
-Requests/sec: 278376.27
-Transfer/sec:     38.76MB
+     99%    2.09ms
+  1384452 requests in 5.01s, 192.77MB read
+Requests/sec: 276421.92
+Transfer/sec:     38.49MB
 == gogo [multi] /hello  t=4 c=500 d=5s ==
 Running 5s test @ http://127.0.0.1:3002/hello
   4 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.84ms    1.25ms  33.72ms   95.32%
-    Req/Sec    70.10k    10.99k   87.39k    84.00%
+    Latency     1.70ms  595.84us  17.81ms   91.87%
+    Req/Sec    73.11k     9.16k  102.75k    85.22%
   Latency Distribution
-     50%    1.61ms
-     75%    1.71ms
-     90%    2.21ms
-     99%    5.48ms
-  1394327 requests in 5.00s, 194.14MB read
-Requests/sec: 278685.76
-Transfer/sec:     38.80MB
+     50%    1.59ms
+     75%    1.66ms
+     90%    1.85ms
+     99%    3.73ms
+  1476185 requests in 5.10s, 205.54MB read
+Requests/sec: 289370.93
+Transfer/sec:     40.29MB
 == gogo [multi] /hello/inon  t=1 c=500 d=5s ==
 Running 5s test @ http://127.0.0.1:3002/hello/inon
   1 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     0.96ms  273.70us   8.84ms   95.34%
-    Req/Sec   275.77k    18.52k  297.52k    80.00%
+    Latency     0.97ms  239.62us   7.24ms   94.87%
+    Req/Sec   277.12k    16.05k  294.49k    86.00%
   Latency Distribution
      50%    0.91ms
      75%    0.95ms
-     90%    1.07ms
-     99%    1.90ms
-  1371354 requests in 5.00s, 189.63MB read
-Requests/sec: 274003.70
-Transfer/sec:     37.89MB
+     90%    1.06ms
+     99%    2.12ms
+  1378903 requests in 5.01s, 190.68MB read
+Requests/sec: 275379.54
+Transfer/sec:     38.08MB
 == gogo [multi] /hello/inon  t=4 c=500 d=5s ==
 Running 5s test @ http://127.0.0.1:3002/hello/inon
   4 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.71ms  309.53us   6.48ms   88.99%
-    Req/Sec    72.35k     4.78k   76.78k    84.50%
+    Latency     1.78ms  418.79us   7.69ms   87.84%
+    Req/Sec    69.79k    15.28k  271.29k    96.52%
   Latency Distribution
-     50%    1.64ms
-     75%    1.71ms
-     90%    1.94ms
-     99%    3.22ms
-  1439479 requests in 5.00s, 199.06MB read
-Requests/sec: 287679.81
-Transfer/sec:     39.78MB
+     50%    1.71ms
+     75%    1.80ms
+     90%    2.16ms
+     99%    3.41ms
+  1396054 requests in 5.10s, 193.05MB read
+Requests/sec: 273656.34
+Transfer/sec:     37.84MB
 == gogo [multi] /db  t=1 c=500 d=5s ==
 Running 5s test @ http://127.0.0.1:3002/db
   1 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     2.27ms  690.02us  53.19ms   90.83%
-    Req/Sec   208.05k    22.03k  225.42k    86.27%
+    Latency     2.37ms  785.36us  43.80ms   89.69%
+    Req/Sec   197.55k    23.72k  219.20k    86.00%
   Latency Distribution
-     50%    2.19ms
-     75%    2.36ms
-     90%    2.59ms
-     99%    5.10ms
-  1055099 requests in 5.10s, 198.91MB read
-Requests/sec: 206705.97
-Transfer/sec:     38.97MB
+     50%    2.26ms
+     75%    2.45ms
+     90%    2.76ms
+     99%    5.68ms
+  983677 requests in 5.01s, 185.45MB read
+Requests/sec: 196187.14
+Transfer/sec:     36.99MB
 == gogo [multi] /db  t=4 c=500 d=5s ==
 Running 5s test @ http://127.0.0.1:3002/db
   4 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     2.43ms  847.86us  58.36ms   91.16%
-    Req/Sec    50.15k    11.64k  204.85k    99.00%
+    Latency     2.52ms    1.03ms 115.49ms   91.76%
+    Req/Sec    48.50k     5.18k   57.68k    82.84%
   Latency Distribution
      50%    2.36ms
-     75%    2.53ms
-     90%    2.88ms
-     99%    5.09ms
-  1003082 requests in 5.10s, 189.10MB read
-Requests/sec: 196608.73
-Transfer/sec:     37.07MB
+     75%    2.54ms
+     90%    2.97ms
+     99%    6.25ms
+  984395 requests in 5.10s, 185.58MB read
+Requests/sec: 192898.20
+Transfer/sec:     36.37MB
