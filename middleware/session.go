@@ -81,6 +81,20 @@ type SessionOptions struct {
 	// LocalKey overrides the req.Local key. Default
 	// SessionLocalKey.
 	LocalKey string
+
+	// MaxEntries caps the in-memory store's bucket count to bound
+	// memory growth under high session-id cardinality (long-running
+	// servers with sustained signup traffic, or attackers spamming
+	// new session cookies). When the cap is hit on a fresh Save,
+	// the store sweeps expired entries first; if that still doesn't
+	// free space, the OLDEST remaining entry (by expires) is
+	// evicted to make room. Zero (default) means 100_000 — enough
+	// for typical fleets, low enough that worst-case memory stays
+	// under ~50 MiB even with rich session payloads. Negative
+	// disables the cap (not recommended outside tests).
+	//
+	// Only consulted when Store is the default MemorySessionStore.
+	MaxEntries int
 }
 
 // Session is the per-request session handle handlers manipulate
@@ -190,7 +204,16 @@ func NewSession(opt SessionOptions) mwhint.Hinted {
 		panic("gogo/middleware: Session requires a Secret")
 	}
 	if opt.Store == nil {
-		opt.Store = NewMemorySessionStore()
+		mem := NewMemorySessionStore()
+		switch {
+		case opt.MaxEntries == 0:
+			mem.maxEntries = 100_000
+		case opt.MaxEntries > 0:
+			mem.maxEntries = opt.MaxEntries
+		default:
+			mem.maxEntries = 0 // negative → disabled
+		}
+		opt.Store = mem
 	}
 	if opt.CookieName == "" {
 		opt.CookieName = "session"
@@ -322,12 +345,20 @@ func verifySessionID(secret []byte, signed string) (string, bool) {
 }
 
 // MemorySessionStore is the default Store: a map[string]*sessionEntry
-// guarded by a sync.RWMutex. Expired entries are reclaimed lazily on
-// Load; call GC manually if your session-id distribution is bursty
-// and you want bounded memory.
+// guarded by a sync.Mutex. Expired entries are reclaimed lazily —
+// on Load when an expired id is touched, and on Save when the cap
+// (maxEntries) is reached. The manual GC method is still available
+// for callers that want to force a full sweep.
+//
+// Memory is bounded by maxEntries (set via SessionOptions.MaxEntries,
+// default 100_000): on a fresh Save at the cap the store first
+// sweeps expired entries, then evicts the oldest-expires entry
+// remaining to make room. Worst-case memory therefore stays
+// predictable even under high-cardinality session-id spam.
 type MemorySessionStore struct {
-	mu      sync.RWMutex
-	entries map[string]*sessionEntry
+	mu         sync.Mutex
+	entries    map[string]*sessionEntry
+	maxEntries int // 0 = unbounded; set by NewSession constructor
 }
 
 type sessionEntry struct {
@@ -336,16 +367,27 @@ type sessionEntry struct {
 }
 
 // NewMemorySessionStore returns an empty MemorySessionStore ready for
-// use as SessionOptions.Store.
+// use as SessionOptions.Store. The store is unbounded by default
+// when used directly; routing it through NewSession applies the
+// MaxEntries cap (default 100_000) automatically.
 func NewMemorySessionStore() *MemorySessionStore {
 	return &MemorySessionStore{entries: make(map[string]*sessionEntry)}
 }
 
+// Load implements SessionStore. Expired entries are deleted from
+// the map before reporting them absent — the doc claim that
+// "expired entries are reclaimed lazily on Load" now holds. Without
+// this delete, an attacker who never revisits a session-id leaves
+// the entry pinned in the map forever, defeating the TTL.
 func (s *MemorySessionStore) Load(id string) (map[string]any, bool) {
-	s.mu.RLock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	e, ok := s.entries[id]
-	s.mu.RUnlock()
-	if !ok || time.Now().After(e.expires) {
+	if !ok {
+		return nil, false
+	}
+	if time.Now().After(e.expires) {
+		delete(s.entries, id)
 		return nil, false
 	}
 	cp := make(map[string]any, len(e.data))
@@ -355,15 +397,47 @@ func (s *MemorySessionStore) Load(id string) (map[string]any, bool) {
 	return cp, true
 }
 
+// Save implements SessionStore. New entries trigger eviction when
+// the store is at maxEntries capacity (existing entries don't, so
+// the steady-state hot path stays O(1)).
 func (s *MemorySessionStore) Save(id string, data map[string]any, ttl time.Duration) error {
 	cp := make(map[string]any, len(data))
 	for k, v := range data {
 		cp[k] = v
 	}
+	now := time.Now()
 	s.mu.Lock()
-	s.entries[id] = &sessionEntry{data: cp, expires: time.Now().Add(ttl)}
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	if _, exists := s.entries[id]; !exists && s.maxEntries > 0 && len(s.entries) >= s.maxEntries {
+		s.evictLocked(now)
+	}
+	s.entries[id] = &sessionEntry{data: cp, expires: now.Add(ttl)}
 	return nil
+}
+
+// evictLocked sweeps expired entries and, if still over capacity,
+// drops the entry with the earliest expires to free a slot. Caller
+// must hold s.mu. O(N) but only fires when the cap binds.
+func (s *MemorySessionStore) evictLocked(now time.Time) {
+	for k, e := range s.entries {
+		if now.After(e.expires) {
+			delete(s.entries, k)
+		}
+	}
+	if s.maxEntries <= 0 || len(s.entries) < s.maxEntries {
+		return
+	}
+	var oldestKey string
+	var oldestExpires time.Time
+	for k, e := range s.entries {
+		if oldestKey == "" || e.expires.Before(oldestExpires) {
+			oldestKey = k
+			oldestExpires = e.expires
+		}
+	}
+	if oldestKey != "" {
+		delete(s.entries, oldestKey)
+	}
 }
 
 func (s *MemorySessionStore) Delete(id string) error {
