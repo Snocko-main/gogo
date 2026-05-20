@@ -132,6 +132,32 @@ func setupShared(app *gogo.App, metrics *middleware.Metrics) {
 		res.Send(200, "text/plain", "ok")
 	})
 
+	// /stream/big — sends a 32 MiB payload in 4 KiB chunks while
+	// honoring backpressure via res.AwaitDrain. Without the drain
+	// hook the loop would queue every chunk in-memory regardless
+	// of network speed; with it, the generator yields to the loop
+	// once the buffer crosses 1 MiB and resumes when uWS reports
+	// it can accept more. Drive with `wrk -t 4 -c 64 -d 10s` and
+	// compare server RSS to the no-drain build.
+	app.GetAsync("/stream/big", func(res *gogo.Response, req *gogo.Request) {
+		chunk := make([]byte, 4*1024)
+		for i := range chunk {
+			chunk[i] = 'x'
+		}
+		const totalChunks = 8 * 1024 // 32 MiB total
+		res.Stream(200, "application/octet-stream", func(w io.Writer) error {
+			for i := 0; i < totalChunks; i++ {
+				if _, err := w.Write(chunk); err != nil {
+					return err
+				}
+				if err := res.AwaitDrain(1 << 20); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	})
+
 	// /headers/x — handler reads 5 typical request headers in
 	// sequence (User-Agent, Accept-Encoding, Cookie, Authorization,
 	// X-Forwarded-For). Pre-D-1 each lookup costs one cgo crossing

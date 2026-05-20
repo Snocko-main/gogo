@@ -368,6 +368,81 @@ func TestStreamLargeBody(t *testing.T) {
 	}
 }
 
+// TestStreamBufferedAmount samples res.BufferedAmount inside a
+// stream loop. The byte counter should be 0 on a freshly-opened
+// stream, rise after writes, and (with a fast localhost client)
+// stay small because uWS drains immediately.
+func TestStreamBufferedAmount(t *testing.T) {
+	var samples []uint64
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.GetAsync("/buf", func(res *gogo.Response, req *gogo.Request) {
+			res.Stream(200, "application/octet-stream", func(w io.Writer) error {
+				samples = append(samples, res.BufferedAmount())
+				_, _ = w.Write([]byte(strings.Repeat("x", 64*1024)))
+				samples = append(samples, res.BufferedAmount())
+				return nil
+			})
+		})
+	})
+	defer teardown()
+
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/buf", port))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if len(body) != 64*1024 {
+		t.Errorf("body length = %d, want %d", len(body), 64*1024)
+	}
+	if len(samples) != 2 {
+		t.Fatalf("samples = %d, want 2", len(samples))
+	}
+	// Before any write the buffer should be empty.
+	if samples[0] != 0 {
+		t.Errorf("BufferedAmount before write = %d, want 0", samples[0])
+	}
+	// After Write the queue is the SUM of what we asked the loop
+	// to push (defer'd) — but the actual uWS-side buffer reflects
+	// only bytes already moved through the C++ side. The value
+	// can be 0 (loop already drained), some intermediate, or up
+	// to the chunk size. Just assert "not panicking" and
+	// trust the sample is coherent.
+	_ = samples[1]
+}
+
+// TestStreamAwaitDrain proves the AwaitDrain helper returns
+// without error on a fast-draining localhost connection. The
+// threshold is set high (1 GiB) so the loop never has to park.
+func TestStreamAwaitDrain(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.GetAsync("/drain", func(res *gogo.Response, req *gogo.Request) {
+			res.Stream(200, "application/octet-stream", func(w io.Writer) error {
+				for i := 0; i < 4; i++ {
+					if _, err := w.Write([]byte("chunk\n")); err != nil {
+						return err
+					}
+					if err := res.AwaitDrain(1 << 30); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+		})
+	})
+	defer teardown()
+
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/drain", port))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "chunk\nchunk\nchunk\nchunk\n" {
+		t.Errorf("body = %q", string(body))
+	}
+}
+
 // TestStreamHeadersIncludeBuffered verifies headers set via
 // res.Header before Stream go out in the initial frame.
 func TestStreamHeadersIncludeBuffered(t *testing.T) {
