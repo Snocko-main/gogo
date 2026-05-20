@@ -1131,6 +1131,127 @@ func TestUseAsyncRejectsBadArgs(t *testing.T) {
 	}
 }
 
+// TestRequestHeadersIterator confirms req.Headers walks every
+// (name, value) pair without cgo on sync routes. Multiple
+// custom request headers are sent; the handler stamps every one
+// it saw back into the response so the test can assert names +
+// values came through unchanged.
+func TestRequestHeadersIterator(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/dump", func(res *gogo.Response, req *gogo.Request) {
+			// Aggregate every header into a sortable list so the
+			// assertion is order-independent (uWS may reorder
+			// trailing headers; user-agent / accept come from
+			// the client in a particular order).
+			var pairs []string
+			n := req.Headers(func(name, value string) bool {
+				pairs = append(pairs, name+":"+value)
+				return true
+			})
+			res.Header("X-Header-Count", strconv.Itoa(n))
+			res.Send(200, "text/plain", strings.Join(pairs, "\n"))
+		})
+	})
+	defer teardown()
+
+	r, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/dump", port), nil)
+	r.Header.Set("X-Custom-A", "alpha")
+	r.Header.Set("X-Custom-B", "beta")
+	r.Header.Set("X-Custom-C", "gamma")
+	resp, err := http.DefaultClient.Do(r)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	pairs := strings.Split(string(body), "\n")
+
+	have := map[string]string{}
+	for _, p := range pairs {
+		k, v, _ := strings.Cut(p, ":")
+		have[k] = v
+	}
+	for _, want := range []struct{ name, value string }{
+		{"x-custom-a", "alpha"},
+		{"x-custom-b", "beta"},
+		{"x-custom-c", "gamma"},
+	} {
+		if got := have[want.name]; got != want.value {
+			t.Errorf("Headers: %q = %q, want %q (full = %v)", want.name, got, want.value, have)
+		}
+	}
+	if cnt := resp.Header.Get("X-Header-Count"); cnt == "" || cnt == "0" {
+		t.Errorf("X-Header-Count = %q, want non-zero", cnt)
+	}
+}
+
+// TestRequestHeadersIteratorEarlyStop verifies that returning
+// false from the iterator callback stops the walk and the count
+// reflects only the headers visited up to that point.
+func TestRequestHeadersIteratorEarlyStop(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/stop", func(res *gogo.Response, req *gogo.Request) {
+			visited := 0
+			req.Headers(func(name, value string) bool {
+				visited++
+				return visited < 2 // stop after the 2nd header
+			})
+			res.Header("X-Visited", strconv.Itoa(visited))
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	r, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/stop", port), nil)
+	r.Header.Set("X-A", "1")
+	r.Header.Set("X-B", "2")
+	r.Header.Set("X-C", "3")
+	resp, err := http.DefaultClient.Do(r)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	resp.Body.Close()
+	if got := resp.Header.Get("X-Visited"); got != "2" {
+		t.Errorf("X-Visited = %q, want 2", got)
+	}
+}
+
+// TestRequestHeadersIteratorAsync covers the snapshot path —
+// req.Headers walks the AsyncCtx's packed blob inside an async
+// handler. The snapshot was already captured before the worker
+// ran, so the underlying live request is gone by this point;
+// the test confirms the headers still arrive via the snapshot.
+func TestRequestHeadersIteratorAsync(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.GetAsync("/dump-async", func(res *gogo.Response, req *gogo.Request) {
+			var pairs []string
+			req.Headers(func(name, value string) bool {
+				pairs = append(pairs, name+":"+value)
+				return true
+			})
+			res.Send(200, "text/plain", strings.Join(pairs, "\n"))
+		})
+	})
+	defer teardown()
+
+	r, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/dump-async", port), nil)
+	r.Header.Set("X-Async-Trace", "trace-42")
+	r.Header.Set("X-Async-Auth", "Bearer xyz")
+	resp, err := http.DefaultClient.Do(r)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	got := string(body)
+	if !strings.Contains(got, "x-async-trace:trace-42") {
+		t.Errorf("missing x-async-trace in async Headers walk: %q", got)
+	}
+	if !strings.Contains(got, "x-async-auth:Bearer xyz") {
+		t.Errorf("missing x-async-auth in async Headers walk: %q", got)
+	}
+}
+
 // TestPlaceBothFiresOnceAndKeepsFastPath registers a raw counter
 // middleware via App.Use. Raw middleware defaults to "both chains"
 // placement so both a sync and async route should observe exactly

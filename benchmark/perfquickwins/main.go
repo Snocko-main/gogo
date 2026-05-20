@@ -119,6 +119,19 @@ func setupShared(app *gogo.App, metrics *middleware.Metrics) {
 		res.Send(200, "text/plain", "ok")
 	})
 
+	// /cors-async/x — async CORS route. Exercises T-5's actual
+	// payoff: the shared-dispatch snapshot now carries headers
+	// at 8 KB (matching the sync scratch buffer), so middleware
+	// that reads Origin / Authorization / etc. on async routes
+	// has zero cgo on the lookup path.
+	app.Use("/cors-async", middleware.CORS(middleware.CORSOptions{
+		AllowOrigins:  []string{"https://app.example.com", "https://*.tenant.example.com"},
+		ExposeHeaders: []string{"X-Request-Id", "X-Rate-Limit"},
+	}))
+	app.GetAsync("/cors-async/x", func(res *gogo.Response, req *gogo.Request) {
+		res.Send(200, "text/plain", "ok")
+	})
+
 	// /headers/x — handler reads 5 typical request headers in
 	// sequence (User-Agent, Accept-Encoding, Cookie, Authorization,
 	// X-Forwarded-For). Pre-D-1 each lookup costs one cgo crossing

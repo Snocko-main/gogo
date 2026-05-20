@@ -816,8 +816,13 @@ constexpr size_t SNAP_PARAM_MAX = 8;
 // forms and the trailing null without bloating AsyncCtx.
 constexpr size_t SNAP_IP_CAP = 64;
 // Headers are encoded as "name\0value\0..." back-to-back so Go can parse on
-// access without knowing the count up front. 4 KB fits the typical request.
-constexpr size_t SNAP_HEADERS_CAP = 4096;
+// access without knowing the count up front. 8 KB matches the sync
+// HEADERS_SCRATCH_SIZE — both paths now have the same upper bound on
+// how many bytes of headers Go gets to see without falling back to
+// cgo (the async path has no cgo fallback because the request is
+// freed by the time the worker runs, so this cap is also the cap on
+// non-truncated lookups for async requests).
+constexpr size_t SNAP_HEADERS_CAP = 8192;
 
 // AsyncCtx is a reference-counted handle that tracks an in-flight async
 // response. Refs are held by:
