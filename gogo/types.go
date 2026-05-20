@@ -3358,6 +3358,67 @@ func (r *Request) Get(name string) string {
 	return r.Header(name)
 }
 
+// Headers iterates every request header pair, lowercase name first.
+// fn returns false to stop early — same convention as
+// sync.Map.Range. Returns the number of headers visited.
+//
+// In sync mode this walks the per-call scratch blob the C++
+// dispatcher packs into the request; in async mode it walks the
+// snapshot blob captured into AsyncCtx before the live request was
+// freed. Either way the iteration stays Go-only — zero cgo per
+// pair. Names are returned in the order uWS parsed them, which
+// matches the order on the wire.
+//
+// Useful for middleware that copies headers verbatim (tracing
+// context propagation, raw audit logs, etc.) without paying one
+// Header(name) call per known header.
+//
+//	req.Headers(func(name, value string) bool {
+//	    out.Header(name, value)
+//	    return true
+//	})
+func (r *Request) Headers(fn func(name, value string) bool) int {
+	if fn == nil {
+		return 0
+	}
+	var blob []byte
+	switch {
+	case r.snap != nil:
+		blob = r.snap.headers
+	case r.syncHeadersPtr != nil && r.syncHeadersLen > 0:
+		blob = unsafe.Slice((*byte)(r.syncHeadersPtr), r.syncHeadersLen)
+	default:
+		// No pre-packed blob available — pull the full header
+		// dump via cgo and walk that. Rare path: only fires when
+		// the dispatcher hasn't populated the scratch pointer
+		// (test stubs, custom request construction).
+		blob = r.inner.headersAll()
+	}
+	count := 0
+	for len(blob) > 0 {
+		j := indexOfZero(blob)
+		if j < 0 {
+			break
+		}
+		name := string(blob[:j])
+		blob = blob[j+1:]
+		if len(blob) == 0 {
+			break
+		}
+		j = indexOfZero(blob)
+		if j < 0 {
+			break
+		}
+		value := string(blob[:j])
+		blob = blob[j+1:]
+		count++
+		if !fn(name, value) {
+			return count
+		}
+	}
+	return count
+}
+
 // Hostname returns the host portion of the Host header, with any ":port"
 // suffix stripped. Returns "" if the request has no Host header.
 func (r *Request) Hostname() string {
