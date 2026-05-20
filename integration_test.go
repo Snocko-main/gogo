@@ -1788,28 +1788,106 @@ func TestSetCookieRejectsBadValue(t *testing.T) {
 	}
 	defer app.Close()
 
-	// We can't easily call SetCookie outside a handler since Response
-	// requires an inner pointer. Test the validator indirectly via the
-	// public API: register a route that tries to set a bad cookie and
-	// confirm the handler panics (caught by uWS HTTP context, returns 500).
-	t.Run("bad name", func(t *testing.T) {
-		defer func() {
-			if recover() == nil {
-				t.Fatalf("expected panic for bad cookie name")
-			}
-		}()
-		var r gogo.Response
-		r.SetCookie(gogo.Cookie{Name: "bad name", Value: "x"})
+	// SetCookie validation runs before any wire output, so we can drive
+	// it against a zero-value Response and observe the panic without
+	// standing up a server.
+	cases := []struct {
+		label  string
+		cookie gogo.Cookie
+	}{
+		{"bad name (space)", gogo.Cookie{Name: "bad name", Value: "x"}},
+		{"bad value (CR)", gogo.Cookie{Name: "ok", Value: "has\rnewline"}},
+		// Path / Domain / Expires / SameSite were not validated in the
+		// original implementation — these subtests are the regression
+		// guard for the cookie-attribute-injection bug. The fix
+		// rejects ";", CTLs, and (for SameSite) any value outside the
+		// three RFC 6265bis tokens.
+		{"path semicolon injection", gogo.Cookie{
+			Name:  "ok",
+			Value: "x",
+			Path:  "/; Domain=evil.example; Secure=false",
+		}},
+		{"path CR injection", gogo.Cookie{Name: "ok", Value: "x", Path: "/foo\r\nX-Bad: 1"}},
+		{"domain semicolon injection", gogo.Cookie{
+			Name:   "ok",
+			Value:  "x",
+			Domain: "victim.com; HttpOnly=false",
+		}},
+		{"domain space injection", gogo.Cookie{Name: "ok", Value: "x", Domain: "victim com"}},
+		{"expires semicolon injection", gogo.Cookie{
+			Name:    "ok",
+			Value:   "x",
+			Expires: "Wed, 21 Oct 2025 07:28:00 GMT; Secure=false",
+		}},
+		{"samesite injection via cast", gogo.Cookie{
+			Name:     "ok",
+			Value:    "x",
+			SameSite: gogo.SameSite("Lax; Domain=evil.example"),
+		}},
+		{"samesite unknown token", gogo.Cookie{
+			Name:     "ok",
+			Value:    "x",
+			SameSite: gogo.SameSite("Whatever"),
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.label, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("SetCookie %s did not panic", tc.label)
+				}
+			}()
+			var r gogo.Response
+			r.SetCookie(tc.cookie)
+		})
+	}
+}
+
+// TestSetCookieAttributesValid: confirm well-formed values for Path,
+// Domain, Expires, and SameSite all pass validation. The serialized
+// header must contain each attribute exactly once.
+func TestSetCookieAttributesValid(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/", func(res *gogo.Response, req *gogo.Request) {
+			res.SetCookie(gogo.Cookie{
+				Name:     "session",
+				Value:    "abc123",
+				Path:     "/api",
+				Domain:   ".example.com",
+				Expires:  "Wed, 21 Oct 2025 07:28:00 GMT",
+				MaxAge:   3600,
+				Secure:   true,
+				HttpOnly: true,
+				SameSite: gogo.SameSiteLax,
+			})
+			res.Send(200, "text/plain", "ok")
+		})
 	})
-	t.Run("bad value", func(t *testing.T) {
-		defer func() {
-			if recover() == nil {
-				t.Fatalf("expected panic for bad cookie value")
-			}
-		}()
-		var r gogo.Response
-		r.SetCookie(gogo.Cookie{Name: "ok", Value: "has\rnewline"})
-	})
+	defer teardown()
+
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/", port))
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status=%d, want 200", resp.StatusCode)
+	}
+	setCookie := resp.Header.Get("Set-Cookie")
+	for _, want := range []string{
+		"session=abc123",
+		"Path=/api",
+		"Domain=.example.com",
+		"Expires=Wed, 21 Oct 2025 07:28:00 GMT",
+		"Max-Age=3600",
+		"Secure",
+		"HttpOnly",
+		"SameSite=Lax",
+	} {
+		if !strings.Contains(setCookie, want) {
+			t.Errorf("Set-Cookie %q missing %q", setCookie, want)
+		}
+	}
 }
 
 func TestSnapshotBoundaries(t *testing.T) {

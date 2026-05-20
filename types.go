@@ -4046,10 +4046,21 @@ type Cookie struct {
 	SameSite SameSite
 }
 
-// SetCookie writes a Set-Cookie response header. Name and Value are
-// validated against the cookie token grammar (no CTL/separator chars) —
-// invalid characters panic, since they typically indicate a programming bug
-// rather than user input the framework should silently accept.
+// SetCookie writes a Set-Cookie response header. Every field that
+// reaches the wire is validated against the relevant grammar before
+// serialization:
+//
+//   - Name: RFC 6265 cookie-name (token grammar, no CTL/separator)
+//   - Value: RFC 6265 cookie-octet
+//   - Path / Domain / Expires: reject CTLs and ";" so user-controlled
+//     input cannot inject additional attributes by smuggling a
+//     semicolon (e.g. Path="/; Domain=evil.com; Secure=false")
+//   - SameSite: exact match against "", "Strict", "Lax", "None"
+//
+// Invalid characters panic — they typically indicate a programming bug
+// or untrusted input reaching a Cookie field unprotected.
+// SetCookieSigned routes through SetCookie so this validation covers
+// signed cookies too.
 //
 // Multiple calls append multiple Set-Cookie headers; browsers handle them
 // independently.
@@ -4059,6 +4070,16 @@ func (r *Response) SetCookie(c Cookie) {
 	}
 	validateCookieName(c.Name)
 	validateCookieValue(c.Value)
+	if c.Path != "" {
+		validateCookiePath(c.Path)
+	}
+	if c.Domain != "" {
+		validateCookieDomain(c.Domain)
+	}
+	if c.Expires != "" {
+		validateCookieExpires(c.Expires)
+	}
+	validateCookieSameSite(c.SameSite)
 
 	var b strings.Builder
 	b.Grow(len(c.Name) + len(c.Value) + 64)
@@ -4121,6 +4142,60 @@ func validateCookieValue(value string) {
 			panic(fmt.Sprintf("gogo: cookie value contains invalid byte %q at offset %d", c, i))
 		}
 	}
+}
+
+// validateCookiePath rejects bytes that would break the Set-Cookie
+// attribute framing. Per RFC 6265 §4.1.1, path-value is any character
+// except CTLs and ";". An attacker who could land user input here
+// without this check could inject extra attributes
+// (Path="/; Domain=evil.com; Secure=false").
+func validateCookiePath(path string) {
+	for i := 0; i < len(path); i++ {
+		c := path[i]
+		if c < 0x20 || c == 0x7f || c == ';' {
+			panic(fmt.Sprintf("gogo: cookie Path %q contains invalid byte 0x%02x at offset %d", path, c, i))
+		}
+	}
+}
+
+// validateCookieDomain rejects bytes that would break attribute framing
+// or fragment the header line. The strict RFC 6265 §4.1.1 grammar
+// requires a subdomain per RFC 1034/1123, but real-world cookies use
+// a slightly wider character set (leading dot, internationalized
+// domain labels post-encoding) — so we reject only the bytes that are
+// definitely dangerous: CTLs, ";", "," , and whitespace.
+func validateCookieDomain(domain string) {
+	for i := 0; i < len(domain); i++ {
+		c := domain[i]
+		if c < 0x20 || c == 0x7f || c == ';' || c == ',' || c == ' ' || c == '\t' {
+			panic(fmt.Sprintf("gogo: cookie Domain %q contains invalid byte 0x%02x at offset %d", domain, c, i))
+		}
+	}
+}
+
+// validateCookieExpires rejects CTLs and ";". The expected IMF-fixdate
+// format (RFC 7231 §7.1.1) uses ASCII letters, digits, ":", " ", and
+// "," (the comma after day-of-week), all of which we permit. ";" would
+// inject another attribute; CTLs would split the header line.
+func validateCookieExpires(expires string) {
+	for i := 0; i < len(expires); i++ {
+		c := expires[i]
+		if c < 0x20 || c == 0x7f || c == ';' {
+			panic(fmt.Sprintf("gogo: cookie Expires %q contains invalid byte 0x%02x at offset %d", expires, c, i))
+		}
+	}
+}
+
+// validateCookieSameSite ensures SameSite is one of the three defined
+// values (or empty, which omits the attribute). The field's type is
+// just a string alias, so a caller can cast arbitrary content into it
+// (gogo.SameSite("Lax; Domain=evil")) — we have to gate that here.
+func validateCookieSameSite(s SameSite) {
+	switch s {
+	case "", SameSiteStrict, SameSiteLax, SameSiteNone:
+		return
+	}
+	panic(fmt.Sprintf("gogo: cookie SameSite %q must be one of \"\", \"Strict\", \"Lax\", \"None\"", s))
 }
 
 // parseSingleQueryParam mirrors uWS::HttpRequest::getQuery(key): linear scan
