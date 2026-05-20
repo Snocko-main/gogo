@@ -366,8 +366,8 @@ func TestRequestIDGenerated(t *testing.T) {
 	if got != headerID {
 		t.Errorf("Locals ID %q != header ID %q", got, headerID)
 	}
-	if len(headerID) != 16 {
-		t.Errorf("ID length %d, want 16", len(headerID))
+	if len(headerID) != 32 {
+		t.Errorf("ID length %d, want 32", len(headerID))
 	}
 }
 
