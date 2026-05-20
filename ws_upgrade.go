@@ -65,7 +65,7 @@ func (c *UpgradeContext) QueryParam(name string) string {
 	return parseSingleQueryParam(c.query, name)
 }
 
-// IP returns the peer IP address as a printable string.
+// IP returns the canonical peer IP address as a printable string.
 func (c *UpgradeContext) IP() string { return c.ip }
 
 // Header reads a request header by name (case-insensitive). The
@@ -260,7 +260,7 @@ func handleWSUpgradeFromCgo(behavior WebSocketBehavior, ctxPtr uintptr,
 		method:      method,
 		url:         url,
 		query:       query,
-		ip:          ip,
+		ip:          normalizePeerIP(ip),
 		headersBlob: headersBlob,
 		protocols:   parseSubprotocolList(offeredProtocols),
 		ctxPtr:      ctxPtr,

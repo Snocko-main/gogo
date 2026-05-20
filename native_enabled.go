@@ -698,6 +698,13 @@ func asyncCtxRelease(ctxHandle uintptr) {
 	C.uwsgo_async_ctx_release(unsafe.Pointer(ctxHandle))
 }
 
+func asyncCtxAborted(ctxHandle uintptr) bool {
+	if ctxHandle == 0 {
+		return true
+	}
+	return C.uwsgo_async_ctx_aborted(unsafe.Pointer(ctxHandle)) != 0
+}
+
 // sharedLayout caches struct offsets exposed by C so the hot path can build
 // responses with plain unsafe.Pointer arithmetic and atomic ops, no cgo.
 // Each AsyncCtx carries a pointer to its App's pending ring; asyncSendShared
@@ -795,19 +802,19 @@ func initSharedLayoutOnce() {
 		ctCap:             uintptr(raw.ctx_inline_ct_cap),
 		bodyCap:           uintptr(raw.ctx_inline_body_cap),
 
-		ctxMethodLenOff:  uintptr(raw.ctx_method_len_offset),
-		ctxURLLenOff:     uintptr(raw.ctx_url_len_offset),
-		ctxQueryLenOff:   uintptr(raw.ctx_query_len_offset),
-		ctxIPLenOff:      uintptr(raw.ctx_ip_len_offset),
-		ctxParamCountOff: uintptr(raw.ctx_param_count_offset),
-		ctxHeadersLenOff: uintptr(raw.ctx_headers_len_offset),
-		ctxTruncatedOff:  uintptr(raw.ctx_truncated_offset),
-		ctxParamLensOff:  uintptr(raw.ctx_param_lens_offset),
-		ctxMethodOff:     uintptr(raw.ctx_method_offset),
-		ctxURLOff:        uintptr(raw.ctx_url_offset),
-		ctxQueryOff:      uintptr(raw.ctx_query_offset),
-		ctxIPOff:         uintptr(raw.ctx_ip_offset),
-		ctxParamsOff:     uintptr(raw.ctx_params_offset),
+		ctxMethodLenOff:       uintptr(raw.ctx_method_len_offset),
+		ctxURLLenOff:          uintptr(raw.ctx_url_len_offset),
+		ctxQueryLenOff:        uintptr(raw.ctx_query_len_offset),
+		ctxIPLenOff:           uintptr(raw.ctx_ip_len_offset),
+		ctxParamCountOff:      uintptr(raw.ctx_param_count_offset),
+		ctxHeadersLenOff:      uintptr(raw.ctx_headers_len_offset),
+		ctxTruncatedOff:       uintptr(raw.ctx_truncated_offset),
+		ctxParamLensOff:       uintptr(raw.ctx_param_lens_offset),
+		ctxMethodOff:          uintptr(raw.ctx_method_offset),
+		ctxURLOff:             uintptr(raw.ctx_url_offset),
+		ctxQueryOff:           uintptr(raw.ctx_query_offset),
+		ctxIPOff:              uintptr(raw.ctx_ip_offset),
+		ctxParamsOff:          uintptr(raw.ctx_params_offset),
 		ctxHeadersOff:         uintptr(raw.ctx_headers_offset),
 		ctxReqBodyLenOff:      uintptr(raw.ctx_req_body_len_offset),
 		ctxReqBodyOverflowOff: uintptr(raw.ctx_req_body_overflow_offset),

@@ -8,6 +8,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -428,8 +429,8 @@ type Config struct {
 
 // App is a uWebSockets HTTP application.
 type App struct {
-	inner            appNative
-	middlewares      []middlewareEntry
+	inner                   appNative
+	middlewares             []middlewareEntry
 	asyncMiddlewares        []asyncMiddlewareEntry
 	cfg                     Config
 	notFoundHandler         Handler
@@ -451,8 +452,8 @@ type App struct {
 	// between Add and Close's drain is purely Go-side; WaitGroup's
 	// Add/Wait race detector requires a happens-before that the
 	// cgo-mediated loop close doesn't provide.
-	closed         atomic.Bool
-	pendingTimers  atomic.Int32
+	closed        atomic.Bool
+	pendingTimers atomic.Int32
 	// routeMethods maps a LITERAL pattern to the set of HTTP methods
 	// registered against it. Used by the catch-all at Listen time to
 	// distinguish "path exists but the method is wrong" (→ 405 with
@@ -2504,10 +2505,11 @@ func (r *Response) BufferedAmount() uint64 {
 
 // AwaitDrain blocks the caller until BufferedAmount falls below
 // threshold, or returns nil immediately if it's already below.
-// Implemented as a one-shot onWritable callback installed on the
-// uWS loop — the goroutine parks on a channel rather than busy-
-// polling, so back-to-back writes against a slow client don't
-// burn CPU.
+// It samples uWS's buffered byte counter at a short interval from the
+// producer goroutine. The polling fallback is intentional: uWS's
+// onWritable signal is edge-triggered and can be missed when a buffer
+// drains before the callback is armed, which would otherwise park the
+// stream permanently.
 //
 // Only valid while a Stream is in flight (r.async != nil); calling
 // outside that scope returns nil with no work done.
@@ -2520,26 +2522,16 @@ func (r *Response) AwaitDrain(threshold uint64) error {
 	if r.async == nil {
 		return nil
 	}
-	if r.BufferedAmount() <= threshold {
-		return nil
-	}
-	wake := make(chan struct{})
-	asyncDeferDrainSignal(r.async.loopPtr, r.async.ctxHandle, newDrainHandle(wake))
-	<-wake
-	// Recheck after wake — onWritable can fire even when the
-	// buffer is still above threshold (uWS schedules the
-	// notification at a lower watermark). Loop until we're
-	// actually below, or until the response was aborted.
 	for r.BufferedAmount() > threshold {
-		if r.async == nil {
+		if r.async == nil || asyncCtxAborted(r.async.ctxHandle) {
 			return errStreamAborted
 		}
-		wake = make(chan struct{})
-		asyncDeferDrainSignal(r.async.loopPtr, r.async.ctxHandle, newDrainHandle(wake))
-		<-wake
+		time.Sleep(drainPollInterval)
 	}
 	return nil
 }
+
+const drainPollInterval = 2 * time.Millisecond
 
 // errStreamAborted is the sentinel returned by AwaitDrain when
 // the response went away while the goroutine was parked.
@@ -4073,12 +4065,27 @@ func (r *Request) IP() string {
 		return r.cachedIP
 	}
 	if r.snap != nil {
-		r.cachedIP = r.snap.ip
+		r.cachedIP = normalizePeerIP(r.snap.ip)
 	} else if r.syncResPtr != nil {
-		r.cachedIP = remoteAddrFromPtr(r.syncResPtr)
+		r.cachedIP = normalizePeerIP(remoteAddrFromPtr(r.syncResPtr))
 	}
 	r.ipCached = true
 	return r.cachedIP
+}
+
+func normalizePeerIP(ip string) string {
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		return ""
+	}
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return ip
+	}
+	if addr.Is4In6() {
+		addr = addr.Unmap()
+	}
+	return addr.String()
 }
 
 // IPs parses the X-Forwarded-For header into a slice of IPs in the order

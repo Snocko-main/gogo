@@ -256,6 +256,10 @@ void uwsgo_res_defer_stream_end(
 // Call this if a goroutine returns without invoking defer_send.
 void uwsgo_async_ctx_release(void *ctx);
 
+// async_ctx_aborted reports whether the async response's client connection
+// has already disconnected. It is safe to sample from a worker goroutine.
+int uwsgo_async_ctx_aborted(void *ctx);
+
 // Memory layout exposed to Go for the shared-memory fast path. Go reads this
 // once at startup, then writes responses directly into ctx memory and pushes
 // onto the shared ring using plain atomic operations — no cgo crossing per

@@ -1053,6 +1053,14 @@ extern "C" void uwsgo_async_ctx_release(void *ctx_handle) {
     ctx->release();
 }
 
+extern "C" int uwsgo_async_ctx_aborted(void *ctx_handle) {
+    auto *ctx = static_cast<AsyncCtx *>(ctx_handle);
+    if (ctx == nullptr) {
+        return 1;
+    }
+    return ctx->aborted.load(std::memory_order_acquire) ? 1 : 0;
+}
+
 extern "C" void uwsgo_shared_layout(uwsgo_shared_layout_t *out) {
     g_request.init();
     // ring is no longer a global pointer; each AsyncCtx carries its App's

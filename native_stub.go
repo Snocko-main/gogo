@@ -7,8 +7,8 @@ import (
 	"unsafe"
 )
 
-func goStringFromC(_ unsafe.Pointer, _ int) string  { return "" }
-func remoteAddrFromPtr(_ unsafe.Pointer) string     { return "" }
+func goStringFromC(_ unsafe.Pointer, _ int) string { return "" }
+func remoteAddrFromPtr(_ unsafe.Pointer) string    { return "" }
 
 var errNativeDisabled = errors.New("gogo native binding disabled: build with CGO_ENABLED=1 and -tags gogo")
 
@@ -64,7 +64,7 @@ func asyncSendShared(uintptr, string, string, string) bool { return false }
 
 func (responseNative) beginAsync() (uintptr, uintptr) { return 0, 0 }
 
-func asyncDeferSend(uintptr, uintptr, string, string, string)                {}
+func asyncDeferSend(uintptr, uintptr, string, string, string)                    {}
 func asyncDeferSendWithHeaders(uintptr, uintptr, string, string, string, string) {}
 func asyncDeferStreamStart(uintptr, uintptr, string, string, string)             {}
 func asyncDeferStreamWrite(uintptr, uintptr, string)                             {}
@@ -72,12 +72,13 @@ func asyncDeferStreamEnd(uintptr, uintptr)                                      
 func asyncDeferDrainSignal(uintptr, uintptr, uintptr)                            {}
 func innerBufferedAmount(responseNative) uint64                                  { return 0 }
 func newDrainHandle(chan struct{}) uintptr                                       { return 0 }
+func asyncCtxAborted(ctxHandle uintptr) bool                                     { return ctxHandle == 0 }
 
 func upgradeAccept(uintptr, string, uintptr) {}
 func upgradeReject(uintptr, string, string)  {}
 func wsGetUserData(*WebSocket) uintptr       { return 0 }
 func wsSetUserData(*WebSocket, uintptr)      {}
-func asyncCtxRelease(uintptr)                                                    {}
+func asyncCtxRelease(uintptr)                {}
 
 func (requestNative) method() string           { return "" }
 func (requestNative) url() string              { return "" }
@@ -87,12 +88,12 @@ func (requestNative) query() string            { return "" }
 func (requestNative) queryParam(string) string { return "" }
 func (requestNative) headersAll() []byte       { return nil }
 
-func (websocketNative) send([]byte, OpCode) bool             { return false }
-func (websocketNative) sendString(string, OpCode) bool       { return false }
-func (websocketNative) end(int, string)                      {}
-func (websocketNative) subscribe(string) bool                { return false }
-func (websocketNative) unsubscribe(string) bool              { return false }
-func (websocketNative) publish(string, []byte, OpCode) bool  { return false }
+func (websocketNative) send([]byte, OpCode) bool            { return false }
+func (websocketNative) sendString(string, OpCode) bool      { return false }
+func (websocketNative) end(int, string)                     {}
+func (websocketNative) subscribe(string) bool               { return false }
+func (websocketNative) unsubscribe(string) bool             { return false }
+func (websocketNative) publish(string, []byte, OpCode) bool { return false }
 
-func (appNative) publish(string, []byte, OpCode)   {}
-func (appNative) publishBatch([]PublishMessage)     {}
+func (appNative) publish(string, []byte, OpCode) {}
+func (appNative) publishBatch([]PublishMessage)  {}
