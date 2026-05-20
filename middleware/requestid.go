@@ -25,6 +25,16 @@ type RequestIDOptions struct {
 	// already uses so the chain stays consistent.
 	Header string
 
+	// MaxLength caps an incoming request ID before it is reused and echoed
+	// back. Overlong IDs are discarded and a fresh ID is generated instead.
+	// Default 128. Negative disables the length cap.
+	MaxLength int
+
+	// Validator can reject incoming IDs that don't match your fleet's
+	// format. When nil, the default accepts visible non-space ASCII only.
+	// Rejected IDs are replaced with a generated ID.
+	Validator func(string) bool
+
 	// Generator produces a new ID when the request has no incoming
 	// value. Default generates 32 random hex characters (16 bytes of
 	// crypto/rand, 128 bits of entropy). Replace with uuid.NewString
@@ -33,7 +43,8 @@ type RequestIDOptions struct {
 }
 
 // RequestID returns a middleware that ensures every request has an ID:
-//   - If the incoming Header value is non-empty, that ID is reused.
+//   - If the incoming Header value is non-empty and passes the configured
+//     length/format policy, that ID is reused.
 //   - Otherwise a new ID is generated via Options.Generator.
 //
 // The ID is echoed on the response in the same header and stashed in
@@ -53,6 +64,12 @@ func RequestID(opts ...RequestIDOptions) mwhint.Hinted {
 	if opt.Generator == nil {
 		opt.Generator = defaultRequestID
 	}
+	if opt.MaxLength == 0 {
+		opt.MaxLength = 128
+	}
+	if opt.Validator == nil {
+		opt.Validator = validDefaultRequestID
+	}
 	// uWS header lookups are case-insensitive when going through the
 	// snapshot path but case-sensitive (lowercase only) through the
 	// sync path. Use the lowercased form for the lookup.
@@ -61,7 +78,7 @@ func RequestID(opts ...RequestIDOptions) mwhint.Hinted {
 	return mwhint.Hinted{Place: mwhint.Both, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler {
 		return func(res *gogo.Response, req *gogo.Request) {
 			id := req.Header(lookupName)
-			if id == "" {
+			if id == "" || requestIDTooLong(id, opt.MaxLength) || !opt.Validator(id) {
 				id = opt.Generator()
 			}
 			req.SetLocal(RequestIDLocalKey, id)
@@ -69,6 +86,20 @@ func RequestID(opts ...RequestIDOptions) mwhint.Hinted {
 			next(res, req)
 		}
 	})}
+}
+
+func requestIDTooLong(id string, max int) bool {
+	return max >= 0 && len(id) > max
+}
+
+func validDefaultRequestID(id string) bool {
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if c <= ' ' || c >= 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // defaultRequestID generates 32 hex characters (128 bits) from

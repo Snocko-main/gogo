@@ -106,7 +106,7 @@ func ParseBody(contentType string, body []byte, out any) error {
 				p.Close()
 				continue
 			}
-			data, err := io.ReadAll(p)
+			data, err := readMultipartPart(p, multipartPartLimit(MultipartOptions{}))
 			p.Close()
 			if err != nil {
 				return fmt.Errorf("gogo: read multipart value %q: %w", name, err)

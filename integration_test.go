@@ -4994,6 +4994,42 @@ func TestBodyParserMultipart(t *testing.T) {
 	}
 }
 
+func TestBodyParserMultipartRejectsOversizeField(t *testing.T) {
+	oldLimit := gogo.DefaultMultipartPartLimit
+	gogo.DefaultMultipartPartLimit = 8
+	defer func() { gogo.DefaultMultipartPartLimit = oldLimit }()
+
+	type form struct {
+		Name string `form:"name"`
+	}
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.PostAsync("/m", 1<<20, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			var f form
+			err := req.BodyParser(&f)
+			if errors.Is(err, gogo.ErrMultipartPartTooLarge) {
+				res.Send(413, "text/plain", "field too large")
+				return
+			}
+			if err != nil {
+				res.Send(500, "text/plain", err.Error())
+				return
+			}
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	_ = mw.WriteField("name", "0123456789abcdef")
+	mw.Close()
+
+	status, respBody := httpPost(t, port, "/m", mw.FormDataContentType(), body.Bytes())
+	if status != 413 || respBody != "field too large" {
+		t.Fatalf("oversize multipart field: got %d %q, want 413", status, respBody)
+	}
+}
+
 // TestBodyParserNoBody: sync handlers reach BodyParser without
 // collecting the body first → ErrNoBody.
 func TestBodyParserNoBody(t *testing.T) {

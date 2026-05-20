@@ -2232,11 +2232,22 @@ func (r *Response) Append(key, value string) *Response {
 // Write appends a response chunk without ending the response.
 func (r *Response) Write(body string) *Response {
 	if r.encoder != nil && !r.encoder.applied {
-		if raw, overflow := r.encoder.writeString(body); !overflow {
+		if prefix, overflow := r.encoder.writeString(body); !overflow {
 			return r
 		} else {
 			r.encoder = nil
-			body = raw
+			if r.async != nil {
+				r.async.body.WriteString(prefix)
+				r.async.body.WriteString(body)
+				return r
+			}
+			r.ensureStatusSync()
+			r.flushPendingHeaders()
+			if prefix != "" {
+				r.inner.write(prefix)
+			}
+			r.inner.write(body)
+			return r
 		}
 	}
 	if r.async != nil {
@@ -2252,9 +2263,21 @@ func (r *Response) Write(body string) *Response {
 // End finishes the response.
 func (r *Response) End(body string) {
 	if r.encoder != nil && !r.encoder.applied {
-		if raw, overflow := r.encoder.writeString(body); overflow {
+		if prefix, overflow := r.encoder.writeString(body); overflow {
 			r.encoder = nil
-			body = raw
+			if r.async != nil {
+				r.async.body.WriteString(prefix)
+				r.async.body.WriteString(body)
+				r.flushAsync()
+				return
+			}
+			r.ensureStatusSync()
+			r.flushPendingHeaders()
+			if prefix != "" {
+				r.inner.write(prefix)
+			}
+			r.inner.end(body)
+			return
 		} else {
 			body = r.applyEncoder("")
 		}
@@ -2289,9 +2312,26 @@ func (r *Response) Send(code int, contentType, body string) {
 	line := statusLine(code)
 
 	if r.encoder != nil && !r.encoder.applied {
-		if raw, overflow := r.encoder.writeString(body); overflow {
+		if prefix, overflow := r.encoder.writeString(body); overflow {
 			r.encoder = nil
-			body = raw
+			if r.async != nil && !r.async.sent {
+				r.async.status = line
+				r.async.contentType = contentType
+				r.async.body.WriteString(prefix)
+				r.async.body.WriteString(body)
+				r.flushAsync()
+				return
+			}
+			r.inner.status(line)
+			r.flushPendingHeaders()
+			if contentType != "" {
+				r.inner.header("Content-Type", contentType)
+			}
+			if prefix != "" {
+				r.inner.write(prefix)
+			}
+			r.inner.end(body)
+			return
 		} else {
 			body = r.applyEncoder(contentType)
 		}
@@ -3294,16 +3334,12 @@ func (r *Response) SetBodyEncoderLimit(maxBytes int, encode func(body []byte, co
 	r.encoder = &bodyEncoder{encode: encode, max: maxBytes}
 }
 
-func (e *bodyEncoder) writeString(s string) (raw string, overflow bool) {
+func (e *bodyEncoder) writeString(s string) (prefix string, overflow bool) {
 	if e.max > 0 && len(s) > e.max-e.buf.Len() {
 		e.applied = true
-		if e.buf.Len() == 0 {
-			raw = s
-		} else {
-			raw = e.buf.String() + s
-		}
+		prefix = e.buf.String()
 		e.buf.Reset()
-		return raw, true
+		return prefix, true
 	}
 	e.buf.WriteString(s)
 	return "", false
