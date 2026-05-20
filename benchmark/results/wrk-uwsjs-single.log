@@ -1,84 +1,168 @@
-== uwsjs [single] /hello  t=1 c=500 d=5s ==
-Running 5s test @ http://127.0.0.1:3003/hello
+== uwsjs [single] /hello  t=1 c=500 d=15s ==
+Running 15s test @ http://127.0.0.1:3003/hello
   1 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.40ms  497.35us  12.03ms   82.41%
-    Req/Sec   269.40k    11.72k  290.31k    92.16%
+    Latency     2.22ms    1.47ms  49.10ms   94.90%
+    Req/Sec   224.84k    34.57k  262.74k    87.33%
   Latency Distribution
-     50%    1.28ms
-     75%    1.55ms
-     90%    2.02ms
-     99%    3.07ms
-  1367164 requests in 5.10s, 190.36MB read
-Requests/sec: 267862.70
-Transfer/sec:     37.30MB
-== uwsjs [single] /hello  t=4 c=500 d=5s ==
-Running 5s test @ http://127.0.0.1:3003/hello
-  4 threads and 500 connections
+     50%    1.97ms
+     75%    2.16ms
+     90%    2.96ms
+     99%    6.57ms
+  3356218 requests in 15.01s, 467.31MB read
+Requests/sec: 223551.95
+Transfer/sec:     31.13MB
+== uwsjs [single] /hello  t=2 c=500 d=15s ==
+Running 15s test @ http://127.0.0.1:3003/hello
+  2 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.85ms  309.58us   7.88ms   94.94%
-    Req/Sec    67.44k    14.30k  261.88k    96.52%
+    Latency     1.99ms  368.92us  21.63ms   96.29%
+    Req/Sec   125.75k     8.05k  135.30k    91.67%
   Latency Distribution
-     50%    1.86ms
-     75%    1.89ms
-     90%    1.93ms
-     99%    2.79ms
-  1349163 requests in 5.10s, 187.85MB read
-Requests/sec: 264472.38
-Transfer/sec:     36.82MB
-== uwsjs [single] /hello/inon  t=1 c=500 d=5s ==
-Running 5s test @ http://127.0.0.1:3003/hello/inon
-  1 threads and 500 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.85ms  409.95us   8.26ms   90.48%
-    Req/Sec   263.78k    11.81k  282.96k    90.00%
-  Latency Distribution
-     50%    1.80ms
-     75%    1.87ms
-     90%    1.95ms
-     99%    3.64ms
-  1311516 requests in 5.00s, 181.36MB read
-Requests/sec: 262084.20
-Transfer/sec:     36.24MB
-== uwsjs [single] /hello/inon  t=4 c=500 d=5s ==
-Running 5s test @ http://127.0.0.1:3003/hello/inon
-  4 threads and 500 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.92ms  227.08us   8.43ms   93.91%
-    Req/Sec    65.09k     3.52k   72.91k    91.18%
-  Latency Distribution
-     50%    1.89ms
-     75%    1.93ms
-     90%    1.99ms
-     99%    2.66ms
-  1320988 requests in 5.10s, 182.67MB read
-Requests/sec: 258886.44
-Transfer/sec:     35.80MB
-== uwsjs [single] /db  t=1 c=500 d=5s ==
-Running 5s test @ http://127.0.0.1:3003/db
-  1 threads and 500 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     2.89ms  395.33us  12.92ms   96.01%
-    Req/Sec   173.88k    10.63k  187.74k    86.27%
-  Latency Distribution
-     50%    2.85ms
-     75%    2.90ms
-     90%    3.01ms
-     99%    4.32ms
-  881893 requests in 5.10s, 166.26MB read
-Requests/sec: 172781.60
-Transfer/sec:     32.57MB
-== uwsjs [single] /db  t=4 c=500 d=5s ==
-Running 5s test @ http://127.0.0.1:3003/db
-  4 threads and 500 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     2.84ms  292.77us  10.63ms   91.83%
-    Req/Sec    43.98k     3.12k   59.20k    92.61%
-  Latency Distribution
-     50%    2.84ms
-     75%    2.90ms
-     90%    2.99ms
+     50%    1.94ms
+     75%    1.99ms
+     90%    2.06ms
      99%    3.68ms
-  888418 requests in 5.10s, 167.49MB read
-Requests/sec: 174151.56
-Transfer/sec:     32.83MB
+  3753038 requests in 15.00s, 522.56MB read
+Requests/sec: 250127.01
+Transfer/sec:     34.83MB
+== uwsjs [single] /hello  t=4 c=500 d=15s ==
+Running 15s test @ http://127.0.0.1:3003/hello
+  4 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.00ms    0.94ms  37.48ms   99.35%
+    Req/Sec    63.67k     3.63k   84.96k    93.37%
+  Latency Distribution
+     50%    1.94ms
+     75%    1.98ms
+     90%    2.04ms
+     99%    2.54ms
+  3820234 requests in 15.10s, 531.92MB read
+Requests/sec: 252933.18
+Transfer/sec:     35.22MB
+== uwsjs [single] /hello  t=8 c=500 d=15s ==
+Running 15s test @ http://127.0.0.1:3003/hello
+  8 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.03ms    1.09ms  38.44ms   98.37%
+    Req/Sec    31.24k     4.62k  138.40k    93.93%
+  Latency Distribution
+     50%    1.95ms
+     75%    2.01ms
+     90%    2.08ms
+     99%    3.05ms
+  3738006 requests in 15.10s, 520.47MB read
+Requests/sec: 247493.50
+Transfer/sec:     34.46MB
+== uwsjs [single] /hello/inon  t=1 c=500 d=15s ==
+Running 15s test @ http://127.0.0.1:3003/hello/inon
+  1 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     1.92ms  525.59us  16.01ms   91.40%
+    Req/Sec   255.25k    14.13k  272.51k    93.38%
+  Latency Distribution
+     50%    1.85ms
+     75%    1.93ms
+     90%    2.03ms
+     99%    3.78ms
+  3834732 requests in 15.10s, 530.28MB read
+Requests/sec: 253872.19
+Transfer/sec:     35.11MB
+== uwsjs [single] /hello/inon  t=2 c=500 d=15s ==
+Running 15s test @ http://127.0.0.1:3003/hello/inon
+  2 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.02ms    1.07ms  39.92ms   98.51%
+    Req/Sec   126.60k    10.80k  252.48k    92.36%
+  Latency Distribution
+     50%    1.95ms
+     75%    1.99ms
+     90%    2.05ms
+     99%    3.01ms
+  3790783 requests in 15.10s, 524.20MB read
+Requests/sec: 250986.41
+Transfer/sec:     34.71MB
+== uwsjs [single] /hello/inon  t=4 c=500 d=15s ==
+Running 15s test @ http://127.0.0.1:3003/hello/inon
+  4 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.09ms    1.02ms  46.61ms   99.19%
+    Req/Sec    61.07k     3.50k   64.37k    92.38%
+  Latency Distribution
+     50%    2.02ms
+     75%    2.07ms
+     90%    2.12ms
+     99%    2.85ms
+  3669329 requests in 15.10s, 507.40MB read
+Requests/sec: 242958.28
+Transfer/sec:     33.60MB
+== uwsjs [single] /hello/inon  t=8 c=500 d=15s ==
+Running 15s test @ http://127.0.0.1:3003/hello/inon
+  8 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.05ms  277.60us  19.15ms   97.32%
+    Req/Sec    30.40k     1.56k   36.93k    95.08%
+  Latency Distribution
+     50%    2.02ms
+     75%    2.08ms
+     90%    2.15ms
+     99%    2.66ms
+  3630509 requests in 15.01s, 502.04MB read
+Requests/sec: 241902.90
+Transfer/sec:     33.45MB
+== uwsjs [single] /db  t=1 c=500 d=15s ==
+Running 15s test @ http://127.0.0.1:3003/db
+  1 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     3.01ms    0.88ms  32.85ms   98.42%
+    Req/Sec   168.74k    10.68k  183.71k    88.67%
+  Latency Distribution
+     50%    2.92ms
+     75%    2.98ms
+     90%    3.11ms
+     99%    4.58ms
+  2519834 requests in 15.02s, 475.04MB read
+Requests/sec: 167734.17
+Transfer/sec:     31.62MB
+== uwsjs [single] /db  t=2 c=500 d=15s ==
+Running 15s test @ http://127.0.0.1:3003/db
+  2 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     3.06ms    0.99ms  39.51ms   98.75%
+    Req/Sec    82.93k     5.02k   90.52k    93.00%
+  Latency Distribution
+     50%    2.98ms
+     75%    3.03ms
+     90%    3.13ms
+     99%    4.06ms
+  2476204 requests in 15.00s, 466.82MB read
+Requests/sec: 165050.16
+Transfer/sec:     31.12MB
+== uwsjs [single] /db  t=4 c=500 d=15s ==
+Running 15s test @ http://127.0.0.1:3003/db
+  4 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     3.03ms    0.97ms  36.15ms   98.74%
+    Req/Sec    41.96k     2.55k   44.63k    91.17%
+  Latency Distribution
+     50%    2.94ms
+     75%    3.00ms
+     90%    3.11ms
+     99%    4.19ms
+  2505778 requests in 15.01s, 472.39MB read
+Requests/sec: 166935.43
+Transfer/sec:     31.47MB
+== uwsjs [single] /db  t=8 c=500 d=15s ==
+Running 15s test @ http://127.0.0.1:3003/db
+  8 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.97ms    0.90ms  33.69ms   98.57%
+    Req/Sec    21.13k     1.13k   23.94k    91.25%
+  Latency Distribution
+     50%    2.91ms
+     75%    2.97ms
+     90%    3.05ms
+     99%    3.91ms
+  2525698 requests in 15.03s, 476.14MB read
+Requests/sec: 168081.47
+Transfer/sec:     31.69MB
