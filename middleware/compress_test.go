@@ -191,3 +191,83 @@ func TestCompressJSONViaWriteEnd(t *testing.T) {
 		t.Errorf("decoded mismatch (len got=%d want=%d)", len(decoded), len(payload))
 	}
 }
+
+// TestCompressSkipsOversizeBody asserts the MaxSize cap kicks in:
+// bodies larger than the configured cap are emitted uncompressed
+// instead of allocating a secondary buffer + burning multi-MiB
+// compression CPU. The previous behavior compressed every body
+// regardless of size, which made a multi-MiB JSON response a
+// trivial DoS vector against process memory.
+func TestCompressSkipsOversizeBody(t *testing.T) {
+	// 4 KiB cap is small enough to test cheaply but large enough
+	// to exceed MinSize so the small-body skip doesn't fire first.
+	const cap = 4 << 10
+	payload := strings.Repeat("zlib-compressible-content ", 1<<8) // ~6 KiB
+	if len(payload) <= cap {
+		t.Fatalf("test payload %d bytes is not larger than cap %d", len(payload), cap)
+	}
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.Compress(middleware.CompressOptions{
+			MaxSize: cap,
+		}))
+		app.Get("/", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", payload)
+		})
+	})
+	defer teardown()
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/", port), nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Oversize body: no Content-Encoding, raw bytes match.
+	if got := resp.Header.Get("Content-Encoding"); got != "" {
+		t.Errorf("Content-Encoding: got %q, want empty (body exceeded MaxSize)", got)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != payload {
+		t.Errorf("raw body mismatch: got %d bytes, want %d", len(body), len(payload))
+	}
+}
+
+// TestCompressMaxSizeDisableSentinel: setting MaxSize=-1 disables
+// the cap, restoring the pre-default behavior of compressing every
+// body that passes the other filters. Useful for benchmarks and for
+// callers who genuinely want to compress arbitrarily large responses.
+func TestCompressMaxSizeDisableSentinel(t *testing.T) {
+	const cap = -1
+	payload := strings.Repeat("compressible-content ", 1<<10) // ~21 KiB
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.Compress(middleware.CompressOptions{
+			MaxSize: cap, // disabled
+		}))
+		app.Get("/", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", payload)
+		})
+	})
+	defer teardown()
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/", port), nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if got := resp.Header.Get("Content-Encoding"); got != "gzip" {
+		t.Errorf("Content-Encoding: got %q, want gzip (MaxSize disabled)", got)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	gr, _ := gzip.NewReader(bytes.NewReader(body))
+	decoded, _ := io.ReadAll(gr)
+	if string(decoded) != payload {
+		t.Errorf("decoded mismatch (len got=%d want=%d)", len(decoded), len(payload))
+	}
+}

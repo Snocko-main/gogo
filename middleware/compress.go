@@ -12,9 +12,10 @@ import (
 )
 
 // CompressOptions configures Compress. Zero value uses
-// gzip.DefaultCompression with a 1 KiB MinSize threshold and the
-// standard "compressible content-type" filter (text/*, application/
-// json, application/javascript, application/xml, image/svg+xml).
+// gzip.DefaultCompression with a 1 KiB MinSize threshold, a 4 MiB
+// MaxSize cap, and the standard "compressible content-type" filter
+// (text/*, application/json, application/javascript, application/xml,
+// image/svg+xml).
 type CompressOptions struct {
 	// Level is the gzip / deflate compression level. Valid range
 	// 0 (no compression) to 9 (best). Default
@@ -26,6 +27,30 @@ type CompressOptions struct {
 	// and the gzip framing overhead often makes the result larger.
 	// Default 1024.
 	MinSize int
+
+	// MaxSize skips compression when the buffered body is LARGER
+	// than this many bytes. The compression step allocates a
+	// secondary buffer ~half the input size to hold the encoded
+	// output, plus the CPU to run gzip / deflate over the whole
+	// thing — both linear in body size, both bounded only by the
+	// handler's own response size before this cap was introduced.
+	// A 100 MiB dynamic JSON response would peak around 150 MiB of
+	// resident heap during compression; concurrent requests
+	// multiply that. With the cap in place, bodies larger than
+	// MaxSize emit uncompressed (no Content-Encoding header) so
+	// downstream proxies / CDNs can apply their own compression if
+	// desired.
+	//
+	// Default 4 MiB. Set to 0 to disable the cap (matches the
+	// pre-cap behavior — every body of any size gets compressed if
+	// it passes the other filters). Negative is treated as zero.
+	//
+	// Note: this caps the COMPRESSION work, not the buffering. The
+	// handler's bytes still flow through the encoder's staging
+	// buffer; for truly streaming responses (SSE, large file
+	// downloads) use SkipFunc to bypass the encoder entirely, or
+	// use Response.Stream which doesn't route through this hook.
+	MaxSize int
 
 	// Filter, when non-nil, is consulted after the body is buffered
 	// to decide whether the response is worth compressing. The
@@ -73,6 +98,11 @@ func Compress(opts ...CompressOptions) mwhint.Hinted {
 	if opt.MinSize == 0 {
 		opt.MinSize = 1024
 	}
+	if opt.MaxSize == 0 {
+		opt.MaxSize = 4 << 20 // 4 MiB — bounds compression CPU + transient memory
+	} else if opt.MaxSize < 0 {
+		opt.MaxSize = 0 // explicit "disable cap" sentinel
+	}
 	if opt.Filter == nil {
 		opt.Filter = defaultCompressFilter
 	}
@@ -93,6 +123,14 @@ func Compress(opts ...CompressOptions) mwhint.Hinted {
 			}
 			res.SetBodyEncoder(func(body []byte, contentType string) ([]byte, string) {
 				if len(body) < opt.MinSize {
+					return body, ""
+				}
+				if opt.MaxSize > 0 && len(body) > opt.MaxSize {
+					// Compressing a multi-MiB body would allocate a
+					// secondary buffer of similar size and burn
+					// noticeable CPU. Emit uncompressed instead so
+					// concurrent large requests don't spike the
+					// process's resident memory.
 					return body, ""
 				}
 				if contentType != "" && !opt.Filter(contentType) {
