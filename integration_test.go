@@ -1844,6 +1844,57 @@ func TestSetCookieRejectsBadValue(t *testing.T) {
 	}
 }
 
+// TestSetCookieSameSiteNoneRequiresSecure: per RFC 6265bis §5.5,
+// SameSite=None cookies without Secure are rejected by modern
+// browsers entirely. The framework panics at the boundary so the
+// misconfig surfaces during development instead of silently breaking
+// auth in production.
+func TestSetCookieSameSiteNoneRequiresSecure(t *testing.T) {
+	t.Run("none-without-secure panics", func(t *testing.T) {
+		defer func() {
+			if recover() == nil {
+				t.Fatalf("SetCookie SameSite=None without Secure did not panic")
+			}
+		}()
+		var r gogo.Response
+		r.SetCookie(gogo.Cookie{
+			Name:     "session",
+			Value:    "x",
+			SameSite: gogo.SameSiteNone,
+			// Secure intentionally omitted
+		})
+	})
+	t.Run("none-with-secure accepted", func(t *testing.T) {
+		// Drive through a real handler so SetCookie's tail (which
+		// writes to res.inner) doesn't crash on a zero-value Response.
+		port, teardown := startApp(t, func(app *gogo.App) {
+			app.Get("/", func(res *gogo.Response, req *gogo.Request) {
+				res.SetCookie(gogo.Cookie{
+					Name:     "session",
+					Value:    "x",
+					SameSite: gogo.SameSiteNone,
+					Secure:   true,
+				})
+				res.Send(200, "text/plain", "ok")
+			})
+		})
+		defer teardown()
+
+		resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/", port))
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("status=%d, want 200 — SameSite=None+Secure should be accepted", resp.StatusCode)
+		}
+		cookie := resp.Header.Get("Set-Cookie")
+		if !strings.Contains(cookie, "SameSite=None") || !strings.Contains(cookie, "Secure") {
+			t.Errorf("Set-Cookie missing expected attrs: %q", cookie)
+		}
+	})
+}
+
 // TestSetCookieAttributesValid: confirm well-formed values for Path,
 // Domain, Expires, and SameSite all pass validation. The serialized
 // header must contain each attribute exactly once.
