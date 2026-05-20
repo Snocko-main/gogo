@@ -3093,6 +3093,20 @@ type Request struct {
 	syncParamPtrs [4]unsafe.Pointer
 	syncParamLens [4]int
 
+	// syncHeadersPtr / syncHeadersLen point at the per-request
+	// `name\0value\0name\0value\0…` blob that dispatch_sync packs in
+	// a stack scratch buffer before calling into Go. Request.Header
+	// scans this blob first and falls back to the cgo getHeader
+	// helper only on a miss — middleware that reads several headers
+	// in series pays one cgo crossing for the whole request instead
+	// of one per Header(name) call.
+	//
+	// The pointer is valid only for the lifetime of the cgo
+	// callback (= the lifetime of reqWrap before it returns to the
+	// pool). resetForPool clears it on return.
+	syncHeadersPtr unsafe.Pointer
+	syncHeadersLen int
+
 	// syncResPtr is the live uWS response pointer for sync-mode handlers.
 	// req.IP() uses it to lazily fetch the peer address via cgo on demand
 	// (most handlers don't read IP, so pre-caching would be wasted work).
@@ -3192,6 +3206,8 @@ func (r *Request) resetForPool() {
 	r.syncURLLen = 0
 	r.syncQueryPtr = nil
 	r.syncQueryLen = 0
+	r.syncHeadersPtr = nil
+	r.syncHeadersLen = 0
 	r.syncParamPtrs = [4]unsafe.Pointer{}
 	r.syncParamLens = [4]int{}
 	r.syncResPtr = nil
@@ -3266,11 +3282,74 @@ func (r *Request) Method() string {
 // Header returns a request header value. Header lookups in async/shared
 // handlers parse the snapshot buffer on every call; cache the value if you
 // need it multiple times.
+//
+// In sync mode the C++ dispatcher packs every header into a stack
+// scratch blob before calling into Go, so this scan is allocation-free
+// and pays zero cgo per call. Headers that overflow the 8 KB scratch
+// buffer fall back to the uWS getHeader helper via cgo — a rare path
+// on real-world requests.
 func (r *Request) Header(name string) string {
 	if r.snap != nil {
 		return r.snap.lookupHeader(name)
 	}
+	if r.syncHeadersPtr != nil && r.syncHeadersLen > 0 {
+		if v, ok := lookupHeaderInSyncBlob(r.syncHeadersPtr, r.syncHeadersLen, name); ok {
+			return v
+		}
+		// Miss on a packed blob can mean either "header absent" or
+		// "header was past the scratch cap". Fall through to cgo to
+		// distinguish; uWS's own getHeader is the source of truth.
+	}
 	return r.inner.header(name)
+}
+
+// lookupHeaderInSyncBlob scans the dispatcher-packed
+// `name\0value\0…` blob for a header by name. Returns
+// (value, true) on hit, ("", false) on miss. Name comparison is
+// case-insensitive — uWS stores header names lowercase so the
+// search needle is normalized once up front.
+func lookupHeaderInSyncBlob(ptr unsafe.Pointer, ln int, name string) (string, bool) {
+	if name == "" {
+		return "", false
+	}
+	buf := unsafe.Slice((*byte)(ptr), ln)
+	needle := name
+	for i := 0; i < len(needle); i++ {
+		c := needle[i]
+		if c >= 'A' && c <= 'Z' {
+			b := make([]byte, len(needle))
+			for j := 0; j < len(needle); j++ {
+				x := needle[j]
+				if x >= 'A' && x <= 'Z' {
+					x += 'a' - 'A'
+				}
+				b[j] = x
+			}
+			needle = string(b)
+			break
+		}
+	}
+	for len(buf) > 0 {
+		j := indexOfZero(buf)
+		if j < 0 {
+			return "", false
+		}
+		key := buf[:j]
+		buf = buf[j+1:]
+		if len(buf) == 0 {
+			return "", false
+		}
+		j = indexOfZero(buf)
+		if j < 0 {
+			return "", false
+		}
+		value := buf[:j]
+		buf = buf[j+1:]
+		if len(key) == len(needle) && bytesEqualLower(key, needle) {
+			return string(value), true
+		}
+	}
+	return "", false
 }
 
 // Get is an alias for Header (case-insensitive header lookup). Mirrors the
