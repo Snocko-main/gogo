@@ -97,6 +97,22 @@ func setup(app *gogo.App) {
 		res.Send(200, "text/plain", "ok")
 	})
 
+	// /headers/x — handler reads 5 typical request headers in
+	// sequence (User-Agent, Accept-Encoding, Cookie, Authorization,
+	// X-Forwarded-For). Pre-D-1 each lookup costs one cgo crossing
+	// (~80 ns × 5 = ~400 ns/req); post-D-1 the dispatcher hands
+	// Go a single packed blob and the lookups stay Go-only.
+	// The handler echoes back the User-Agent so the bench client
+	// can verify the read actually happened.
+	app.Get("/headers/x", func(res *gogo.Response, req *gogo.Request) {
+		ua := req.Header("user-agent")
+		_ = req.Header("accept-encoding")
+		_ = req.Header("cookie")
+		_ = req.Header("authorization")
+		_ = req.Header("x-forwarded-for")
+		res.Send(200, "text/plain", ua)
+	})
+
 	// /cors — CORS middleware scoped to the /cors prefix via the
 	// app-level Use so we can pass the bundled mwhint.Hinted value
 	// (Group.Use is typed to gogo.Middleware only).

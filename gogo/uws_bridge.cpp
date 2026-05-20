@@ -19,6 +19,7 @@ extern "C" void uwsgoHandleHTTP(uintptr_t handler_id, uwsgo_res_t *res, uwsgo_re
     const char *method, size_t method_len,
     const char *url, size_t url_len,
     const char *query, size_t query_len,
+    const char *headers_blob, size_t headers_len,
     const char *p0, size_t p0_len,
     const char *p1, size_t p1_len,
     const char *p2, size_t p2_len,
@@ -287,17 +288,34 @@ extern "C" uwsgo_app_t *uwsgo_app_new(void) {
 // needs the complete type to delete recycled ctxs).
 extern "C" void uwsgo_app_free(uwsgo_app_t *app);
 
+// HEADERS_SCRATCH_SIZE caps how many request-header bytes the
+// dispatcher copies into the stack-allocated blob before falling
+// back to the cgo lookup path. 8 KB covers the realistic upper
+// bound for a browser request (≈ 20 headers × ≈ 400 bytes
+// each); requests that overflow simply lose the pre-pack benefit
+// on the trailing headers — Request.Header still works via the
+// cgo helper for any name that wasn't packed.
+static constexpr size_t HEADERS_SCRATCH_SIZE = 8 * 1024;
+
 // dispatch_sync invokes uwsgoHandleHTTP with method / URL / query / the
-// first four route parameters already pulled out of the uWS request.
-// uWS keeps these as std::string_view pointers into its own request
-// buffer; the buffer is alive for the duration of the C++ callback,
-// which is exactly the lifetime of the Go Request wrapper, so passing
-// the raw (data, len) pairs to Go is safe and lets Request's accessors
-// materialize lazily without a cgo round-trip back into uWS.
+// first four route parameters already pulled out of the uWS request,
+// plus a single packed `name\0value\0name\0value\0…` headers blob
+// built in a stack scratch buffer. uWS keeps method / url / query /
+// params / per-header views as std::string_view pointers into its own
+// request buffer; the buffer is alive for the duration of the C++
+// callback, which is exactly the lifetime of the Go Request wrapper,
+// so passing the raw (data, len) pairs to Go is safe and lets
+// Request's accessors materialize lazily without a cgo round-trip
+// back into uWS.
 //
 // Four params covers the realistic ceiling — uWS itself supports more,
 // but routes with more than four named params are extremely rare. Reads
 // past index 3 fall through to the cgo getParameter helper.
+//
+// The packed headers blob is a single contiguous buffer the Go side
+// can scan for any header by name without going back across cgo — the
+// dominant per-request cost for middleware that reads Origin / Cookie
+// / Authorization / User-Agent in series.
 static inline void dispatch_sync(uintptr_t handler_id, uWS::HttpResponse<false> *res, uWS::HttpRequest *req) {
     auto method = req->getMethod();
     auto url = req->getUrl();
@@ -306,12 +324,39 @@ static inline void dispatch_sync(uintptr_t handler_id, uWS::HttpResponse<false> 
     auto p1 = req->getParameter(1);
     auto p2 = req->getParameter(2);
     auto p3 = req->getParameter(3);
+
+    // Pack headers into a per-call stack scratch buffer. Walks uWS's
+    // already-parsed pair list; stops cleanly on the first header
+    // that won't fit, leaving the partial blob valid (every entry
+    // ends with a NUL pair).
+    char headers_buf[HEADERS_SCRATCH_SIZE];
+    size_t headers_len = 0;
+    for (auto it = req->begin(); it != req->end(); ++it) {
+        auto pair = *it;
+        auto name = pair.first;
+        auto value = pair.second;
+        size_t need = name.size() + 1 + value.size() + 1;
+        if (headers_len + need > sizeof(headers_buf)) {
+            // Don't truncate mid-pair — leave the buffer at the last
+            // complete entry so the Go-side scanner never sees a
+            // dangling key with no terminator.
+            break;
+        }
+        std::memcpy(headers_buf + headers_len, name.data(), name.size());
+        headers_len += name.size();
+        headers_buf[headers_len++] = 0;
+        std::memcpy(headers_buf + headers_len, value.data(), value.size());
+        headers_len += value.size();
+        headers_buf[headers_len++] = 0;
+    }
+
     uwsgoHandleHTTP(handler_id,
         reinterpret_cast<uwsgo_res_t *>(res),
         reinterpret_cast<uwsgo_req_t *>(req),
         method.data(), method.size(),
         url.data(), url.size(),
         query.data(), query.size(),
+        headers_buf, headers_len,
         p0.data(), p0.size(),
         p1.data(), p1.size(),
         p2.data(), p2.size(),
