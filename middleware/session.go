@@ -129,6 +129,17 @@ func (s *Session) Get(key string) any {
 }
 
 // Set writes value at key and marks the session for save.
+//
+// Call Set / Delete BEFORE the response begins streaming (i.e. before
+// res.Send / Status / Write / Stream / SSE start emitting bytes). If
+// the session was loaded from a stale signed cookie, the first write
+// rotates the session id and the rotation cookie is queued onto the
+// response via res.SetCookie — once the response headers are on the
+// wire that cookie can no longer reach the client and the next
+// request from this user will arrive with the now-orphaned old id.
+// The framework cannot prevent this without breaking valid streaming
+// patterns, so the contract is documented and enforced by convention:
+// finish your session mutations early in the handler.
 func (s *Session) Set(key string, value any) {
 	s.rotateIfNeeded()
 	if s.data == nil {
@@ -138,7 +149,8 @@ func (s *Session) Set(key string, value any) {
 	s.dirty = true
 }
 
-// Delete removes a key from the session.
+// Delete removes a key from the session. The same "mutate before
+// streaming" contract documented on Set applies here.
 func (s *Session) Delete(key string) {
 	if s.data == nil {
 		return
@@ -148,6 +160,12 @@ func (s *Session) Delete(key string) {
 	s.dirty = true
 }
 
+// rotateIfNeeded swaps out a stale signed session id on the first
+// write. When that happens AFTER the response has already started
+// flushing the rotation cookie is silently dropped — see the Set
+// godoc for the contract that guards against it. The rotation closure
+// is supplied by loadOrCreateSession at request entry; tests
+// substitute their own to assert when rotation actually fires.
 func (s *Session) rotateIfNeeded() {
 	if s == nil || !s.rotateOnWrite || s.rotate == nil {
 		return

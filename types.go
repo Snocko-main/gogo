@@ -4611,6 +4611,13 @@ func (r *Response) SetCookie(c Cookie) {
 		validateCookieExpires(c.Expires)
 	}
 	validateCookieSameSite(c.SameSite)
+	if c.SameSite == SameSiteNone && !c.Secure {
+		// RFC 6265bis §5.5: cookies with SameSite=None MUST also be
+		// Secure or browsers reject them entirely. Catching at the
+		// framework boundary turns a silent "cookie never set in the
+		// browser" footgun into an obvious programmer error.
+		panic("gogo: SetCookie: SameSite=None requires Secure=true (RFC 6265bis §5.5)")
+	}
 
 	var b strings.Builder
 	b.Grow(len(c.Name) + len(c.Value) + 64)

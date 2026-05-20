@@ -305,3 +305,74 @@ func TestCompressMaxSizeDisableSentinel(t *testing.T) {
 		t.Errorf("decoded mismatch (len got=%d want=%d)", len(decoded), len(payload))
 	}
 }
+
+// TestCompressOversizeWriteWithPendingHeadersLandsBoth is the
+// regression test for the sendSplit-with-pending-headers path: when
+// an oversize body triggers the encoder bypass mid-stream, the
+// framework writes the staging prefix + the new chunk as two parts.
+// If headers staged by earlier middleware (RequestID, CORS,
+// app-specific) were lost or duplicated during the split, downstream
+// clients / proxies would miss critical metadata.
+//
+// Exercises:
+//
+//   - RequestID middleware staging an X-Request-ID header
+//   - Compress middleware with a tiny MaxSize that forces overflow on
+//     the first oversize chunk
+//   - A handler that Write()s past the cap then End()s a trailing
+//     chunk so both branches of the split path fire
+//
+// Asserts: X-Request-ID present on the response, body byte-equal,
+// no Content-Encoding header (oversize → bypassed), no duplicated
+// X-Request-ID.
+func TestCompressOversizeWriteWithPendingHeadersLandsBoth(t *testing.T) {
+	const cap = 4 << 10
+	payload := strings.Repeat("split-path-marker ", 1<<8) // ~4.5 KiB > cap
+	if len(payload) <= cap {
+		t.Fatalf("payload %d not larger than cap %d", len(payload), cap)
+	}
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		// RequestID stages X-Request-ID in pendingHeaders before
+		// the handler runs.
+		app.Use(middleware.RequestID())
+		app.Use(middleware.Compress(middleware.CompressOptions{MaxSize: cap}))
+		app.Get("/", func(res *gogo.Response, req *gogo.Request) {
+			res.Header("Content-Type", "text/plain")
+			// Force overflow: Write the body in two pieces so the
+			// encoder buffer accumulates the first chunk, then the
+			// second chunk's End() pushes total > cap → sendSplit
+			// fires with both prefix and tail.
+			res.Write(payload[:cap-128])
+			res.End(payload[cap-128:])
+		})
+	})
+	defer teardown()
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/", port), nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if got := resp.Header.Get("Content-Encoding"); got != "" {
+		t.Errorf("Content-Encoding=%q, want empty (oversize bypass)", got)
+	}
+	rid := resp.Header.Get("X-Request-ID")
+	if rid == "" {
+		t.Errorf("X-Request-ID missing — pending header was dropped by sendSplit")
+	}
+	if values := resp.Header.Values("X-Request-ID"); len(values) > 1 {
+		t.Errorf("X-Request-ID duplicated: %v", values)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(body) != payload {
+		t.Errorf("body mismatch: got %d bytes, want %d", len(body), len(payload))
+	}
+}

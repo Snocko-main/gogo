@@ -70,7 +70,12 @@ func BasicAuth(opt BasicAuthOptions) mwhint.Hinted {
 	if opt.LocalKey == "" {
 		opt.LocalKey = BasicAuthLocalKey
 	}
-	challenge := `Basic realm="` + opt.Realm + `", charset="UTF-8"`
+	// RFC 7235 quoted-string grammar — realm is bound by double
+	// quotes, and any " or \ in the value must be backslash-escaped.
+	// CTLs and DEL are illegal in a quoted-string per RFC 7230 §3.2.6
+	// and would otherwise trip validateHeaderValue's panic. Reuse the
+	// JWT auth-param escaper so both challenges follow the same rule.
+	challenge := `Basic realm="` + jwtAuthParam(opt.Realm) + `", charset="UTF-8"`
 
 	verify := opt.Validator
 	if verify == nil {

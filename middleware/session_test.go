@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/cookiejar"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -580,5 +582,72 @@ func TestSessionExplicitSave(t *testing.T) {
 	resp.Body.Close()
 	if string(body) != "phase=final" {
 		t.Errorf("final state not persisted by OnFinish: probe returned %q", string(body))
+	}
+}
+
+// TestSessionRotateOnWriteIssuesNewCookieBeforeBody is the happy-path
+// contract test for the rotate-on-first-write behavior: a request
+// that carries a signed but server-missing session id (typical of a
+// signed cookie that survived a store wipe / restart) gets rotated
+// to a fresh id, and the new Set-Cookie reaches the client BECAUSE
+// the handler mutated state before sending the body. The other side
+// of the contract — mutating after the body started — is documented
+// on Session.Set rather than guarded in code, since uWS gives no
+// reliable signal to detect "header already on the wire" from a
+// goroutine.
+func TestSessionRotateOnWriteIssuesNewCookieBeforeBody(t *testing.T) {
+	store := middleware.NewMemorySessionStore()
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.NewSession(middleware.SessionOptions{
+			Secret: []byte("session-secret-32-bytes-AAAAAAAA"),
+			Store:  store,
+			TTL:    time.Minute,
+		}))
+		app.Get("/touch", func(res *gogo.Response, req *gogo.Request) {
+			s := req.Local(middleware.SessionLocalKey).(*middleware.Session)
+			// Mutate FIRST — this triggers rotation BEFORE Send.
+			s.Set("phase", "rotated")
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	jar, _ := newCookieJar()
+	client := &http.Client{Jar: jar, Timeout: 5 * time.Second}
+
+	// Seed: issue a real signed cookie via one request.
+	resp, _ := client.Get(fmt.Sprintf("http://127.0.0.1:%d/touch", port))
+	resp.Body.Close()
+
+	// Inspect: jar has the issued cookie. Find its raw signed value
+	// and record the id portion so we can verify rotation later.
+	u, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d/", port))
+	cookies := jar.Cookies(u)
+	if len(cookies) == 0 {
+		t.Fatal("no session cookie issued")
+	}
+	originalSigned := cookies[0].Value
+	originalID := strings.Split(originalSigned, ".")[0]
+
+	// Now wipe the store row but KEEP the signed cookie. Next
+	// request looks like "signed cookie that survived restart".
+	store.Delete(originalID)
+
+	// Second request: same jar, same cookie → triggers rotation
+	// because store row is gone but signature is valid.
+	resp, _ = client.Get(fmt.Sprintf("http://127.0.0.1:%d/touch", port))
+	resp.Body.Close()
+
+	cookies = jar.Cookies(u)
+	if len(cookies) == 0 {
+		t.Fatal("rotation lost the session cookie")
+	}
+	newSigned := cookies[0].Value
+	if newSigned == originalSigned {
+		t.Fatal("rotation did not issue a new signed id")
+	}
+	newID := strings.Split(newSigned, ".")[0]
+	if newID == originalID {
+		t.Fatalf("rotation kept the same id: %q", newID)
 	}
 }
