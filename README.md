@@ -1338,27 +1338,37 @@ turns the parts Go needs into a small C ABI.
 
 ## Benchmarking
 
-There are three comparable HTTP benchmark servers:
+There are five comparable HTTP benchmark servers:
 
-- `benchmark/nethttp`: Go standard library `net/http`
 - `benchmark/gogo`: this binding
+- `benchmark/nethttp`: Go standard library `net/http`
 - `benchmark/fiber`: gofiber/fiber on fasthttp
+- `benchmark/node-uwebsockets`: uWebSockets.js on Node
+- `benchmark/bun-elysia`: Elysia on Bun
 
-Start each in a separate terminal:
+`scripts/bench_wrk.sh` starts each server, hits `/hello`, `/hello/:name`,
+and `/db` with `wrk`, then tears it down. See the script header for the
+env knobs.
+
+### Results
+
+Single-worker, median req/s across `wrk -t {1,2,4,8} -c 500 -d 15s`,
+Apple M1 8-core, macOS 26.
+
+| framework  |       `/hello` | `/hello/:name` |          `/db` |
+|------------|---------------:|---------------:|---------------:|
+| **gogo**   |    **296,793** |    **273,654** |    **192,319** |
+| uwsjs      |        248,810 |        246,972 |        167,335 |
+| fiber      |        243,596 |        227,940 |         98,999 |
+| bun+elysia |        210,421 |        201,456 |        131,955 |
+| net/http   |        148,165 |        142,569 |         74,639 |
+
+`/db` reads one row from a 1000-row SQLite table with a random id —
+exercises the framework + driver, not just the HTTP layer.
+
+To reproduce:
 
 ```sh
-go run ./benchmark/nethttp
-CGO_ENABLED=1 go run -tags gogo ./benchmark/gogo
-go run ./benchmark/fiber
+export CGO_ENABLED=1
+./scripts/bench_wrk.sh
 ```
-
-Run wrk against them (use `-t 1` so client threads don't compete with the
-single-threaded uWS loop for CPU):
-
-```sh
-wrk -t 1 -c 100 -d 10s http://localhost:3002/health   # gogo
-wrk -t 1 -c 100 -d 10s http://localhost:3004/health   # fiber
-```
-
-Use the same machine, same power mode, same payloads, and repeat each run
-3–5 times. Watch both throughput and latency percentiles.
