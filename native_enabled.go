@@ -274,6 +274,16 @@ func newSnapshotFromCtx(ctxPtr uintptr) *requestSnapshot {
 	headersLen := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxHeadersLenOff))
 	truncated := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxTruncatedOff)) != 0
 
+	// Defense in depth: the C++ side caps paramCount at SNAP_PARAM_MAX
+	// before writing it, but if that invariant ever breaks (layout
+	// drift, bridge regression, memory corruption) trusting the raw
+	// value would let Go allocate an arbitrarily large slice and
+	// read past the AsyncCtx's param region. Clamp here so the worst
+	// case stays bounded.
+	if paramCount > uint32(shared.snapParamMax) {
+		paramCount = uint32(shared.snapParamMax)
+	}
+
 	snap := &requestSnapshot{
 		method:    copyAt(ctxPtr+shared.ctxMethodOff, int(methodLen)),
 		url:       copyAt(ctxPtr+shared.ctxURLOff, int(urlLen)),
@@ -288,6 +298,12 @@ func newSnapshotFromCtx(ctxPtr uintptr) *requestSnapshot {
 		params := make([]string, paramCount)
 		for i := uint32(0); i < paramCount; i++ {
 			plen := *(*uint32)(unsafe.Pointer(paramLensBase + uintptr(i)*unsafe.Sizeof(uint32(0))))
+			// Per-param length should also fit within snapParamCap;
+			// clamp so a corrupted length can't drive copyAt past
+			// the slot.
+			if uintptr(plen) > shared.snapParamCap {
+				plen = uint32(shared.snapParamCap)
+			}
 			params[i] = copyAt(paramsBase+uintptr(i)*shared.snapParamCap, int(plen))
 		}
 		snap.params = params
