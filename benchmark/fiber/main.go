@@ -46,11 +46,18 @@ func initDB(path string) error {
 }
 
 func main() {
+	prefork := os.Getenv("FIBER_PREFORK") == "1"
 	app := fiber.New(fiber.Config{
 		DisableStartupMessage: true,
+		Prefork:               prefork,
 	})
 
 	app.Get("/plain", func(c *fiber.Ctx) error {
+		c.Set("Content-Type", "text/plain; charset=utf-8")
+		return c.SendString("hello world\n")
+	})
+
+	app.Get("/hello", func(c *fiber.Ctx) error {
 		c.Set("Content-Type", "text/plain; charset=utf-8")
 		return c.SendString("hello world\n")
 	})
@@ -108,6 +115,10 @@ func main() {
 		return c.SendString(fmt.Sprintf(`{"id":%d,"name":%q,"email":%q,"role":%q}`+"\n", id, name, email, role))
 	})
 
-	log.Println("Fiber listening on http://localhost:3004")
+	if prefork {
+		log.Println("Fiber listening on http://localhost:3004 (prefork)")
+	} else {
+		log.Println("Fiber listening on http://localhost:3004")
+	}
 	log.Fatal(app.Listen(":3004"))
 }

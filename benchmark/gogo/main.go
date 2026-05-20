@@ -73,6 +73,9 @@ func main() {
 		app.Get("/plain", func(res *gogo.Response, req *gogo.Request) {
 			res.Send(200, "text/plain; charset=utf-8", "hello world\n")
 		})
+		app.Get("/hello", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain; charset=utf-8", "hello world\n")
+		})
 		app.Get("/json", func(res *gogo.Response, req *gogo.Request) {
 			res.Send(200, "application/json", `{"message":"hello world","ok":true}`+"\n")
 		})

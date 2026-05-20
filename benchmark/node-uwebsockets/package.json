@@ -5,6 +5,7 @@
     "start": "node server.cjs"
   },
   "dependencies": {
+    "better-sqlite3": "^11.5.0",
     "uWebSockets.js": "git+https://github.com/uNetworking/uWebSockets.js.git#v20.64.0"
   }
 }

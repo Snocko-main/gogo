@@ -80,14 +80,14 @@ turns the parts Go needs into a small C ABI.
 There are three comparable HTTP benchmark servers:
 
 - `benchmark/nethttp`: Go standard library `net/http`
-- `benchmark/uwsgo`: this binding
+- `benchmark/gogo`: this binding
 - `benchmark/fiber`: gofiber/fiber on fasthttp
 
 Start each in a separate terminal:
 
 ```sh
 go run ./benchmark/nethttp
-CGO_ENABLED=1 go run -tags gogo ./benchmark/uwsgo
+CGO_ENABLED=1 go run -tags gogo ./benchmark/gogo
 go run ./benchmark/fiber
 ```
 
