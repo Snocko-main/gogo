@@ -2522,16 +2522,24 @@ func (r *Response) AwaitDrain(threshold uint64) error {
 	if r.async == nil {
 		return nil
 	}
-	for r.BufferedAmount() > threshold {
-		if r.async == nil || asyncCtxAborted(r.async.ctxHandle) {
+	return waitForDrain(
+		func() uint64 { return r.BufferedAmount() },
+		func() bool { return r.async == nil || asyncCtxAborted(r.async.ctxHandle) },
+		threshold,
+	)
+}
+
+const drainPollInterval = 2 * time.Millisecond
+
+func waitForDrain(buffered func() uint64, aborted func() bool, threshold uint64) error {
+	for buffered() > threshold {
+		if aborted() {
 			return errStreamAborted
 		}
 		time.Sleep(drainPollInterval)
 	}
 	return nil
 }
-
-const drainPollInterval = 2 * time.Millisecond
 
 // errStreamAborted is the sentinel returned by AwaitDrain when
 // the response went away while the goroutine was parked.
