@@ -395,6 +395,24 @@ func TestCookieValueRoundtrip(t *testing.T) {
 	}
 }
 
+func TestDefaultMultipartPartLimitSetter(t *testing.T) {
+	oldLimit := GetDefaultMultipartPartLimit()
+	defer SetDefaultMultipartPartLimit(oldLimit)
+	SetDefaultMultipartPartLimit(123)
+	if got := GetDefaultMultipartPartLimit(); got != 123 {
+		t.Fatalf("GetDefaultMultipartPartLimit() = %d, want 123", got)
+	}
+}
+
+func TestDefaultMultipartPartLimitLegacyAssignment(t *testing.T) {
+	oldLimit := GetDefaultMultipartPartLimit()
+	defer SetDefaultMultipartPartLimit(oldLimit)
+	DefaultMultipartPartLimit = 456
+	if got := GetDefaultMultipartPartLimit(); got != 456 {
+		t.Fatalf("legacy DefaultMultipartPartLimit assignment read as %d, want 456", got)
+	}
+}
+
 // BenchmarkParseCookieValue measures cookie lookup; this runs once per
 // incoming request that calls Cookie(), so the alloc target is zero.
 func BenchmarkParseCookieValue(b *testing.B) {

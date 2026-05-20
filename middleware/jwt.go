@@ -187,8 +187,23 @@ func JWT(opt JWTOptions) mwhint.Hinted {
 }
 
 func jwtReject(res *gogo.Response, reason string) {
-	res.Header("WWW-Authenticate", `Bearer error="invalid_token", error_description="`+reason+`"`)
+	res.Header("WWW-Authenticate", `Bearer error="invalid_token", error_description="`+jwtAuthParam(reason)+`"`)
 	res.Send(401, "text/plain; charset=utf-8", "Unauthorized\n")
+}
+
+func jwtAuthParam(value string) string {
+	var b strings.Builder
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		switch {
+		case c == '"' || c == '\\':
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		case c >= 0x20 && c != 0x7f:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 func defaultJWTTokenFunc(req *gogo.Request) string {

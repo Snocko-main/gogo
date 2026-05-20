@@ -106,7 +106,7 @@ func TestFastRequestIDGeneratorUnderRequestID(t *testing.T) {
 }
 
 // BenchmarkRequestIDGeneratorDefault measures the cost of the
-// stock crypto/rand-backed default generator (16 hex chars from 8
+// stock crypto/rand-backed default generator (32 hex chars from 16
 // random bytes). Inlines the same logic so the benchmark stays
 // self-contained.
 func BenchmarkRequestIDGeneratorDefault(b *testing.B) {
@@ -121,9 +121,9 @@ func BenchmarkRequestIDGeneratorDefault(b *testing.B) {
 // the benchmark above can measure the stock generator without
 // reaching into the package's unexported API.
 func stockRequestIDForBench() string {
-	var buf [8]byte
+	var buf [16]byte
 	if _, err := crand.Read(buf[:]); err != nil {
-		return "00000000-rand-fail"
+		return "00000000000000000000000000000000"
 	}
 	return hex.EncodeToString(buf[:])
 }

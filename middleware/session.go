@@ -114,7 +114,10 @@ type Session struct {
 	// persist is the per-request closure that writes Session state
 	// back to the configured Store. Set by loadOrCreateSession.
 	// Captured by Save and by the middleware's deferred OnFinish.
-	persist func(s *Session)
+	persist       func(s *Session)
+	expire        func()
+	rotate        func(s *Session)
+	rotateOnWrite bool
 }
 
 // Get returns the value at key, or nil when absent.
@@ -127,6 +130,7 @@ func (s *Session) Get(key string) any {
 
 // Set writes value at key and marks the session for save.
 func (s *Session) Set(key string, value any) {
+	s.rotateIfNeeded()
 	if s.data == nil {
 		s.data = make(map[string]any)
 	}
@@ -139,19 +143,32 @@ func (s *Session) Delete(key string) {
 	if s.data == nil {
 		return
 	}
+	s.rotateIfNeeded()
 	delete(s.data, key)
 	s.dirty = true
 }
 
-// Destroy clears the session payload and instructs the middleware
-// to remove the row from the store after the handler returns. The
-// session cookie remains until it expires naturally — clients can
-// be issued a new one on next visit. (We can't safely write a new
-// Set-Cookie header after Destroy because the response may already
-// be in flight by the time the middleware tail runs.)
+func (s *Session) rotateIfNeeded() {
+	if s == nil || !s.rotateOnWrite || s.rotate == nil {
+		return
+	}
+	s.rotate(s)
+	s.rotateOnWrite = false
+}
+
+// Destroy clears the session payload, asks the middleware to remove the store
+// row after the handler returns, and expires the session cookie immediately
+// when headers are still writable. If the response is already in flight, the
+// next request rotates a stale signed cookie to a fresh session id rather than
+// reusing the destroyed id.
 func (s *Session) Destroy() {
 	s.data = nil
+	s.dirty = false
 	s.destroyed = true
+	if s.expire != nil {
+		s.expire()
+		s.expire = nil
+	}
 }
 
 // Save persists the current session state to the configured Store
@@ -270,20 +287,40 @@ func loadOrCreateSession(req *gogo.Request, res *gogo.Response, opt SessionOptio
 	persist := func(s *Session) {
 		persistSession(s, opt)
 	}
+	expire := func() {
+		expireSessionCookie(res, opt)
+	}
+	rotate := func(s *Session) {
+		oldID := s.ID
+		s.ID = newSessionID()
+		setSessionCookie(res, opt, maxAge, s.ID)
+		_ = opt.Store.Delete(oldID)
+	}
 	raw := req.Cookie(opt.CookieName)
 	if raw != "" {
 		if id, ok := verifySessionID(opt.Secret, raw); ok {
 			if data, exists := opt.Store.Load(id); exists {
-				return &Session{ID: id, data: data, persist: persist}
+				return &Session{ID: id, data: data, persist: persist, expire: expire}
 			}
-			return &Session{ID: id, persist: persist}
+			// Signed but absent/expired store rows stay stable for read-only
+			// requests, but rotate before the next write so logout and store
+			// expiry cannot resurrect a fixated identifier.
+			return &Session{ID: id, persist: persist, expire: expire, rotate: rotate, rotateOnWrite: true}
 		}
 	}
+	return issueSession(res, opt, maxAge, persist, expire)
+}
+
+func issueSession(res *gogo.Response, opt SessionOptions, maxAge int, persist func(*Session), expire func()) *Session {
 	id := newSessionID()
-	signed := signSessionID(opt.Secret, id)
+	setSessionCookie(res, opt, maxAge, id)
+	return &Session{ID: id, persist: persist, expire: expire}
+}
+
+func setSessionCookie(res *gogo.Response, opt SessionOptions, maxAge int, id string) {
 	res.SetCookie(gogo.Cookie{
 		Name:     opt.CookieName,
-		Value:    signed,
+		Value:    signSessionID(opt.Secret, id),
 		Path:     opt.CookiePath,
 		Domain:   opt.CookieDomain,
 		MaxAge:   maxAge,
@@ -291,7 +328,19 @@ func loadOrCreateSession(req *gogo.Request, res *gogo.Response, opt SessionOptio
 		HttpOnly: true,
 		SameSite: opt.CookieSameSite,
 	})
-	return &Session{ID: id, persist: persist}
+}
+
+func expireSessionCookie(res *gogo.Response, opt SessionOptions) {
+	res.SetCookie(gogo.Cookie{
+		Name:     opt.CookieName,
+		Path:     opt.CookiePath,
+		Domain:   opt.CookieDomain,
+		MaxAge:   -1,
+		Expires:  "Thu, 01 Jan 1970 00:00:00 GMT",
+		Secure:   opt.CookieSecure,
+		HttpOnly: true,
+		SameSite: opt.CookieSameSite,
+	})
 }
 
 func persistSession(s *Session, opt SessionOptions) {

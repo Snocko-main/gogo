@@ -2322,15 +2322,7 @@ func (r *Response) Send(code int, contentType, body string) {
 				r.flushAsync()
 				return
 			}
-			r.inner.status(line)
-			r.flushPendingHeaders()
-			if contentType != "" {
-				r.inner.header("Content-Type", contentType)
-			}
-			if prefix != "" {
-				r.inner.write(prefix)
-			}
-			r.inner.end(body)
+			r.sendSplitSync(line, contentType, prefix, body)
 			return
 		} else {
 			body = r.applyEncoder(contentType)
@@ -2371,6 +2363,25 @@ func (r *Response) Send(code int, contentType, body string) {
 		r.inner.header("Content-Type", contentType)
 	}
 	r.inner.end(body)
+}
+
+func (r *Response) sendSplitSync(status, contentType, prefix, body string) {
+	if len(r.pendingHeaders) == 0 {
+		r.inner.sendSplit(status, contentType, nil, prefix, body)
+		return
+	}
+	bufp := headerBlobPool.Get().(*[]byte)
+	buf := (*bufp)[:0]
+	for _, h := range r.pendingHeaders {
+		buf = append(buf, h.name...)
+		buf = append(buf, 0)
+		buf = append(buf, h.value...)
+		buf = append(buf, 0)
+	}
+	r.inner.sendSplit(status, contentType, buf, prefix, body)
+	*bufp = buf[:0]
+	headerBlobPool.Put(bufp)
+	r.pendingHeaders = r.pendingHeaders[:0]
 }
 
 // JSON marshals v and sends it with Content-Type: application/json. If

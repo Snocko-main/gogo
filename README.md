@@ -396,6 +396,13 @@ app.PostAsync("/users", 1<<20, func(res *gogo.Response, req *gogo.Request, body 
 })
 ```
 
+Multipart value parts parsed by `BodyParser` and `ParseMultipart` are capped by
+`GetDefaultMultipartPartLimit()` (8 MiB by default). Override the process default
+with `SetDefaultMultipartPartLimit(n)` before registering handlers, or pass
+`MultipartOptions{MaxPartBytes: n}` to multipart APIs for route-specific limits.
+The older `DefaultMultipartPartLimit = n` assignment style still works during
+startup, but the setter is preferred for runtime-safe updates.
+
 ## Cookies
 
 ```go
@@ -756,6 +763,9 @@ Sessions persist automatically at request completion via
 `Response.OnFinish` — that means mutations made inside a
 `res.Async(...)` goroutine are saved correctly (the persist call
 fires after the goroutine finishes, not after `next` returns).
+`sess.Destroy()` deletes the store row, expires the browser cookie when headers
+are still writable, and stale signed cookies are rotated to a fresh session ID
+before their next write instead of reusing the destroyed identifier.
 
 For handlers that need an explicit mid-flight commit — checkpointing
 before launching a background job, persisting auth state before an

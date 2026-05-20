@@ -759,6 +759,43 @@ extern "C" void uwsgo_res_send(
     r->end(std::string_view(body, body_len));
 }
 
+extern "C" void uwsgo_res_send_split(
+    uwsgo_res_t *res,
+    const char *status, size_t status_len,
+    const char *content_type, size_t content_type_len,
+    const char *headers_blob, size_t headers_len,
+    const char *prefix, size_t prefix_len,
+    const char *body, size_t body_len) {
+    auto *r = reinterpret_cast<uWS::HttpResponse<false> *>(res);
+    r->cork([r, status, status_len, content_type, content_type_len,
+             headers_blob, headers_len, prefix, prefix_len, body, body_len]() {
+        r->writeStatus(std::string_view(status, status_len));
+        const char *p = headers_len > 0 ? headers_blob : nullptr;
+        const char *end = headers_len > 0 ? headers_blob + headers_len : nullptr;
+        while (p != nullptr && p < end) {
+            const char *name_end = static_cast<const char *>(
+                std::memchr(p, 0, static_cast<size_t>(end - p)));
+            if (name_end == nullptr) break;
+            std::string_view name(p, static_cast<size_t>(name_end - p));
+            p = name_end + 1;
+            if (p >= end) break;
+            const char *value_end = static_cast<const char *>(
+                std::memchr(p, 0, static_cast<size_t>(end - p)));
+            if (value_end == nullptr) break;
+            std::string_view value(p, static_cast<size_t>(value_end - p));
+            p = value_end + 1;
+            r->writeHeader(name, value);
+        }
+        if (content_type_len > 0) {
+            r->writeHeader(std::string_view("Content-Type", 12), std::string_view(content_type, content_type_len));
+        }
+        if (prefix_len > 0) {
+            r->write(std::string_view(prefix, prefix_len));
+        }
+        r->end(std::string_view(body, body_len));
+    });
+}
+
 extern "C" size_t uwsgo_res_remote_addr(uwsgo_res_t *res, char *buffer, size_t buffer_len) {
     auto *r = reinterpret_cast<uWS::HttpResponse<false> *>(res);
     auto addr = r->getRemoteAddressAsText();

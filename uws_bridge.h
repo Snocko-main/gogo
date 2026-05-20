@@ -132,6 +132,13 @@ void uwsgo_res_send(
     const char *status, size_t status_len,
     const char *content_type, size_t content_type_len,
     const char *body, size_t body_len);
+void uwsgo_res_send_split(
+    uwsgo_res_t *res,
+    const char *status, size_t status_len,
+    const char *content_type, size_t content_type_len,
+    const char *headers_blob, size_t headers_len,
+    const char *prefix, size_t prefix_len,
+    const char *body, size_t body_len);
 
 // uwsgo_res_buffered_amount returns how many bytes uWS has accepted
 // for sending but hasn't yet flushed to the socket — the standard

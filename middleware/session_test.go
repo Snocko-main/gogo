@@ -376,6 +376,128 @@ func TestSessionDestroyAfterResponseAsync(t *testing.T) {
 	}
 }
 
+func TestSessionRotatesStaleSignedCookieAfterDestroy(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.NewSession(middleware.SessionOptions{
+			Secret: []byte("session-secret-32-bytes-AAAAAAAA"),
+			TTL:    time.Minute,
+		}))
+		app.Get("/seed", func(res *gogo.Response, req *gogo.Request) {
+			sess := req.Local(middleware.SessionLocalKey).(*middleware.Session)
+			sess.Set("seed", "yes")
+			res.Send(200, "text/plain", sess.ID)
+		})
+		app.Get("/logout", func(res *gogo.Response, req *gogo.Request) {
+			sess := req.Local(middleware.SessionLocalKey).(*middleware.Session)
+			sess.Destroy()
+			res.Send(200, "text/plain", "destroyed")
+		})
+		app.Get("/login-again", func(res *gogo.Response, req *gogo.Request) {
+			sess := req.Local(middleware.SessionLocalKey).(*middleware.Session)
+			sess.Set("user_id", float64(42))
+			res.Send(200, "text/plain", sess.ID)
+		})
+	})
+	defer teardown()
+
+	resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/seed", port))
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	firstIDBytes, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	var oldCookie *http.Cookie
+	for _, c := range resp.Cookies() {
+		if c.Name == "session" {
+			copy := *c
+			oldCookie = &copy
+		}
+	}
+	if oldCookie == nil {
+		t.Fatalf("seed did not issue session cookie: %v", resp.Cookies())
+	}
+	firstID := string(firstIDBytes)
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/logout", port), nil)
+	req.AddCookie(oldCookie)
+	resp, err = noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("logout: %v", err)
+	}
+	resp.Body.Close()
+	expired := false
+	for _, c := range resp.Cookies() {
+		if c.Name == "session" && c.MaxAge < 0 {
+			expired = true
+		}
+	}
+	if !expired {
+		t.Fatalf("Destroy did not expire the session cookie: %v", resp.Cookies())
+	}
+
+	req, _ = http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/login-again", port), nil)
+	req.AddCookie(oldCookie)
+	resp, err = noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("login-again: %v", err)
+	}
+	secondIDBytes, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	secondID := string(secondIDBytes)
+	if secondID == "" || secondID == firstID {
+		t.Fatalf("stale signed cookie reused session id: first=%q second=%q", firstID, secondID)
+	}
+	rotated := false
+	for _, c := range resp.Cookies() {
+		if c.Name == "session" && c.Value != oldCookie.Value {
+			rotated = true
+		}
+	}
+	if !rotated {
+		t.Fatalf("stale signed cookie was not rotated: %v", resp.Cookies())
+	}
+}
+
+func TestSessionReadOnlyEmptySessionDoesNotChurnCookie(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.NewSession(middleware.SessionOptions{
+			Secret: []byte("session-secret-32-bytes-AAAAAAAA"),
+			TTL:    time.Minute,
+		}))
+		app.Get("/whoami", func(res *gogo.Response, req *gogo.Request) {
+			sess := req.Local(middleware.SessionLocalKey).(*middleware.Session)
+			res.Send(200, "text/plain", sess.ID)
+		})
+	})
+	defer teardown()
+
+	jar, _ := newCookieJar()
+	client := &http.Client{Jar: jar, Timeout: 5 * time.Second}
+
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/whoami", port))
+	if err != nil {
+		t.Fatalf("first whoami: %v", err)
+	}
+	firstIDBytes, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if len(resp.Cookies()) == 0 {
+		t.Fatalf("first request did not issue a session cookie")
+	}
+
+	resp, err = client.Get(fmt.Sprintf("http://127.0.0.1:%d/whoami", port))
+	if err != nil {
+		t.Fatalf("second whoami: %v", err)
+	}
+	secondIDBytes, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(secondIDBytes) != string(firstIDBytes) {
+		t.Fatalf("read-only empty session ID changed: first=%q second=%q", firstIDBytes, secondIDBytes)
+	}
+	if cookies := resp.Cookies(); len(cookies) != 0 {
+		t.Fatalf("read-only empty session churned Set-Cookie on second request: %v", cookies)
+	}
+}
+
 // TestSessionExplicitSave covers Session.Save() — a handler that
 // wants to checkpoint state before the response finishes can call
 // it, and the change must be visible to a parallel request that

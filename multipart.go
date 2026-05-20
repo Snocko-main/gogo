@@ -11,13 +11,27 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 )
 
-// DefaultMultipartPartLimit bounds how much ParseMultipart will read for any
-// single part before returning ErrMultipartPartTooLarge. It protects apps that
-// raise Config.BodyLimit for uploads but still use the convenience API that
-// materializes each part into memory. Set to 0 to disable the default cap.
+// DefaultMultipartPartLimit is the process default used by ParseMultipart when
+// MultipartOptions.MaxPartBytes is zero. It remains assignable for backward
+// compatibility with earlier versions; prefer SetDefaultMultipartPartLimit for
+// runtime changes so readers observe the update atomically.
 var DefaultMultipartPartLimit int64 = 8 << 20
+
+// SetDefaultMultipartPartLimit sets the process-wide multipart per-part cap
+// used when MultipartOptions.MaxPartBytes is zero. Values at or below zero
+// disable the default cap. Prefer explicit MultipartOptions for per-route
+// policies.
+func SetDefaultMultipartPartLimit(maxBytes int64) {
+	atomic.StoreInt64(&DefaultMultipartPartLimit, maxBytes)
+}
+
+// GetDefaultMultipartPartLimit returns the process-wide multipart per-part cap.
+func GetDefaultMultipartPartLimit() int64 {
+	return atomic.LoadInt64(&DefaultMultipartPartLimit)
+}
 
 // ErrMultipartPartTooLarge is returned when a multipart part exceeds the
 // configured per-part limit.
@@ -27,7 +41,7 @@ var ErrMultipartPartTooLarge = errors.New("gogo: multipart part exceeds max size
 // ParseMultipartStream.
 type MultipartOptions struct {
 	// MaxPartBytes caps bytes read for each individual part. Zero uses
-	// DefaultMultipartPartLimit; negative disables the per-part cap.
+	// GetDefaultMultipartPartLimit; negative disables the per-part cap.
 	MaxPartBytes int64
 }
 
@@ -118,7 +132,7 @@ func (p *MultipartPart) SaveInto(dir string) (string, error) {
 // other parse errors surface verbatim from mime/multipart.
 //
 // Memory: each part is read fully into memory before fn fires, capped by
-// DefaultMultipartPartLimit unless options override it. Suitable for typical
+// GetDefaultMultipartPartLimit unless options override it. Suitable for typical
 // avatar / document uploads up to a few MiB. For large file parts, prefer
 // ParseMultipartStream / Request.MultipartStream so the part can be copied
 // without an extra Data allocation. The request body itself is still governed
@@ -303,10 +317,11 @@ func multipartPartLimit(opt MultipartOptions) int64 {
 	if opt.MaxPartBytes > 0 {
 		return opt.MaxPartBytes
 	}
-	if DefaultMultipartPartLimit < 0 {
+	limit := GetDefaultMultipartPartLimit()
+	if limit < 0 {
 		return 0
 	}
-	return DefaultMultipartPartLimit
+	return limit
 }
 
 func readMultipartPart(r io.Reader, limit int64) ([]byte, error) {

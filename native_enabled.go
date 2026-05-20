@@ -536,6 +536,17 @@ func (r responseNative) send(status, contentType, body string) {
 	)
 }
 
+func (r responseNative) sendSplit(status, contentType string, headers []byte, prefix, body string) {
+	C.uwsgo_res_send_split(
+		r.ptr,
+		unsafeStringData(status), C.size_t(len(status)),
+		unsafeStringData(contentType), C.size_t(len(contentType)),
+		unsafeByteData(headers), C.size_t(len(headers)),
+		unsafeStringData(prefix), C.size_t(len(prefix)),
+		unsafeStringData(body), C.size_t(len(body)),
+	)
+}
+
 func (r responseNative) loop() loopNative {
 	return loopNative{ptr: C.uwsgo_res_get_loop(r.ptr)}
 }

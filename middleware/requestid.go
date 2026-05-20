@@ -120,11 +120,9 @@ func defaultRequestID() string {
 
 // FastRequestIDGenerator returns a generator that produces 22-character
 // base64url IDs from a ChaCha8 PRNG seeded once per pool slot from
-// crypto/rand. ~5-10% faster than the default crypto/rand path on
-// modern Linux (where crypto/rand uses getrandom + a kernel cache),
-// and 2-4× faster on older kernels / non-Linux. The bigger win is
-// the 16-byte (128-bit) ID payload vs the default's 8-byte (64-bit)
-// — tracing identifiers that won't collide even at >10^9 IDs/window.
+// crypto/rand. The entropy matches the default generator's 16-byte
+// (128-bit) payload while emitting a shorter 22-character base64url string
+// instead of the default 32-character hex string.
 //
 // Tracing identifiers don't need cryptographic strength — they need
 // uniqueness with high probability. ChaCha8 has a 256-bit internal

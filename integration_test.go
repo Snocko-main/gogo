@@ -4995,9 +4995,9 @@ func TestBodyParserMultipart(t *testing.T) {
 }
 
 func TestBodyParserMultipartRejectsOversizeField(t *testing.T) {
-	oldLimit := gogo.DefaultMultipartPartLimit
-	gogo.DefaultMultipartPartLimit = 8
-	defer func() { gogo.DefaultMultipartPartLimit = oldLimit }()
+	oldLimit := gogo.GetDefaultMultipartPartLimit()
+	gogo.SetDefaultMultipartPartLimit(8)
+	defer gogo.SetDefaultMultipartPartLimit(oldLimit)
 
 	type form struct {
 		Name string `form:"name"`

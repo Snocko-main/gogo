@@ -48,11 +48,13 @@ func (responseNative) headersBatch([]byte, int)    {}
 func (responseNative) write(string)                {}
 func (responseNative) end(string)                  {}
 func (responseNative) send(string, string, string) {}
-func (responseNative) loop() loopNative            { return loopNative{} }
-func (responseNative) onAborted(any)               {}
-func (responseNative) cork(func())                 {}
-func (responseNative) onData(func([]byte, bool))   {}
-func (responseNative) remoteAddr() string          { return "" }
+func (responseNative) sendSplit(string, string, []byte, string, string) {
+}
+func (responseNative) loop() loopNative          { return loopNative{} }
+func (responseNative) onAborted(any)             {}
+func (responseNative) cork(func())               {}
+func (responseNative) onData(func([]byte, bool)) {}
+func (responseNative) remoteAddr() string        { return "" }
 
 func (loopNative) defer_(func()) {}
 
