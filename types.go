@@ -273,6 +273,13 @@ type WebSocketBehavior struct {
 	// drives its own ping protocol.
 	DisablePings bool
 
+	// UnsafeAutoUpgrade restores uWS's legacy default of accepting every
+	// WebSocket handshake when Upgrade is nil. The secure default rejects
+	// browser handshakes that carry an Origin header unless the app installs
+	// an explicit Upgrade callback. Only set this for public, non-cookie
+	// endpoints where cross-origin WebSocket access is intentional.
+	UnsafeAutoUpgrade bool
+
 	// Upgrade runs synchronously on the uWS loop thread for every
 	// incoming WebSocket handshake before the connection is
 	// established. The callback inspects request headers / query /
@@ -289,15 +296,14 @@ type WebSocketBehavior struct {
 	//     of the connection's lifetime
 	//   - rejecting based on origin / referrer / API quota
 	//
-	// SECURITY: leaving Upgrade nil accepts every handshake — including
-	// cross-origin requests from any website the user has open. The
-	// HTTP middleware chain (CORS in particular) does NOT cover the
-	// WebSocket upgrade path, so a Same-Origin Policy gate that
-	// protects fetch() does NOT protect WebSocket(). If the endpoint
-	// uses session cookies or any other ambient credential, an
-	// attacker page can open ws://yoursite/... from the user's
-	// browser and ride the user's session — Cross-Site WebSocket
-	// Hijacking (CSWSH).
+	// SECURITY: when Upgrade is nil the framework accepts non-browser
+	// handshakes that omit Origin, but rejects browser handshakes that
+	// carry Origin. The HTTP middleware chain (CORS in particular) does
+	// NOT cover the WebSocket upgrade path, so a Same-Origin Policy gate
+	// that protects fetch() does NOT protect WebSocket(). If the endpoint
+	// uses session cookies or any other ambient credential, an attacker
+	// page can open ws://yoursite/... from the user's browser and ride the
+	// user's session — Cross-Site WebSocket Hijacking (CSWSH).
 	//
 	// At minimum verify the Origin header against an allow-list. The
 	// middleware package ships middleware.WebSocketAuth for the
@@ -2067,6 +2073,7 @@ type Response struct {
 type bodyEncoder struct {
 	buf     strings.Builder
 	encode  func(body []byte, contentType string) (encoded []byte, contentEncoding string)
+	max     int
 	applied bool
 }
 
@@ -2224,9 +2231,13 @@ func (r *Response) Append(key, value string) *Response {
 
 // Write appends a response chunk without ending the response.
 func (r *Response) Write(body string) *Response {
-	if r.encoder != nil {
-		r.encoder.buf.WriteString(body)
-		return r
+	if r.encoder != nil && !r.encoder.applied {
+		if raw, overflow := r.encoder.writeString(body); !overflow {
+			return r
+		} else {
+			r.encoder = nil
+			body = raw
+		}
 	}
 	if r.async != nil {
 		r.async.body.WriteString(body)
@@ -2241,8 +2252,12 @@ func (r *Response) Write(body string) *Response {
 // End finishes the response.
 func (r *Response) End(body string) {
 	if r.encoder != nil && !r.encoder.applied {
-		r.encoder.buf.WriteString(body)
-		body = r.applyEncoder("")
+		if raw, overflow := r.encoder.writeString(body); overflow {
+			r.encoder = nil
+			body = raw
+		} else {
+			body = r.applyEncoder("")
+		}
 	}
 	if r.async != nil {
 		r.async.body.WriteString(body)
@@ -2274,8 +2289,12 @@ func (r *Response) Send(code int, contentType, body string) {
 	line := statusLine(code)
 
 	if r.encoder != nil && !r.encoder.applied {
-		r.encoder.buf.WriteString(body)
-		body = r.applyEncoder(contentType)
+		if raw, overflow := r.encoder.writeString(body); overflow {
+			r.encoder = nil
+			body = raw
+		} else {
+			body = r.applyEncoder(contentType)
+		}
 	}
 
 	// Async mode: try the zero-cgo shared-memory path first. Falls back
@@ -3256,11 +3275,38 @@ func (r *Response) releaseRef() {
 // it is consumed; subsequent writes go through the normal direct
 // path.
 func (r *Response) SetBodyEncoder(encode func(body []byte, contentType string) (encoded []byte, contentEncoding string)) {
+	r.SetBodyEncoderLimit(0, encode)
+}
+
+// SetBodyEncoderLimit is SetBodyEncoder plus a staging-buffer cap. When
+// maxBytes is positive and the buffered body would grow beyond it, the encoder
+// is bypassed and the response continues unencoded from the original bytes.
+// This lets middleware such as Compress bound both compression work and the
+// pre-compression staging buffer.
+func (r *Response) SetBodyEncoderLimit(maxBytes int, encode func(body []byte, contentType string) (encoded []byte, contentEncoding string)) {
 	if encode == nil {
 		r.encoder = nil
 		return
 	}
-	r.encoder = &bodyEncoder{encode: encode}
+	if maxBytes < 0 {
+		maxBytes = 0
+	}
+	r.encoder = &bodyEncoder{encode: encode, max: maxBytes}
+}
+
+func (e *bodyEncoder) writeString(s string) (raw string, overflow bool) {
+	if e.max > 0 && len(s) > e.max-e.buf.Len() {
+		e.applied = true
+		if e.buf.Len() == 0 {
+			raw = s
+		} else {
+			raw = e.buf.String() + s
+		}
+		e.buf.Reset()
+		return raw, true
+	}
+	e.buf.WriteString(s)
+	return "", false
 }
 
 // applyEncoder runs the buffered body through the encoder, attaches

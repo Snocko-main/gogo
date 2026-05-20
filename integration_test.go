@@ -58,7 +58,7 @@ func startApp(t testing.TB, configure func(app *gogo.App)) (port int, teardown f
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 
-		app, err := gogo.NewApp()
+		app, err := gogo.NewApp(gogo.Config{BindAddr: "127.0.0.1"})
 		if err != nil {
 			listenErr <- fmt.Errorf("NewApp: %w", err)
 			close(runDone)
@@ -2650,6 +2650,9 @@ func TestGroupGlobalUseStillWraps(t *testing.T) {
 // gogo.Config (BodyLimit, BindAddr, …).
 func startAppCfg(t *testing.T, cfg gogo.Config, configure func(app *gogo.App)) (port int, teardown func()) {
 	t.Helper()
+	if cfg.BindAddr == "" {
+		cfg.BindAddr = "127.0.0.1"
+	}
 	port = freePort(t)
 	ready := make(chan *gogo.App, 1)
 	listenErr := make(chan error, 1)
@@ -4073,10 +4076,10 @@ func TestSendFileRange(t *testing.T) {
 	defer teardown()
 
 	cases := []struct {
-		hdr     string
-		want    string
-		wantCR  string
-		wantSt  int
+		hdr    string
+		want   string
+		wantCR string
+		wantSt int
 	}{
 		{"bytes=0-3", "0123", "bytes 0-3/16", 206},
 		{"bytes=10-", "abcdef", "bytes 10-15/16", 206},
@@ -4869,9 +4872,9 @@ func TestHTTPMethodHelpersBodyLimit(t *testing.T) {
 // JSON into a typed struct.
 func TestBodyParserJSON(t *testing.T) {
 	type user struct {
-		Name  string   `json:"name"`
-		Age   int      `json:"age"`
-		Tags  []string `json:"tags"`
+		Name string   `json:"name"`
+		Age  int      `json:"age"`
+		Tags []string `json:"tags"`
 	}
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.PostAsync("/u", 64*1024, func(res *gogo.Response, req *gogo.Request, body []byte) {
@@ -5573,6 +5576,82 @@ func TestMultipartSaveInto(t *testing.T) {
 	}
 	if filepath.Dir(path) != dir {
 		t.Errorf("saved outside dir: got %s, want under %s", path, dir)
+	}
+}
+
+func TestMultipartRejectsOversizePart(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.PostAsync("/u", 1<<20, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			err := req.MultipartWithOptions(gogo.MultipartOptions{MaxPartBytes: 8}, func(p *gogo.MultipartPart) error {
+				return nil
+			})
+			if errors.Is(err, gogo.ErrMultipartPartTooLarge) {
+				res.Send(413, "text/plain", "part too large")
+				return
+			}
+			if err != nil {
+				res.Send(500, "text/plain", err.Error())
+				return
+			}
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	fw, _ := mw.CreateFormFile("up", "big.txt")
+	fw.Write([]byte("0123456789abcdef"))
+	mw.Close()
+
+	status, respBody := httpPost(t, port, "/u", mw.FormDataContentType(), body.Bytes())
+	if status != 413 || respBody != "part too large" {
+		t.Fatalf("oversize part: got %d %q, want 413", status, respBody)
+	}
+}
+
+func TestMultipartStreamSaveInto(t *testing.T) {
+	dir := t.TempDir()
+	savedPath := make(chan string, 1)
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.PostAsync("/u", 1<<20, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			err := req.MultipartStream(gogo.MultipartOptions{MaxPartBytes: 1 << 10}, func(p *gogo.MultipartStreamPart) error {
+				if !p.IsFile() {
+					return nil
+				}
+				path, err := p.SaveInto(dir)
+				if err != nil {
+					return err
+				}
+				savedPath <- path
+				return nil
+			})
+			if err != nil {
+				res.Send(500, "text/plain", err.Error())
+				return
+			}
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	fw, _ := mw.CreateFormFile("up", "stream.txt")
+	fw.Write([]byte("hello streamed disk"))
+	mw.Close()
+
+	status, _ := httpPost(t, port, "/u", mw.FormDataContentType(), body.Bytes())
+	if status != 200 {
+		t.Fatalf("stream save: status %d", status)
+	}
+	got, err := os.ReadFile(<-savedPath)
+	if err != nil {
+		t.Fatalf("read saved: %v", err)
+	}
+	if string(got) != "hello streamed disk" {
+		t.Errorf("saved body = %q", string(got))
 	}
 }
 

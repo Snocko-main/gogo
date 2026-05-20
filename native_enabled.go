@@ -398,6 +398,10 @@ func (a *appNative) websocket(pattern string, behavior WebSocketBehavior) {
 	cpattern := C.CString(pattern)
 	defer C.free(unsafe.Pointer(cpattern))
 
+	if behavior.Upgrade == nil && !behavior.UnsafeAutoUpgrade {
+		behavior.Upgrade = defaultWebSocketUpgrade
+	}
+
 	handle := cgo.NewHandle(behavior)
 	a.handles = append(a.handles, handle)
 

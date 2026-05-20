@@ -165,12 +165,12 @@ func TestWSUpgradeRejection(t *testing.T) {
 // Protocols on the context.
 func TestWSUpgradeHeaderAccess(t *testing.T) {
 	type seen struct {
-		url      string
-		query    string
-		method   string
-		ip       string
-		header   string
-		protos   []string
+		url    string
+		query  string
+		method string
+		ip     string
+		header string
+		protos []string
 	}
 	var (
 		mu      sync.Mutex
@@ -363,8 +363,8 @@ func TestWSUserDataSetAtOpen(t *testing.T) {
 	}
 }
 
-// TestWSUpgradeNoCallbackUsesDefault: without an Upgrade callback
-// the framework retains uWS's default auto-accept behavior.
+// TestWSUpgradeNoCallbackUsesDefault: without an Upgrade callback the
+// framework accepts non-browser clients that omit Origin.
 func TestWSUpgradeNoCallbackUsesDefault(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.WebSocket("/ws", gogo.WebSocketBehavior{
@@ -386,6 +386,56 @@ func TestWSUpgradeNoCallbackUsesDefault(t *testing.T) {
 	}
 	if got != "hi" {
 		t.Errorf("body = %q, want hi", got)
+	}
+}
+
+func TestWSUpgradeNoCallbackRejectsBrowserOrigin(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.WebSocket("/ws", gogo.WebSocketBehavior{})
+	})
+	defer teardown()
+
+	resp, _, conn, err := dialWSWithHeaders(port, "/ws", map[string]string{
+		"Origin": "https://evil.example",
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 403 {
+		t.Fatalf("status = %d, want 403; body=%q", resp.StatusCode, string(body))
+	}
+	if !strings.Contains(string(body), "origin not allowed") {
+		t.Errorf("body = %q, want origin rejection", string(body))
+	}
+}
+
+func TestWSUpgradeUnsafeAutoUpgradeAllowsBrowserOrigin(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.WebSocket("/ws", gogo.WebSocketBehavior{
+			UnsafeAutoUpgrade: true,
+			Open: func(ws *gogo.WebSocket) {
+				ws.SendText("hi")
+			},
+		})
+	})
+	defer teardown()
+
+	resp, key, conn, err := dialWSWithHeaders(port, "/ws", map[string]string{
+		"Origin": "https://app.example",
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	resp.Body.Close()
+	if resp.StatusCode != 101 {
+		t.Fatalf("status = %d, want 101", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Sec-WebSocket-Accept"); got != expectedAccept(key) {
+		t.Fatalf("bad accept: got %q want %q", got, expectedAccept(key))
 	}
 }
 

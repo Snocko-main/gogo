@@ -33,7 +33,7 @@ func startAppB(tb testing.TB, configure func(*gogo.App)) (*gogo.App, int, func()
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 
-		app, err := gogo.NewApp()
+		app, err := gogo.NewApp(gogo.Config{BindAddr: "127.0.0.1"})
 		if err != nil {
 			listenErr <- err
 			close(runDone)

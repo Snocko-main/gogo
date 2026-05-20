@@ -35,8 +35,11 @@ type TestServer struct {
 	host      string
 	runDone   chan struct{}
 	closeOnce sync.Once
+	release   func()
 	client    *http.Client
 }
+
+var testServerMu sync.Mutex
 
 // NewTestServer starts an App on a free port, runs the setup
 // callback on the loop's locked goroutine, and waits for the
@@ -60,6 +63,16 @@ func NewTestServer(setup func(*App)) (*TestServer, error) {
 	if setup == nil {
 		return nil, fmt.Errorf("gogo: NewTestServer: setup callback is required")
 	}
+	// The native binding has process-wide shared worker/ring state. Serialize
+	// public test servers so package tests that call t.Parallel don't create
+	// multiple native Apps in the same process at once.
+	testServerMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			testServerMu.Unlock()
+		}
+	}()
 
 	port, err := freeLocalPort()
 	if err != nil {
@@ -78,7 +91,7 @@ func NewTestServer(setup func(*App)) (*TestServer, error) {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 
-		app, err := NewApp()
+		app, err := NewApp(Config{BindAddr: "127.0.0.1"})
 		if err != nil {
 			listenErr <- fmt.Errorf("NewApp: %w", err)
 			close(runDone)
@@ -115,11 +128,14 @@ func NewTestServer(setup func(*App)) (*TestServer, error) {
 		return nil, fmt.Errorf("gogo: NewTestServer: %w", err)
 	}
 
-	return &TestServer{
+	ts := &TestServer{
 		app:     app,
 		port:    port,
 		host:    host,
 		runDone: runDone,
+		release: func() {
+			testServerMu.Unlock()
+		},
 		client: &http.Client{
 			// Disable keep-alive so Close doesn't have to wait
 			// for idle connections to drain. Tests typically
@@ -129,7 +145,9 @@ func NewTestServer(setup func(*App)) (*TestServer, error) {
 			Transport: &http.Transport{DisableKeepAlives: true},
 			Timeout:   10 * time.Second,
 		},
-	}, nil
+	}
+	locked = false
+	return ts, nil
 }
 
 // Port returns the loopback port the server is listening on.
@@ -198,6 +216,9 @@ func (ts *TestServer) Close() {
 			// The loop didn't exit — best we can do is stop
 			// waiting. The leaked goroutine will be reaped when
 			// the process exits.
+		}
+		if ts.release != nil {
+			ts.release()
 		}
 	})
 }

@@ -13,13 +13,30 @@ import (
 	"strings"
 )
 
+// DefaultMultipartPartLimit bounds how much ParseMultipart will read for any
+// single part before returning ErrMultipartPartTooLarge. It protects apps that
+// raise Config.BodyLimit for uploads but still use the convenience API that
+// materializes each part into memory. Set to 0 to disable the default cap.
+var DefaultMultipartPartLimit int64 = 8 << 20
+
+// ErrMultipartPartTooLarge is returned when a multipart part exceeds the
+// configured per-part limit.
+var ErrMultipartPartTooLarge = errors.New("gogo: multipart part exceeds max size")
+
+// MultipartOptions configures ParseMultipartWithOptions and
+// ParseMultipartStream.
+type MultipartOptions struct {
+	// MaxPartBytes caps bytes read for each individual part. Zero uses
+	// DefaultMultipartPartLimit; negative disables the per-part cap.
+	MaxPartBytes int64
+}
+
 // MultipartPart is one chunk of a parsed multipart/form-data body.
 // Returned to the callback passed to ParseMultipart / Request.Multipart.
 //
-// The Data slice is valid only for the duration of the callback — it
-// aliases an internal buffer that the iterator reuses for the next
-// part. Append to a fresh slice or call SaveAt before returning if
-// you need the bytes later.
+// The Data slice is valid after the callback returns, but retaining it also
+// retains that part's bytes. Use MultipartStream when file parts should be
+// copied to disk or another writer without an extra per-part allocation.
 type MultipartPart struct {
 	// Name is the form field name (the "name" attribute of the
 	// originating <input>). Empty when the part has no
@@ -100,12 +117,19 @@ func (p *MultipartPart) SaveInto(dir string) (string, error) {
 // ErrUnsupportedMediaType when contentType is not multipart/form-data;
 // other parse errors surface verbatim from mime/multipart.
 //
-// Memory: each part is read fully into memory before fn fires.
-// Suitable for typical avatar / document uploads up to a few MiB.
-// Very large uploads (multi-GB streaming) need a different surface —
-// out of scope here; reach for net/http.MultipartReader manually
-// over a streaming body source.
+// Memory: each part is read fully into memory before fn fires, capped by
+// DefaultMultipartPartLimit unless options override it. Suitable for typical
+// avatar / document uploads up to a few MiB. For large file parts, prefer
+// ParseMultipartStream / Request.MultipartStream so the part can be copied
+// without an extra Data allocation. The request body itself is still governed
+// by Config.BodyLimit before multipart parsing begins.
 func ParseMultipart(contentType string, body []byte, fn func(*MultipartPart) error) error {
+	return ParseMultipartWithOptions(contentType, body, MultipartOptions{}, fn)
+}
+
+// ParseMultipartWithOptions is ParseMultipart with explicit per-part limits.
+func ParseMultipartWithOptions(contentType string, body []byte, opt MultipartOptions, fn func(*MultipartPart) error) error {
+	limit := multipartPartLimit(opt)
 	mediaType, params, err := mime.ParseMediaType(contentType)
 	if err != nil {
 		return fmt.Errorf("gogo: parse multipart media type: %w", err)
@@ -127,7 +151,7 @@ func ParseMultipart(contentType string, body []byte, fn func(*MultipartPart) err
 		if err != nil {
 			return fmt.Errorf("gogo: read multipart part: %w", err)
 		}
-		data, readErr := io.ReadAll(raw)
+		data, readErr := readMultipartPart(raw, limit)
 		closeErr := raw.Close()
 		if readErr != nil {
 			return fmt.Errorf("gogo: read part data: %w", readErr)
@@ -152,6 +176,95 @@ func ParseMultipart(contentType string, body []byte, fn func(*MultipartPart) err
 	}
 }
 
+// MultipartStreamPart exposes a multipart part as a stream. It avoids the
+// extra per-part allocation performed by ParseMultipart's Data field. The
+// Reader is valid only during the callback.
+type MultipartStreamPart struct {
+	Name        string
+	FileName    string
+	ContentType string
+	Header      textproto.MIMEHeader
+	Reader      io.Reader
+}
+
+func (p *MultipartStreamPart) IsFile() bool { return p.FileName != "" }
+
+// SaveInto streams the part into dir using the basename of FileName.
+func (p *MultipartStreamPart) SaveInto(dir string) (string, error) {
+	if p.FileName == "" {
+		return "", errors.New("gogo: SaveInto requires a file part with a FileName")
+	}
+	base := filepath.Base(p.FileName)
+	if base == "." || base == ".." || base == string(filepath.Separator) || base == "" {
+		return "", fmt.Errorf("gogo: SaveInto: unsafe filename %q", p.FileName)
+	}
+	full := filepath.Join(dir, base)
+	f, err := os.OpenFile(full, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return "", err
+	}
+	_, copyErr := io.Copy(f, p.Reader)
+	closeErr := f.Close()
+	if copyErr != nil {
+		return "", copyErr
+	}
+	return full, closeErr
+}
+
+// ParseMultipartStream iterates multipart parts without materializing each part
+// into a Data slice. The request body is still the collected []byte supplied by
+// the caller, but file parts can be copied directly from the multipart reader
+// to disk or another writer.
+func ParseMultipartStream(contentType string, body []byte, opt MultipartOptions, fn func(*MultipartStreamPart) error) error {
+	limit := multipartPartLimit(opt)
+	mediaType, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return fmt.Errorf("gogo: parse multipart media type: %w", err)
+	}
+	if mediaType != "multipart/form-data" {
+		return ErrUnsupportedMediaType
+	}
+	boundary := params["boundary"]
+	if boundary == "" {
+		return errors.New("gogo: multipart/form-data missing boundary")
+	}
+
+	mr := multipart.NewReader(bytes.NewReader(body), boundary)
+	for {
+		raw, err := mr.NextPart()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("gogo: read multipart part: %w", err)
+		}
+		lr := newMultipartLimitReader(raw, limit)
+		part := &MultipartStreamPart{
+			Name:        raw.FormName(),
+			FileName:    raw.FileName(),
+			ContentType: strings.TrimSpace(raw.Header.Get("Content-Type")),
+			Header:      raw.Header,
+			Reader:      lr,
+		}
+		cbErr := fn(part)
+		if cbErr != nil {
+			_ = raw.Close()
+			if errors.Is(cbErr, io.EOF) {
+				return nil
+			}
+			return cbErr
+		}
+		_, drainErr := io.Copy(io.Discard, lr)
+		closeErr := raw.Close()
+		if drainErr != nil {
+			return fmt.Errorf("gogo: read part data: %w", drainErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("gogo: close part: %w", closeErr)
+		}
+	}
+}
+
 // Multipart is the Request-side wrapper for ParseMultipart. Use it
 // from PostAsync handlers where the body is pre-collected; sync
 // handlers should collect the body via Response.Body first and call
@@ -165,4 +278,75 @@ func (r *Request) Multipart(fn func(*MultipartPart) error) error {
 		return ErrNoBody
 	}
 	return ParseMultipart(r.Header("content-type"), r.body, fn)
+}
+
+// MultipartWithOptions is Multipart with explicit limits.
+func (r *Request) MultipartWithOptions(opt MultipartOptions, fn func(*MultipartPart) error) error {
+	if r.body == nil {
+		return ErrNoBody
+	}
+	return ParseMultipartWithOptions(r.Header("content-type"), r.body, opt, fn)
+}
+
+// MultipartStream iterates multipart parts as streams.
+func (r *Request) MultipartStream(opt MultipartOptions, fn func(*MultipartStreamPart) error) error {
+	if r.body == nil {
+		return ErrNoBody
+	}
+	return ParseMultipartStream(r.Header("content-type"), r.body, opt, fn)
+}
+
+func multipartPartLimit(opt MultipartOptions) int64 {
+	if opt.MaxPartBytes < 0 {
+		return 0
+	}
+	if opt.MaxPartBytes > 0 {
+		return opt.MaxPartBytes
+	}
+	if DefaultMultipartPartLimit < 0 {
+		return 0
+	}
+	return DefaultMultipartPartLimit
+}
+
+func readMultipartPart(r io.Reader, limit int64) ([]byte, error) {
+	if limit <= 0 {
+		return io.ReadAll(r)
+	}
+	lr := newMultipartLimitReader(r, limit)
+	data, err := io.ReadAll(lr)
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+type multipartLimitReader struct {
+	r     io.Reader
+	limit int64
+	read  int64
+}
+
+func newMultipartLimitReader(r io.Reader, limit int64) *multipartLimitReader {
+	return &multipartLimitReader{r: r, limit: limit}
+}
+
+func (r *multipartLimitReader) Read(p []byte) (int, error) {
+	if r.limit > 0 && r.read >= r.limit {
+		var one [1]byte
+		n, err := r.r.Read(one[:])
+		if n > 0 {
+			return 0, ErrMultipartPartTooLarge
+		}
+		return 0, err
+	}
+	if r.limit > 0 {
+		remaining := r.limit - r.read
+		if int64(len(p)) > remaining {
+			p = p[:remaining]
+		}
+	}
+	n, err := r.r.Read(p)
+	r.read += int64(n)
+	return n, err
 }

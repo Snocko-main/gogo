@@ -235,6 +235,40 @@ func TestCompressSkipsOversizeBody(t *testing.T) {
 	}
 }
 
+func TestCompressSkipsOversizeWriteEndWithoutBufferingTail(t *testing.T) {
+	const cap = 4 << 10
+	payload := strings.Repeat("streamed-compressible-content ", 1<<8)
+	if len(payload) <= cap {
+		t.Fatalf("test payload %d bytes is not larger than cap %d", len(payload), cap)
+	}
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.Compress(middleware.CompressOptions{MaxSize: cap}))
+		app.Get("/", func(res *gogo.Response, req *gogo.Request) {
+			res.Header("Content-Type", "text/plain")
+			res.Write(payload[:cap-64])
+			res.End(payload[cap-64:])
+		})
+	})
+	defer teardown()
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/", port), nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if got := resp.Header.Get("Content-Encoding"); got != "" {
+		t.Errorf("Content-Encoding: got %q, want empty", got)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != payload {
+		t.Errorf("raw body mismatch: got %d bytes, want %d", len(body), len(payload))
+	}
+}
+
 // TestCompressMaxSizeDisableSentinel: setting MaxSize=-1 disables
 // the cap, restoring the pre-default behavior of compressing every
 // body that passes the other filters. Useful for benchmarks and for

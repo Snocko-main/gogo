@@ -46,7 +46,7 @@ func startApp(t *testing.T, configure func(app *gogo.App)) (port int, teardown f
 	go func() {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
-		app, err := gogo.NewApp()
+		app, err := gogo.NewApp(gogo.Config{BindAddr: "127.0.0.1"})
 		if err != nil {
 			listenErr <- fmt.Errorf("NewApp: %w", err)
 			close(runDone)
@@ -180,11 +180,11 @@ func TestLoggerJSONFormat(t *testing.T) {
 	}
 	line := strings.TrimSpace(buf.String())
 	var entry struct {
-		Method    string  `json:"method"`
-		URL       string  `json:"url"`
-		Status    int     `json:"status"`
+		Method     string  `json:"method"`
+		URL        string  `json:"url"`
+		Status     int     `json:"status"`
 		DurationMs float64 `json:"duration_ms"`
-		IP        string  `json:"ip"`
+		IP         string  `json:"ip"`
 	}
 	if err := json.Unmarshal([]byte(line), &entry); err != nil {
 		t.Fatalf("invalid JSON log line %q: %v", line, err)
@@ -470,9 +470,9 @@ func TestCORSAllowHeadersWhitelistEnforced(t *testing.T) {
 	defer teardown()
 
 	cases := []struct {
-		name       string
-		requested  string
-		mustAllow  []string // headers that must appear in the response
+		name         string
+		requested    string
+		mustAllow    []string // headers that must appear in the response
 		mustNotAllow []string // headers that must NOT appear
 	}{
 		{
@@ -597,10 +597,10 @@ func TestCORSAllowList(t *testing.T) {
 	defer teardown()
 
 	for _, tc := range []struct {
-		origin     string
-		wantAllow  string
-		wantVary   bool
-		wantCreds  string
+		origin    string
+		wantAllow string
+		wantVary  bool
+		wantCreds string
 	}{
 		{"https://app.example.com", "https://app.example.com", true, "true"},
 		{"https://sub.trusted.io", "https://sub.trusted.io", true, "true"},
