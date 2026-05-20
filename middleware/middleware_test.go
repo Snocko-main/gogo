@@ -262,7 +262,11 @@ func TestCORSPermissive(t *testing.T) {
 	req, _ = http.NewRequest("OPTIONS", fmt.Sprintf("http://127.0.0.1:%d/api", port), nil)
 	req.Header.Set("Origin", "https://example.com")
 	req.Header.Set("Access-Control-Request-Method", "POST")
-	req.Header.Set("Access-Control-Request-Headers", "X-Custom")
+	// Mix one whitelisted header (Content-Type is in the default
+	// AllowHeaders) with one that isn't (X-Custom). The middleware
+	// must filter — return only the whitelisted one and drop X-Custom
+	// — otherwise the configured AllowHeaders list is a no-op.
+	req.Header.Set("Access-Control-Request-Headers", "Content-Type, X-Custom")
 	resp, err = noKeepaliveClient.Do(req)
 	if err != nil {
 		t.Fatalf("OPTIONS /api: %v", err)
@@ -274,10 +278,143 @@ func TestCORSPermissive(t *testing.T) {
 	if got := resp.Header.Get("Access-Control-Allow-Methods"); !strings.Contains(got, "POST") {
 		t.Errorf("Allow-Methods: %q", got)
 	}
-	// We echo the requested headers when the caller sends them.
-	if got := resp.Header.Get("Access-Control-Allow-Headers"); got != "X-Custom" {
-		t.Errorf("Allow-Headers: got %q, want X-Custom", got)
+	allowHeaders := resp.Header.Get("Access-Control-Allow-Headers")
+	if !strings.Contains(strings.ToLower(allowHeaders), "content-type") {
+		t.Errorf("Allow-Headers should include Content-Type (whitelisted), got %q", allowHeaders)
 	}
+	if strings.Contains(strings.ToLower(allowHeaders), "x-custom") {
+		t.Errorf("Allow-Headers leaked X-Custom (not in whitelist), got %q", allowHeaders)
+	}
+}
+
+// TestCORSAllowHeadersWhitelistEnforced is the focused regression test
+// for the AllowHeaders bypass: with an explicit whitelist, a preflight
+// that requests headers outside the whitelist must NOT receive those
+// headers in Access-Control-Allow-Headers. The previous implementation
+// echoed Access-Control-Request-Headers verbatim, making AllowHeaders
+// configuration meaningless against a malicious cross-origin page.
+func TestCORSAllowHeadersWhitelistEnforced(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.CORS(middleware.CORSOptions{
+			AllowOrigins: []string{"https://app.example.com"},
+			AllowHeaders: []string{"Content-Type", "X-Trace-ID"},
+		}))
+		app.Get("/api", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	cases := []struct {
+		name       string
+		requested  string
+		mustAllow  []string // headers that must appear in the response
+		mustNotAllow []string // headers that must NOT appear
+	}{
+		{
+			name:         "allowed subset is reflected",
+			requested:    "Content-Type, X-Trace-ID",
+			mustAllow:    []string{"content-type", "x-trace-id"},
+			mustNotAllow: nil,
+		},
+		{
+			name:         "non-whitelisted header is dropped",
+			requested:    "Content-Type, X-Internal-Token",
+			mustAllow:    []string{"content-type"},
+			mustNotAllow: []string{"x-internal-token"},
+		},
+		{
+			name:         "case-insensitive match preserves request casing",
+			requested:    "content-type, X-TRACE-ID",
+			mustAllow:    []string{"content-type", "X-TRACE-ID"},
+			mustNotAllow: nil,
+		},
+		{
+			name:         "all-disallowed yields no Allow-Headers",
+			requested:    "X-Evil, X-Internal-User",
+			mustAllow:    nil,
+			mustNotAllow: []string{"x-evil", "x-internal-user"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, _ := http.NewRequest("OPTIONS", fmt.Sprintf("http://127.0.0.1:%d/api", port), nil)
+			req.Header.Set("Origin", "https://app.example.com")
+			req.Header.Set("Access-Control-Request-Method", "POST")
+			req.Header.Set("Access-Control-Request-Headers", tc.requested)
+			resp, err := noKeepaliveClient.Do(req)
+			if err != nil {
+				t.Fatalf("preflight: %v", err)
+			}
+			resp.Body.Close()
+			got := strings.ToLower(resp.Header.Get("Access-Control-Allow-Headers"))
+			for _, h := range tc.mustAllow {
+				if !strings.Contains(got, strings.ToLower(h)) {
+					t.Errorf("Allow-Headers=%q missing %q", got, h)
+				}
+			}
+			for _, h := range tc.mustNotAllow {
+				if strings.Contains(got, strings.ToLower(h)) {
+					t.Errorf("Allow-Headers=%q leaked non-whitelisted %q", got, h)
+				}
+			}
+		})
+	}
+}
+
+// TestCORSAllowHeadersWildcard verifies that AllowHeaders=["*"] echoes
+// the client's requested list — when credentials are NOT enabled (per
+// Fetch spec). With credentials enabled the wildcard must NOT bypass
+// the explicit list.
+func TestCORSAllowHeadersWildcard(t *testing.T) {
+	t.Run("wildcard without credentials echoes request", func(t *testing.T) {
+		port, teardown := startApp(t, func(app *gogo.App) {
+			app.Use(middleware.CORS(middleware.CORSOptions{
+				AllowOrigins: []string{"https://app.example.com"},
+				AllowHeaders: []string{"*"},
+			}))
+			app.Get("/x", func(res *gogo.Response, req *gogo.Request) {
+				res.Send(200, "text/plain", "ok")
+			})
+		})
+		defer teardown()
+		req, _ := http.NewRequest("OPTIONS", fmt.Sprintf("http://127.0.0.1:%d/x", port), nil)
+		req.Header.Set("Origin", "https://app.example.com")
+		req.Header.Set("Access-Control-Request-Method", "POST")
+		req.Header.Set("Access-Control-Request-Headers", "X-Anything, Y-Else")
+		resp, _ := noKeepaliveClient.Do(req)
+		resp.Body.Close()
+		got := resp.Header.Get("Access-Control-Allow-Headers")
+		if !strings.Contains(got, "X-Anything") || !strings.Contains(got, "Y-Else") {
+			t.Errorf("wildcard should echo request headers, got %q", got)
+		}
+	})
+	t.Run("wildcard with credentials enforces explicit list", func(t *testing.T) {
+		port, teardown := startApp(t, func(app *gogo.App) {
+			app.Use(middleware.CORS(middleware.CORSOptions{
+				AllowOrigins:     []string{"https://app.example.com"},
+				AllowHeaders:     []string{"*", "Content-Type"},
+				AllowCredentials: true,
+			}))
+			app.Get("/x", func(res *gogo.Response, req *gogo.Request) {
+				res.Send(200, "text/plain", "ok")
+			})
+		})
+		defer teardown()
+		req, _ := http.NewRequest("OPTIONS", fmt.Sprintf("http://127.0.0.1:%d/x", port), nil)
+		req.Header.Set("Origin", "https://app.example.com")
+		req.Header.Set("Access-Control-Request-Method", "POST")
+		req.Header.Set("Access-Control-Request-Headers", "Content-Type, X-Sneaky")
+		resp, _ := noKeepaliveClient.Do(req)
+		resp.Body.Close()
+		got := strings.ToLower(resp.Header.Get("Access-Control-Allow-Headers"))
+		if !strings.Contains(got, "content-type") {
+			t.Errorf("credentialed wildcard should still pass Content-Type, got %q", got)
+		}
+		if strings.Contains(got, "x-sneaky") {
+			t.Errorf("credentialed wildcard leaked X-Sneaky, got %q", got)
+		}
+	})
 }
 
 // TestCORSAllowList: an explicit AllowOrigins list reflects matched
