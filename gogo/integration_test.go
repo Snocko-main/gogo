@@ -1131,6 +1131,138 @@ func TestUseAsyncRejectsBadArgs(t *testing.T) {
 	}
 }
 
+// TestPostSharedDispatch sends a small JSON body to a PostAsync
+// route registered with maxBodyBytes within the SNAP_BODY_CAP
+// (zero-cgo path). The handler receives the body via the
+// snapshot — no res.Body cgo call needed — and echoes it back.
+func TestPostSharedDispatch(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.PostAsync("/echo", 4096, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			// Body should match what the client sent verbatim.
+			res.Header("X-Body-Len", strconv.Itoa(len(body)))
+			res.Send(200, "application/json", string(body))
+		})
+	})
+	defer teardown()
+
+	payload := []byte(`{"hello":"world","n":42}`)
+	resp, err := http.Post(
+		fmt.Sprintf("http://127.0.0.1:%d/echo", port),
+		"application/json",
+		bytes.NewReader(payload),
+	)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200; body=%q", resp.StatusCode, string(body))
+	}
+	if string(body) != string(payload) {
+		t.Errorf("body = %q, want %q", string(body), string(payload))
+	}
+	if got := resp.Header.Get("X-Body-Len"); got != strconv.Itoa(len(payload)) {
+		t.Errorf("X-Body-Len = %q, want %d", got, len(payload))
+	}
+}
+
+// TestPostSharedOversize_413 sends a body larger than the route's
+// maxBodyBytes. The shared-dispatch path rejects on the loop
+// thread with 413 — no goroutine ever spawns.
+func TestPostSharedOversize_413(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.PostAsync("/echo", 64, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	payload := make([]byte, 256) // > maxBodyBytes=64
+	for i := range payload {
+		payload[i] = 'x'
+	}
+	resp, err := http.Post(
+		fmt.Sprintf("http://127.0.0.1:%d/echo", port),
+		"application/octet-stream",
+		bytes.NewReader(payload),
+	)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 413 {
+		t.Errorf("status = %d, want 413", resp.StatusCode)
+	}
+}
+
+// TestPostSharedFallbackForLargeBody confirms PostAsync auto-falls
+// back to the cgo-mediated async path when the route's maxBodyBytes
+// exceeds the shared-dispatch cap. The visible behavior should be
+// identical (body echoed back); the difference is the dispatch
+// mechanism, which we don't expose to user code.
+func TestPostSharedFallbackForLargeBody(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		// 32 KiB cap — well above the 8 KiB shared-dispatch cap,
+		// forces the fallback path.
+		app.PostAsync("/big", 32*1024, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			res.Header("X-Body-Len", strconv.Itoa(len(body)))
+			res.Send(200, "application/octet-stream", string(body))
+		})
+	})
+	defer teardown()
+
+	payload := make([]byte, 16*1024) // 16 KiB — fits the 32 KiB cap, exceeds 8 KiB shared cap
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	resp, err := http.Post(
+		fmt.Sprintf("http://127.0.0.1:%d/big", port),
+		"application/octet-stream",
+		bytes.NewReader(payload),
+	)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if !bytes.Equal(body, payload) {
+		t.Errorf("body mismatch: got %d bytes, want %d", len(body), len(payload))
+	}
+}
+
+// TestPostSharedSeesHeaders confirms the request-side snapshot
+// (headers / URL / params / etc.) reaches the worker the same way
+// it does on GetAsync.
+func TestPostSharedSeesHeaders(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.PostAsync("/users/:id", 4096, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			res.Header("X-Param-Id", req.Param("id"))
+			res.Header("X-Saw-Auth", req.Header("authorization"))
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	r, _ := http.NewRequest("POST", fmt.Sprintf("http://127.0.0.1:%d/users/alice", port),
+		strings.NewReader("hi"))
+	r.Header.Set("Authorization", "Bearer abc")
+	resp, err := http.DefaultClient.Do(r)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+	if got := resp.Header.Get("X-Param-Id"); got != "alice" {
+		t.Errorf("X-Param-Id = %q, want alice", got)
+	}
+	if got := resp.Header.Get("X-Saw-Auth"); got != "Bearer abc" {
+		t.Errorf("X-Saw-Auth = %q, want Bearer abc", got)
+	}
+}
+
 // TestRequestHeadersIterator confirms req.Headers walks every
 // (name, value) pair without cgo on sync routes. Multiple
 // custom request headers are sent; the handler stamps every one

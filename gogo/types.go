@@ -926,6 +926,13 @@ func (a *App) Post(pattern string, handler Handler) {
 	a.inner.post(uwsPattern, a.applyMeta(meta, a.wrap(uwsPattern, handler)))
 }
 
+// postSharedBodyCap mirrors SNAP_BODY_CAP in the C++ bridge. POST
+// routes whose maxBodyBytes fits under this cap route through the
+// zero-cgo shared-dispatch path; larger bodies fall back to the
+// cgo-mediated async path that collects via res.Body. Keep these
+// two constants in sync with the C side (gogo/uws_bridge.cpp).
+const postSharedBodyCap = 8 * 1024
+
 // PostAsyncHandler is the handler signature for PostAsync routes. It receives
 // the response, a snapshot of the request (URL/query/params/headers all
 // captured before uWS freed the live request), and the fully-collected body.
@@ -946,6 +953,19 @@ func (a *App) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandl
 	finalAsync := AsyncHandler(func(res *Response, req *Request) {
 		handler(res, req, req.body)
 	})
+
+	// Zero-cgo fast path: small bodies (within the per-ctx
+	// SNAP_BODY_CAP) and no sync middleware → register on the
+	// shared-dispatch ring with body collection in C++. The worker
+	// goroutine reads the assembled body via req.snap + req.body
+	// without paying a single cgo crossing per request.
+	if maxBodyBytes > 0 && maxBodyBytes <= postSharedBodyCap &&
+		meta == nil && !a.hasMatchingMiddleware(uwsPattern) {
+		wrappedAsync := a.applyAppRefAsync(a.applyMetaAsync(meta, a.wrapAsync(uwsPattern, finalAsync)))
+		a.inner.postShared(uwsPattern, wrappedAsync, maxBodyBytes)
+		return
+	}
+
 	// PostAsync always runs the sync chain via a.wrap before
 	// dispatching the worker — PlaceBoth twins fire there, so the
 	// async chain composed inside res.Async must skip them.

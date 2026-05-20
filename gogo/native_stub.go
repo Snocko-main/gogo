@@ -25,6 +25,7 @@ func newAppNative() (appNative, error) {
 func (appNative) get(string, Handler)                      {}
 func (appNative) getStatic(string, string, string, string) {}
 func (appNative) getShared(string, AsyncHandler)           {}
+func (appNative) postShared(string, AsyncHandler, int)     {}
 func (appNative) post(string, Handler)                     {}
 func (appNative) any(string, Handler)                      {}
 func (appNative) put(string, Handler)                      {}

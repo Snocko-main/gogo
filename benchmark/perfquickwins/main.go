@@ -204,4 +204,27 @@ func setupShared(app *gogo.App, metrics *middleware.Metrics) {
 	app.Get("/heavy/x", func(res *gogo.Response, req *gogo.Request) {
 		res.Send(200, "text/plain", "ok")
 	})
+
+	// /post/small — POST with a small body (≤ 8 KB). When no
+	// middleware matches the pattern and the body cap fits, D-6
+	// auto-picks the shared-memory dispatch path: the C++ loop
+	// accumulates the body into the AsyncCtx snapshot and the
+	// worker goroutine reads it without any cgo crossings.
+	// Drive with `wrk -s post-small.lua -t 4 -c 64 -d 30s …`
+	// where post-small.lua sends a ~256-byte JSON payload.
+	app.PostAsync("/post/small", 8*1024, func(res *gogo.Response, req *gogo.Request, body []byte) {
+		// Touch the body so the snapshot path actually pays for
+		// the read — otherwise the bench would measure the
+		// pre-D-6 fallback shape.
+		_ = len(body)
+		res.Send(200, "text/plain", "ok")
+	})
+
+	// /post/big — POST with a large body cap (> 8 KB). Forces the
+	// classic async path (no shared dispatch) so the bench can
+	// produce an apples-to-apples comparison with /post/small.
+	app.PostAsync("/post/big", 64*1024, func(res *gogo.Response, req *gogo.Request, body []byte) {
+		_ = len(body)
+		res.Send(200, "text/plain", "ok")
+	})
 }
