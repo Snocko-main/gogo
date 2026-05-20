@@ -2053,6 +2053,12 @@ type Response struct {
 	// so a callback registered after the goroutine ran ahead of the
 	// middleware fires inline instead of being orphaned.
 	finished bool
+
+	// abort holds Go-side callbacks registered against uWS's single
+	// onAborted slot. uWS only stores one handler, so Response-level
+	// users must multiplex rather than calling r.inner.onAborted from
+	// multiple features and overwriting each other.
+	abort *responseAbortState
 }
 
 // bodyEncoder is the staging buffer + transformer used to defer
@@ -2070,6 +2076,12 @@ type asyncState struct {
 	contentType string
 	body        strings.Builder
 	sent        bool
+}
+
+type responseAbortState struct {
+	mu        sync.Mutex
+	callbacks []func()
+	fired     bool
 }
 
 // Status sets the HTTP status code. The standard reason phrase from
@@ -3215,6 +3227,7 @@ func (r *Response) releaseRef() {
 		r.pendingHeaders = r.pendingHeaders[:0]
 	}
 	r.encoder = nil
+	r.abort = nil
 	// Reset the finish state for the next pool use — we already
 	// drained above, but the recycled wrapper needs a clean slate.
 	r.finishMu.Lock()
@@ -3398,8 +3411,61 @@ func (r *Response) Loop() *Loop {
 // synchronously inside the route handler when responding asynchronously.
 func (r *Response) OnAborted() *Aborted {
 	state := &Aborted{}
-	r.inner.onAborted(state)
+	r.onAbort(func() {
+		state.state.Store(true)
+	})
 	return state
+}
+
+func (r *Response) onAbort(fn func()) {
+	if fn == nil {
+		return
+	}
+	state := r.abort
+	if state == nil {
+		state = &responseAbortState{}
+		r.abort = state
+		r.inner.onAborted(func() {
+			state.run()
+		})
+	}
+	state.add(fn)
+}
+
+func (s *responseAbortState) add(fn func()) {
+	s.mu.Lock()
+	if s.fired {
+		s.mu.Unlock()
+		runAbortCallback(fn)
+		return
+	}
+	s.callbacks = append(s.callbacks, fn)
+	s.mu.Unlock()
+}
+
+func (s *responseAbortState) run() {
+	s.mu.Lock()
+	if s.fired {
+		s.mu.Unlock()
+		return
+	}
+	s.fired = true
+	fns := s.callbacks
+	s.callbacks = nil
+	s.mu.Unlock()
+
+	for _, fn := range fns {
+		runAbortCallback(fn)
+	}
+}
+
+func runAbortCallback(fn func()) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			reportPanic(rec)
+		}
+	}()
+	fn()
 }
 
 // Cork batches all response writes inside fn into a single packet. Required
@@ -3464,7 +3530,7 @@ func (r *Response) OnData(fn func(chunk []byte, isLast bool)) {
 	// that check — without it, a connection abort mid-body crashes
 	// the process. The handler also releases our pinned ref so the
 	// wrapper can recycle even when the client disconnects.
-	r.inner.onAborted(release)
+	r.onAbort(release)
 	r.inner.onData(func(chunk []byte, isLast bool) {
 		if exceeded {
 			// Already emitted 413 — swallow tail chunks until
@@ -3538,7 +3604,7 @@ func (r *Response) Body(maxBytes int, done func(body []byte, err error)) {
 		finished = true
 		r.releaseRef()
 	}
-	r.inner.onAborted(func() {
+	r.onAbort(func() {
 		aborted.state.Store(true)
 		release()
 	})
@@ -3761,7 +3827,6 @@ func (r *Request) resetForPool() {
 		delete(r.locals, k)
 	}
 }
-
 
 // URL returns the request URL path. Query string is exposed separately via
 // Query(); URL() does not include it.

@@ -3160,6 +3160,79 @@ func TestBodyLimitChunkedBodyZeroMaxIsLiteral(t *testing.T) {
 	}
 }
 
+// TestOnDataPreservesUserOnAborted: Response.OnData installs its own abort
+// callback to release the pinned response ref on early disconnect, but it must
+// not overwrite a user callback registered through Response.OnAborted. uWS only
+// stores one native onAborted handler, so the framework has to multiplex
+// Go-side callbacks.
+func TestOnDataPreservesUserOnAborted(t *testing.T) {
+	started := make(chan *gogo.Aborted, 1)
+	port, teardown := startAppCfg(t, gogo.Config{BodyLimit: 1 << 20}, func(app *gogo.App) {
+		app.Post("/upload", func(res *gogo.Response, req *gogo.Request) {
+			aborted := res.OnAborted()
+			res.OnData(func(chunk []byte, isLast bool) {})
+			started <- aborted
+		})
+	})
+	defer teardown()
+
+	aborted := openChunkedUploadAndAbort(t, port, "/upload", started)
+	waitForAbortFlag(t, aborted)
+}
+
+// TestBodyPreservesUserOnAborted is the same overwrite guard for Response.Body,
+// which also needs an internal abort callback to release its body-collection
+// ref when the client disconnects before isLast.
+func TestBodyPreservesUserOnAborted(t *testing.T) {
+	started := make(chan *gogo.Aborted, 1)
+	port, teardown := startAppCfg(t, gogo.Config{BodyLimit: 1 << 20}, func(app *gogo.App) {
+		app.Post("/upload", func(res *gogo.Response, req *gogo.Request) {
+			aborted := res.OnAborted()
+			res.Body(1<<20, func(body []byte, err error) {})
+			started <- aborted
+		})
+	})
+	defer teardown()
+
+	aborted := openChunkedUploadAndAbort(t, port, "/upload", started)
+	waitForAbortFlag(t, aborted)
+}
+
+func openChunkedUploadAndAbort(t *testing.T, port int, path string, started <-chan *gogo.Aborted) *gogo.Aborted {
+	t.Helper()
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	fmt.Fprintf(conn, "POST %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n", path, port)
+	fmt.Fprintf(conn, "Content-Type: application/octet-stream\r\n")
+	fmt.Fprintf(conn, "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+	_, _ = conn.Write([]byte("1\r\nx\r\n"))
+
+	var aborted *gogo.Aborted
+	select {
+	case aborted = <-started:
+	case <-time.After(2 * time.Second):
+		conn.Close()
+		t.Fatal("handler did not start")
+	}
+	conn.Close()
+	return aborted
+}
+
+func waitForAbortFlag(t *testing.T, aborted *gogo.Aborted) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if aborted.Load() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("user OnAborted flag was not set after client abort")
+}
+
 // TestBindAddrLocalhost: when Config.BindAddr is set to 127.0.0.1, the
 // listener is reachable on loopback. (We can't reliably test refusal on
 // a non-loopback IP without knowing the box's external addresses; the
@@ -5645,4 +5718,3 @@ func TestParseMultipartDirect(t *testing.T) {
 		t.Fatalf("parts: %d, want 2: %v", len(parts), parts)
 	}
 }
-
