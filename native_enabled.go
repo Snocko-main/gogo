@@ -672,28 +672,6 @@ func innerBufferedAmount(rn responseNative) uint64 {
 	return uint64(C.uwsgo_res_buffered_amount(rn.ptr))
 }
 
-// newDrainHandle wraps a wake channel into a cgo.Handle that the
-// loop-side onWritable lambda can resolve. Defined here so the
-// types.go AwaitDrain implementation stays free of the cgo
-// dependency (it lives in a file compiled by both the cgo and
-// non-cgo builds).
-func newDrainHandle(wake chan struct{}) uintptr {
-	return uintptr(cgo.NewHandle(wake))
-}
-
-// asyncDeferDrainSignal arms a one-shot drain notifier on the loop
-// thread. uwsgoHandleDrain (Go //export below) fires the next time
-// uWS reports the send buffer drained below its high-water mark.
-// Used by Response.AwaitDrain to block a worker until the network
-// catches up.
-func asyncDeferDrainSignal(loopPtr, ctxHandle, callbackID uintptr) {
-	C.uwsgo_res_defer_drain_signal(
-		(*C.uwsgo_loop_t)(unsafe.Pointer(loopPtr)),
-		unsafe.Pointer(ctxHandle),
-		C.uintptr_t(callbackID),
-	)
-}
-
 func asyncCtxRelease(ctxHandle uintptr) {
 	C.uwsgo_async_ctx_release(unsafe.Pointer(ctxHandle))
 }

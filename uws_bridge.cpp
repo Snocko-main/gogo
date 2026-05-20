@@ -1639,41 +1639,6 @@ extern "C" void uwsgo_res_defer_stream_end(
     });
 }
 
-// uwsgo_res_defer_drain_signal arms a one-shot onWritable hook on
-// the loop thread. The next time uWS reports it can accept more
-// bytes (i.e. the send buffer drained below the high-water mark),
-// the lambda fires the Go callback and unsubscribes — the
-// caller's goroutine waiting on backpressure wakes up.
-//
-// The ctx's retain/release balance mirrors the other defer_*
-// helpers: one retain before queueing, one release after the
-// onWritable lambda runs OR the aborted short-circuit fires.
-extern "C" void uwsgo_res_defer_drain_signal(
-    uwsgo_loop_t *loop,
-    void *ctx_handle,
-    uintptr_t callback_id) {
-    auto *l = reinterpret_cast<uWS::Loop *>(loop);
-    auto *ctx = static_cast<AsyncCtx *>(ctx_handle);
-    ctx->retain();
-
-    l->defer([ctx, callback_id]() mutable {
-        if (ctx->aborted.load(std::memory_order_acquire)) {
-            uwsgoHandleDrain(callback_id);
-            ctx->release();
-            return;
-        }
-        auto *r = ctx->response;
-        // onWritable's callback returns true to keep subscribed, false
-        // to drop. We want one-shot: fire the Go callback, drop the
-        // subscription, release the ctx.
-        r->onWritable([ctx, callback_id](uintptr_t /*offset*/) mutable -> bool {
-            uwsgoHandleDrain(callback_id);
-            ctx->release();
-            return false;
-        });
-    });
-}
-
 extern "C" size_t uwsgo_req_method(uwsgo_req_t *req, char *buffer, size_t buffer_len) {
     auto value = reinterpret_cast<uWS::HttpRequest *>(req)->getMethod();
     return copy_string_view(value, buffer, buffer_len);

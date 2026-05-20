@@ -69,9 +69,7 @@ func asyncDeferSendWithHeaders(uintptr, uintptr, string, string, string, string)
 func asyncDeferStreamStart(uintptr, uintptr, string, string, string)             {}
 func asyncDeferStreamWrite(uintptr, uintptr, string)                             {}
 func asyncDeferStreamEnd(uintptr, uintptr)                                       {}
-func asyncDeferDrainSignal(uintptr, uintptr, uintptr)                            {}
 func innerBufferedAmount(responseNative) uint64                                  { return 0 }
-func newDrainHandle(chan struct{}) uintptr                                       { return 0 }
 func asyncCtxAborted(ctxHandle uintptr) bool                                     { return ctxHandle == 0 }
 
 func upgradeAccept(uintptr, string, uintptr) {}
