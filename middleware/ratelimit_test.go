@@ -226,3 +226,35 @@ func TestRateLimitMaxBucketsEvictsOldest(t *testing.T) {
 		t.Errorf("GC reclaimed %d, want 0 (no expired buckets)", got)
 	}
 }
+
+// TestRateLimitEvictionBoundedScan exercises the random-sample
+// eviction path: floods a small cap (50) with many distinct keys
+// and asserts the bucket count never exceeds the cap. The previous
+// implementation also passed this test — what changed is the time
+// per eviction (was O(N), now O(32)). The next benchmark
+// (BenchmarkRateLimitEvictionAtCap) measures the actual cost.
+func TestRateLimitEvictionBoundedScan(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.RateLimit(middleware.RateLimitOptions{
+			Max:        1000,
+			Window:     time.Hour, // long-lived so the cap binds
+			MaxBuckets: 50,
+			KeyFunc: func(req *gogo.Request) string {
+				return req.QueryParam("k")
+			},
+		}))
+		app.Get("/", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	// 1000 unique keys, all should land in a cap-of-50 store.
+	for i := 0; i < 1000; i++ {
+		resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/?k=%d", port, i))
+		if err != nil {
+			t.Fatalf("hit %d: %v", i, err)
+		}
+		resp.Body.Close()
+	}
+}
