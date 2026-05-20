@@ -1353,7 +1353,7 @@ env knobs.
 ### Results
 
 Single-worker, median req/s across `wrk -t {1,2,4,8} -c 500 -d 15s`,
-Apple M1 8-core, macOS 26.
+Apple M3 8-core, macOS 26.
 
 | framework  |       `/hello` | `/hello/:name` |          `/db` |
 |------------|---------------:|---------------:|---------------:|
