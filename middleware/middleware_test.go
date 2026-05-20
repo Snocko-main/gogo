@@ -301,10 +301,16 @@ func TestLoggerCapturesPostAsyncStatus(t *testing.T) {
 }
 
 // TestLoggerFiresOnHandlerPanic confirms the defer-OnFinish pattern
-// keeps the log line firing even when the handler panics. The
-// framework's outer recover catches the panic and emits 500; our
-// defer fires on the unwind before that recover, so OnFinish gets
-// registered (and fires inline for sync responses).
+// keeps the log line firing even when the handler panics, AND that
+// the recorded status reflects the framework's 500 instead of the
+// pre-panic statusCode value.
+//
+// Pre-fix: OnFinish ran inline at defer-time, before the framework's
+// outer recover invoked res.Send(500). The recorded status was the
+// statusCode at panic time — typically 0 (defaulted to 200 by the
+// "unset" fallback), so the log said the request succeeded.
+// Post-fix: OnFinish queues, releaseRef drains after Send(500) sets
+// statusCode=500, the log line reads 500.
 func TestLoggerFiresOnHandlerPanic(t *testing.T) {
 	buf := &safeBuf{}
 	port, teardown := startApp(t, func(app *gogo.App) {
@@ -324,7 +330,7 @@ func TestLoggerFiresOnHandlerPanic(t *testing.T) {
 	}
 	resp.Body.Close()
 	if resp.StatusCode != 500 {
-		t.Fatalf("status: got %d, want 500", resp.StatusCode)
+		t.Fatalf("wire status: got %d, want 500", resp.StatusCode)
 	}
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -336,7 +342,60 @@ func TestLoggerFiresOnHandlerPanic(t *testing.T) {
 	}
 	line := strings.TrimSpace(buf.String())
 	if line == "" {
-		t.Fatal("logger swallowed the panic case — defer OnFinish did not fire")
+		t.Fatal("logger swallowed the panic case — OnFinish did not drain")
+	}
+
+	// Logged status must match the wire — otherwise observability is
+	// lying about which requests actually failed.
+	var entry struct {
+		Status int `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(line), &entry); err != nil {
+		t.Fatalf("bad log line %q: %v", line, err)
+	}
+	if entry.Status != 500 {
+		t.Errorf("logged status: got %d, want 500 — pre-fix bug recorded the pre-panic statusCode", entry.Status)
+	}
+}
+
+// TestMetricsCapturesPanicAsServerError mirrors the Logger panic
+// test for the Metrics middleware: a panicking handler must be
+// counted under status=500, not status=200 (the pre-fix bug).
+func TestMetricsCapturesPanicAsServerError(t *testing.T) {
+	metrics := middleware.NewMetrics()
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(metrics.Middleware())
+		app.Get("/boom", func(res *gogo.Response, req *gogo.Request) {
+			panic("intentional test panic")
+		})
+	})
+	defer teardown()
+
+	resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/boom", port))
+	if err != nil {
+		t.Fatalf("GET /boom: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 500 {
+		t.Fatalf("wire status: got %d, want 500", resp.StatusCode)
+	}
+
+	// Give Metrics' OnFinish a beat to drain.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if metrics.Snapshot().Status["500"] > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	snap := metrics.Snapshot()
+	if snap.Status["500"] != 1 {
+		t.Errorf("metrics status=500 count: got %d, want 1 — panic was misrecorded",
+			snap.Status["500"])
+	}
+	if snap.Status["200"] != 0 {
+		t.Errorf("metrics status=200 count: got %d, want 0 — panic was counted as success",
+			snap.Status["200"])
 	}
 }
 

@@ -3183,6 +3183,21 @@ func (r *Response) releaseRef() {
 	if r.refs.Add(-1) != 0 {
 		return
 	}
+	// Drain any OnFinish callbacks before tearing the response state
+	// down. For sync responses this is the ONLY drain point — and it
+	// runs from the HTTP handler's defer AFTER the framework's panic
+	// recover + Send(500), so callbacks see the final statusCode.
+	// For async responses finishAsync already drained the queue;
+	// we'll see an empty slice and skip.
+	r.finishMu.Lock()
+	fns := r.onFinish
+	r.onFinish = nil
+	r.finished = true
+	r.finishMu.Unlock()
+	for _, fn := range fns {
+		runFinishCallback(fn)
+	}
+
 	r.inner = responseNative{}
 	r.async = nil
 	r.statusCode = 0
@@ -3191,11 +3206,9 @@ func (r *Response) releaseRef() {
 		r.pendingHeaders = r.pendingHeaders[:0]
 	}
 	r.encoder = nil
-	// Sync-path responses never call finishAsync, so reset the
-	// onFinish state here too. Async responses already drained it
-	// in finishAsync.
+	// Reset the finish state for the next pool use — we already
+	// drained above, but the recycled wrapper needs a clean slate.
 	r.finishMu.Lock()
-	r.onFinish = nil
 	r.finished = false
 	r.finishMu.Unlock()
 	responsePool.Put(r)
@@ -3332,28 +3345,36 @@ func runFinishCallback(fn func()) {
 // `next(res, req); persist(state)` and a handler that calls
 // Response.Async would silently persist pre-async state — the
 // goroutine's mutations land after persist already ran.
+//
+// Drain timing:
+//
+//   - Sync response: callbacks queue and fire from releaseRef, which
+//     runs from the framework's HTTP-handler defer AFTER any panic
+//     recovery and Send(500). This is what makes Logger / Metrics see
+//     status=500 when the handler panics rather than the pre-panic
+//     statusCode value.
+//   - Async response (Response.Async or GetAsync): callbacks fire
+//     from finishAsync as soon as the goroutine completes, then
+//     releaseRef finds the queue empty when it eventually recycles.
+//   - Late-registration race in async mode: if the goroutine drained
+//     and reset r.finished before the middleware reached OnFinish,
+//     the callback runs inline — the response wrapper is still alive
+//     because the caller still holds a ref.
 func (r *Response) OnFinish(fn func()) {
 	if fn == nil {
 		return
 	}
 	r.finishMu.Lock()
-	switch {
-	case r.async == nil:
-		// Sync response — middleware reached us after the handler
-		// returned, so state is stable. Run fn inline.
+	if r.finished {
+		// Async goroutine already drained the queue — register lost
+		// the race to finishAsync. Run inline; the response wrapper
+		// is still alive (caller holds a ref).
 		r.finishMu.Unlock()
 		runFinishCallback(fn)
-	case r.finished:
-		// Async goroutine already drained — register lost the race
-		// to finishAsync. Run fn inline; the response is still alive
-		// because the middleware that called us still holds a ref
-		// to the wrapper.
-		r.finishMu.Unlock()
-		runFinishCallback(fn)
-	default:
-		r.onFinish = append(r.onFinish, fn)
-		r.finishMu.Unlock()
+		return
 	}
+	r.onFinish = append(r.onFinish, fn)
+	r.finishMu.Unlock()
 }
 
 // Loop returns the event loop that owns this response. Capture it inside the
