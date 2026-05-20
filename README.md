@@ -733,6 +733,7 @@ app.Use(mw.NewSession(mw.SessionOptions{
     Store:        mw.NewMemorySessionStore(),    // swap for Redis in prod
     TTL:          24 * time.Hour,
     CookieSecure: true,
+    MaxEntries:   100_000,                       // default; cap memory
 }))
 
 app.GetAsync("/login", func(res *gogo.Response, req *gogo.Request) {
@@ -777,6 +778,15 @@ app.Get("/checkpoint", func(res *gogo.Response, req *gogo.Request) {
     // completes — no extra Save() needed at the end.
 })
 ```
+
+The default in-memory store is bounded at **100,000 entries**. Expired
+sessions are evicted lazily on `Load` (the previous implementation kept
+expired rows alive until `GC()` was called manually). When the cap is
+hit on a fresh `Save`, the store sweeps expired entries first and
+otherwise drops the oldest-`expires` entry to make room. Raise the cap
+via `MaxEntries` if your workload legitimately keeps many concurrent
+sessions; pass a negative value to disable (not recommended outside
+tests).
 
 For multi-instance fleets, implement `SessionStore` (and `RateLimitStore`)
 on top of Redis / Memcache.
