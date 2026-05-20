@@ -11,7 +11,7 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
-	gogo "uwebsockets-go/gogo"
+	gogo "github.com/Snocko-main/gogo"
 )
 
 var dbConn *sql.DB

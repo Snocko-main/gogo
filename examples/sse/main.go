@@ -21,7 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	gogo "uwebsockets-go/gogo"
+	gogo "github.com/Snocko-main/gogo"
 )
 
 const indexHTML = `<!doctype html>

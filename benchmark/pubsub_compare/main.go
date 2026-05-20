@@ -71,7 +71,7 @@ import (
 	"sync/atomic"
 	"syscall"
 
-	gogo "uwebsockets-go/gogo"
+	gogo "github.com/Snocko-main/gogo"
 )
 
 func main() {

@@ -35,7 +35,7 @@ should land before any 1.0 release.
 
 ### P0-1. Validate `Reply.ContentType` for CRLF injection
 
-`gogo/types.go:432-435` — `app.Get(pattern, Reply{ContentType: …})` passes
+`types.go:432-435` — `app.Get(pattern, Reply{ContentType: …})` passes
 the content type straight into the C++ static-response slot without ever
 running it through `validateHeaderValue`. A programmer who plumbs user
 input into `Reply.ContentType` (rare but possible — version reflection
@@ -48,7 +48,7 @@ helpers. Effort: ~5 lines.
 
 ### P0-2. Default body limit on `Post` / `Any`
 
-`gogo/types.go:577-586` — only `PostAsync` enforces a body cap.
+`types.go:577-586` — only `PostAsync` enforces a body cap.
 `app.Post(pattern, handler)` and `app.Any(pattern, handler)` let the user
 call `res.Body(maxBytes, …)` themselves; if they forget, uWS will hand
 through unlimited body bytes to user code. Memory-exhaustion DoS.
@@ -60,7 +60,7 @@ handler. Effort: medium — touches bridge + types.
 
 ### P0-3. Default panic logging
 
-`gogo/types.go:104-125` — `SetPanicHandler(nil)` means panics in user
+`types.go:104-125` — `SetPanicHandler(nil)` means panics in user
 code are silently swallowed. In stress + abort scenarios the framework
 emits a best-effort 500 to the client, but the server operator never sees
 the panic. Bugs and attack-triggered panics go invisible in production.
@@ -71,7 +71,7 @@ Effort: ~10 lines.
 
 ### P0-4. `JSON()` error leaks internal detail
 
-`gogo/types.go:1130-1138` — when `json.Marshal` fails, the marshal error
+`types.go:1130-1138` — when `json.Marshal` fails, the marshal error
 message goes back to the client as plain text. Marshal failures only
 happen for programmer-shaped values (channels, funcs, cycles), but Go
 runtime messages can include type names and package paths.
@@ -81,7 +81,7 @@ generic body. Effort: trivial.
 
 ### P0-5. WebSocket has no max-payload / idle config
 
-`gogo/types.go:152-157` — `WebSocketBehavior` exposes only `Open`,
+`types.go:152-157` — `WebSocketBehavior` exposes only `Open`,
 `Message`, `Close`. uWS itself supports `maxPayloadLength`,
 `idleTimeout`, `maxBackpressure`, `sendPingsAutomatically` — all of those
 are security-relevant and should be configurable. Without them a single
@@ -93,7 +93,7 @@ bridge ABI change.
 
 ### P0-6. `Listen` is `0.0.0.0`-only
 
-`gogo/types.go:878-881` — no way to bind to `127.0.0.1` or a specific
+`types.go:878-881` — no way to bind to `127.0.0.1` or a specific
 interface. Forces operators to firewall externally for what should be a
 one-line config.
 
@@ -112,7 +112,7 @@ uWS. Effort: medium.
 
 ### P0-8. `headersAll()` has no upper bound
 
-`gogo/native_enabled.go:662-670` — the headersAll() Go side allocates
+`native_enabled.go:662-670` — the headersAll() Go side allocates
 exactly what uWS reports. uWS has internal limits (~8 KiB by default)
 but they are not surfaced as a gogo-level cap and the snapshot path
 already enforces 4 KiB. Mismatched limits between sync and async paths
@@ -123,7 +123,7 @@ the C++ side. Effort: small.
 
 ### P0-9. Cookie value quoted-string handling
 
-`gogo/types.go:1261-1285` — `Cookie(name)` returns `pair[eq+1:]` verbatim.
+`types.go:1261-1285` — `Cookie(name)` returns `pair[eq+1:]` verbatim.
 RFC 6265 allows the value to be wrapped in `"..."`; most frameworks strip
 those quotes. Not a security bug per se but a correctness gap that bites
 session-cookie interop.

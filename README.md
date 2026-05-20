@@ -3,6 +3,14 @@
 A Go HTTP framework built on the uWebSockets C++ HTTP server, designed for
 low cgo overhead and high concurrency on real-world IO-bound workloads.
 
+```sh
+go get github.com/Snocko-main/gogo
+```
+
+```go
+import gogo "github.com/Snocko-main/gogo"
+```
+
 It is intentionally thin:
 
 - Go owns route registration and handlers.
@@ -25,7 +33,7 @@ It is intentionally thin:
 The binding expects uWebSockets to be vendored here:
 
 ```txt
-gogo/third_party/uWebSockets
+third_party/uWebSockets
 ```
 
 One way to set that up:

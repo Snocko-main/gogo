@@ -1,0 +1,171 @@
+package middleware
+
+import (
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/Snocko-main/gogo"
+	"github.com/Snocko-main/gogo/internal/mwhint"
+)
+
+// RateLimitOptions configures the in-memory fixed-window rate limiter.
+// Zero value means "no limit" — at minimum Max and Window must be set.
+type RateLimitOptions struct {
+	// Max is the number of requests allowed per Window per key.
+	// Required; zero disables the middleware (it passes everything
+	// through).
+	Max int
+
+	// Window is the fixed window length. Counters reset at each
+	// boundary. Required.
+	Window time.Duration
+
+	// KeyFunc derives the bucket key from the request. Default
+	// req.IP(). Override to rate-limit by user ID, API key, etc.
+	KeyFunc func(*gogo.Request) string
+
+	// SkipFunc, when non-nil and returning true, bypasses the limit
+	// entirely. Useful for whitelisting health-check probes or
+	// authenticated admin traffic.
+	SkipFunc func(*gogo.Request) bool
+
+	// OnLimit, when non-nil, is invoked instead of the default 429
+	// Too Many Requests response when a key is over its limit. The
+	// middleware has already attached the X-RateLimit-* and
+	// Retry-After headers before calling OnLimit.
+	OnLimit gogo.Handler
+
+	// Store overrides the in-memory bucket store. Empty default is a
+	// process-local map[string]*rateBucket guarded by a mutex.
+	// Provide an implementation backed by Redis / Memcache for
+	// distributed deployments.
+	Store RateLimitStore
+}
+
+// RateLimitStore abstracts the bucket backend so production
+// deployments can swap in Redis / Memcache for shared counters
+// across instances.
+type RateLimitStore interface {
+	// Hit increments the counter for key in the current window and
+	// returns the new count and the time the window resets. If the
+	// window has rolled over, the store should reset to 1.
+	Hit(key string, window time.Duration) (count int, resetAt time.Time)
+}
+
+// RateLimit returns a middleware that enforces a fixed-window per-key
+// quota. When a key exceeds Max requests within Window, subsequent
+// requests are short-circuited with 429 Too Many Requests and a
+// Retry-After header. The default key is the client IP; override
+// KeyFunc to rate-limit by user, API key, etc.
+//
+// The middleware also emits the conventional informational headers
+// on every response:
+//
+//	X-RateLimit-Limit      — configured Max
+//	X-RateLimit-Remaining  — requests left in the current window
+//	X-RateLimit-Reset      — Unix timestamp when the window resets
+//
+// In-memory backing is single-process. For multi-instance fleets
+// supply a Store implementation that consults a shared backend.
+func RateLimit(opt RateLimitOptions) mwhint.Hinted {
+	if opt.Max <= 0 || opt.Window <= 0 {
+		// No-op pass-through when not configured.
+		return mwhint.Hinted{Place: mwhint.Sync, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler { return next })}
+	}
+	if opt.KeyFunc == nil {
+		opt.KeyFunc = func(req *gogo.Request) string { return req.IP() }
+	}
+	if opt.Store == nil {
+		opt.Store = NewMemoryRateLimitStore()
+	}
+	maxStr := strconv.Itoa(opt.Max)
+
+	return mwhint.Hinted{Place: mwhint.Sync, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler {
+		return func(res *gogo.Response, req *gogo.Request) {
+			if opt.SkipFunc != nil && opt.SkipFunc(req) {
+				next(res, req)
+				return
+			}
+			key := opt.KeyFunc(req)
+			count, resetAt := opt.Store.Hit(key, opt.Window)
+			remaining := opt.Max - count
+			if remaining < 0 {
+				remaining = 0
+			}
+			res.Header("X-RateLimit-Limit", maxStr)
+			res.Header("X-RateLimit-Remaining", strconv.Itoa(remaining))
+			res.Header("X-RateLimit-Reset", strconv.FormatInt(resetAt.Unix(), 10))
+
+			if count > opt.Max {
+				retryAfter := int(time.Until(resetAt).Seconds())
+				if retryAfter < 1 {
+					retryAfter = 1
+				}
+				res.Header("Retry-After", strconv.Itoa(retryAfter))
+				if opt.OnLimit != nil {
+					opt.OnLimit(res, req)
+					return
+				}
+				res.Send(429, "text/plain; charset=utf-8", "Too Many Requests\n")
+				return
+			}
+			next(res, req)
+		}
+	})}
+}
+
+// MemoryRateLimitStore is the default in-memory backend for RateLimit.
+// Counters are kept in a map[string]*rateBucket protected by a single
+// mutex; suitable for a single process at moderate QPS. Idle buckets
+// are reclaimed lazily on access — call GC manually if you have a
+// long-tailed key distribution and want bounded memory.
+type MemoryRateLimitStore struct {
+	mu      sync.Mutex
+	buckets map[string]*rateBucket
+}
+
+type rateBucket struct {
+	count   int
+	resetAt time.Time
+}
+
+// NewMemoryRateLimitStore returns an empty in-memory store ready for
+// use as RateLimitOptions.Store.
+func NewMemoryRateLimitStore() *MemoryRateLimitStore {
+	return &MemoryRateLimitStore{buckets: make(map[string]*rateBucket)}
+}
+
+// Hit implements RateLimitStore. The window rolls forward to
+// now+window the first time a key is seen, and on every reset crossing
+// thereafter.
+func (s *MemoryRateLimitStore) Hit(key string, window time.Duration) (int, time.Time) {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok := s.buckets[key]
+	if !ok || now.After(b.resetAt) {
+		b = &rateBucket{count: 1, resetAt: now.Add(window)}
+		s.buckets[key] = b
+		return 1, b.resetAt
+	}
+	b.count++
+	return b.count, b.resetAt
+}
+
+// GC removes buckets whose window has already expired. Call
+// periodically if your key cardinality is unbounded and you want
+// to cap memory. Returns the number of buckets reclaimed.
+func (s *MemoryRateLimitStore) GC() int {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	removed := 0
+	for k, b := range s.buckets {
+		if now.After(b.resetAt) {
+			delete(s.buckets, k)
+			removed++
+		}
+	}
+	return removed
+}

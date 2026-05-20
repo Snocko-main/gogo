@@ -16,7 +16,7 @@ import (
 	"fmt"
 	"log"
 
-	gogo "uwebsockets-go/gogo"
+	gogo "github.com/Snocko-main/gogo"
 )
 
 func main() {

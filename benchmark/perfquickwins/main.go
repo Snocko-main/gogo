@@ -41,8 +41,8 @@ import (
 	"runtime"
 	"strconv"
 
-	gogo "uwebsockets-go/gogo"
-	"uwebsockets-go/gogo/middleware"
+	gogo "github.com/Snocko-main/gogo"
+	"github.com/Snocko-main/gogo/middleware"
 )
 
 func main() {
