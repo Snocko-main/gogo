@@ -1,6 +1,7 @@
 package gogo
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -84,7 +85,7 @@ func ParseBody(contentType string, body []byte, out any) error {
 		if boundary == "" {
 			return errors.New("gogo: multipart/form-data missing boundary")
 		}
-		mr := multipart.NewReader(strings.NewReader(string(body)), boundary)
+		mr := multipart.NewReader(bytes.NewReader(body), boundary)
 		values := url.Values{}
 		for {
 			p, err := mr.NextPart()

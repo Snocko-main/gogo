@@ -1053,6 +1053,14 @@ extern "C" void uwsgo_async_ctx_release(void *ctx_handle) {
     ctx->release();
 }
 
+extern "C" int uwsgo_async_ctx_aborted(void *ctx_handle) {
+    auto *ctx = static_cast<AsyncCtx *>(ctx_handle);
+    if (ctx == nullptr) {
+        return 1;
+    }
+    return ctx->aborted.load(std::memory_order_acquire) ? 1 : 0;
+}
+
 extern "C" void uwsgo_shared_layout(uwsgo_shared_layout_t *out) {
     g_request.init();
     // ring is no longer a global pointer; each AsyncCtx carries its App's
@@ -1628,41 +1636,6 @@ extern "C" void uwsgo_res_defer_stream_end(
         auto *r = ctx->response;
         r->end(std::string_view());
         ctx->release();
-    });
-}
-
-// uwsgo_res_defer_drain_signal arms a one-shot onWritable hook on
-// the loop thread. The next time uWS reports it can accept more
-// bytes (i.e. the send buffer drained below the high-water mark),
-// the lambda fires the Go callback and unsubscribes — the
-// caller's goroutine waiting on backpressure wakes up.
-//
-// The ctx's retain/release balance mirrors the other defer_*
-// helpers: one retain before queueing, one release after the
-// onWritable lambda runs OR the aborted short-circuit fires.
-extern "C" void uwsgo_res_defer_drain_signal(
-    uwsgo_loop_t *loop,
-    void *ctx_handle,
-    uintptr_t callback_id) {
-    auto *l = reinterpret_cast<uWS::Loop *>(loop);
-    auto *ctx = static_cast<AsyncCtx *>(ctx_handle);
-    ctx->retain();
-
-    l->defer([ctx, callback_id]() mutable {
-        if (ctx->aborted.load(std::memory_order_acquire)) {
-            uwsgoHandleDrain(callback_id);
-            ctx->release();
-            return;
-        }
-        auto *r = ctx->response;
-        // onWritable's callback returns true to keep subscribed, false
-        // to drop. We want one-shot: fire the Go callback, drop the
-        // subscription, release the ctx.
-        r->onWritable([ctx, callback_id](uintptr_t /*offset*/) mutable -> bool {
-            uwsgoHandleDrain(callback_id);
-            ctx->release();
-            return false;
-        });
     });
 }
 

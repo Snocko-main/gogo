@@ -672,30 +672,15 @@ func innerBufferedAmount(rn responseNative) uint64 {
 	return uint64(C.uwsgo_res_buffered_amount(rn.ptr))
 }
 
-// newDrainHandle wraps a wake channel into a cgo.Handle that the
-// loop-side onWritable lambda can resolve. Defined here so the
-// types.go AwaitDrain implementation stays free of the cgo
-// dependency (it lives in a file compiled by both the cgo and
-// non-cgo builds).
-func newDrainHandle(wake chan struct{}) uintptr {
-	return uintptr(cgo.NewHandle(wake))
-}
-
-// asyncDeferDrainSignal arms a one-shot drain notifier on the loop
-// thread. uwsgoHandleDrain (Go //export below) fires the next time
-// uWS reports the send buffer drained below its high-water mark.
-// Used by Response.AwaitDrain to block a worker until the network
-// catches up.
-func asyncDeferDrainSignal(loopPtr, ctxHandle, callbackID uintptr) {
-	C.uwsgo_res_defer_drain_signal(
-		(*C.uwsgo_loop_t)(unsafe.Pointer(loopPtr)),
-		unsafe.Pointer(ctxHandle),
-		C.uintptr_t(callbackID),
-	)
-}
-
 func asyncCtxRelease(ctxHandle uintptr) {
 	C.uwsgo_async_ctx_release(unsafe.Pointer(ctxHandle))
+}
+
+func asyncCtxAborted(ctxHandle uintptr) bool {
+	if ctxHandle == 0 {
+		return true
+	}
+	return C.uwsgo_async_ctx_aborted(unsafe.Pointer(ctxHandle)) != 0
 }
 
 // sharedLayout caches struct offsets exposed by C so the hot path can build
@@ -795,19 +780,19 @@ func initSharedLayoutOnce() {
 		ctCap:             uintptr(raw.ctx_inline_ct_cap),
 		bodyCap:           uintptr(raw.ctx_inline_body_cap),
 
-		ctxMethodLenOff:  uintptr(raw.ctx_method_len_offset),
-		ctxURLLenOff:     uintptr(raw.ctx_url_len_offset),
-		ctxQueryLenOff:   uintptr(raw.ctx_query_len_offset),
-		ctxIPLenOff:      uintptr(raw.ctx_ip_len_offset),
-		ctxParamCountOff: uintptr(raw.ctx_param_count_offset),
-		ctxHeadersLenOff: uintptr(raw.ctx_headers_len_offset),
-		ctxTruncatedOff:  uintptr(raw.ctx_truncated_offset),
-		ctxParamLensOff:  uintptr(raw.ctx_param_lens_offset),
-		ctxMethodOff:     uintptr(raw.ctx_method_offset),
-		ctxURLOff:        uintptr(raw.ctx_url_offset),
-		ctxQueryOff:      uintptr(raw.ctx_query_offset),
-		ctxIPOff:         uintptr(raw.ctx_ip_offset),
-		ctxParamsOff:     uintptr(raw.ctx_params_offset),
+		ctxMethodLenOff:       uintptr(raw.ctx_method_len_offset),
+		ctxURLLenOff:          uintptr(raw.ctx_url_len_offset),
+		ctxQueryLenOff:        uintptr(raw.ctx_query_len_offset),
+		ctxIPLenOff:           uintptr(raw.ctx_ip_len_offset),
+		ctxParamCountOff:      uintptr(raw.ctx_param_count_offset),
+		ctxHeadersLenOff:      uintptr(raw.ctx_headers_len_offset),
+		ctxTruncatedOff:       uintptr(raw.ctx_truncated_offset),
+		ctxParamLensOff:       uintptr(raw.ctx_param_lens_offset),
+		ctxMethodOff:          uintptr(raw.ctx_method_offset),
+		ctxURLOff:             uintptr(raw.ctx_url_offset),
+		ctxQueryOff:           uintptr(raw.ctx_query_offset),
+		ctxIPOff:              uintptr(raw.ctx_ip_offset),
+		ctxParamsOff:          uintptr(raw.ctx_params_offset),
 		ctxHeadersOff:         uintptr(raw.ctx_headers_offset),
 		ctxReqBodyLenOff:      uintptr(raw.ctx_req_body_len_offset),
 		ctxReqBodyOverflowOff: uintptr(raw.ctx_req_body_overflow_offset),

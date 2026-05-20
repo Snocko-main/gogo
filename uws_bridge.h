@@ -147,16 +147,6 @@ void uwsgo_res_send(
 // transactional.
 size_t uwsgo_res_buffered_amount(uwsgo_res_t *res);
 
-// uwsgo_res_defer_drain_signal arms an onWritable callback on the
-// loop thread that fires the next time uWS reports it can accept
-// more bytes. The Go callback (uwsgoHandleDrain) flips a Go-side
-// atomic so a worker goroutine waiting on backpressure can wake.
-// Implemented inside the async/stream subsystem; a separate
-// helper because the standard sync-mode response wrapper does not
-// own a loop pointer to defer onto.
-void uwsgo_res_defer_drain_signal(uwsgo_loop_t *loop, void *ctx,
-    uintptr_t callback_id);
-
 // uwsgo_res_remote_addr writes the formatted peer IP into buffer (returns
 // the size needed if buffer is too small or NULL). uWS caches the
 // formatted string on first call so this is effectively free for any
@@ -255,6 +245,10 @@ void uwsgo_res_defer_stream_end(
 // async_ctx_release drops Go's reference to ctx without sending a response.
 // Call this if a goroutine returns without invoking defer_send.
 void uwsgo_async_ctx_release(void *ctx);
+
+// async_ctx_aborted reports whether the async response's client connection
+// has already disconnected. It is safe to sample from a worker goroutine.
+int uwsgo_async_ctx_aborted(void *ctx);
 
 // Memory layout exposed to Go for the shared-memory fast path. Go reads this
 // once at startup, then writes responses directly into ctx memory and pushes
