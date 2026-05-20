@@ -28,28 +28,15 @@ type CompressOptions struct {
 	// Default 1024.
 	MinSize int
 
-	// MaxSize skips compression when the buffered body is LARGER
-	// than this many bytes. The compression step allocates a
-	// secondary buffer ~half the input size to hold the encoded
-	// output, plus the CPU to run gzip / deflate over the whole
-	// thing — both linear in body size, both bounded only by the
-	// handler's own response size before this cap was introduced.
-	// A 100 MiB dynamic JSON response would peak around 150 MiB of
-	// resident heap during compression; concurrent requests
-	// multiply that. With the cap in place, bodies larger than
-	// MaxSize emit uncompressed (no Content-Encoding header) so
-	// downstream proxies / CDNs can apply their own compression if
-	// desired.
+	// MaxSize caps both compression work and the middleware's staging
+	// buffer. Once the response body would grow beyond this many bytes,
+	// the encoder is bypassed and the response continues uncompressed
+	// (no Content-Encoding header). This avoids retaining a whole large
+	// dynamic response just to later decide it is too large to compress.
 	//
 	// Default 4 MiB. Set to 0 to disable the cap (matches the
 	// pre-cap behavior — every body of any size gets compressed if
 	// it passes the other filters). Negative is treated as zero.
-	//
-	// Note: this caps the COMPRESSION work, not the buffering. The
-	// handler's bytes still flow through the encoder's staging
-	// buffer; for truly streaming responses (SSE, large file
-	// downloads) use SkipFunc to bypass the encoder entirely, or
-	// use Response.Stream which doesn't route through this hook.
 	MaxSize int
 
 	// Filter, when non-nil, is consulted after the body is buffered
@@ -78,7 +65,7 @@ type CompressOptions struct {
 //
 //	app.Use(middleware.Compress())
 //
-// Limitations
+// # Limitations
 //
 // SendFile is not compressed — the static-file path streams the
 // file directly to uWS without flowing through Write / End.
@@ -121,16 +108,8 @@ func Compress(opts ...CompressOptions) mwhint.Hinted {
 				next(res, req)
 				return
 			}
-			res.SetBodyEncoder(func(body []byte, contentType string) ([]byte, string) {
+			res.SetBodyEncoderLimit(opt.MaxSize, func(body []byte, contentType string) ([]byte, string) {
 				if len(body) < opt.MinSize {
-					return body, ""
-				}
-				if opt.MaxSize > 0 && len(body) > opt.MaxSize {
-					// Compressing a multi-MiB body would allocate a
-					// secondary buffer of similar size and burn
-					// noticeable CPU. Emit uncompressed instead so
-					// concurrent large requests don't spike the
-					// process's resident memory.
 					return body, ""
 				}
 				if contentType != "" && !opt.Filter(contentType) {

@@ -9,6 +9,14 @@ import (
 	"strings"
 )
 
+func defaultWebSocketUpgrade(ctx *UpgradeContext) {
+	if ctx.Header("origin") != "" || ctx.Header("sec-websocket-origin") != "" {
+		ctx.Reject(403, "origin not allowed")
+		return
+	}
+	ctx.Accept("")
+}
+
 // UpgradeContext is passed to WebSocketBehavior.Upgrade for every
 // incoming WebSocket handshake. It carries a snapshot of the
 // request (URL, query, headers, peer IP, offered subprotocols) and
