@@ -109,19 +109,36 @@ func Logger(opts ...LoggerOptions) mwhint.Hinted {
 				return
 			}
 			start := time.Now()
+			// Snapshot per-request fields that the snapshot Request
+			// makes available now — Method / IP / User-Agent are all
+			// driven by the request, which is fully populated before
+			// the handler runs and stable across any Response.Async
+			// upgrade. URL is already captured above.
+			method := req.Method()
+			ip := req.IP()
+			userAgent := req.Header("user-agent")
+			// Defer the log emission through Response.OnFinish so the
+			// recorded Status / Duration reflect the handler's final
+			// response — including any work the handler offloaded to
+			// a Response.Async goroutine. The defer form covers the
+			// handler-panic case too: the unwind triggers our defer
+			// before the framework's outer recover sends a 500, so
+			// every request shows up in the log even when it panics.
+			defer res.OnFinish(func() {
+				entry := LogEntry{
+					Method:    method,
+					URL:       url,
+					Status:    res.StatusCode(),
+					Duration:  time.Since(start),
+					IP:        ip,
+					UserAgent: userAgent,
+				}
+				line := opt.Format(entry)
+				mu.Lock()
+				fmt.Fprintln(opt.Output, line)
+				mu.Unlock()
+			})
 			next(res, req)
-			entry := LogEntry{
-				Method:    req.Method(),
-				URL:       url,
-				Status:    res.StatusCode(),
-				Duration:  time.Since(start),
-				IP:        req.IP(),
-				UserAgent: req.Header("user-agent"),
-			}
-			line := opt.Format(entry)
-			mu.Lock()
-			fmt.Fprintln(opt.Output, line)
-			mu.Unlock()
 		}
 	})}
 }

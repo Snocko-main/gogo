@@ -235,6 +235,111 @@ func TestLoggerSkipPaths(t *testing.T) {
 	}
 }
 
+// TestLoggerCapturesPostAsyncStatus is the regression test for the
+// "logger fires before res.Async goroutine finishes" footgun. A
+// sync handler that does its real work inside Response.Async and
+// emits a non-default status (here 202 Accepted) must show up in
+// the log with the correct status and a non-trivial duration —
+// previously the logger read res.StatusCode() right after next()
+// returned, before the goroutine had run, and recorded status=200
+// with near-zero duration.
+func TestLoggerCapturesPostAsyncStatus(t *testing.T) {
+	buf := &safeBuf{}
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.Logger(middleware.LoggerOptions{
+			Output: buf,
+			Format: middleware.JSONFormat,
+		}))
+		app.Get("/queue", func(res *gogo.Response, req *gogo.Request) {
+			res.Async(func() {
+				time.Sleep(15 * time.Millisecond)
+				res.Send(202, "text/plain", "queued")
+			})
+		})
+	})
+	defer teardown()
+
+	resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/queue", port))
+	if err != nil {
+		t.Fatalf("GET /queue: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 202 {
+		t.Fatalf("status: got %d, want 202", resp.StatusCode)
+	}
+
+	// Logger fires from finishAsync after the goroutine completes;
+	// give it a beat to drain to the buffer.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(buf.String(), "\n") {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	line := strings.TrimSpace(buf.String())
+	if line == "" {
+		t.Fatal("logger emitted no line for async-upgrade request")
+	}
+	var entry struct {
+		Status     int     `json:"status"`
+		DurationMs float64 `json:"duration_ms"`
+	}
+	if err := json.Unmarshal([]byte(line), &entry); err != nil {
+		t.Fatalf("bad log line %q: %v", line, err)
+	}
+	if entry.Status != 202 {
+		t.Errorf("status: got %d, want 202 — logger captured pre-async status", entry.Status)
+	}
+	// The handler slept 15 ms before Send; the recorded duration must
+	// reflect that, not a near-zero measurement from before the async
+	// goroutine started.
+	if entry.DurationMs < 10 {
+		t.Errorf("duration_ms: got %.3f, want ≥ 10 — logger captured pre-async duration", entry.DurationMs)
+	}
+}
+
+// TestLoggerFiresOnHandlerPanic confirms the defer-OnFinish pattern
+// keeps the log line firing even when the handler panics. The
+// framework's outer recover catches the panic and emits 500; our
+// defer fires on the unwind before that recover, so OnFinish gets
+// registered (and fires inline for sync responses).
+func TestLoggerFiresOnHandlerPanic(t *testing.T) {
+	buf := &safeBuf{}
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.Logger(middleware.LoggerOptions{
+			Output: buf,
+			Format: middleware.JSONFormat,
+		}))
+		app.Get("/boom", func(res *gogo.Response, req *gogo.Request) {
+			panic("intentional test panic")
+		})
+	})
+	defer teardown()
+
+	resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/boom", port))
+	if err != nil {
+		t.Fatalf("GET /boom: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 500 {
+		t.Fatalf("status: got %d, want 500", resp.StatusCode)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(buf.String(), "\n") {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	line := strings.TrimSpace(buf.String())
+	if line == "" {
+		t.Fatal("logger swallowed the panic case — defer OnFinish did not fire")
+	}
+}
+
 // TestCORSPermissive: zero-value CORSOptions emits Allow-Origin: * and
 // echoes preflight requests with the default method/header list.
 func TestCORSPermissive(t *testing.T) {
