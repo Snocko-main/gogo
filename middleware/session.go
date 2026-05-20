@@ -85,14 +85,22 @@ type SessionOptions struct {
 
 // Session is the per-request session handle handlers manipulate
 // during a request. Mutations are persisted to the Store after the
-// handler returns; concurrent goroutines writing to the same handle
-// race — sessions are intended to be used from the request goroutine
-// only.
+// handler returns (via Response.OnFinish, which runs after any
+// Response.Async goroutine completes); concurrent goroutines writing
+// to the same handle race — sessions are intended to be used from
+// the request goroutine only.
+//
+// Handlers that need state to land mid-flight (before the response
+// is fully written) can call Save explicitly.
 type Session struct {
 	ID        string
 	data      map[string]any
 	dirty     bool
 	destroyed bool
+	// persist is the per-request closure that writes Session state
+	// back to the configured Store. Set by loadOrCreateSession.
+	// Captured by Save and by the middleware's deferred OnFinish.
+	persist func(s *Session)
 }
 
 // Get returns the value at key, or nil when absent.
@@ -130,6 +138,32 @@ func (s *Session) Delete(key string) {
 func (s *Session) Destroy() {
 	s.data = nil
 	s.destroyed = true
+}
+
+// Save persists the current session state to the configured Store
+// immediately, without waiting for the response to finish. Useful
+// when a handler:
+//
+//   - wants the session row to land before launching a background
+//     goroutine that depends on the persisted state
+//   - performs a Response.Async upgrade and writes session
+//     mutations from inside the goroutine but wants an
+//     intermediate checkpoint
+//   - emits a streaming response (SSE) and needs the auth payload
+//     committed before sending events
+//
+// The middleware's deferred OnFinish callback still runs at the
+// end of the request, so a Save followed by additional mutations
+// followed by handler return all end up persisted — Save just
+// adds a synchronous checkpoint.
+//
+// Safe to call multiple times. Idempotent when nothing changed
+// (dirty flag short-circuits the store write).
+func (s *Session) Save() {
+	if s == nil || s.persist == nil {
+		return
+	}
+	s.persist(s)
 }
 
 // NewSession returns a Middleware that loads the session for the
@@ -190,19 +224,36 @@ func NewSession(opt SessionOptions) mwhint.Hinted {
 			sess := loadOrCreateSession(req, res, opt, maxAge)
 			req.SetLocal(opt.LocalKey, sess)
 			next(res, req)
-			persistSession(sess, opt)
+			// Defer persistence to Response.OnFinish so handlers
+			// that upgrade to async via Response.Async still get
+			// their session mutations saved correctly. For sync
+			// responses OnFinish executes the callback inline so
+			// behavior matches the original "save right after
+			// next returns" semantics. The lifecycle is documented
+			// on Session itself — callers can also force a save
+			// mid-handler via Session.Save when they need state
+			// to land before the goroutine completes.
+			res.OnFinish(func() {
+				persistSession(sess, opt)
+			})
 		}
 	})}
 }
 
 func loadOrCreateSession(req *gogo.Request, res *gogo.Response, opt SessionOptions, maxAge int) *Session {
+	// One closure per request, captured by both Session.Save and the
+	// middleware's OnFinish callback so explicit and deferred saves
+	// share a single write path.
+	persist := func(s *Session) {
+		persistSession(s, opt)
+	}
 	raw := req.Cookie(opt.CookieName)
 	if raw != "" {
 		if id, ok := verifySessionID(opt.Secret, raw); ok {
 			if data, exists := opt.Store.Load(id); exists {
-				return &Session{ID: id, data: data}
+				return &Session{ID: id, data: data, persist: persist}
 			}
-			return &Session{ID: id}
+			return &Session{ID: id, persist: persist}
 		}
 	}
 	id := newSessionID()
@@ -217,7 +268,7 @@ func loadOrCreateSession(req *gogo.Request, res *gogo.Response, opt SessionOptio
 		HttpOnly: true,
 		SameSite: opt.CookieSameSite,
 	})
-	return &Session{ID: id}
+	return &Session{ID: id, persist: persist}
 }
 
 func persistSession(s *Session, opt SessionOptions) {
