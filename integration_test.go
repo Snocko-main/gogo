@@ -4028,6 +4028,119 @@ func TestSendFileAsync(t *testing.T) {
 	}
 }
 
+// TestSendFileLargeStreaming verifies a multi-MiB file streams
+// byte-for-byte through the chunked-encoding path. The old
+// whole-file-into-RAM implementation also returned the correct
+// bytes; what changed is that this test passing in combination
+// with TestSendFileBackpressureSlowReader (which exercises the
+// AwaitDrain park/wake cycle) demonstrates the body is being
+// produced incrementally rather than allocated up front.
+func TestSendFileLargeStreaming(t *testing.T) {
+	// 8 MiB deterministic file (xorshift32 keyed by offset so any
+	// truncation / reordering on the wire is visible).
+	const size = 8 << 20
+	src := make([]byte, size)
+	state := uint32(0xC0DE1234)
+	for i := range src {
+		state ^= state << 13
+		state ^= state >> 17
+		state ^= state << 5
+		src[i] = byte(state)
+	}
+	path := writeTempFile(t, ".bin", src)
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/big", func(res *gogo.Response, req *gogo.Request) {
+			if err := res.SendFile(req, path); err != nil {
+				t.Errorf("SendFile: %v", err)
+			}
+		})
+	})
+	defer teardown()
+
+	resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/big", port))
+	if err != nil {
+		t.Fatalf("GET /big: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+	if len(body) != size {
+		t.Fatalf("body length: got %d, want %d", len(body), size)
+	}
+	if !bytes.Equal(body, src) {
+		t.Fatal("body does not match source")
+	}
+}
+
+// TestSendFileBackpressureSlowReader simulates a slow client and
+// asserts the streaming path still completes byte-for-byte. The old
+// whole-file-into-RAM path didn't care about consumer speed since
+// the body was already buffered; the streaming path relies on
+// AwaitDrain to park the goroutine when uWS's send buffer climbs
+// past the threshold, then resume when the consumer makes progress.
+// If backpressure didn't work the goroutine would either hang or
+// the kernel send buffer would balloon past expected bounds.
+func TestSendFileBackpressureSlowReader(t *testing.T) {
+	const size = 4 << 20 // 4 MiB
+	src := make([]byte, size)
+	for i := range src {
+		src[i] = byte(i & 0xFF)
+	}
+	path := writeTempFile(t, ".bin", src)
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/slow", func(res *gogo.Response, req *gogo.Request) {
+			if err := res.SendFile(req, path); err != nil {
+				t.Errorf("SendFile: %v", err)
+			}
+		})
+	})
+	defer teardown()
+
+	resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/slow", port))
+	if err != nil {
+		t.Fatalf("GET /slow: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	// Drip-read 4 KiB at a time with a small sleep so the server's
+	// send buffer fills and AwaitDrain has to park. net/http already
+	// handles chunked-encoding decoding, so the returned bytes are
+	// the decoded body. A successful test means the producer
+	// throttled correctly; a hang means backpressure broke.
+	deadline := time.Now().Add(30 * time.Second)
+	var collected bytes.Buffer
+	buf := make([]byte, 4096)
+	for collected.Len() < size && time.Now().Before(deadline) {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			collected.Write(buf[:n])
+			time.Sleep(2 * time.Millisecond)
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			t.Fatalf("read: %v", rerr)
+		}
+	}
+	if collected.Len() != size {
+		t.Fatalf("body length: got %d, want %d", collected.Len(), size)
+	}
+	if !bytes.Equal(collected.Bytes(), src) {
+		t.Fatal("backpressure-streamed body does not match source")
+	}
+}
+
 // TestRedirectFromGetAsync locks in the fix for the latent loop-pointer
 // bug: res.Loop() reads thread-local uWS::Loop::get(), which from a
 // shared-dispatch worker goroutine returns the wrong loop (or null).

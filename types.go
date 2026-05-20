@@ -2595,12 +2595,32 @@ func (r *Response) Redirect(location string, code int) {
 	r.inner.end("")
 }
 
-// MaxSendFileBytes caps how large a file SendFile and Download will read
-// into memory before serving. Files larger than this return
-// ErrFileTooLarge without touching the response. Defaults to 100 MiB;
-// reassign at startup to raise the ceiling, or roll your own
-// Write-loop streaming for arbitrarily large blobs.
+// MaxSendFileBytes is a sanity cap on the largest file SendFile and
+// Download will agree to serve — a misconfiguration guard, not a
+// memory limit. The streaming body path uses an O(chunk) buffer
+// regardless of file size, so memory pressure no longer scales with
+// the file. Files larger than the cap return ErrFileTooLarge without
+// touching the response; raise this at startup if your workload
+// legitimately serves bigger blobs.
+//
+// Default 100 MiB.
 var MaxSendFileBytes int64 = 100 << 20
+
+// SendFileChunkBytes is the buffer size used for each disk read +
+// stream write iteration. Memory used per concurrent SendFile call
+// is bounded by this value plus uWS's internal write buffer (which
+// grows up to SendFileBackpressureBytes before AwaitDrain parks the
+// goroutine). 64 KiB matches the typical filesystem read-ahead
+// granularity and uWS's default send-batch size.
+var SendFileChunkBytes int = 64 << 10
+
+// SendFileBackpressureBytes is the high-water mark for uWS's
+// per-socket send buffer. When the buffer climbs above this value
+// the streaming SendFile path parks on AwaitDrain until uWS notifies
+// it the buffer has drained — this keeps a slow consumer from
+// holding the goroutine hostage AND keeps the kernel buffer bounded
+// at the same level regardless of file size.
+var SendFileBackpressureBytes uint64 = 1 << 20
 
 // ErrFileTooLarge is returned by SendFile / Download when the target
 // file is larger than MaxSendFileBytes.
@@ -2624,9 +2644,17 @@ var ErrFileTooLarge = errors.New("gogo: file exceeds MaxSendFileBytes")
 // missing, a directory, or unreadable; the response is left untouched
 // in that case so the caller can decide what to send.
 //
-// Reads block the calling goroutine. Call SendFile from a GetAsync
-// handler (or wrap a sync call in Response.Async) to avoid stalling
-// the uWS loop on disk I/O.
+// Memory usage is bounded by SendFileChunkBytes (default 64 KiB) +
+// SendFileBackpressureBytes (default 1 MiB) per concurrent call,
+// regardless of file size. The body is streamed via chunked
+// transfer-encoding using Response.Stream, so a slow consumer
+// applies backpressure to the read loop rather than buffering the
+// entire file.
+//
+// From a sync handler SendFile transparently upgrades to async via
+// Response.Async so the uWS loop thread isn't blocked on disk I/O;
+// the function returns nil immediately after the open/stat/range
+// prep, and the body streams from a goroutine.
 func (r *Response) SendFile(req *Request, path string) error {
 	return r.sendFile(req, path, "", false)
 }
@@ -2654,17 +2682,19 @@ func (r *Response) sendFile(req *Request, path, filename string, attachment bool
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 
 	info, err := f.Stat()
 	if err != nil {
+		f.Close()
 		return err
 	}
 	if info.IsDir() {
+		f.Close()
 		return fmt.Errorf("gogo: SendFile: %s is a directory", path)
 	}
 	size := info.Size()
 	if size > MaxSendFileBytes {
+		f.Close()
 		return ErrFileTooLarge
 	}
 	mtime := info.ModTime().UTC()
@@ -2678,12 +2708,14 @@ func (r *Response) sendFile(req *Request, path, filename string, attachment bool
 	if req != nil {
 		if inm := req.Header("if-none-match"); inm != "" {
 			if etagMatch(inm, etag) {
+				f.Close()
 				r.sendBytes(304, []responseHeader{{"ETag", etag}}, nil)
 				return nil
 			}
 		} else if ims := req.Header("if-modified-since"); ims != "" {
 			if t, err := http.ParseTime(ims); err == nil &&
 				!mtime.Truncate(time.Second).After(t) {
+				f.Close()
 				r.sendBytes(304, []responseHeader{{"ETag", etag}}, nil)
 				return nil
 			}
@@ -2703,37 +2735,110 @@ func (r *Response) sendFile(req *Request, path, filename string, attachment bool
 		rangeHeader = req.Header("range")
 	}
 
-	headers := []responseHeader{
-		{"Content-Type", ctype},
-		{"Accept-Ranges", "bytes"},
-		{"Last-Modified", lastMod},
-		{"ETag", etag},
-	}
-	if attachment {
-		headers = append(headers, responseHeader{"Content-Disposition", buildDisposition(filename, true)})
-	}
-
-	var body []byte
-	status := 200
-	if start, end, ok := parseSingleByteRange(rangeHeader, size); ok {
-		sliceLen := end - start + 1
-		body = make([]byte, sliceLen)
-		if _, err := f.ReadAt(body, start); err != nil {
-			return err
-		}
+	// Range parsing → start offset + content length for the body slice.
+	var (
+		start         int64 // offset into the file
+		contentLength = size
+		status        = 200
+		rangeRespVal  string
+	)
+	if rs, re, ok := parseSingleByteRange(rangeHeader, size); ok {
+		start = rs
+		contentLength = re - rs + 1
 		status = 206
-		headers = append(headers, responseHeader{
-			"Content-Range",
-			fmt.Sprintf("bytes %d-%d/%d", start, end, size),
-		})
-	} else if size > 0 {
-		body = make([]byte, size)
-		if _, err := f.ReadAt(body, 0); err != nil {
-			return err
-		}
+		rangeRespVal = fmt.Sprintf("bytes %d-%d/%d", rs, re, size)
 	}
 
-	r.sendBytes(status, headers, body)
+	// Empty body short-circuit — 0-byte file or empty range. Skip the
+	// streaming path entirely and emit a fixed-length empty response.
+	if contentLength == 0 {
+		f.Close()
+		headers := []responseHeader{
+			{"Content-Type", ctype},
+			{"Accept-Ranges", "bytes"},
+			{"Last-Modified", lastMod},
+			{"ETag", etag},
+			{"Content-Length", "0"},
+		}
+		if attachment {
+			headers = append(headers, responseHeader{"Content-Disposition", buildDisposition(filename, true)})
+		}
+		if rangeRespVal != "" {
+			headers = append(headers, responseHeader{"Content-Range", rangeRespVal})
+		}
+		r.sendBytes(status, headers, nil)
+		return nil
+	}
+
+	// Stage every header before Stream so they ship in the initial
+	// status-line frame. Stream uses chunked transfer-encoding for
+	// the body, so we intentionally omit Content-Length here — uWS
+	// would otherwise advertise both a fixed length and chunked
+	// framing, which is malformed per RFC 7230.
+	r.Header("Accept-Ranges", "bytes")
+	r.Header("Last-Modified", lastMod)
+	r.Header("ETag", etag)
+	if attachment {
+		r.Header("Content-Disposition", buildDisposition(filename, true))
+	}
+	if rangeRespVal != "" {
+		r.Header("Content-Range", rangeRespVal)
+	}
+
+	stream := func() {
+		defer f.Close()
+		_ = r.Stream(status, ctype, func(w io.Writer) error {
+			if start > 0 {
+				if _, err := f.Seek(start, io.SeekStart); err != nil {
+					return err
+				}
+			}
+			chunk := SendFileChunkBytes
+			if chunk <= 0 {
+				chunk = 64 << 10
+			}
+			backpressure := SendFileBackpressureBytes
+			if backpressure == 0 {
+				backpressure = 1 << 20
+			}
+			buf := make([]byte, chunk)
+			remaining := contentLength
+			for remaining > 0 {
+				toRead := int64(chunk)
+				if remaining < toRead {
+					toRead = remaining
+				}
+				n, rerr := f.Read(buf[:toRead])
+				if n > 0 {
+					if _, werr := w.Write(buf[:n]); werr != nil {
+						return werr
+					}
+					remaining -= int64(n)
+					if r.BufferedAmount() > backpressure {
+						if derr := r.AwaitDrain(backpressure); derr != nil {
+							return derr
+						}
+					}
+				}
+				if rerr == io.EOF {
+					break
+				}
+				if rerr != nil {
+					return rerr
+				}
+			}
+			return nil
+		})
+	}
+
+	// Sync handler → upgrade to async so disk I/O doesn't stall the
+	// uWS loop thread and so Stream's prerequisites are met. Async
+	// handlers stream inline on the worker goroutine.
+	if r.async == nil {
+		r.Async(stream)
+		return nil
+	}
+	stream()
 	return nil
 }
 
