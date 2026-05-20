@@ -114,3 +114,71 @@ func TestBasicAuthValidatorCallback(t *testing.T) {
 		t.Errorf("validator calls=%d", calls)
 	}
 }
+
+// TestBasicAuthRealmEscapesUnsafeChars: Realm values that contain RFC
+// 7230 quoted-string delimiters or control characters must be escaped
+// before going into the WWW-Authenticate header. Pre-fix the framework
+// would either emit a malformed header (silent grammar break for "
+// or \) or panic via validateHeaderValue (CR/LF/NUL). The escaper
+// shared with JWT authParam handles both cases.
+func TestBasicAuthRealmEscapesUnsafeChars(t *testing.T) {
+	cases := []struct {
+		name      string
+		realm     string
+		wantChunk string // substring that must appear in the response header
+		notChunk  string // substring that must NOT appear (raw, unescaped)
+	}{
+		{
+			name:      "quote",
+			realm:     `we"have"quotes`,
+			wantChunk: `realm="we\"have\"quotes"`,
+		},
+		{
+			name:      "backslash",
+			realm:     `back\slash`,
+			wantChunk: `realm="back\\slash"`,
+		},
+		{
+			name:      "CR LF dropped",
+			realm:     "with\r\nCRLF",
+			wantChunk: `realm="withCRLF"`,
+			notChunk:  "\r\n",
+		},
+		{
+			name:      "NUL dropped",
+			realm:     "nul\x00here",
+			wantChunk: `realm="nulhere"`,
+			notChunk:  "\x00",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			port, teardown := startApp(t, func(app *gogo.App) {
+				app.Use(middleware.BasicAuth(middleware.BasicAuthOptions{
+					Users: map[string]string{"u": "p"},
+					Realm: tc.realm,
+				}))
+				app.Get("/", func(res *gogo.Response, req *gogo.Request) {
+					res.Send(200, "text/plain", "ok")
+				})
+			})
+			defer teardown()
+
+			resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/", port))
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != 401 {
+				t.Fatalf("status %d, want 401 (so we can inspect WWW-Authenticate)", resp.StatusCode)
+			}
+			got := resp.Header.Get("WWW-Authenticate")
+			if !strings.Contains(got, tc.wantChunk) {
+				t.Errorf("WWW-Authenticate=%q missing %q", got, tc.wantChunk)
+			}
+			if tc.notChunk != "" && strings.Contains(got, tc.notChunk) {
+				t.Errorf("WWW-Authenticate=%q leaked unescaped %q", got, tc.notChunk)
+			}
+		})
+	}
+}
