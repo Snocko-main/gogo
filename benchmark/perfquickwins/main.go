@@ -66,8 +66,21 @@ func main() {
 	// wrk run doesn't spam stdout.
 	gogo.SetPanicHandler(func(r any) {})
 
+	// Shared state created ONCE — every worker's setup closure
+	// captures the same metrics instance, so counters aggregate
+	// across loops instead of each worker maintaining its own
+	// disjoint copy.
+	var sharedMetrics *middleware.Metrics
+	if os.Getenv("GOGO_METRICS") == "1" {
+		sharedMetrics = middleware.NewMetrics()
+	}
+
+	setupFn := func(app *gogo.App) {
+		setupShared(app, sharedMetrics)
+	}
+
 	if cores > 1 {
-		handle, err := gogo.RunMultiCore(cores, port, setup)
+		handle, err := gogo.RunMultiCore(cores, port, setupFn)
 		if err != nil {
 			log.Fatalf("RunMultiCore: %v", err)
 		}
@@ -83,7 +96,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("NewApp: %v", err)
 	}
-	setup(app)
+	setupFn(app)
 	if !app.Listen(port) {
 		log.Fatalf("Listen %s failed", addr)
 	}
@@ -91,7 +104,16 @@ func main() {
 	app.Run()
 }
 
-func setup(app *gogo.App) {
+func setupShared(app *gogo.App, metrics *middleware.Metrics) {
+	// When GOGO_METRICS=1 is set, the caller threads the same
+	// *Metrics instance into every worker — multi-core RunMultiCore
+	// then aggregates counters across workers instead of each
+	// worker maintaining its own disjoint copy.
+	if metrics != nil {
+		app.Use(metrics.Middleware())
+		app.Get("/metrics", metrics.Handler())
+	}
+
 	// /plain — baseline, no middleware, no buffered headers.
 	app.Get("/plain", func(res *gogo.Response, req *gogo.Request) {
 		res.Send(200, "text/plain", "ok")
