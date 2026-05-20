@@ -188,28 +188,46 @@ func (s *MemoryRateLimitStore) Hit(key string, window time.Duration) (int, time.
 	return b.count, b.resetAt
 }
 
-// evictLocked sweeps expired buckets and, if still over capacity,
-// drops the bucket with the earliest resetAt. Caller must hold s.mu.
+// evictLocked frees one slot using approximate-LRU random sampling.
+// Caller must hold s.mu.
+//
+// A full O(N) scan over a 100k+ bucket map under the store lock was
+// a CPU/latency spike waiting to happen — every "new key" Hit while
+// the cap was binding would stall every other goroutine touching
+// the limiter for ~milliseconds. The fix here is the same trick
+// Redis uses for its allkeys-lru policy: sample a small random
+// subset, evict the oldest from the sample. Go's map iteration is
+// randomized, so the first K visits constitute a uniform sample
+// without any explicit shuffle.
+//
+// During the sample pass we also opportunistically clear any
+// expired entries we happen to land on — that's free reclamation
+// on the same scan. Stop the moment we've freed a slot (a single
+// expired delete satisfies the caller); otherwise fall through to
+// evicting the oldest non-expired entry from the sample.
 func (s *MemoryRateLimitStore) evictLocked(now time.Time) {
+	const sampleSize = 32
+	var oldestKey string
+	var oldestReset time.Time
+	sampled := 0
 	for k, b := range s.buckets {
 		if now.After(b.resetAt) {
 			delete(s.buckets, k)
+			if s.maxBuckets <= 0 || len(s.buckets) < s.maxBuckets {
+				return
+			}
+			continue
 		}
-	}
-	if s.maxBuckets <= 0 || len(s.buckets) < s.maxBuckets {
-		return
-	}
-	// Still full — drop the oldest-resetAt bucket. O(N) scan, but
-	// only runs when the cap binds; the common path stays O(1).
-	var oldestKey string
-	var oldestReset time.Time
-	for k, b := range s.buckets {
 		if oldestKey == "" || b.resetAt.Before(oldestReset) {
 			oldestKey = k
 			oldestReset = b.resetAt
 		}
+		sampled++
+		if sampled >= sampleSize {
+			break
+		}
 	}
-	if oldestKey != "" {
+	if oldestKey != "" && (s.maxBuckets <= 0 || len(s.buckets) >= s.maxBuckets) {
 		delete(s.buckets, oldestKey)
 	}
 }

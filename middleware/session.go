@@ -415,27 +415,45 @@ func (s *MemorySessionStore) Save(id string, data map[string]any, ttl time.Durat
 	return nil
 }
 
-// evictLocked sweeps expired entries and, if still over capacity,
-// drops the entry with the earliest expires to free a slot. Caller
-// must hold s.mu. O(N) but only fires when the cap binds.
+// evictLocked frees one slot using approximate-LRU random sampling.
+// Caller must hold s.mu.
+//
+// A full O(N) scan under the store lock was a CPU/latency spike
+// waiting to happen — every new-session Save while the cap was
+// binding would stall every other goroutine touching the store for
+// ~milliseconds at the 100k default. The fix uses Redis's allkeys-
+// lru trick: sample a small random subset and evict the oldest
+// from the sample. Go's map iteration is randomized, so the first
+// K visits constitute a uniform sample without any explicit
+// shuffle.
+//
+// During the sample pass we also opportunistically clear expired
+// entries we happen to land on — free reclamation on the same
+// scan. Stop the moment we've freed a slot; otherwise fall through
+// to evicting the oldest non-expired entry from the sample.
 func (s *MemorySessionStore) evictLocked(now time.Time) {
+	const sampleSize = 32
+	var oldestKey string
+	var oldestExpires time.Time
+	sampled := 0
 	for k, e := range s.entries {
 		if now.After(e.expires) {
 			delete(s.entries, k)
+			if s.maxEntries <= 0 || len(s.entries) < s.maxEntries {
+				return
+			}
+			continue
 		}
-	}
-	if s.maxEntries <= 0 || len(s.entries) < s.maxEntries {
-		return
-	}
-	var oldestKey string
-	var oldestExpires time.Time
-	for k, e := range s.entries {
 		if oldestKey == "" || e.expires.Before(oldestExpires) {
 			oldestKey = k
 			oldestExpires = e.expires
 		}
+		sampled++
+		if sampled >= sampleSize {
+			break
+		}
 	}
-	if oldestKey != "" {
+	if oldestKey != "" && (s.maxEntries <= 0 || len(s.entries) >= s.maxEntries) {
 		delete(s.entries, oldestKey)
 	}
 }
