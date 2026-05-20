@@ -272,13 +272,13 @@ type WebSocketBehavior struct {
 	// drives its own ping protocol.
 	DisablePings bool
 
-	// Upgrade, when non-nil, runs synchronously on the uWS loop
-	// thread for every incoming WebSocket handshake before the
-	// connection is established. The callback inspects request
-	// headers / query / peer IP / offered subprotocols and MUST
-	// call ctx.Accept(...) or ctx.Reject(...) before returning —
-	// failing to do either causes the framework to refuse the
-	// upgrade with a 500 (and log the misuse).
+	// Upgrade runs synchronously on the uWS loop thread for every
+	// incoming WebSocket handshake before the connection is
+	// established. The callback inspects request headers / query /
+	// peer IP / offered subprotocols and MUST call ctx.Accept(...) or
+	// ctx.Reject(...) before returning — failing to do either causes
+	// the framework to refuse the upgrade with a 500 (and log the
+	// misuse).
 	//
 	// Typical uses:
 	//
@@ -288,8 +288,20 @@ type WebSocketBehavior struct {
 	//     of the connection's lifetime
 	//   - rejecting based on origin / referrer / API quota
 	//
-	// If Upgrade is nil, uWS's default path accepts every request
-	// without subprotocol negotiation.
+	// SECURITY: leaving Upgrade nil accepts every handshake — including
+	// cross-origin requests from any website the user has open. The
+	// HTTP middleware chain (CORS in particular) does NOT cover the
+	// WebSocket upgrade path, so a Same-Origin Policy gate that
+	// protects fetch() does NOT protect WebSocket(). If the endpoint
+	// uses session cookies or any other ambient credential, an
+	// attacker page can open ws://yoursite/... from the user's
+	// browser and ride the user's session — Cross-Site WebSocket
+	// Hijacking (CSWSH).
+	//
+	// At minimum verify the Origin header against an allow-list. The
+	// middleware package ships middleware.WebSocketAuth for the
+	// common case (origin check + optional bearer / cookie /
+	// subprotocol gating).
 	Upgrade func(*UpgradeContext)
 }
 

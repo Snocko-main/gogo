@@ -1033,41 +1033,67 @@ app.PublishBatch([]gogo.PublishMessage{
 
 ### Upgrade-time auth and subprotocols
 
-Use the `Upgrade` callback to inspect request headers, negotiate a
-subprotocol, and attach per-connection user data:
+⚠️ **CSWSH** — leaving `Upgrade` nil accepts every handshake including
+cross-origin requests. The HTTP CORS middleware does NOT cover the
+WebSocket upgrade path, so an attacker page at `https://evil.example`
+can open `ws://yoursite/ws` from the user's browser and ride the
+user's session cookies. Same idea as CSRF, different protocol.
+
+**Use `middleware.WebSocketAuth` for the common case** — origin
+allow-list, optional Verify callback, optional subprotocol gating:
 
 ```go
-app.WebSocket("/ws", gogo.WebSocketBehavior{
-    Upgrade: func(ctx *gogo.UpgradeContext) {
-        // Authenticate at handshake time.
-        token := ctx.QueryParam("token")
-        if token == "" {
-            ctx.Reject(401, "missing token")
-            return
-        }
-        user, err := db.LoadUserByToken(token)
-        if err != nil {
-            ctx.Reject(401, "bad token")
-            return
-        }
+import mw "github.com/Snocko-main/gogo/middleware"
 
-        // Pick a subprotocol from the client's offer.
-        chosen := ""
-        for _, p := range ctx.Protocols() {
-            if p == "chat.v1" {
-                chosen = p
-                break
+app.WebSocket("/ws", gogo.WebSocketBehavior{
+    Upgrade: mw.WebSocketAuth(mw.WebSocketAuthOptions{
+        AllowedOrigins: []string{"https://app.example.com"},
+        Verify: func(ctx *gogo.UpgradeContext) (any, bool, int, string) {
+            user, err := db.LoadUserByToken(ctx.QueryParam("token"))
+            if err != nil {
+                return nil, false, 401, "bad token"
             }
-        }
-        ctx.SetUserData(user)
-        ctx.Accept(chosen)
-    },
+            return user, true, 0, ""           // userData = user
+        },
+        AllowedSubprotocols: []string{"chat.v2", "chat.v1"},
+    }),
     Open: func(ws *gogo.WebSocket) {
-        u := ws.UserData().(*User)
+        u := ws.UserData().(*User)             // set by Verify
         ws.SendText("welcome, " + u.Name + "\n")
         ws.Subscribe("user." + strconv.Itoa(u.ID))
     },
     Message: handleWSMessage,
+})
+```
+
+Defaults:
+- Empty `AllowedOrigins` + `AllowMissingOrigin=false` → reject every
+  request that arrives with an Origin header — i.e. all browsers.
+  Set `AllowedOrigins` explicitly before going to production.
+- `AllowMissingOrigin=true` → permit handshakes without an Origin
+  (CLI tools like `websocat`). Safe IF you have no browser clients
+  on this endpoint.
+- `AllowedOrigins: []string{"*"}` → accept any origin. Opt-in for
+  public APIs that don't rely on ambient cookie auth.
+
+**Roll-your-own** — if `WebSocketAuth` doesn't fit, write the
+callback directly. The same hooks apply: inspect `ctx.Header("origin")`,
+`ctx.QueryParam(...)`, `ctx.Protocols()`, call `ctx.SetUserData(...)`
++ `ctx.Accept(protocol)` or `ctx.Reject(status, body)`:
+
+```go
+app.WebSocket("/ws", gogo.WebSocketBehavior{
+    Upgrade: func(ctx *gogo.UpgradeContext) {
+        // YOU are responsible for the origin check here.
+        if !allowOrigin(ctx.Header("origin")) {
+            ctx.Reject(403, "bad origin")
+            return
+        }
+        // ... rest of auth ...
+        ctx.Accept("")
+    },
+    Open:    handleOpen,
+    Message: handleMessage,
 })
 ```
 
@@ -1303,6 +1329,11 @@ app.MethodNotAllowed(func(res *gogo.Response, req *gogo.Request) {
   Adapt with a small wrapper or use the bundled `middleware` package.
 - WebSocket pub/sub topics are exact-match strings — no MQTT-style
   wildcards.
+- WebSocket `Upgrade == nil` accepts every handshake including
+  cross-origin (CSWSH risk if the endpoint uses cookies). HTTP CORS
+  middleware does NOT cover the upgrade. See
+  [Upgrade-time auth and subprotocols](#upgrade-time-auth-and-subprotocols)
+  for `middleware.WebSocketAuth`.
 - TLS / HTTP/2 are out of scope here; terminate at a reverse proxy
   (nginx, Caddy, an L7 load balancer).
 - `req.IPs()` returns `nil` unless `Config.TrustProxy=true` — see
