@@ -5,6 +5,23 @@ import (
 	"testing"
 )
 
+func TestBodyEncoderOverflowReturnsPrefixOnly(t *testing.T) {
+	enc := &bodyEncoder{max: 4}
+	if prefix, overflow := enc.writeString("abc"); overflow || prefix != "" {
+		t.Fatalf("first write: prefix=%q overflow=%v, want no overflow", prefix, overflow)
+	}
+	prefix, overflow := enc.writeString("defgh")
+	if !overflow {
+		t.Fatal("second write: overflow=false, want true")
+	}
+	if prefix != "abc" {
+		t.Fatalf("overflow prefix = %q, want buffered prefix only", prefix)
+	}
+	if enc.buf.Len() != 0 {
+		t.Fatalf("buffer len after overflow = %d, want 0", enc.buf.Len())
+	}
+}
+
 // FuzzParseCookieValue feeds arbitrary Cookie header content + arbitrary
 // names; the parser must never panic, must always return a string, and
 // must agree with a slow reference implementation for ASCII inputs.
@@ -134,18 +151,18 @@ func TestValidateHeaderName(t *testing.T) {
 	}
 
 	bad := map[string]string{
-		"empty":             "",
-		"with CR":           "X-Foo\r",
-		"with LF":           "X-Foo\n",
-		"with NUL":          "X-Foo\x00",
-		"with colon":        "X-Foo:Bar",
-		"with space":        "X-Foo Bar",
-		"with high bit":     "X-Foo\x80",
-		"leading control":   "\x01X-Foo",
-		"parentheses":       "(X-Foo)",
-		"double quotes":     "\"X-Foo\"",
-		"forward slash":     "X/Foo",
-		"trailing tab":      "X-Foo\t",
+		"empty":           "",
+		"with CR":         "X-Foo\r",
+		"with LF":         "X-Foo\n",
+		"with NUL":        "X-Foo\x00",
+		"with colon":      "X-Foo:Bar",
+		"with space":      "X-Foo Bar",
+		"with high bit":   "X-Foo\x80",
+		"leading control": "\x01X-Foo",
+		"parentheses":     "(X-Foo)",
+		"double quotes":   "\"X-Foo\"",
+		"forward slash":   "X/Foo",
+		"trailing tab":    "X-Foo\t",
 	}
 	for label, name := range bad {
 		t.Run("invalid/"+label, func(t *testing.T) {
@@ -242,11 +259,11 @@ func TestValidateCookiePath(t *testing.T) {
 		}()
 	}
 	bad := map[string]string{
-		"semicolon":  "/; Domain=evil.com",
-		"CR":         "/foo\r",
-		"LF":         "/foo\n",
-		"NUL":        "/foo\x00",
-		"DEL":        "/foo\x7f",
+		"semicolon": "/; Domain=evil.com",
+		"CR":        "/foo\r",
+		"LF":        "/foo\n",
+		"NUL":       "/foo\x00",
+		"DEL":       "/foo\x7f",
 	}
 	for label, p := range bad {
 		t.Run("invalid/"+label, func(t *testing.T) {
@@ -273,12 +290,12 @@ func TestValidateCookieDomain(t *testing.T) {
 		}()
 	}
 	bad := map[string]string{
-		"semicolon":     "evil.com; HttpOnly=false",
-		"comma":         "a.com,b.com",
-		"space":         "victim com",
-		"tab":           "victim\tcom",
-		"CR":            "victim.com\r",
-		"control byte":  "victim\x01com",
+		"semicolon":    "evil.com; HttpOnly=false",
+		"comma":        "a.com,b.com",
+		"space":        "victim com",
+		"tab":          "victim\tcom",
+		"CR":           "victim.com\r",
+		"control byte": "victim\x01com",
 	}
 	for label, d := range bad {
 		t.Run("invalid/"+label, func(t *testing.T) {

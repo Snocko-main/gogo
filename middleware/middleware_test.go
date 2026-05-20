@@ -701,6 +701,62 @@ func TestRequestIDReused(t *testing.T) {
 	}
 }
 
+func TestRequestIDRejectsOversizeIncoming(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.RequestID(middleware.RequestIDOptions{
+			Generator: func() string { return "generated-id" },
+		}))
+		app.Get("/r", func(res *gogo.Response, req *gogo.Request) {
+			id, _ := req.Local(middleware.RequestIDLocalKey).(string)
+			res.Send(200, "text/plain", id)
+		})
+	})
+	defer teardown()
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/r", port), nil)
+	req.Header.Set("X-Request-ID", strings.Repeat("a", 129))
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /r: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.Header.Get("X-Request-ID") != "generated-id" {
+		t.Errorf("header ID: got %q, want generated-id", resp.Header.Get("X-Request-ID"))
+	}
+	if string(body) != "generated-id" {
+		t.Errorf("Locals ID: got %q, want generated-id", body)
+	}
+}
+
+func TestRequestIDRejectsInvalidIncoming(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.RequestID(middleware.RequestIDOptions{
+			Generator: func() string { return "generated-id" },
+		}))
+		app.Get("/r", func(res *gogo.Response, req *gogo.Request) {
+			id, _ := req.Local(middleware.RequestIDLocalKey).(string)
+			res.Send(200, "text/plain", id)
+		})
+	})
+	defer teardown()
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/r", port), nil)
+	req.Header.Set("X-Request-ID", "bad id")
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /r: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.Header.Get("X-Request-ID") != "generated-id" {
+		t.Errorf("header ID: got %q, want generated-id", resp.Header.Get("X-Request-ID"))
+	}
+	if string(body) != "generated-id" {
+		t.Errorf("Locals ID: got %q, want generated-id", body)
+	}
+}
+
 // TestRequestIDCustomHeader: the Header option points at a different
 // header (X-Correlation-ID); both incoming and outgoing use that name.
 func TestRequestIDCustomHeader(t *testing.T) {
