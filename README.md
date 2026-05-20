@@ -1033,11 +1033,16 @@ app.PublishBatch([]gogo.PublishMessage{
 
 ### Upgrade-time auth and subprotocols
 
-⚠️ **CSWSH** — leaving `Upgrade` nil accepts every handshake including
-cross-origin requests. The HTTP CORS middleware does NOT cover the
-WebSocket upgrade path, so an attacker page at `https://evil.example`
-can open `ws://yoursite/ws` from the user's browser and ride the
-user's session cookies. Same idea as CSRF, different protocol.
+⚠️ **CSWSH** — the HTTP CORS middleware does NOT cover the WebSocket
+upgrade path. If a WebSocket endpoint accepts a browser handshake from
+`https://evil.example`, that page can open `ws://yoursite/ws` and ride
+the user's session cookies. Same idea as CSRF, different protocol.
+
+Secure default: when `Upgrade` is nil, gogo accepts non-browser clients
+that omit `Origin` (CLI tools, service-to-service clients) and rejects
+browser-style handshakes that include `Origin` with `403 origin not
+allowed`. For browser clients, install an explicit `Upgrade` callback
+that checks an origin allow-list.
 
 **Use `middleware.WebSocketAuth` for the common case** — origin
 allow-list, optional Verify callback, optional subprotocol gating:
@@ -1075,6 +1080,20 @@ Defaults:
   on this endpoint.
 - `AllowedOrigins: []string{"*"}` → accept any origin. Opt-in for
   public APIs that don't rely on ambient cookie auth.
+
+**Legacy auto-accept** — if you intentionally want the old uWS behavior
+of accepting every handshake when `Upgrade` is nil, set
+`UnsafeAutoUpgrade: true`. Use this only for public, non-cookie
+endpoints where cross-origin WebSocket access is expected:
+
+```go
+app.WebSocket("/public-events", gogo.WebSocketBehavior{
+    UnsafeAutoUpgrade: true,
+    Open: func(ws *gogo.WebSocket) {
+        ws.Subscribe("public.events")
+    },
+})
+```
 
 **Roll-your-own** — if `WebSocketAuth` doesn't fit, write the
 callback directly. The same hooks apply: inspect `ctx.Header("origin")`,
@@ -1329,9 +1348,12 @@ app.MethodNotAllowed(func(res *gogo.Response, req *gogo.Request) {
   Adapt with a small wrapper or use the bundled `middleware` package.
 - WebSocket pub/sub topics are exact-match strings — no MQTT-style
   wildcards.
-- WebSocket `Upgrade == nil` accepts every handshake including
-  cross-origin (CSWSH risk if the endpoint uses cookies). HTTP CORS
-  middleware does NOT cover the upgrade. See
+- WebSocket `Upgrade == nil` rejects browser handshakes with an
+  `Origin` header, but accepts non-browser handshakes that omit it.
+  Use an explicit `Upgrade` callback for browser clients. Set
+  `UnsafeAutoUpgrade: true` only when cross-origin auto-accept is
+  intentional and the endpoint does not rely on ambient cookies. HTTP
+  CORS middleware does NOT cover the upgrade. See
   [Upgrade-time auth and subprotocols](#upgrade-time-auth-and-subprotocols)
   for `middleware.WebSocketAuth`.
 - TLS / HTTP/2 are out of scope here; terminate at a reverse proxy
