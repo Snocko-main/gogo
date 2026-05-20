@@ -143,3 +143,221 @@ func TestSessionMemoryStoreExpires(t *testing.T) {
 func newCookieJar() (http.CookieJar, error) {
 	return cookiejar.New(nil)
 }
+
+// TestSessionPersistsAfterResponseAsync is the regression test for
+// the session-vs-Response.Async lifecycle footgun: the middleware
+// used to persist immediately after next() returned, but a sync
+// handler that upgraded via res.Async would mutate the session
+// AFTER persist had already fired — losing the mutation. With the
+// Response.OnFinish hook the save is deferred until the goroutine
+// completes, so mutations land correctly.
+func TestSessionPersistsAfterResponseAsync(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.NewSession(middleware.SessionOptions{
+			Secret: []byte("session-secret-32-bytes-AAAAAAAA"),
+			TTL:    time.Minute,
+		}))
+		// Sync handler that does its real work inside a Response.Async
+		// goroutine. The goroutine sets a session value AFTER the
+		// outer middleware's next() returned — the old persist-on-
+		// next-return path would have missed this write.
+		app.Get("/login-async", func(res *gogo.Response, req *gogo.Request) {
+			sess := req.Local(middleware.SessionLocalKey).(*middleware.Session)
+			res.Async(func() {
+				// Simulate work that has to happen off the loop thread.
+				time.Sleep(20 * time.Millisecond)
+				sess.Set("user_id", float64(42))
+				sess.Set("logged_in", true)
+				res.Send(200, "text/plain", "logged in")
+			})
+		})
+		app.Get("/me", func(res *gogo.Response, req *gogo.Request) {
+			sess := req.Local(middleware.SessionLocalKey).(*middleware.Session)
+			uid := sess.Get("user_id")
+			loggedIn := sess.Get("logged_in")
+			if uid == nil || loggedIn != true {
+				res.Send(401, "text/plain", "no session")
+				return
+			}
+			res.Send(200, "text/plain", fmt.Sprintf("user=%v logged_in=%v", uid, loggedIn))
+		})
+	})
+	defer teardown()
+
+	jar, _ := newCookieJar()
+	client := &http.Client{Jar: jar, Timeout: 5 * time.Second}
+
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/login-async", port))
+	if err != nil {
+		t.Fatalf("login-async: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || string(body) != "logged in" {
+		t.Fatalf("login-async: status=%d body=%q", resp.StatusCode, string(body))
+	}
+
+	// Follow-up request reads the session. If the async mutation
+	// didn't persist, /me returns 401.
+	resp, err = client.Get(fmt.Sprintf("http://127.0.0.1:%d/me", port))
+	if err != nil {
+		t.Fatalf("me: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("session mutation in res.Async goroutine was not persisted: /me returned %d %q",
+			resp.StatusCode, string(body))
+	}
+	if string(body) != "user=42 logged_in=true" {
+		t.Errorf("session payload: got %q, want %q", string(body), "user=42 logged_in=true")
+	}
+}
+
+// TestSessionDestroyAfterResponseAsync covers the destruction half:
+// a Response.Async goroutine that calls sess.Destroy() must trigger
+// the Store.Delete call when the response finishes, not before.
+func TestSessionDestroyAfterResponseAsync(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.NewSession(middleware.SessionOptions{
+			Secret: []byte("session-secret-32-bytes-AAAAAAAA"),
+			TTL:    time.Minute,
+		}))
+		// Seed
+		app.Get("/seed", func(res *gogo.Response, req *gogo.Request) {
+			sess := req.Local(middleware.SessionLocalKey).(*middleware.Session)
+			sess.Set("seed", "yes")
+			res.Send(200, "text/plain", "seeded")
+		})
+		// Destroy from inside res.Async
+		app.Get("/logout-async", func(res *gogo.Response, req *gogo.Request) {
+			sess := req.Local(middleware.SessionLocalKey).(*middleware.Session)
+			res.Async(func() {
+				time.Sleep(20 * time.Millisecond)
+				sess.Destroy()
+				res.Send(200, "text/plain", "destroyed")
+			})
+		})
+		// Verify — same cookie, but Destroy should have wiped the store entry.
+		app.Get("/probe", func(res *gogo.Response, req *gogo.Request) {
+			sess := req.Local(middleware.SessionLocalKey).(*middleware.Session)
+			if sess.Get("seed") != nil {
+				res.Send(200, "text/plain", "still here")
+				return
+			}
+			res.Send(200, "text/plain", "gone")
+		})
+	})
+	defer teardown()
+
+	jar, _ := newCookieJar()
+	client := &http.Client{Jar: jar, Timeout: 5 * time.Second}
+
+	resp, _ := client.Get(fmt.Sprintf("http://127.0.0.1:%d/seed", port))
+	resp.Body.Close()
+	resp, _ = client.Get(fmt.Sprintf("http://127.0.0.1:%d/probe", port))
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "still here" {
+		t.Fatalf("seed didn't persist: probe returned %q", string(body))
+	}
+
+	resp, _ = client.Get(fmt.Sprintf("http://127.0.0.1:%d/logout-async", port))
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "destroyed" {
+		t.Fatalf("logout-async: got %q", string(body))
+	}
+
+	resp, _ = client.Get(fmt.Sprintf("http://127.0.0.1:%d/probe", port))
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "gone" {
+		t.Errorf("Destroy() in res.Async did not persist: probe returned %q", string(body))
+	}
+}
+
+// TestSessionExplicitSave covers Session.Save() — a handler that
+// wants to checkpoint state before the response finishes can call
+// it, and the change must be visible to a parallel request that
+// arrives BEFORE the original handler returns. The handler runs
+// inside Response.Async so the uWS loop thread stays free to serve
+// the concurrent probe request.
+func TestSessionExplicitSave(t *testing.T) {
+	released := make(chan struct{})
+	checkpointed := make(chan struct{})
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.NewSession(middleware.SessionOptions{
+			Secret: []byte("session-secret-32-bytes-AAAAAAAA"),
+			TTL:    time.Minute,
+		}))
+		// Seed runs first so the cookie lands in the jar before the
+		// long-running /checkpoint holds its response open.
+		app.Get("/seed", func(res *gogo.Response, req *gogo.Request) {
+			sess := req.Local(middleware.SessionLocalKey).(*middleware.Session)
+			sess.Set("phase", "seed")
+			res.Send(200, "text/plain", "seeded")
+		})
+		app.Get("/checkpoint", func(res *gogo.Response, req *gogo.Request) {
+			sess := req.Local(middleware.SessionLocalKey).(*middleware.Session)
+			res.Async(func() {
+				sess.Set("phase", "checkpoint")
+				sess.Save() // explicit, mid-handler
+				close(checkpointed)
+				<-released // hold the response open
+				sess.Set("phase", "final")
+				res.Send(200, "text/plain", "done")
+			})
+		})
+		app.Get("/probe", func(res *gogo.Response, req *gogo.Request) {
+			sess := req.Local(middleware.SessionLocalKey).(*middleware.Session)
+			res.Send(200, "text/plain", fmt.Sprintf("phase=%v", sess.Get("phase")))
+		})
+	})
+	defer teardown()
+
+	jar, _ := newCookieJar()
+	client := &http.Client{Jar: jar, Timeout: 5 * time.Second}
+
+	// Seed first — establishes the session cookie in the jar.
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/seed", port))
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	resp.Body.Close()
+
+	// Kick off the long handler in a goroutine. It reuses the seeded
+	// cookie so it operates on the same session row.
+	done := make(chan struct{})
+	go func() {
+		resp, _ := client.Get(fmt.Sprintf("http://127.0.0.1:%d/checkpoint", port))
+		if resp != nil {
+			resp.Body.Close()
+		}
+		close(done)
+	}()
+
+	// Wait for the explicit Save to fire.
+	<-checkpointed
+
+	// Now probe — should see the checkpointed value even though the
+	// original handler's goroutine is still running.
+	resp, _ = client.Get(fmt.Sprintf("http://127.0.0.1:%d/probe", port))
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "phase=checkpoint" {
+		t.Errorf("explicit Save not visible mid-handler: probe returned %q", string(body))
+	}
+
+	close(released)
+	<-done
+
+	// Final probe — OnFinish should have persisted the "final" value.
+	resp, _ = client.Get(fmt.Sprintf("http://127.0.0.1:%d/probe", port))
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "phase=final" {
+		t.Errorf("final state not persisted by OnFinish: probe returned %q", string(body))
+	}
+}
