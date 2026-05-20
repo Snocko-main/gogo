@@ -28,10 +28,18 @@ type CORSOptions struct {
 	// safe-plus-write set: GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD.
 	AllowMethods []string
 
-	// AllowHeaders is the list of headers returned in the preflight
-	// Access-Control-Allow-Headers. Defaults to common request headers
-	// that don't satisfy the CORS-safelisted-request-header check
-	// (Content-Type, Authorization).
+	// AllowHeaders is the whitelist of request headers the server
+	// permits on cross-origin requests. The preflight response's
+	// Access-Control-Allow-Headers is computed as the case-insensitive
+	// intersection of the client's Access-Control-Request-Headers and
+	// this list — headers the client asks for that are NOT in this
+	// list are silently dropped from the response, which causes the
+	// browser to refuse to send them on the actual request.
+	//
+	// Default: Content-Type, Authorization. The literal "*" is
+	// supported and means "any header" per the Fetch spec, but ONLY
+	// when AllowCredentials is false; with credentials enabled the
+	// wildcard is ignored and the configured list is enforced exactly.
 	AllowHeaders []string
 
 	// ExposeHeaders lists response headers the browser is allowed to
@@ -98,6 +106,22 @@ func CORS(opts ...CORSOptions) mwhint.Hinted {
 	// path repeated the same case-folding work on every request.
 	compiledOrigins := compileOrigins(opt.AllowOrigins)
 
+	// Lowercase set of allowed request headers, used at preflight to
+	// filter Access-Control-Request-Headers against the configured
+	// whitelist instead of echoing the client's value verbatim. The
+	// previous behavior let a malicious page bypass AllowHeaders by
+	// simply listing every header it wanted in the preflight — the
+	// configured list had no effect.
+	allowHeadersAny := false
+	allowHeadersSet := make(map[string]bool, len(opt.AllowHeaders))
+	for _, h := range opt.AllowHeaders {
+		if h == "*" {
+			allowHeadersAny = true
+			continue
+		}
+		allowHeadersSet[strings.ToLower(h)] = true
+	}
+
 	return mwhint.Hinted{Place: mwhint.Both, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler {
 		return func(res *gogo.Response, req *gogo.Request) {
 			origin := req.Header("origin")
@@ -126,7 +150,29 @@ func CORS(opts ...CORSOptions) mwhint.Hinted {
 					}
 					res.Header("Access-Control-Allow-Methods", methodsCSV)
 					if reqHeaders := req.Header("access-control-request-headers"); reqHeaders != "" {
-						res.Header("Access-Control-Allow-Headers", reqHeaders)
+						// Filter the requested header list against the
+						// configured AllowHeaders whitelist. The Fetch
+						// spec lets the browser send any header it likes
+						// in the preflight; the server's job is to
+						// answer with the subset it actually permits.
+						// Echoing the request verbatim would make the
+						// whitelist a no-op.
+						switch {
+						case allowHeadersAny && !opt.AllowCredentials:
+							// "*" is a literal wildcard only when
+							// credentials are not used; echo what the
+							// client asked for so non-safelisted
+							// headers (the whole point of "*") get
+							// through.
+							res.Header("Access-Control-Allow-Headers", reqHeaders)
+						default:
+							if matched := filterAllowedHeaders(reqHeaders, allowHeadersSet); matched != "" {
+								res.Header("Access-Control-Allow-Headers", matched)
+							}
+							// Empty match → omit the header. The
+							// browser will refuse to send the actual
+							// request, which is the correct gate.
+						}
 					} else if headersCSV != "" {
 						res.Header("Access-Control-Allow-Headers", headersCSV)
 					}
@@ -196,6 +242,34 @@ func compileOrigins(patterns []string) []compiledOrigin {
 		out = append(out, compiledOrigin{full: lp})
 	}
 	return out
+}
+
+// filterAllowedHeaders parses the comma-separated Access-Control-
+// Request-Headers value and returns a CSV of entries that appear in
+// the (lowercased) allowed set. The original casing from the request
+// is preserved in the output. Unmatched headers are dropped silently
+// — the browser's preflight check will then refuse to send those
+// headers on the actual request, which is the intended gate.
+func filterAllowedHeaders(raw string, allowed map[string]bool) string {
+	if len(allowed) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(raw))
+	for _, p := range strings.Split(raw, ",") {
+		h := strings.TrimSpace(p)
+		if h == "" {
+			continue
+		}
+		if !allowed[strings.ToLower(h)] {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(h)
+	}
+	return b.String()
 }
 
 // matchCompiledOrigin tests whether origin matches any compiled
