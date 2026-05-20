@@ -2994,6 +2994,172 @@ func TestBodyLimitChunkedUnderLimit(t *testing.T) {
 	}
 }
 
+// TestBodyLimitChunkedBodyClampedByConfig: when the handler asks
+// Body(maxBytes, ...) for a value LARGER than the app's BodyLimit,
+// the effective cap is BodyLimit — the app-wide ceiling wins. Tests
+// the clamp on chunked uploads, where there's no Content-Length for
+// the C++ pre-check to catch.
+//
+// Without the clamp, a handler that asked res.Body(10<<20, ...) on
+// an app with BodyLimit=1024 could accept a multi-MiB chunked
+// upload — the OnData accumulator wraps res.OnData, not the
+// internal res.Body path, so the app cap was bypassable.
+func TestBodyLimitChunkedBodyClampedByConfig(t *testing.T) {
+	const bodyLimit = 1024
+	port, teardown := startAppCfg(t, gogo.Config{BodyLimit: bodyLimit}, func(app *gogo.App) {
+		// Handler asks for 10 MiB — bigger than the app cap. The
+		// clamp must kick in and reject at bodyLimit instead.
+		app.Post("/upload", func(res *gogo.Response, req *gogo.Request) {
+			res.Body(10<<20, func(body []byte, err error) {
+				if err != nil {
+					res.Send(413, "text/plain", err.Error())
+					return
+				}
+				res.Send(200, "text/plain", "ok")
+			})
+		})
+	})
+	defer teardown()
+
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	requestHead := "POST /upload HTTP/1.1\r\n" +
+		fmt.Sprintf("Host: 127.0.0.1:%d\r\n", port) +
+		"Content-Type: application/octet-stream\r\n" +
+		"Transfer-Encoding: chunked\r\n" +
+		"Connection: close\r\n\r\n"
+	if _, err := conn.Write([]byte(requestHead)); err != nil {
+		t.Fatalf("write head: %v", err)
+	}
+	// 4 KiB total via 512-byte chunks — handler's 10 MiB cap would
+	// happily accept this, but the app's 1 KiB cap must reject.
+	chunk := bytes.Repeat([]byte("x"), 512)
+	for i := 0; i < 8; i++ {
+		fmt.Fprintf(conn, "%x\r\n", len(chunk))
+		conn.Write(chunk)
+		conn.Write([]byte("\r\n"))
+	}
+	conn.Write([]byte("0\r\n\r\n"))
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 413 {
+		t.Errorf("chunked body via Body(10MiB) on app with BodyLimit=1024: got %d, want 413", resp.StatusCode)
+	}
+}
+
+// TestBodyLimitChunkedBodyHandlerCapWinsWhenStricter: when the
+// handler's maxBytes is SMALLER than the app's BodyLimit, the
+// handler-supplied cap wins (i.e. the stricter of the two always
+// applies). Locks in the min() semantics in both directions.
+func TestBodyLimitChunkedBodyHandlerCapWinsWhenStricter(t *testing.T) {
+	const bodyLimit = 1 << 20 // 1 MiB app cap
+	const handlerCap = 512    // way smaller — handler wants tight bound
+
+	port, teardown := startAppCfg(t, gogo.Config{BodyLimit: bodyLimit}, func(app *gogo.App) {
+		app.Post("/upload", func(res *gogo.Response, req *gogo.Request) {
+			res.Body(handlerCap, func(body []byte, err error) {
+				if err != nil {
+					res.Send(413, "text/plain", err.Error())
+					return
+				}
+				res.Send(200, "text/plain", "ok")
+			})
+		})
+	})
+	defer teardown()
+
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	requestHead := "POST /upload HTTP/1.1\r\n" +
+		fmt.Sprintf("Host: 127.0.0.1:%d\r\n", port) +
+		"Content-Type: application/octet-stream\r\n" +
+		"Transfer-Encoding: chunked\r\n" +
+		"Connection: close\r\n\r\n"
+	conn.Write([]byte(requestHead))
+	// 1 KiB body — under app cap, over handler cap.
+	chunk := bytes.Repeat([]byte("x"), 512)
+	for i := 0; i < 2; i++ {
+		fmt.Fprintf(conn, "%x\r\n", len(chunk))
+		conn.Write(chunk)
+		conn.Write([]byte("\r\n"))
+	}
+	conn.Write([]byte("0\r\n\r\n"))
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 413 {
+		t.Errorf("handler's tighter cap should reject: got %d, want 413", resp.StatusCode)
+	}
+}
+
+// TestBodyLimitChunkedBodyZeroMaxIsLiteral: Body(0, ...) is taken
+// literally — accept zero bytes, reject anything larger — even when
+// the app's BodyLimit is positive. The clamp is one-directional;
+// the app cap can tighten, never loosen, the caller's request.
+//
+// The first iteration of the clamp accidentally treated maxBytes <= 0
+// as "use app cap instead", which would have flipped a handler that
+// explicitly asked for 0 bytes into accepting up to 1 MiB. This test
+// locks the literal-zero semantics in.
+func TestBodyLimitChunkedBodyZeroMaxIsLiteral(t *testing.T) {
+	const appCap = 1 << 20 // generous app cap — handler asks for tighter
+	port, teardown := startAppCfg(t, gogo.Config{BodyLimit: appCap}, func(app *gogo.App) {
+		app.Post("/empty", func(res *gogo.Response, req *gogo.Request) {
+			res.Body(0, func(body []byte, err error) {
+				if err != nil {
+					res.Send(413, "text/plain", err.Error())
+					return
+				}
+				res.Send(200, "text/plain", fmt.Sprintf("got %d bytes", len(body)))
+			})
+		})
+	})
+	defer teardown()
+
+	// A single byte must be rejected — Body(0) means 0 means 0.
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	fmt.Fprintf(conn, "POST /empty HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n", port)
+	fmt.Fprintf(conn, "Content-Type: application/octet-stream\r\n")
+	fmt.Fprintf(conn, "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+	// One single-byte chunk + terminator.
+	conn.Write([]byte("1\r\nx\r\n0\r\n\r\n"))
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 413 {
+		t.Errorf("Body(0) accepted a 1-byte payload: got %d, want 413", resp.StatusCode)
+	}
+}
+
 // TestBindAddrLocalhost: when Config.BindAddr is set to 127.0.0.1, the
 // listener is reachable on loopback. (We can't reliably test refusal on
 // a non-loopback IP without knowing the box's external addresses; the

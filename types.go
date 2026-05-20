@@ -372,13 +372,22 @@ type asyncMiddlewareEntry struct {
 // only get added here when they need a single, app-wide value.
 type Config struct {
 	// BodyLimit caps the request-body bytes a Post / Any route will
-	// accept. The framework rejects oversized requests with 413 at
-	// arrival by checking the Content-Length header on the C++ side
-	// before dispatching to Go — zero per-request cost beyond the
-	// existing header lookup. Chunked transfer-encoded requests with
-	// no Content-Length bypass this check; handlers that accept those
-	// must call res.Body(maxN, ...) for protection. Set to 0 to
-	// disable. Default 4 MiB.
+	// accept. Enforced at three layers so every intake shape gets the
+	// same upper bound:
+	//
+	//   - Content-Length declared: rejected with 413 at arrival on the
+	//     C++ side before any cgo crossing — zero per-request cost
+	//     beyond the existing header lookup.
+	//   - Chunked transfer-encoded + Response.OnData: the Go-side
+	//     accumulator inside OnData totals chunk sizes and emits
+	//     413 + close as soon as the running total crosses the cap.
+	//   - Chunked transfer-encoded + Response.Body: the caller-supplied
+	//     maxBytes is clamped down by BodyLimit when BodyLimit is
+	//     smaller, so handlers that ask Body(10 MiB) on an app capped
+	//     at 1 MiB top out at 1 MiB.
+	//
+	// Set to 0 to disable the cap entirely (not recommended outside
+	// tests). Default 4 MiB.
 	BodyLimit int
 
 	// BindAddr is the local interface to bind on. Empty string means
@@ -3490,11 +3499,29 @@ type errFramework string
 func (e errFramework) Error() string { return string(e) }
 
 // Body collects the full request body and invokes done once it has arrived.
-// If the body exceeds maxBytes, done is called with err = ErrBodyTooLarge and
-// the response is closed without sending. Call inside the route handler
-// before it returns; done runs on the loop thread (spawn a goroutine for
-// blocking work).
+// If the body exceeds the effective limit, done is called with err =
+// ErrBodyTooLarge and the response is closed without sending. Call inside
+// the route handler before it returns; done runs on the loop thread (spawn
+// a goroutine for blocking work).
+//
+// The effective limit is the LOWER of maxBytes and Config.BodyLimit when
+// BOTH are positive. A handler that asks for 10 MiB on an app configured
+// with BodyLimit=1 MiB tops out at 1 MiB — the app cap wins. This
+// mirrors the OnData and Content-Length gates so all three intake paths
+// enforce the same upper bound; without the clamp here, a chunked upload
+// (which sidesteps the C++ Content-Length pre-check) could exceed the
+// app's BodyLimit whenever the handler's local cap was larger.
+//
+// maxBytes <= 0 is honored literally and NOT widened by Config.BodyLimit:
+// Body(0, ...) accepts a zero-byte body and rejects everything else;
+// Body(-1, ...) rejects every chunk. Clamping is one-directional — the
+// app cap can tighten the caller's request, never loosen it.
 func (r *Response) Body(maxBytes int, done func(body []byte, err error)) {
+	if r.app != nil && maxBytes > 0 {
+		if bl := r.app.cfg.BodyLimit; bl > 0 && bl < maxBytes {
+			maxBytes = bl
+		}
+	}
 	var buf []byte
 	var finished bool
 	aborted := &Aborted{}
