@@ -221,6 +221,141 @@ func FuzzValidateHeaderValue(f *testing.F) {
 	})
 }
 
+// TestValidateCookiePath, TestValidateCookieDomain,
+// TestValidateCookieExpires, and TestValidateCookieSameSite cover the
+// cookie-attribute validators. The goal is to make sure each one
+// rejects bytes that would inject an extra attribute (";"), break the
+// header line (CTLs), or — for SameSite — slip past the typed enum.
+func TestValidateCookiePath(t *testing.T) {
+	good := []string{"/", "/api/v1", "/", "/path-with-dash_and_under", "/", ""}
+	for _, p := range good {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("valid Path %q panicked: %v", p, r)
+				}
+			}()
+			if p == "" {
+				return // empty Path is allowed; SetCookie skips emission
+			}
+			validateCookiePath(p)
+		}()
+	}
+	bad := map[string]string{
+		"semicolon":  "/; Domain=evil.com",
+		"CR":         "/foo\r",
+		"LF":         "/foo\n",
+		"NUL":        "/foo\x00",
+		"DEL":        "/foo\x7f",
+	}
+	for label, p := range bad {
+		t.Run("invalid/"+label, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("invalid Path %q (%s) did not panic", p, label)
+				}
+			}()
+			validateCookiePath(p)
+		})
+	}
+}
+
+func TestValidateCookieDomain(t *testing.T) {
+	good := []string{"example.com", ".example.com", "sub.example.com", "single", "xn--punycode.example"}
+	for _, d := range good {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("valid Domain %q panicked: %v", d, r)
+				}
+			}()
+			validateCookieDomain(d)
+		}()
+	}
+	bad := map[string]string{
+		"semicolon":     "evil.com; HttpOnly=false",
+		"comma":         "a.com,b.com",
+		"space":         "victim com",
+		"tab":           "victim\tcom",
+		"CR":            "victim.com\r",
+		"control byte":  "victim\x01com",
+	}
+	for label, d := range bad {
+		t.Run("invalid/"+label, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("invalid Domain %q (%s) did not panic", d, label)
+				}
+			}()
+			validateCookieDomain(d)
+		})
+	}
+}
+
+func TestValidateCookieExpires(t *testing.T) {
+	good := []string{
+		"Wed, 21 Oct 2025 07:28:00 GMT",
+		"Thu, 01 Jan 1970 00:00:00 GMT",
+		"Mon, 14 Feb 2022 13:37:00 UTC",
+	}
+	for _, e := range good {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("valid Expires %q panicked: %v", e, r)
+				}
+			}()
+			validateCookieExpires(e)
+		}()
+	}
+	bad := map[string]string{
+		"semicolon": "Wed, 21 Oct 2025 07:28:00 GMT; Secure=false",
+		"CR":        "Wed, 21 Oct 2025\r07:28:00 GMT",
+		"NUL":       "Wed,\x0021 Oct",
+	}
+	for label, e := range bad {
+		t.Run("invalid/"+label, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("invalid Expires %q (%s) did not panic", e, label)
+				}
+			}()
+			validateCookieExpires(e)
+		})
+	}
+}
+
+func TestValidateCookieSameSite(t *testing.T) {
+	good := []SameSite{"", SameSiteStrict, SameSiteLax, SameSiteNone}
+	for _, s := range good {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("valid SameSite %q panicked: %v", s, r)
+				}
+			}()
+			validateCookieSameSite(s)
+		}()
+	}
+	bad := []SameSite{
+		"Whatever",
+		"lax",                                // case-sensitive per spec
+		SameSite("Lax; Domain=evil.example"), // injection via cast
+		SameSite("Strict\r\nX-Bad: 1"),
+		SameSite("None;"),
+	}
+	for _, s := range bad {
+		t.Run("invalid/"+string(s), func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("invalid SameSite %q did not panic", s)
+				}
+			}()
+			validateCookieSameSite(s)
+		})
+	}
+}
+
 // TestCookieValueRoundtrip is a small property test: every cookie value that
 // SetCookie accepts must round-trip through parseCookieValue cleanly.
 func TestCookieValueRoundtrip(t *testing.T) {
