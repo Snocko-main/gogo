@@ -303,6 +303,12 @@ typedef struct uwsgo_shared_layout_t {
     size_t ctx_ip_offset;
     size_t ctx_params_offset;
     size_t ctx_headers_offset;
+    // Request body (post_shared); distinct from the inline
+    // response body (ctx_body_offset above) which has a fixed
+    // tiny cap for the response payload.
+    size_t ctx_req_body_len_offset;
+    size_t ctx_req_body_overflow_offset;
+    size_t ctx_req_body_offset;
     size_t ctx_snap_method_cap;
     size_t ctx_snap_url_cap;
     size_t ctx_snap_query_cap;
@@ -310,6 +316,7 @@ typedef struct uwsgo_shared_layout_t {
     size_t ctx_snap_param_cap;
     size_t ctx_snap_param_max;
     size_t ctx_snap_headers_cap;
+    size_t ctx_snap_req_body_cap;
 } uwsgo_shared_layout_t;
 
 void uwsgo_shared_layout(uwsgo_shared_layout_t *out);
@@ -331,6 +338,21 @@ void uwsgo_wake_drain(uwsgo_loop_t *loop, void *ring);
 // and invoke the handler bound to handler_id. The Go side keeps the
 // handler_id -> handler map.
 void uwsgo_app_get_shared(uwsgo_app_t *app, const char *pattern, uint32_t handler_id);
+
+// uwsgo_app_post_shared registers a POST route that uses the same
+// zero-cgo shared-memory dispatch path as uwsgo_app_get_shared,
+// but also collects the request body into the per-request
+// AsyncCtx before pushing onto the ring. Bodies up to max_body
+// (capped internally at SNAP_BODY_CAP = 8 KiB) succeed; oversized
+// bodies short-circuit with 413 on the loop thread, no goroutine
+// spawned. The Go side reads the collected bytes via the snapshot
+// layout fields (ctx_body_offset / ctx_body_len_offset).
+//
+// max_body == 0 means "use SNAP_BODY_CAP as the cap" — the
+// default Go shim picks this when the user didn't pass an
+// explicit limit smaller than the buffer.
+void uwsgo_app_post_shared(uwsgo_app_t *app, const char *pattern,
+    uint32_t handler_id, size_t max_body);
 
 // Returns the lower-cased HTTP method ("get", "post", ...).
 size_t uwsgo_req_method(uwsgo_req_t *req, char *buffer, size_t buffer_len);

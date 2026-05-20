@@ -84,6 +84,23 @@ func main() {
 		return c.SendString("ok")
 	})
 
+	// /post/small — POST with a small body, mirrors gogo's shared-
+	// dispatch route. The handler touches the body so fiber can't
+	// short-circuit the read.
+	app.Post("/post/small", func(c *fiber.Ctx) error {
+		_ = len(c.Body())
+		c.Set("Content-Type", "text/plain")
+		return c.SendString("ok")
+	})
+
+	// /post/big — POST with a larger body, mirrors gogo's classic
+	// async path.
+	app.Post("/post/big", func(c *fiber.Ctx) error {
+		_ = len(c.Body())
+		c.Set("Content-Type", "text/plain")
+		return c.SendString("ok")
+	})
+
 	if err := app.Listen(addr); err != nil {
 		log.Fatalf("Listen %s: %v", addr, err)
 	}

@@ -843,6 +843,15 @@ constexpr size_t SNAP_IP_CAP = 64;
 // non-truncated lookups for async requests).
 constexpr size_t SNAP_HEADERS_CAP = 8192;
 
+// Request body slot for the zero-cgo shared-dispatch PostAsync
+// path. Bodies up to this size are collected on the loop side into
+// the per-request AsyncCtx, then handed to the Go worker via
+// shared memory — same path GetAsync uses, no per-chunk cgo. Above
+// this cap the framework falls back to the cgo-mediated async
+// path. 8 KiB matches the sync scratch buffer and covers the
+// realistic ceiling for typical JSON / form / webhook POST bodies.
+constexpr size_t SNAP_BODY_CAP = 8192;
+
 // AsyncCtx is a reference-counted handle that tracks an in-flight async
 // response. Refs are held by:
 //   1. Go-side state, until uwsgo_res_defer_send or uwsgo_async_ctx_release transfers it
@@ -889,6 +898,15 @@ struct AsyncCtx {
     char params[SNAP_PARAM_MAX][SNAP_PARAM_CAP];
     char headers[SNAP_HEADERS_CAP];
 
+    // Request body — only populated for POST routes registered
+    // via uwsgo_app_post_shared. body_len carries the byte count;
+    // body_overflow is set when the incoming payload exceeded
+    // SNAP_BODY_CAP (or the route's max), so Go can surface a 413
+    // without re-reading the size out of band.
+    uint32_t body_len = 0;
+    uint32_t body_overflow = 0;
+    char body[SNAP_BODY_CAP];
+
     void retain() { refcount.fetch_add(1, std::memory_order_relaxed); }
 
     // reset_for_pool wipes mutable state so a recycled ctx is
@@ -914,6 +932,8 @@ struct AsyncCtx {
         headers_len = 0;
         truncated = 0;
         ip_len = 0;
+        body_len = 0;
+        body_overflow = 0;
         for (uint32_t i = 0; i < SNAP_PARAM_MAX; i++) param_lens[i] = 0;
         // pool field is sticky across recycles — it points at the same
         // App's pool for the entire lifetime of this object.
@@ -1072,6 +1092,9 @@ extern "C" void uwsgo_shared_layout(uwsgo_shared_layout_t *out) {
     out->ctx_ip_offset = offsetof(AsyncCtx, ip);
     out->ctx_params_offset = offsetof(AsyncCtx, params);
     out->ctx_headers_offset = offsetof(AsyncCtx, headers);
+    out->ctx_req_body_len_offset = offsetof(AsyncCtx, body_len);
+    out->ctx_req_body_overflow_offset = offsetof(AsyncCtx, body_overflow);
+    out->ctx_req_body_offset = offsetof(AsyncCtx, body);
     out->ctx_snap_method_cap = SNAP_METHOD_CAP;
     out->ctx_snap_url_cap = SNAP_URL_CAP;
     out->ctx_snap_query_cap = SNAP_QUERY_CAP;
@@ -1079,6 +1102,7 @@ extern "C" void uwsgo_shared_layout(uwsgo_shared_layout_t *out) {
     out->ctx_snap_param_cap = SNAP_PARAM_CAP;
     out->ctx_snap_param_max = SNAP_PARAM_MAX;
     out->ctx_snap_headers_cap = SNAP_HEADERS_CAP;
+    out->ctx_snap_req_body_cap = SNAP_BODY_CAP;
 }
 
 // uwsgo_app_get_shared registers a route whose dispatch path skips the
@@ -1146,24 +1170,97 @@ static void snapshot_request(uwsgo_app_t *app, AsyncCtx *ctx, uWS::HttpResponse<
     ctx->truncated = truncated ? 1 : 0;
 }
 
+// enqueue_ctx pushes a fully-populated AsyncCtx onto the request
+// ring. Returns true on success; on failure (ring full or pool
+// contention) it has already written a 503 to res and released
+// the ctx — callers must NOT touch ctx or res after a false
+// return. Used by both the GET and POST shared-dispatch paths so
+// the enqueue-and-recover logic stays in one place.
+static bool enqueue_ctx(AsyncCtx *ctx, uWS::HttpResponse<false> *res) {
+    uint64_t tail = g_request.tail.load(std::memory_order_relaxed);
+    for (int spin = 0;; ++spin) {
+        PendingSlot *slot = &g_request.slots[tail & RING_MASK];
+        uint64_t seq = slot->sequence.load(std::memory_order_acquire);
+        int64_t diff = (int64_t)(seq - tail);
+        if (diff == 0) {
+            if (g_request.tail.compare_exchange_weak(
+                    tail, tail + 1,
+                    std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+                res->onAborted([hold = CtxHold(ctx)]() {
+                    hold.ctx->aborted.store(1, std::memory_order_release);
+                });
+                slot->ctx = ctx;
+                slot->sequence.store(tail + 1, std::memory_order_release);
+                return true;
+            }
+        } else if (diff < 0) {
+            ctx->release();
+            res->writeStatus("503 Service Unavailable");
+            res->writeHeader("Content-Type", "text/plain; charset=utf-8");
+            res->end("Server overloaded\n");
+            return false;
+        } else {
+            tail = g_request.tail.load(std::memory_order_relaxed);
+        }
+        if (spin > 100000) {
+            ctx->release();
+            res->writeStatus("503 Service Unavailable");
+            res->writeHeader("Content-Type", "text/plain; charset=utf-8");
+            res->end("Enqueue contention\n");
+            return false;
+        }
+    }
+}
+
+// acquire_shared_ctx pulls an AsyncCtx from the App's recycle pool
+// (or allocates one on miss) and stamps it with the per-request
+// fields the worker needs. Used by both GET and POST shared-
+// dispatch handlers — keeps the pool / handler_id / loop wiring
+// in one place.
+static AsyncCtx *acquire_shared_ctx(uwsgo_app_t *app, uWS::HttpResponse<false> *res, uint32_t handler_id) {
+    AsyncCtx *ctx = app->ctx_pool ? app->ctx_pool->pop() : nullptr;
+    if (!ctx) {
+        ctx = new AsyncCtx;
+        ctx->pool = app->ctx_pool;
+    }
+    ctx->response = res;
+    ctx->loop = uWS::Loop::get();
+    ctx->pending_ring = app->pending_ring;
+    ctx->handler_id = handler_id;
+    return ctx;
+}
+
 extern "C" void uwsgo_app_get_shared(uwsgo_app_t *app, const char *pattern, uint32_t handler_id) {
     app->app->get(pattern, [app, handler_id](auto *res, auto *req) {
-        // Try the App's recycle pool first; fall back to new AsyncCtx
-        // only when the pool is empty (cold start, burst beyond pool
-        // capacity, etc.). A pool hit skips the ~13 KiB allocation +
-        // initializer-list pass that new AsyncCtx pays.
-        AsyncCtx *ctx = app->ctx_pool ? app->ctx_pool->pop() : nullptr;
-        if (!ctx) {
-            ctx = new AsyncCtx;
-            ctx->pool = app->ctx_pool;  // bind once for the object's lifetime
+        AsyncCtx *ctx = acquire_shared_ctx(app, res, handler_id);
+        // Snapshot before any cgo / Go work — uWS HttpRequest is
+        // live only inside this lambda.
+        snapshot_request(app, ctx, res, req);
+        if (ctx->truncated) {
+            ctx->release();
+            res->writeStatus("431 Request Header Fields Too Large");
+            res->writeHeader("Content-Type", "text/plain; charset=utf-8");
+            res->end("Request snapshot too large\n");
+            return;
         }
-        ctx->response = res;
-        ctx->loop = uWS::Loop::get();
-        ctx->pending_ring = app->pending_ring;
-        ctx->handler_id = handler_id;
-        // Snapshot before any cgo / Go work — uWS HttpRequest is live only
-        // inside this lambda. Reject oversized snapshots instead of handing
-        // security-sensitive middleware silently truncated request data.
+        enqueue_ctx(ctx, res);
+    });
+}
+
+// uwsgo_app_post_shared is the POST counterpart to
+// uwsgo_app_get_shared. The lambda snapshots the request the same
+// way, then collects body chunks into ctx->body until either
+// isLast=true (push to ring) or the cap is exceeded (413 + release).
+// max_body is clamped to SNAP_BODY_CAP — Go-side registration
+// validates the user's requested cap before reaching here.
+extern "C" void uwsgo_app_post_shared(uwsgo_app_t *app, const char *pattern,
+    uint32_t handler_id, size_t max_body) {
+    if (max_body == 0 || max_body > SNAP_BODY_CAP) {
+        max_body = SNAP_BODY_CAP;
+    }
+    app->app->post(pattern, [app, handler_id, max_body](auto *res, auto *req) {
+        AsyncCtx *ctx = acquire_shared_ctx(app, res, handler_id);
         snapshot_request(app, ctx, res, req);
         if (ctx->truncated) {
             ctx->release();
@@ -1173,49 +1270,53 @@ extern "C" void uwsgo_app_get_shared(uwsgo_app_t *app, const char *pattern, uint
             return;
         }
 
-        // CAS-based bounded MPMC enqueue. If the ring is full (next slot's
-        // sequence is behind our intended position), we reject the request
-        // with 503 instead of spinning — that would block the loop thread.
-        uint64_t tail = g_request.tail.load(std::memory_order_relaxed);
-        for (int spin = 0;; ++spin) {
-            PendingSlot *slot = &g_request.slots[tail & RING_MASK];
-            uint64_t seq = slot->sequence.load(std::memory_order_acquire);
-            int64_t diff = (int64_t)(seq - tail);
-            if (diff == 0) {
-                // Slot is empty for this tail; try to claim it.
-                if (g_request.tail.compare_exchange_weak(
-                        tail, tail + 1,
-                        std::memory_order_relaxed,
-                        std::memory_order_relaxed)) {
-                    res->onAborted([hold = CtxHold(ctx)]() {
-                        hold.ctx->aborted.store(1, std::memory_order_release);
-                    });
-                    slot->ctx = ctx;
-                    slot->sequence.store(tail + 1, std::memory_order_release);
-                    return;
+        // Body collection runs after the lambda returns — uWS calls
+        // onData per chunk. We accumulate into ctx->body until
+        // isLast or overflow. ctx is captured by reference into the
+        // closure; the onAborted hook flips the aborted flag so a
+        // disconnected client mid-stream doesn't enqueue garbage.
+        res->onAborted([hold = CtxHold(ctx)]() {
+            hold.ctx->aborted.store(1, std::memory_order_release);
+        });
+        res->onData([ctx, res, max_body](std::string_view chunk, bool isLast) mutable {
+            if (ctx->aborted.load(std::memory_order_acquire)) {
+                // Client gone — drop the ctx, no enqueue. release()
+                // here mirrors the onAborted increment so refcount
+                // stays balanced.
+                if (isLast) ctx->release();
+                return;
+            }
+            if (!ctx->body_overflow) {
+                size_t room = max_body - ctx->body_len;
+                if (chunk.size() > room) {
+                    // Capture what fits then flag overflow; we'll
+                    // 413 on the next isLast.
+                    std::memcpy(ctx->body + ctx->body_len, chunk.data(), room);
+                    ctx->body_len += static_cast<uint32_t>(room);
+                    ctx->body_overflow = 1;
+                } else {
+                    if (chunk.size() > 0) {
+                        std::memcpy(ctx->body + ctx->body_len, chunk.data(), chunk.size());
+                        ctx->body_len += static_cast<uint32_t>(chunk.size());
+                    }
                 }
-                // CAS lost; retry with new tail (already updated by CAS).
-            } else if (diff < 0) {
-                // Ring is full — consumer is RING_SIZE slots behind. Reject.
-                ctx->release();
-                res->writeStatus("503 Service Unavailable");
-                res->writeHeader("Content-Type", "text/plain; charset=utf-8");
-                res->end("Server overloaded\n");
-                return;
-            } else {
-                // Another producer just claimed this slot; reload tail and retry.
-                tail = g_request.tail.load(std::memory_order_relaxed);
             }
-            // Defensive cap: huge contention shouldn't happen, but bail out
-            // before the loop thread is locked indefinitely.
-            if (spin > 100000) {
+            if (!isLast) return;
+
+            if (ctx->body_overflow) {
                 ctx->release();
-                res->writeStatus("503 Service Unavailable");
+                res->writeStatus("413 Payload Too Large");
                 res->writeHeader("Content-Type", "text/plain; charset=utf-8");
-                res->end("Enqueue contention\n");
+                res->end("payload too large\n");
                 return;
             }
-        }
+            // Body complete and within cap. Push to the ring so a
+            // worker goroutine can run the user handler. The
+            // enqueue_ctx helper also re-registers onAborted on
+            // success — that's the canonical hook for the post-
+            // enqueue abort signal, matching the GET path.
+            enqueue_ctx(ctx, res);
+        });
     });
 }
 

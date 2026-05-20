@@ -94,6 +94,28 @@ func (a *appNative) getShared(pattern string, handler AsyncHandler) {
 	ensureSharedWorkers()
 }
 
+// postShared registers a POST route on the zero-cgo shared
+// dispatch path. The C++ lambda collects the request body into
+// per-ctx memory (capped at the smaller of maxBody and
+// SNAP_BODY_CAP) and pushes onto the request ring once the body
+// is complete; the Go worker then runs handler with req.body
+// already populated from the ctx snapshot.
+//
+// maxBody == 0 means "use the C-side default" (SNAP_BODY_CAP).
+// Bodies larger than the active cap short-circuit with 413 on
+// the loop thread — the goroutine is never spawned.
+func (a *appNative) postShared(pattern string, handler AsyncHandler, maxBody int) {
+	id := registerSharedHandler(handler)
+	cpattern := C.CString(pattern)
+	defer C.free(unsafe.Pointer(cpattern))
+	if maxBody < 0 {
+		maxBody = 0
+	}
+	C.uwsgo_app_post_shared(a.ptr, cpattern, C.uint32_t(id), C.size_t(maxBody))
+	sharedActive.Store(true)
+	ensureSharedWorkers()
+}
+
 // workerCount controls how many goroutines drain the request ring. Read once
 // when the first shared route registers (and workers spin up); changing it
 // after that has no effect. Default = NumCPU — spinning workers compete
@@ -215,6 +237,10 @@ func runSharedHandler(handler AsyncHandler, ctxPtr uintptr) {
 	// the snapshot survives past ctx release.
 	reqWrap := requestPool.Get().(*Request)
 	reqWrap.snap = newSnapshotFromCtx(ctxPtr)
+	// post_shared routes leave the collected body in ctx memory;
+	// readSharedReqBody copies it out into a Go slice so the
+	// handler can read it via req.Body() after ctx release.
+	reqWrap.body = readSharedReqBody(ctxPtr)
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -272,7 +298,22 @@ func newSnapshotFromCtx(ctxPtr uintptr) *requestSnapshot {
 		copy(hdrs, unsafe.Slice((*byte)(unsafe.Pointer(ctxPtr+shared.ctxHeadersOff)), int(headersLen)))
 		snap.headers = hdrs
 	}
+
 	return snap
+}
+
+// readSharedReqBody copies the post_shared-collected request body
+// out of ctx memory into a fresh Go slice so it survives ctx
+// release. GET routes leave body_len = 0 — the call is a single
+// compare-and-skip for that path.
+func readSharedReqBody(ctxPtr uintptr) []byte {
+	bodyLen := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxReqBodyLenOff))
+	if bodyLen == 0 {
+		return nil
+	}
+	out := make([]byte, bodyLen)
+	copy(out, unsafe.Slice((*byte)(unsafe.Pointer(ctxPtr+shared.ctxReqBodyOff)), int(bodyLen)))
+	return out
 }
 
 func copyAt(base uintptr, n int) string {
@@ -684,13 +725,19 @@ type sharedLayout struct {
 	ctxIPOff         uintptr
 	ctxParamsOff     uintptr
 	ctxHeadersOff    uintptr
-	snapMethodCap    uintptr
-	snapURLCap       uintptr
-	snapQueryCap     uintptr
-	snapIPCap        uintptr
-	snapParamCap     uintptr
-	snapParamMax     uintptr
-	snapHeadersCap   uintptr
+	// post_shared request-body collection: byte count + overflow
+	// flag + body buffer offsets, plus the per-ctx body capacity.
+	ctxReqBodyLenOff      uintptr
+	ctxReqBodyOverflowOff uintptr
+	ctxReqBodyOff         uintptr
+	snapMethodCap         uintptr
+	snapURLCap            uintptr
+	snapQueryCap          uintptr
+	snapIPCap             uintptr
+	snapParamCap          uintptr
+	snapParamMax          uintptr
+	snapHeadersCap        uintptr
+	snapReqBodyCap        uintptr
 }
 
 var shared sharedLayout
@@ -745,14 +792,18 @@ func initSharedLayoutOnce() {
 		ctxQueryOff:      uintptr(raw.ctx_query_offset),
 		ctxIPOff:         uintptr(raw.ctx_ip_offset),
 		ctxParamsOff:     uintptr(raw.ctx_params_offset),
-		ctxHeadersOff:    uintptr(raw.ctx_headers_offset),
-		snapMethodCap:    uintptr(raw.ctx_snap_method_cap),
-		snapURLCap:       uintptr(raw.ctx_snap_url_cap),
-		snapQueryCap:     uintptr(raw.ctx_snap_query_cap),
-		snapIPCap:        uintptr(raw.ctx_snap_ip_cap),
-		snapParamCap:     uintptr(raw.ctx_snap_param_cap),
-		snapParamMax:     uintptr(raw.ctx_snap_param_max),
-		snapHeadersCap:   uintptr(raw.ctx_snap_headers_cap),
+		ctxHeadersOff:         uintptr(raw.ctx_headers_offset),
+		ctxReqBodyLenOff:      uintptr(raw.ctx_req_body_len_offset),
+		ctxReqBodyOverflowOff: uintptr(raw.ctx_req_body_overflow_offset),
+		ctxReqBodyOff:         uintptr(raw.ctx_req_body_offset),
+		snapMethodCap:         uintptr(raw.ctx_snap_method_cap),
+		snapURLCap:            uintptr(raw.ctx_snap_url_cap),
+		snapQueryCap:          uintptr(raw.ctx_snap_query_cap),
+		snapIPCap:             uintptr(raw.ctx_snap_ip_cap),
+		snapParamCap:          uintptr(raw.ctx_snap_param_cap),
+		snapParamMax:          uintptr(raw.ctx_snap_param_max),
+		snapHeadersCap:        uintptr(raw.ctx_snap_headers_cap),
+		snapReqBodyCap:        uintptr(raw.ctx_snap_req_body_cap),
 	}
 	sharedReady = true
 }
