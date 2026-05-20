@@ -141,6 +141,58 @@
 //	res.SetCookie(gogo.Cookie{Name: "x", Value: "y", HttpOnly: true})
 //	res.JSON(200, map[string]any{"ok": true})
 //
+// # Multi-core
+//
+// Single-loop mode (NewApp + Run) caps throughput at one OS thread —
+// uWebSockets is event-loop driven, not goroutine-per-request. To
+// saturate every vCPU, use RunMultiCore:
+//
+//	handle, err := gogo.RunMultiCore(runtime.NumCPU(), 3000, func(app *gogo.App) {
+//	    app.Get("/plain", plainHandler)
+//	    // … same routes / middleware as a single-loop app …
+//	})
+//	if err != nil { log.Fatal(err) }
+//	// signal-driven graceful shutdown:
+//	<-sigCh
+//	handle.Shutdown()
+//	handle.Wait()
+//
+// RunMultiCore spawns N independent App instances, each bound to the
+// same port via SO_REUSEPORT — the kernel load-balances incoming
+// connections across the listening sockets. setup runs once per
+// instance on the OS thread that instance will own.
+//
+// Tuning knobs that actually matter:
+//
+//   - GOMAXPROCS — pin to the same N you passed to RunMultiCore. The
+//     scheduler then has exactly one P per loop; oversubscribing
+//     wastes context-switch budget, undersubscribing starves loops.
+//   - SetWorkerCount — controls the GetAsync worker-goroutine pool.
+//     Default = NumCPU. With RunMultiCore each loop already owns one
+//     core; the workers compete for the same CPUs, so consider
+//     halving this if your GetAsync handlers are short and your
+//     workload is sync-route-heavy.
+//   - Shared resources (DB pools, caches) — create ONCE outside
+//     RunMultiCore and capture the pointers into the handler
+//     closures. setup runs once per loop; allocating fresh DB pools
+//     per loop wastes RAM and connection slots.
+//   - Per-loop CPU pinning — gogo does not pin to specific cores.
+//     Linux's scheduler typically keeps each loop on its initial CPU
+//     for cache locality. If you need stricter pinning run the
+//     server under `taskset -c 0-(N-1)` or wrap LockOSThread with a
+//     sched_setaffinity call.
+//
+// On a 4 vCPU host the gogo bench /plain route scales from ~112 k RPS
+// at 1 core to ~230 k RPS at 2 cores (~2.05× linear). Past 2 cores
+// the same-host wrk client starts competing with the server for CPU,
+// so the apparent 4-core number drops back to ~200 k — a true 4-core
+// measurement needs a separate load-generator host. Either way, gogo
+// per core consistently outruns fiber per core on this hardware
+// (+86 % at 1 core, +48 % at 4 cores, both routes saturated).
+//
+// See examples/multicore for a full setup with graceful shutdown
+// + a /metrics endpoint formatted as Prometheus text exposition.
+//
 // # Graceful shutdown
 //
 //	app.Shutdown() // close listen socket + drain timer; returns immediately
