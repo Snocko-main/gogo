@@ -3,6 +3,7 @@
 package gogo_test
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
@@ -2857,6 +2858,139 @@ func TestBodyLimitContentLengthRejected(t *testing.T) {
 	}
 	if handlerHits.Load() != 1 {
 		t.Fatalf("handler ran for over-limit POST: hits=%d, want 1", handlerHits.Load())
+	}
+}
+
+// TestBodyLimitChunkedRejected: a chunked-transfer-encoded POST that
+// streams more than the configured BodyLimit must get a 413 from the
+// Go-side OnData accumulator. The C++ pre-check only sees Content-
+// Length; chunked requests slip past it, so without this gate a
+// handler that called OnData against a malicious unbounded chunked
+// upload would accumulate bytes forever.
+//
+// Drive via raw TCP since net/http buffers chunked bodies and may
+// add its own Content-Length.
+func TestBodyLimitChunkedRejected(t *testing.T) {
+	var handlerHits atomic.Int32
+	var dataBytes atomic.Int64
+	port, teardown := startAppCfg(t, gogo.Config{BodyLimit: 1024}, func(app *gogo.App) {
+		app.Post("/upload", func(res *gogo.Response, req *gogo.Request) {
+			handlerHits.Add(1)
+			res.OnData(func(chunk []byte, isLast bool) {
+				dataBytes.Add(int64(len(chunk)))
+				if isLast {
+					res.Send(200, "text/plain", "ok")
+				}
+			})
+		})
+	})
+	defer teardown()
+
+	// Build a chunked-encoded POST that streams 4096 bytes total
+	// (4× the cap). Each chunk is 512 bytes so we cross the
+	// boundary mid-stream.
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	requestHead := "POST /upload HTTP/1.1\r\n" +
+		fmt.Sprintf("Host: 127.0.0.1:%d\r\n", port) +
+		"Content-Type: application/octet-stream\r\n" +
+		"Transfer-Encoding: chunked\r\n" +
+		"Connection: close\r\n\r\n"
+	if _, err := conn.Write([]byte(requestHead)); err != nil {
+		t.Fatalf("write head: %v", err)
+	}
+	chunk := bytes.Repeat([]byte("x"), 512)
+	for i := 0; i < 8; i++ {
+		// chunk-size hex CRLF chunk-data CRLF
+		if _, err := fmt.Fprintf(conn, "%x\r\n", len(chunk)); err != nil {
+			break
+		}
+		if _, err := conn.Write(chunk); err != nil {
+			break
+		}
+		if _, err := conn.Write([]byte("\r\n")); err != nil {
+			break
+		}
+	}
+	// trailing zero-length chunk to terminate
+	_, _ = conn.Write([]byte("0\r\n\r\n"))
+
+	// Read response.
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 413 {
+		t.Errorf("chunked over-limit: got %d, want 413", resp.StatusCode)
+	}
+	// Verify the handler stopped receiving data well before the
+	// full 4 KiB arrived — at most one cap-worth plus the partial
+	// chunk that tripped the gate.
+	if dataBytes.Load() > 2*1024 {
+		t.Errorf("OnData kept accepting bytes past the limit: got %d", dataBytes.Load())
+	}
+	_ = handlerHits.Load()
+}
+
+// TestBodyLimitChunkedUnderLimit: a chunked upload that stays under
+// the cap completes normally and the handler sees the full body.
+func TestBodyLimitChunkedUnderLimit(t *testing.T) {
+	var dataBytes atomic.Int64
+	const limit = 4096
+	port, teardown := startAppCfg(t, gogo.Config{BodyLimit: limit}, func(app *gogo.App) {
+		app.Post("/upload", func(res *gogo.Response, req *gogo.Request) {
+			res.OnData(func(chunk []byte, isLast bool) {
+				dataBytes.Add(int64(len(chunk)))
+				if isLast {
+					res.Send(200, "text/plain", "ok")
+				}
+			})
+		})
+	})
+	defer teardown()
+
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	requestHead := "POST /upload HTTP/1.1\r\n" +
+		fmt.Sprintf("Host: 127.0.0.1:%d\r\n", port) +
+		"Content-Type: application/octet-stream\r\n" +
+		"Transfer-Encoding: chunked\r\n" +
+		"Connection: close\r\n\r\n"
+	if _, err := conn.Write([]byte(requestHead)); err != nil {
+		t.Fatalf("write head: %v", err)
+	}
+	// 4 chunks of 512 bytes = 2 KiB total, well under the 4 KiB cap.
+	chunk := bytes.Repeat([]byte("x"), 512)
+	for i := 0; i < 4; i++ {
+		fmt.Fprintf(conn, "%x\r\n", len(chunk))
+		conn.Write(chunk)
+		conn.Write([]byte("\r\n"))
+	}
+	conn.Write([]byte("0\r\n\r\n"))
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("under-limit chunked POST: got %d, want 200", resp.StatusCode)
+	}
+	if dataBytes.Load() != 2048 {
+		t.Errorf("OnData total bytes: got %d, want 2048", dataBytes.Load())
 	}
 }
 

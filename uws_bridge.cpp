@@ -394,9 +394,16 @@ extern "C" void uwsgo_app_get_static(uwsgo_app_t *app, const char *pattern,
 
 // body_limit_rejects checks the declared Content-Length against the app's
 // body_limit and writes a 413 directly without dispatching to Go if it
-// exceeds. Returns true when the request was rejected. The check is
-// best-effort: requests with no Content-Length (chunked transfer) slip
-// through and must be policed by res.Body(maxN, ...) on the Go side.
+// exceeds. Returns true when the request was rejected.
+//
+// Coverage:
+//   - Content-Length present: enforced here at request arrival,
+//     before any cgo crossing. Cheapest gate.
+//   - Content-Length absent (chunked transfer-encoded): handled on
+//     the Go side. Response.OnData and Response.Body both
+//     accumulate chunk sizes against the same body_limit and emit
+//     413 + close as soon as the total exceeds the cap. So bypass
+//     here is not a bypass overall — just a different layer.
 static bool body_limit_rejects(uwsgo_app_t *app, uWS::HttpResponse<false> *res, uWS::HttpRequest *req) {
     if (app->body_limit == 0) return false;
     auto cl = req->getHeader("content-length");

@@ -3419,11 +3419,64 @@ func (r *Response) Cork(fn func()) {
 // fires the ref is held until the response is destroyed; for the
 // Body() collector that case is covered explicitly via its own onAborted.
 func (r *Response) OnData(fn func(chunk []byte, isLast bool)) {
+	// Mirror the C++ side's Content-Length-based body_limit_rejects
+	// gate for chunked transfer-encoded requests, which have no
+	// Content-Length and therefore slip past that pre-handler check.
+	// Without this, a handler that called OnData against an
+	// unbounded chunked upload would keep accumulating bytes
+	// forever — the C++ comment acknowledged the gap and told the
+	// caller to police it themselves; we now police it here so
+	// every OnData consumer inherits the same cap as Post/Any
+	// routes with a known Content-Length.
+	//
+	// Body(maxBytes, done) already enforces its own cap; this gate
+	// applies on top, so a handler that asks for 10 MiB max but the
+	// app config sets BodyLimit=4 MiB still tops out at 4 MiB.
+	var bodyLimit int
+	if r.app != nil {
+		bodyLimit = r.app.cfg.BodyLimit
+	}
+	var total int
+	var exceeded bool
+	var released bool
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		r.releaseRef()
+	}
 	r.acquireRef()
+	// uWS rejects handler returns without either a response or an
+	// abort handler ("Returning from a request handler without
+	// responding or attaching an abort handler is forbidden!").
+	// OnData is the "I'll respond later from a chunk callback"
+	// shape, so we register a no-op aborted handler here to satisfy
+	// that check — without it, a connection abort mid-body crashes
+	// the process. The handler also releases our pinned ref so the
+	// wrapper can recycle even when the client disconnects.
+	r.inner.onAborted(release)
 	r.inner.onData(func(chunk []byte, isLast bool) {
+		if exceeded {
+			// Already emitted 413 — swallow tail chunks until
+			// isLast so we can release the wrapper ref once.
+			if isLast {
+				release()
+			}
+			return
+		}
+		total += len(chunk)
+		if bodyLimit > 0 && total > bodyLimit {
+			exceeded = true
+			r.Send(413, "text/plain; charset=utf-8", "payload too large\n")
+			if isLast {
+				release()
+			}
+			return
+		}
 		fn(chunk, isLast)
 		if isLast {
-			r.releaseRef()
+			release()
 		}
 	})
 }
