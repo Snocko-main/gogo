@@ -368,19 +368,26 @@ func verifyJWT(tok string, verify jwtVerifier, expectedAlg string, leeway time.D
 
 	now := time.Now()
 	if expRaw, ok := claims["exp"]; ok {
-		if expF, ok := expRaw.(float64); ok {
-			expT := time.Unix(int64(expF), 0)
-			if now.After(expT.Add(leeway)) {
-				return nil, errors.New("token expired")
-			}
+		// Reject non-numeric exp claims rather than silently skipping
+		// the expiration check — a token carrying `"exp": "tomorrow"`
+		// would otherwise pass verification with no expiry enforced.
+		expF, ok := expRaw.(float64)
+		if !ok {
+			return nil, errors.New("malformed exp claim")
+		}
+		expT := time.Unix(int64(expF), 0)
+		if now.After(expT.Add(leeway)) {
+			return nil, errors.New("token expired")
 		}
 	}
 	if nbfRaw, ok := claims["nbf"]; ok {
-		if nbfF, ok := nbfRaw.(float64); ok {
-			nbfT := time.Unix(int64(nbfF), 0)
-			if now.Add(leeway).Before(nbfT) {
-				return nil, errors.New("token not yet valid")
-			}
+		nbfF, ok := nbfRaw.(float64)
+		if !ok {
+			return nil, errors.New("malformed nbf claim")
+		}
+		nbfT := time.Unix(int64(nbfF), 0)
+		if now.Add(leeway).Before(nbfT) {
+			return nil, errors.New("token not yet valid")
 		}
 	}
 	return claims, nil

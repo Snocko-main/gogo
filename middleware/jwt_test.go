@@ -139,6 +139,60 @@ func TestJWTExpired(t *testing.T) {
 	}
 }
 
+// TestJWTNonNumericExp asserts that a token carrying a non-numeric `exp`
+// claim (e.g. "tomorrow" instead of a Unix timestamp) is rejected as
+// malformed instead of silently skipping the expiration check.
+// Regression test for the security review finding: the previous
+// implementation type-asserted to float64 and skipped the check when
+// the assertion failed, letting attackers forge tokens with no expiry.
+func TestJWTNonNumericExp(t *testing.T) {
+	secret := []byte("test-secret-test-secret-AAAAAAAA")
+	tok, _ := middleware.SignJWT(middleware.JWTHS256, secret, map[string]any{
+		"sub": "x",
+		"exp": "tomorrow", // string, not numeric
+	})
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.JWT(middleware.JWTOptions{Secret: secret}))
+		app.Get("/me", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/me", port), nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, _ := noKeepaliveClient.Do(req)
+	resp.Body.Close()
+	if resp.StatusCode != 401 {
+		t.Fatalf("non-numeric exp not rejected: got %d, want 401", resp.StatusCode)
+	}
+}
+
+// TestJWTNonNumericNbf is the not-before twin of TestJWTNonNumericExp:
+// a string-typed `nbf` claim must be rejected, not silently skipped.
+func TestJWTNonNumericNbf(t *testing.T) {
+	secret := []byte("test-secret-test-secret-AAAAAAAA")
+	tok, _ := middleware.SignJWT(middleware.JWTHS256, secret, map[string]any{
+		"sub": "x",
+		"nbf": []any{1, 2, 3}, // array, not numeric
+	})
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.JWT(middleware.JWTOptions{Secret: secret}))
+		app.Get("/me", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/me", port), nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, _ := noKeepaliveClient.Do(req)
+	resp.Body.Close()
+	if resp.StatusCode != 401 {
+		t.Fatalf("non-numeric nbf not rejected: got %d, want 401", resp.StatusCode)
+	}
+}
+
 func TestJWTOptional(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.Use(middleware.JWT(middleware.JWTOptions{

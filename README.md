@@ -40,7 +40,8 @@ It is intentionally thin:
   - [Sync middleware](#sync-middleware)
   - [Async middleware](#async-middleware)
   - [Bundled middleware](#bundled-middleware)
-  - [Logger, Request ID, CORS, Rate Limiting, JWT](#bundled-middleware)
+  - [RequestID — 128-bit IDs](#requestid--128-bit-ids)
+  - [RateLimit memory cap](#ratelimit-memory-cap)
   - [Sessions](#sessions)
 - [Database Connection](#database-connection)
 - [Server-Sent Events](#server-sent-events-sse)
@@ -52,6 +53,8 @@ It is intentionally thin:
 - [Multi-core](#multi-core)
 - [Graceful Shutdown](#graceful-shutdown)
 - [Configuration](#configuration)
+  - [TrustProxy and client IPs](#trustproxy-and-client-ips)
+  - [Redirect and open redirects](#redirect-and-open-redirects)
 - [Error Handling & Panic Recovery](#error-handling--panic-recovery)
 - [Caveats](#caveats)
 - [Benchmarking](#benchmarking)
@@ -484,7 +487,7 @@ import (
     mw "github.com/Snocko-main/gogo/middleware"
 )
 
-app.Use(mw.RequestID())                              // X-Request-ID
+app.Use(mw.RequestID())                              // X-Request-ID, 128-bit
 app.Use(mw.Logger(mw.LoggerOptions{
     Format:    mw.JSONFormat,                        // structured logs
     SkipPaths: []string{"/healthz", "/metrics"},
@@ -497,8 +500,9 @@ app.Use(mw.CORS(mw.CORSOptions{
 app.Use(mw.Helmet())                                  // common security headers
 app.Use(mw.Compress())                                // gzip / deflate
 app.Use(mw.RateLimit(mw.RateLimitOptions{
-    Max:    100,
-    Window: time.Minute,                              // 100 req / IP / minute
+    Max:        100,
+    Window:     time.Minute,                          // 100 req / IP / minute
+    MaxBuckets: 100_000,                              // see "RateLimit memory cap" below
 }))
 app.Use("/admin/*", mw.BasicAuth(mw.BasicAuthOptions{
     Users: map[string]string{"alice": "secret"},
@@ -522,6 +526,91 @@ metrics := mw.NewMetrics()
 app.Use(metrics.Middleware())
 app.Get("/metrics", metrics.Handler())
 ```
+
+### RequestID — 128-bit IDs
+
+`mw.RequestID()` emits **32-hex-char IDs (128 bits of entropy)** by default.
+Drop-in compatible with most tracing systems, but worth checking before
+upgrade if your downstream pipeline hard-codes ID length:
+
+- ❌ `VARCHAR(16)` / `CHAR(16)` columns will silently truncate — widen to
+  `VARCHAR(64)` or `TEXT`.
+- ❌ Regex like `^[a-f0-9]{16}$` — drop the count or update to `{32}`.
+- ✅ Treating the ID as an opaque string anywhere (logs, JSON, headers).
+
+If you must keep 16-char IDs for an existing parser, plug a custom
+generator:
+
+```go
+import (
+    "crypto/rand"
+    "encoding/hex"
+)
+
+app.Use(mw.RequestID(mw.RequestIDOptions{
+    Generator: func() string {
+        var buf [8]byte
+        rand.Read(buf[:])
+        return hex.EncodeToString(buf[:])   // 16 chars, 64-bit entropy
+    },
+}))
+```
+
+The 64-bit variant has measurable collision risk past ~10⁹ IDs (≈ 30 req/s
+for a year). 128 bits keeps collision probability astronomically low — use
+the default for new systems.
+
+### RateLimit memory cap
+
+`MemoryRateLimitStore` is capped at **100,000 buckets** by default to
+protect against attacker-driven cardinality explosion. When the cap is
+hit the store evicts expired buckets first, then drops the oldest-`resetAt`
+bucket.
+
+The cap binds tightly when your `KeyFunc` returns many distinct values
+per window — user IDs, API keys, tokens, headers. For `KeyFunc = req.IP()`
+behind a CDN it almost never binds.
+
+| `KeyFunc` returns        | Typical cardinality      | 100k enough? |
+| ------------------------ | ------------------------ | ------------ |
+| `req.IP()` behind a CDN  | 1 (the CDN's address)    | yes          |
+| `req.IP()` public-facing | ~50k unique IPs/min      | yes          |
+| `userID` (SaaS, 10k DAU) | ~10k                     | yes          |
+| `apiKey` for a partner-heavy API | 500k+            | **raise it** |
+| Header you don't control (User-Agent, etc.) | unbounded | the cap is the protection |
+
+Raise it when you know cardinality is high:
+
+```go
+app.Use(mw.RateLimit(mw.RateLimitOptions{
+    Max:        100,
+    Window:     time.Minute,
+    KeyFunc:    func(req *gogo.Request) string { return req.Local("userID").(string) },
+    MaxBuckets: 2_000_000,                    // ~200 MiB worst case
+}))
+```
+
+Set `MaxBuckets: -1` to disable the cap entirely (tests only — re-introduces
+the OOM risk).
+
+For multi-instance fleets, plug a Redis-backed `RateLimitStore` instead —
+the cap is irrelevant when state lives in Redis, and counters stay
+consistent across instances:
+
+```go
+app.Use(mw.RateLimit(mw.RateLimitOptions{
+    Max:    100,
+    Window: time.Minute,
+    Store:  &MyRedisStore{client: redisClient},   // implement RateLimitStore
+}))
+```
+
+**Side effect when the cap binds**: eviction resets the rate-limit counter
+for the evicted key. An attacker spamming new keys to fill the cap will
+push legitimate users' buckets out faster than their window naturally
+expires, effectively *weakening* the rate limit for those users. The cap
+itself is a memory-safety bound — pair with `KeyFunc` choices that don't
+let unauthenticated clients invent unlimited keys.
 
 ### Sessions
 
@@ -958,7 +1047,71 @@ app, _ := gogo.NewApp(gogo.Config{
 | `BodyLimit`     | 4 MiB   | Reject Content-Length > limit with 413 on the C++ side  |
 | `BindAddr`      | `""`    | Empty = all interfaces (`0.0.0.0`)                      |
 | `CapturePeerIP` | `false` | Snapshot peer IP for async / shared-dispatch paths      |
-| `TrustProxy`    | `false` | Honor `X-Forwarded-Proto` in `req.Protocol()`/`Secure()` |
+| `TrustProxy`    | `false` | Honor `X-Forwarded-*` in `Protocol()`/`Secure()`/`IPs()` |
+
+### TrustProxy and client IPs
+
+When `TrustProxy` is **off** (the default), the framework treats every
+`X-Forwarded-*` header as untrusted attacker input:
+
+- `req.Protocol()` / `req.Secure()` ignore `X-Forwarded-Proto`.
+- `req.IPs()` returns `nil` (the X-Forwarded-For chain is not exposed).
+- `req.IP()` returns the immediate TCP peer — the proxy itself if you have one.
+
+Turn `TrustProxy` **on** only when the server actually sits behind a
+trusted reverse proxy (nginx, an L7 load balancer, a CDN with origin
+shielding). Once on, the leftmost entry in `req.IPs()` is the client IP
+as reported by your proxy chain.
+
+```go
+// Behind a CDN — opt in so req.IPs() returns the real client.
+app, _ := gogo.NewApp(gogo.Config{TrustProxy: true})
+
+app.Get("/whoami", func(res *gogo.Response, req *gogo.Request) {
+    ips := req.IPs()
+    client := req.IP()
+    if len(ips) > 0 {
+        client = ips[0]                      // leftmost = original client
+    }
+    res.Send(200, "text/plain", "you are "+client+"\n")
+})
+```
+
+Internet-facing servers that read X-Forwarded-For anyway (against
+recommendation) must call `req.Header("x-forwarded-for")` and parse it
+themselves, accepting that any client can forge the value.
+
+### Redirect and open redirects
+
+`res.Redirect(loc, code)` writes any string into the `Location` header
+that gogo can validate is free of header-injection control characters
+(CR/LF/NUL — those return 500 without panicking). The framework does
+**NOT** validate that the target stays within your own host.
+
+Passing user-controlled input straight to `Redirect` is an open-redirect
+bug — attackers craft links that look like your domain but bounce to a
+phishing page:
+
+```go
+// ❌ Vulnerable
+app.Get("/login", func(res *gogo.Response, req *gogo.Request) {
+    res.Redirect(req.QueryParam("next"), 302)    // attacker: ?next=https://evil.com
+})
+
+// ✅ Safe — validate against an allow-list
+var safeNextPaths = map[string]bool{"/": true, "/dashboard": true, "/profile": true}
+
+app.Get("/login", func(res *gogo.Response, req *gogo.Request) {
+    next := req.QueryParam("next")
+    if !safeNextPaths[next] {
+        next = "/"
+    }
+    res.Redirect(next, 302)
+})
+```
+
+For more flexible targets, parse the URL and verify the host matches
+your own before redirecting.
 
 ## Error Handling & Panic Recovery
 
@@ -1002,6 +1155,16 @@ app.MethodNotAllowed(func(res *gogo.Response, req *gogo.Request) {
   wildcards.
 - TLS / HTTP/2 are out of scope here; terminate at a reverse proxy
   (nginx, Caddy, an L7 load balancer).
+- `req.IPs()` returns `nil` unless `Config.TrustProxy=true` — see
+  [TrustProxy and client IPs](#trustproxy-and-client-ips).
+- `res.Redirect` does not protect against open redirects — caller must
+  allow-list targets. See [Redirect and open redirects](#redirect-and-open-redirects).
+- `mw.RequestID()` emits 32-hex-char (128-bit) IDs by default — see
+  [RequestID — 128-bit IDs](#requestid--128-bit-ids) if you have a
+  downstream parser that hard-codes 16-char IDs.
+- `mw.RateLimit()` caps the in-memory store at 100k buckets — raise via
+  `MaxBuckets` or plug a Redis store for high-cardinality keys. See
+  [RateLimit memory cap](#ratelimit-memory-cap).
 
 ## Examples
 

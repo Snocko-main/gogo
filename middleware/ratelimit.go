@@ -41,6 +41,17 @@ type RateLimitOptions struct {
 	// Provide an implementation backed by Redis / Memcache for
 	// distributed deployments.
 	Store RateLimitStore
+
+	// MaxBuckets caps the in-memory store's bucket count to bound
+	// memory growth under high key cardinality (e.g. attacker spam
+	// with a unique key per request). When the cap is hit the store
+	// sweeps expired buckets first; if that still doesn't free space,
+	// the OLDEST remaining bucket (by resetAt) is evicted to make
+	// room. Zero (default) means 100_000 — enough for legitimate
+	// fleets, low enough that worst-case memory stays under ~10 MiB.
+	// Negative disables the cap (not recommended outside tests).
+	// Only consulted when Store is the default MemoryRateLimitStore.
+	MaxBuckets int
 }
 
 // RateLimitStore abstracts the bucket backend so production
@@ -77,7 +88,16 @@ func RateLimit(opt RateLimitOptions) mwhint.Hinted {
 		opt.KeyFunc = func(req *gogo.Request) string { return req.IP() }
 	}
 	if opt.Store == nil {
-		opt.Store = NewMemoryRateLimitStore()
+		mem := NewMemoryRateLimitStore()
+		switch {
+		case opt.MaxBuckets == 0:
+			mem.maxBuckets = 100_000
+		case opt.MaxBuckets > 0:
+			mem.maxBuckets = opt.MaxBuckets
+		default:
+			mem.maxBuckets = 0 // negative → disabled
+		}
+		opt.Store = mem
 	}
 	maxStr := strconv.Itoa(opt.Max)
 
@@ -117,12 +137,20 @@ func RateLimit(opt RateLimitOptions) mwhint.Hinted {
 
 // MemoryRateLimitStore is the default in-memory backend for RateLimit.
 // Counters are kept in a map[string]*rateBucket protected by a single
-// mutex; suitable for a single process at moderate QPS. Idle buckets
-// are reclaimed lazily on access — call GC manually if you have a
-// long-tailed key distribution and want bounded memory.
+// mutex; suitable for a single process at moderate QPS.
+//
+// Memory is bounded by maxBuckets (set via RateLimitOptions.MaxBuckets,
+// default 100_000): when the cap is reached Hit first sweeps expired
+// buckets, then evicts the oldest-resetAt remaining bucket to make
+// room — so the worst-case footprint stays predictable even under
+// high-cardinality key spam (per-user-agent, per-token, etc.).
+//
+// GC may also be called manually to reclaim space before the cap is
+// hit; otherwise the lazy sweep inside Hit covers the common case.
 type MemoryRateLimitStore struct {
-	mu      sync.Mutex
-	buckets map[string]*rateBucket
+	mu         sync.Mutex
+	buckets    map[string]*rateBucket
+	maxBuckets int // 0 = unbounded; set by RateLimit constructor
 }
 
 type rateBucket struct {
@@ -131,26 +159,59 @@ type rateBucket struct {
 }
 
 // NewMemoryRateLimitStore returns an empty in-memory store ready for
-// use as RateLimitOptions.Store.
+// use as RateLimitOptions.Store. The store is unbounded by default
+// when used directly; routing it through RateLimit applies the
+// MaxBuckets cap (default 100_000) automatically.
 func NewMemoryRateLimitStore() *MemoryRateLimitStore {
 	return &MemoryRateLimitStore{buckets: make(map[string]*rateBucket)}
 }
 
 // Hit implements RateLimitStore. The window rolls forward to
 // now+window the first time a key is seen, and on every reset crossing
-// thereafter.
+// thereafter. When maxBuckets is configured and the store is at
+// capacity for a brand-new key, expired buckets are reclaimed first;
+// if that doesn't free space the oldest-resetAt bucket is evicted.
 func (s *MemoryRateLimitStore) Hit(key string, window time.Duration) (int, time.Time) {
 	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	b, ok := s.buckets[key]
 	if !ok || now.After(b.resetAt) {
+		if !ok && s.maxBuckets > 0 && len(s.buckets) >= s.maxBuckets {
+			s.evictLocked(now)
+		}
 		b = &rateBucket{count: 1, resetAt: now.Add(window)}
 		s.buckets[key] = b
 		return 1, b.resetAt
 	}
 	b.count++
 	return b.count, b.resetAt
+}
+
+// evictLocked sweeps expired buckets and, if still over capacity,
+// drops the bucket with the earliest resetAt. Caller must hold s.mu.
+func (s *MemoryRateLimitStore) evictLocked(now time.Time) {
+	for k, b := range s.buckets {
+		if now.After(b.resetAt) {
+			delete(s.buckets, k)
+		}
+	}
+	if s.maxBuckets <= 0 || len(s.buckets) < s.maxBuckets {
+		return
+	}
+	// Still full — drop the oldest-resetAt bucket. O(N) scan, but
+	// only runs when the cap binds; the common path stays O(1).
+	var oldestKey string
+	var oldestReset time.Time
+	for k, b := range s.buckets {
+		if oldestKey == "" || b.resetAt.Before(oldestReset) {
+			oldestKey = k
+			oldestReset = b.resetAt
+		}
+	}
+	if oldestKey != "" {
+		delete(s.buckets, oldestKey)
+	}
 }
 
 // GC removes buckets whose window has already expired. Call

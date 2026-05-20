@@ -17,7 +17,7 @@ import (
 const RequestIDLocalKey = "gogo.requestID"
 
 // RequestIDOptions configures RequestID. Zero value reads / sets
-// X-Request-ID and generates 16-hex-char IDs from crypto/rand.
+// X-Request-ID and generates 32-hex-char (128-bit) IDs from crypto/rand.
 type RequestIDOptions struct {
 	// Header is the request/response header name carrying the ID.
 	// Default "X-Request-ID". Some shops prefer X-Correlation-ID or
@@ -26,9 +26,9 @@ type RequestIDOptions struct {
 	Header string
 
 	// Generator produces a new ID when the request has no incoming
-	// value. Default generates 16 random hex characters (8 bytes of
-	// crypto/rand). Replace with uuid.NewString or a ULID generator
-	// for systems with established conventions.
+	// value. Default generates 32 random hex characters (16 bytes of
+	// crypto/rand, 128 bits of entropy). Replace with uuid.NewString
+	// or a ULID generator for systems with established conventions.
 	Generator func() string
 }
 
@@ -71,17 +71,18 @@ func RequestID(opts ...RequestIDOptions) mwhint.Hinted {
 	})}
 }
 
-// defaultRequestID generates 16 hex characters from 8 bytes of
-// crypto/rand. Effectively zero collision risk for any reasonable
-// QPS / retention window.
+// defaultRequestID generates 32 hex characters (128 bits) from
+// crypto/rand. 128 bits keeps collision probability negligible even
+// at >10^15 IDs and matches the entropy of FastRequestIDGenerator —
+// the previous 64-bit default could collide in long-retention traces.
 func defaultRequestID() string {
-	var buf [8]byte
+	var buf [16]byte
 	if _, err := rand.Read(buf[:]); err != nil {
 		// crypto/rand.Read should never fail on modern OSes; if it
 		// does we fall back to a constant so the pipeline doesn't
 		// break. Production deployments should set their own
 		// Generator if they need stricter guarantees.
-		return "00000000-rand-fail"
+		return "00000000000000000000000000000000"
 	}
 	return hex.EncodeToString(buf[:])
 }

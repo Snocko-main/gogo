@@ -2842,7 +2842,10 @@ func TestRequestIntrospection(t *testing.T) {
 		secure   bool
 	}
 	var sync, async, shared atomic.Pointer[captured]
-	port, teardown := startAppCfg(t, gogo.Config{CapturePeerIP: true}, func(app *gogo.App) {
+	// TrustProxy enables IPs() — without it the helper deliberately
+	// returns nil since the X-Forwarded-For header is attacker-controlled
+	// on an internet-facing server.
+	port, teardown := startAppCfg(t, gogo.Config{CapturePeerIP: true, TrustProxy: true}, func(app *gogo.App) {
 		app.Get("/sync", func(res *gogo.Response, req *gogo.Request) {
 			sync.Store(&captured{
 				ip:       req.IP(),
@@ -2973,8 +2976,47 @@ func TestPeerIPDefaultOff(t *testing.T) {
 	}
 }
 
+// TestIPsRequiresTrustProxy asserts that Request.IPs() returns nil
+// unless Config.TrustProxy is true — the X-Forwarded-For header is
+// attacker-controlled when the server faces the public internet
+// directly, so exposing it via a typed helper would let any client
+// spoof their apparent identity to a logger or rate limiter.
+func TestIPsRequiresTrustProxy(t *testing.T) {
+	type result struct {
+		ips []string
+	}
+	var captured atomic.Pointer[result]
+
+	// CapturePeerIP enabled so the snapshot path has something to
+	// read; TrustProxy intentionally left at false (the default).
+	port, teardown := startAppCfg(t, gogo.Config{CapturePeerIP: true}, func(app *gogo.App) {
+		app.Get("/", func(res *gogo.Response, req *gogo.Request) {
+			captured.Store(&result{ips: req.IPs()})
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/", port), nil)
+	req.Header.Set("X-Forwarded-For", "10.0.0.1, 10.0.0.2")
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	resp.Body.Close()
+
+	got := captured.Load()
+	if got == nil {
+		t.Fatal("handler did not record IPs result")
+	}
+	if got.ips != nil {
+		t.Errorf("IPs() returned %v with TrustProxy=false; want nil so spoofed X-Forwarded-For is not exposed", got.ips)
+	}
+}
+
 // TestResponseRedirect: status defaults to 302; Location header is set;
-// body is empty. CRLF in location panics at the validation gate.
+// body is empty. CRLF in location is rejected with a 500 (panic-free)
+// so a malicious request can't trigger the panic handler on every hit.
 func TestResponseRedirect(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.Get("/r1", func(res *gogo.Response, req *gogo.Request) {
@@ -2984,11 +3026,6 @@ func TestResponseRedirect(t *testing.T) {
 			res.Redirect("/perm", 301)
 		})
 		app.Get("/inject", func(res *gogo.Response, req *gogo.Request) {
-			defer func() {
-				if r := recover(); r != nil {
-					res.Send(400, "text/plain", "rejected")
-				}
-			}()
 			res.Redirect("/x\r\nX-Bad: 1", 302)
 		})
 	})
@@ -3028,10 +3065,15 @@ func TestResponseRedirect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("/inject: %v", err)
 	}
-	b, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode != 400 || !strings.Contains(string(b), "rejected") {
-		t.Errorf("CRLF injection not rejected: %d %q", resp.StatusCode, string(b))
+	_ = resp.Body.Close()
+	if resp.StatusCode != 500 {
+		t.Errorf("CRLF injection not rejected with 500: status=%d", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "" {
+		t.Errorf("CRLF injection wrote Location header: %q", loc)
+	}
+	if extra := resp.Header.Get("X-Bad"); extra != "" {
+		t.Errorf("CRLF injection smuggled a header: X-Bad=%q", extra)
 	}
 }
 

@@ -93,6 +93,20 @@ func validateHeaderValue(key, value string) {
 	}
 }
 
+// containsCtlForHeader is the panic-free twin of validateHeaderValue used
+// on code paths where the input typically comes from a request (so a
+// hostile peer should not be able to trigger a panic by simply sending
+// a malformed value).
+func containsCtlForHeader(value string) bool {
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if c == '\r' || c == '\n' || c == 0 {
+			return true
+		}
+	}
+	return false
+}
+
 var (
 	// Pre-grow pendingHeaders to a small capacity so middleware
 	// that buffers a handful of headers (CORS: 3-4, Helmet: ~10)
@@ -627,8 +641,12 @@ func (a *App) applyMeta(meta *routeMeta, h Handler) Handler {
 // friends would see res.app == nil on every async-route request.
 func (a *App) applyAppRefAsync(h AsyncHandler) AsyncHandler {
 	app := a
+	trustProxy := a.cfg.TrustProxy
 	return func(res *Response, req *Request) {
 		res.app = app
+		if trustProxy {
+			req.trustProxy = true
+		}
 		h(res, req)
 	}
 }
@@ -2478,8 +2496,18 @@ func validJSONPCallback(s string) bool {
 // default), 303 (see other — POST → GET), 307 (temp, preserves method),
 // 308 (permanent, preserves method). Status 0 defaults to 302.
 //
-// The location string is validated against CRLF / NUL injection before
-// being written into the Location header.
+// CRLF / NUL in location is treated as a programming or input-validation
+// bug: the framework refuses to write the bad header and responds 500
+// instead of panicking. This keeps a hostile request from amplifying
+// into a panic-handler trigger when handler code passes user input
+// straight to Redirect (e.g. res.Redirect(req.QueryParam("next"), 302)).
+//
+// SECURITY: gogo does NOT validate that location stays within your own
+// host. Passing user-controlled input here without a host allow-list is
+// an open-redirect bug — attackers can craft links that look like they
+// land on your site but bounce to a phishing page. Sanitize the target
+// (compare against a known list of paths or hostnames) before calling
+// Redirect.
 //
 // In async mode this schedules a Cork on the loop so the status, Location
 // header, and empty body go out as a single packet; do not call Send /
@@ -2488,8 +2516,16 @@ func (r *Response) Redirect(location string, code int) {
 	if code == 0 {
 		code = 302
 	}
+	if containsCtlForHeader(location) {
+		// Untrusted input that would inject a header break. Report so
+		// operators see it, but don't panic — that turns one bad
+		// request into a 500 storm via the panic handler. Send a
+		// plain 500 instead.
+		reportPanic(fmt.Errorf("gogo: Redirect: location contains a control character (CR/LF/NUL); responding 500"))
+		r.Send(500, "text/plain; charset=utf-8", "internal error\n")
+		return
+	}
 	r.statusCode = code
-	validateHeaderValue("Location", location)
 	line := statusLine(code)
 	if r.async != nil && !r.async.sent {
 		r.async.sent = true
@@ -3582,7 +3618,17 @@ func (r *Request) IP() string {
 // the proxies appended them (leftmost = original client). Returns nil if
 // the header is absent or empty. Trim trailing whitespace and strip the
 // optional port suffix on each entry.
+//
+// Returns nil when Config.TrustProxy is false — without that flag, the
+// X-Forwarded-For header is attacker-controlled and any IP in it should
+// be treated as untrusted input, not exposed via this helper. Callers
+// that genuinely need the raw header value on an internet-facing server
+// (rare, and almost always a logging mistake) can read it via
+// req.Header("x-forwarded-for") and parse it themselves.
 func (r *Request) IPs() []string {
+	if !r.trustProxy {
+		return nil
+	}
 	xff := r.Header("x-forwarded-for")
 	if xff == "" {
 		return nil
