@@ -2365,10 +2365,33 @@ func (r *Response) Stream(status int, contentType string, fn func(w io.Writer) e
 	return fnErr
 }
 
+// StreamBackpressureBytes is the high-water mark, in bytes of uWS's
+// per-socket send buffer, at which streamWriter.Write automatically
+// parks the calling goroutine on AwaitDrain. The check fires after
+// every successful chunk write — a slow consumer therefore can't
+// drive the Go producer faster than the kernel can flush.
+//
+// Default 1 MiB. Set to 0 to disable the automatic check (the
+// handler is then responsible for invoking BufferedAmount /
+// AwaitDrain itself, the pre-default behavior).
+//
+// The same threshold protects every Stream / SSE caller — file
+// serving paths still use SendFileBackpressureBytes for its own
+// reads-from-disk loop.
+var StreamBackpressureBytes uint64 = 1 << 20
+
 // streamWriter is the io.Writer handed to Stream's callback. Each
 // Write call schedules a defer to the uWS loop thread that calls
 // res->write(chunk); the cgo bridge dups the bytes before the defer
 // is queued so the caller may reuse the buffer immediately.
+//
+// After each write streamWriter consults BufferedAmount; when uWS's
+// send buffer climbs past StreamBackpressureBytes the goroutine
+// parks on AwaitDrain until uWS signals the buffer has flushed.
+// This keeps slow consumers from forcing the framework to copy
+// unbounded chunks into the C heap (one per cgo defer entry) faster
+// than the loop can drain them. Handlers that need to opt out can
+// set StreamBackpressureBytes = 0 and drive BufferedAmount manually.
 type streamWriter struct {
 	r *Response
 }
@@ -2378,6 +2401,22 @@ func (s *streamWriter) Write(p []byte) (int, error) {
 		return 0, nil
 	}
 	asyncDeferStreamWrite(s.r.async.loopPtr, s.r.async.ctxHandle, string(p))
+	threshold := StreamBackpressureBytes
+	if threshold == 0 {
+		return len(p), nil
+	}
+	if s.r.BufferedAmount() <= threshold {
+		return len(p), nil
+	}
+	// uWS is buffering more than threshold for this socket — park
+	// here so we don't queue another cgo defer (each of which heap-
+	// copies the chunk on the C side) until the consumer catches up.
+	if err := s.r.AwaitDrain(threshold); err != nil {
+		// Stream is aborted (client disconnected). The bytes we just
+		// queued may or may not have made the wire; surface the error
+		// so the user's stream loop can stop emitting.
+		return len(p), err
+	}
 	return len(p), nil
 }
 

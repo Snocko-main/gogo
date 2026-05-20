@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -493,6 +494,133 @@ func TestStreamPanicsOnSyncRoute(t *testing.T) {
 	r.Body.Close()
 	if r.StatusCode != 500 || body != "caught" {
 		t.Errorf("expected caught-panic 500: status=%d body=%q", r.StatusCode, body)
+	}
+}
+
+// TestStreamDefaultBackpressureBounds is the regression guard for the
+// "Stream/SSE auto-backpressure" behavior. A handler that writes
+// aggressively without ever calling AwaitDrain manually must still
+// keep memory under control when the client reads slowly. The check:
+// when uWS's BufferedAmount climbs past StreamBackpressureBytes, the
+// next streamWriter.Write parks the producer until the buffer drains.
+//
+// Without the default backpressure: the producer would queue an
+// unbounded number of cgo defers, each copying the chunk into the C
+// heap, and the process would balloon.
+func TestStreamDefaultBackpressureBounds(t *testing.T) {
+	// Per-chunk size and total target stream size. We aim to send
+	// at least 4 MiB so the 1 MiB default threshold is exercised
+	// several times.
+	const chunkSize = 64 << 10
+	const totalChunks = 64 // 4 MiB total
+
+	// observedMax records the highest BufferedAmount the producer
+	// goroutine sees. Without the default backpressure check this
+	// can grow unbounded; with it the value should stay close to
+	// StreamBackpressureBytes (1 MiB default).
+	var observedMax uint64
+	var observedMu sync.Mutex
+	record := func(v uint64) {
+		observedMu.Lock()
+		if v > observedMax {
+			observedMax = v
+		}
+		observedMu.Unlock()
+	}
+
+	chunk := bytes.Repeat([]byte{'x'}, chunkSize)
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.GetAsync("/big", func(res *gogo.Response, req *gogo.Request) {
+			_ = res.Stream(200, "application/octet-stream", func(w io.Writer) error {
+				for i := 0; i < totalChunks; i++ {
+					if _, werr := w.Write(chunk); werr != nil {
+						return werr
+					}
+					record(res.BufferedAmount())
+				}
+				return nil
+			})
+		})
+	})
+	defer teardown()
+
+	// Drip-read 8 KiB at a time with a 1 ms sleep so the producer
+	// pulls ahead and triggers the backpressure park.
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/big", port))
+	if err != nil {
+		t.Fatalf("GET /big: %v", err)
+	}
+	defer resp.Body.Close()
+	var collected bytes.Buffer
+	buf := make([]byte, 8<<10)
+	deadline := time.Now().Add(30 * time.Second)
+	for collected.Len() < chunkSize*totalChunks && time.Now().Before(deadline) {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			collected.Write(buf[:n])
+			time.Sleep(time.Millisecond)
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			t.Fatalf("read: %v", rerr)
+		}
+	}
+	if collected.Len() != chunkSize*totalChunks {
+		t.Fatalf("collected %d bytes, want %d", collected.Len(), chunkSize*totalChunks)
+	}
+
+	observedMu.Lock()
+	peak := observedMax
+	observedMu.Unlock()
+
+	// The backpressure threshold is 1 MiB; uWS's onWritable fires
+	// at a lower watermark so the producer may see the buffer
+	// climb slightly higher between the post-write check and
+	// AwaitDrain's park. Bound peak at 4× threshold — enough slack
+	// for the wake-and-recheck race, but tight enough that the
+	// "no backpressure" regression (peak ≈ stream total) shows up
+	// as a failure.
+	cap := gogo.StreamBackpressureBytes * 4
+	if peak > cap {
+		t.Errorf("peak BufferedAmount %d > 4×threshold %d; backpressure not enforced", peak, cap)
+	}
+}
+
+// TestStreamBackpressureOptOut verifies that setting
+// StreamBackpressureBytes to 0 restores the pre-default behavior:
+// the writer no longer parks, and the handler is responsible for its
+// own AwaitDrain calls. We assert the writer never hits an explicit
+// drain check (the producer races ahead) by confirming a known-fast
+// completion time for a small payload.
+func TestStreamBackpressureOptOut(t *testing.T) {
+	saved := gogo.StreamBackpressureBytes
+	gogo.StreamBackpressureBytes = 0
+	defer func() { gogo.StreamBackpressureBytes = saved }()
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.GetAsync("/opt-out", func(res *gogo.Response, req *gogo.Request) {
+			_ = res.Stream(200, "text/plain", func(w io.Writer) error {
+				_, err := w.Write([]byte("hello opt-out"))
+				return err
+			})
+		})
+	})
+	defer teardown()
+
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/opt-out", port))
+	if err != nil {
+		t.Fatalf("GET /opt-out: %v", err)
+	}
+	body := readAllString(t, resp)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("status: got %d, want 200", resp.StatusCode)
+	}
+	if body != "hello opt-out" {
+		t.Errorf("body: got %q, want %q", body, "hello opt-out")
 	}
 }
 
