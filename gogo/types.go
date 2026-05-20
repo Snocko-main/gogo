@@ -94,7 +94,14 @@ func validateHeaderValue(key, value string) {
 }
 
 var (
-	responsePool   = sync.Pool{New: func() any { return &Response{} }}
+	// Pre-grow pendingHeaders to a small capacity so middleware
+	// that buffers a handful of headers (CORS: 3-4, Helmet: ~10)
+	// doesn't trigger the first-request realloc storm. The backing
+	// array is retained across pool recycles, so the cost only
+	// fires once per wrapper's lifetime.
+	responsePool = sync.Pool{New: func() any {
+		return &Response{pendingHeaders: make([]responseHeader, 0, 8)}
+	}}
 	requestPool    = sync.Pool{New: func() any { return &Request{} }}
 	asyncStatePool = sync.Pool{New: func() any { return &asyncState{} }}
 )
@@ -1962,19 +1969,63 @@ func (r *Response) Status(code int) *Response {
 	return r
 }
 
-// flushPendingHeaders writes every buffered header to the wire via
-// cgo. Must be called after status was written (or auto-200'd). Resets
+// headerBlobPool holds the packing buffer used by
+// flushPendingHeaders for the 2+ headers path. Pooling the buffer
+// eliminates the per-request heap allocation that strings.Builder
+// otherwise produced — at 70k RPS that was ~18 MB/sec of garbage
+// that swamped the cgo savings the batch path was meant to
+// capture. The pool's New function pre-grows each fresh buffer to
+// 512 bytes (8 headers × 64 bytes average — wide enough to absorb
+// Helmet-sized stacks without ever reallocating).
+var headerBlobPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 512)
+		return &b
+	},
+}
+
+// flushPendingHeaders writes every buffered header to the wire.
+// Must be called after status was written (or auto-200'd). Resets
 // the buffer length to zero so the same response wrapper recycled
-// later doesn't re-emit stale headers. Cheap no-op when the slice is
-// empty (which is the common case — no buffered headers means no
-// middleware that added them).
+// later doesn't re-emit stale headers. Cheap no-op when the slice
+// is empty (which is the common case — no buffered headers means
+// no middleware that added them).
+//
+// One-header fast path uses the single-call header() bridge (one
+// cgo crossing). Two-or-more-headers batches the writes via
+// headersBatch() — packs the headers into a pooled key\0value\0…
+// buffer and crosses once for the whole set. With CORS adding 3–4
+// headers per request this saves (N-1) cgo crossings per response
+// at the cost of the append loop. The buffer comes from a
+// sync.Pool so the hot path allocates nothing.
 func (r *Response) flushPendingHeaders() {
-	if len(r.pendingHeaders) == 0 {
+	n := len(r.pendingHeaders)
+	if n == 0 {
 		return
 	}
-	for _, h := range r.pendingHeaders {
+	if n == 1 {
+		h := r.pendingHeaders[0]
 		r.inner.header(h.name, h.value)
+		r.pendingHeaders = r.pendingHeaders[:0]
+		return
 	}
+	// 2+ headers: pack once, cross once. Buffer is pooled to
+	// avoid per-request heap churn under sustained load.
+	bufp := headerBlobPool.Get().(*[]byte)
+	buf := (*bufp)[:0]
+	for _, h := range r.pendingHeaders {
+		buf = append(buf, h.name...)
+		buf = append(buf, 0)
+		buf = append(buf, h.value...)
+		buf = append(buf, 0)
+	}
+	r.inner.headersBatch(buf, n)
+	// Stash the (possibly grown) backing array back into the pool
+	// so the next request inherits the capacity. Empty the buffer
+	// before return so a recycled []byte never carries stale
+	// content past a Get / Put boundary.
+	*bufp = buf[:0]
+	headerBlobPool.Put(bufp)
 	r.pendingHeaders = r.pendingHeaders[:0]
 }
 

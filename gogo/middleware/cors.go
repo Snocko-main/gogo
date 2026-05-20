@@ -92,6 +92,11 @@ func CORS(opts ...CORSOptions) mwhint.Hinted {
 		maxAgeStr = strconv.Itoa(opt.MaxAge)
 	}
 	allowAny := len(opt.AllowOrigins) == 1 && opt.AllowOrigins[0] == "*"
+	// Compile patterns ONCE at construction so the request hot
+	// path is a single ToLower(origin) plus direct == / HasPrefix
+	// / HasSuffix comparisons. The old EqualFold-per-pattern
+	// path repeated the same case-folding work on every request.
+	compiledOrigins := compileOrigins(opt.AllowOrigins)
 
 	return mwhint.Hinted{Place: mwhint.Both, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler {
 		return func(res *gogo.Response, req *gogo.Request) {
@@ -99,7 +104,7 @@ func CORS(opts ...CORSOptions) mwhint.Hinted {
 			allowed := ""
 			if allowAny && !opt.AllowCredentials {
 				allowed = "*"
-			} else if origin != "" && matchOrigin(opt.AllowOrigins, origin) {
+			} else if origin != "" && matchCompiledOrigin(compiledOrigins, origin) {
 				allowed = origin
 			}
 
@@ -155,27 +160,62 @@ func CORS(opts ...CORSOptions) mwhint.Hinted {
 	})}
 }
 
-// matchOrigin reports whether origin is allowed by the patterns in
-// allowed. Patterns are matched case-insensitively. A pattern of
-// "https://*.example.com" matches any host suffix; the wildcard must
-// follow "://".
-func matchOrigin(allowed []string, origin string) bool {
-	for _, pat := range allowed {
-		if pat == "*" {
-			return true
+// compiledOrigin is the parsed-once form of an AllowOrigins entry.
+// Exact patterns store their lowercase form in full; wildcard
+// patterns (scheme://*.domain) split into the scheme prefix and
+// the dotted suffix, both lowercase, so the request hot path is
+// pure HasPrefix / HasSuffix against a single ToLower(origin).
+type compiledOrigin struct {
+	full     string // lowercase exact match (empty if wildcard)
+	wildcard bool
+	scheme   string // lowercase, no "://" (only set when wildcard)
+	suffix   string // ".example.com" (leading dot, lowercase)
+}
+
+// compileOrigins converts the user-supplied AllowOrigins list into
+// compiledOrigin form once at middleware construction. The "*"
+// wildcard is handled outside this function (allowAny short-circuit
+// in CORS) so it does not appear in the compiled slice.
+func compileOrigins(patterns []string) []compiledOrigin {
+	out := make([]compiledOrigin, 0, len(patterns))
+	for _, p := range patterns {
+		if p == "*" {
+			// Handled by the allowAny fast path; skip so we
+			// don't accidentally lowercase the literal "*".
+			continue
 		}
-		if strings.EqualFold(pat, origin) {
-			return true
+		lp := strings.ToLower(p)
+		if idx := strings.Index(lp, "://*."); idx > 0 {
+			out = append(out, compiledOrigin{
+				wildcard: true,
+				scheme:   lp[:idx],
+				suffix:   "." + lp[idx+len("://*."):],
+			})
+			continue
 		}
-		// Wildcard subdomain support: scheme://*.domain.
-		if i := strings.Index(pat, "://*."); i > 0 {
-			scheme := pat[:i]
-			suffix := pat[i+len("://*."):]
-			lowerOrigin := strings.ToLower(origin)
-			if strings.HasPrefix(lowerOrigin, strings.ToLower(scheme)+"://") &&
-				strings.HasSuffix(lowerOrigin, "."+strings.ToLower(suffix)) {
+		out = append(out, compiledOrigin{full: lp})
+	}
+	return out
+}
+
+// matchCompiledOrigin tests whether origin matches any compiled
+// pattern. Lowercases origin once, then runs a single == /
+// HasPrefix / HasSuffix per pattern.
+func matchCompiledOrigin(compiled []compiledOrigin, origin string) bool {
+	if len(compiled) == 0 {
+		return false
+	}
+	lower := strings.ToLower(origin)
+	for _, p := range compiled {
+		if p.wildcard {
+			if strings.HasPrefix(lower, p.scheme+"://") &&
+				strings.HasSuffix(lower, p.suffix) {
 				return true
 			}
+			continue
+		}
+		if p.full == lower {
+			return true
 		}
 	}
 	return false

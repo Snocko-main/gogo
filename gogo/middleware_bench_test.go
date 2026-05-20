@@ -54,6 +54,57 @@ func runHTTPBench(b *testing.B, configure func(app *gogo.App), path string) {
 	}
 }
 
+// runHTTPBenchWithRequest is the runHTTPBench twin that builds each
+// request via http.NewRequest so the caller can stamp headers
+// (Origin, Authorization, etc.) — used by benches that exercise
+// header-conditional code paths like CORS origin matching.
+func runHTTPBenchWithRequest(b *testing.B, configure func(app *gogo.App), path string, stamp func(req *http.Request)) {
+	b.Helper()
+	port, teardown := startApp(b, configure)
+	defer teardown()
+
+	tr := &http.Transport{
+		MaxIdleConns:        16,
+		MaxIdleConnsPerHost: 16,
+		IdleConnTimeout:     30 * time.Second,
+		DisableCompression:  true,
+	}
+	defer tr.CloseIdleConnections()
+	client := &http.Client{Transport: tr, Timeout: 5 * time.Second}
+	url := fmt.Sprintf("http://127.0.0.1:%d%s", port, path)
+
+	makeReq := func() *http.Request {
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			b.Fatalf("new request: %v", err)
+		}
+		if stamp != nil {
+			stamp(req)
+		}
+		return req
+	}
+
+	// Warm up the keep-alive connection and JIT path.
+	for i := 0; i < 100; i++ {
+		resp, err := client.Do(makeReq())
+		if err != nil {
+			b.Fatalf("warmup: %v", err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		resp, err := client.Do(makeReq())
+		if err != nil {
+			b.Fatalf("get: %v", err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+}
+
 // startApp's signature uses *testing.T. Provide a thin shim that lets
 // the benchmark reuse it via the testing.TB interface that both T and
 // B satisfy. Avoids duplicating the listener boilerplate.
@@ -161,4 +212,68 @@ func BenchmarkRequest_AsyncRoute_Stack(b *testing.B) {
 			res.Send(200, "text/plain", "ok")
 		})
 	}, "/x")
+}
+
+// BenchmarkRequest_SyncRoute_CORS isolates the CORS middleware on a
+// sync route. CORS sets 2-3 response headers per request (Allow-Origin,
+// Vary, optionally Expose-Headers) — the exact scenario T-1's batched
+// flushPendingHeaders targets, and T-2's pre-lowercased origins
+// shaves the per-request EqualFold loop.
+func BenchmarkRequest_SyncRoute_CORS(b *testing.B) {
+	runHTTPBench(b, func(app *gogo.App) {
+		app.Use(middleware.CORS(middleware.CORSOptions{
+			AllowOrigins:  []string{"https://app.example.com", "https://*.example.com"},
+			ExposeHeaders: []string{"X-Request-Id", "X-Rate-Limit"},
+		}))
+		app.Get("/x", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "ok")
+		})
+	}, "/x")
+}
+
+// BenchmarkRequest_SyncRoute_HeavyHeaders exercises the many-headers
+// path that T-1 (batch flushPendingHeaders) optimizes most. The
+// middleware stamps 8 response headers; without batching this
+// would cost ~8 cgo crossings per response on top of the status +
+// body crossings.
+func BenchmarkRequest_SyncRoute_HeavyHeaders(b *testing.B) {
+	runHTTPBench(b, func(app *gogo.App) {
+		app.Use(func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				res.Header("X-Service", "gogo")
+				res.Header("X-Region", "us-west-2")
+				res.Header("X-Build", "abc123")
+				res.Header("X-Trace-Id", "trace-1")
+				res.Header("Cache-Control", "no-store")
+				res.Header("Vary", "Accept-Encoding")
+				res.Header("X-Frame-Options", "DENY")
+				res.Header("X-Content-Type-Options", "nosniff")
+				next(res, req)
+			}
+		})
+		app.Get("/x", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "ok")
+		})
+	}, "/x")
+}
+
+// BenchmarkRequest_SyncRoute_CORS_OriginMatch sends an Origin header
+// matching one of two configured allow-list entries — this is the
+// path T-2 affects (origin lowercased once per request + direct ==
+// rather than EqualFold per pattern).
+func BenchmarkRequest_SyncRoute_CORS_OriginMatch(b *testing.B) {
+	runHTTPBenchWithRequest(b, func(app *gogo.App) {
+		app.Use(middleware.CORS(middleware.CORSOptions{
+			AllowOrigins: []string{
+				"https://app.example.com",
+				"https://admin.example.com",
+				"https://*.tenant.example.com",
+			},
+		}))
+		app.Get("/x", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "ok")
+		})
+	}, "/x", func(req *http.Request) {
+		req.Header.Set("Origin", "https://admin.example.com")
+	})
 }
