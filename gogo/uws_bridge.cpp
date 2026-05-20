@@ -39,6 +39,7 @@ extern "C" void uwsgoHandleWSUpgrade(
 extern "C" void uwsgoHandleDefer(uintptr_t callback_id);
 extern "C" void uwsgoHandleAborted(uintptr_t callback_id);
 extern "C" void uwsgoHandleCork(uintptr_t callback_id);
+extern "C" void uwsgoHandleDrain(uintptr_t callback_id);
 extern "C" void uwsgoHandleData(uintptr_t callback_id, const char *data, size_t len, int is_last);
 extern "C" void uwsgoReleaseHandle(uintptr_t callback_id);
 
@@ -714,6 +715,24 @@ extern "C" void uwsgo_res_write_headers_batch(uwsgo_res_t *res,
 
 extern "C" void uwsgo_res_write(uwsgo_res_t *res, const char *body, size_t body_len) {
     reinterpret_cast<uWS::HttpResponse<false> *>(res)->write(std::string_view(body, body_len));
+}
+
+// HttpResponseAccess is the C++ pattern for reaching a protected
+// base-class method: derive a class that publicly re-exports
+// AsyncSocket::getBufferedAmount and reinterpret-cast through it.
+// uWS deliberately scopes the getter to friend WebSocketContext +
+// the response itself; for our backpressure hook we need it
+// readable from the streaming caller's side.
+class HttpResponseAccess : public uWS::HttpResponse<false> {
+public:
+    using uWS::AsyncSocket<false>::getBufferedAmount;
+};
+
+// uwsgo_res_buffered_amount returns uWS's own send-queue depth in
+// bytes. Used by Go-side streaming callers to detect backpressure
+// (queue grows when the client can't drain fast enough).
+extern "C" size_t uwsgo_res_buffered_amount(uwsgo_res_t *res) {
+    return reinterpret_cast<HttpResponseAccess *>(res)->getBufferedAmount();
 }
 
 extern "C" void uwsgo_res_end(uwsgo_res_t *res, const char *body, size_t body_len) {
@@ -1501,6 +1520,41 @@ extern "C" void uwsgo_res_defer_stream_end(
         auto *r = ctx->response;
         r->end(std::string_view());
         ctx->release();
+    });
+}
+
+// uwsgo_res_defer_drain_signal arms a one-shot onWritable hook on
+// the loop thread. The next time uWS reports it can accept more
+// bytes (i.e. the send buffer drained below the high-water mark),
+// the lambda fires the Go callback and unsubscribes — the
+// caller's goroutine waiting on backpressure wakes up.
+//
+// The ctx's retain/release balance mirrors the other defer_*
+// helpers: one retain before queueing, one release after the
+// onWritable lambda runs OR the aborted short-circuit fires.
+extern "C" void uwsgo_res_defer_drain_signal(
+    uwsgo_loop_t *loop,
+    void *ctx_handle,
+    uintptr_t callback_id) {
+    auto *l = reinterpret_cast<uWS::Loop *>(loop);
+    auto *ctx = static_cast<AsyncCtx *>(ctx_handle);
+    ctx->retain();
+
+    l->defer([ctx, callback_id]() mutable {
+        if (ctx->aborted.load(std::memory_order_acquire)) {
+            uwsgoHandleDrain(callback_id);
+            ctx->release();
+            return;
+        }
+        auto *r = ctx->response;
+        // onWritable's callback returns true to keep subscribed, false
+        // to drop. We want one-shot: fire the Go callback, drop the
+        // subscription, release the ctx.
+        r->onWritable([ctx, callback_id](uintptr_t /*offset*/) mutable -> bool {
+            uwsgoHandleDrain(callback_id);
+            ctx->release();
+            return false;
+        });
     });
 }
 

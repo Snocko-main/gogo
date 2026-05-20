@@ -133,6 +133,30 @@ void uwsgo_res_send(
     const char *content_type, size_t content_type_len,
     const char *body, size_t body_len);
 
+// uwsgo_res_buffered_amount returns how many bytes uWS has accepted
+// for sending but hasn't yet flushed to the socket — the standard
+// backpressure signal. Grows when the client isn't draining fast
+// enough; shrinks as the kernel acknowledges sends.
+//
+// The read is intentionally non-locking: uWS's underlying counter
+// is a single naturally-aligned size_t in uSockets, so the read
+// returns a coherent (possibly slightly stale) snapshot even when
+// called from a worker goroutine that isn't the loop thread.
+// Callers using this as a throttle threshold should not depend on
+// exact synchronization with the loop; the value is sampled, not
+// transactional.
+size_t uwsgo_res_buffered_amount(uwsgo_res_t *res);
+
+// uwsgo_res_defer_drain_signal arms an onWritable callback on the
+// loop thread that fires the next time uWS reports it can accept
+// more bytes. The Go callback (uwsgoHandleDrain) flips a Go-side
+// atomic so a worker goroutine waiting on backpressure can wake.
+// Implemented inside the async/stream subsystem; a separate
+// helper because the standard sync-mode response wrapper does not
+// own a loop pointer to defer onto.
+void uwsgo_res_defer_drain_signal(uwsgo_loop_t *loop, void *ctx,
+    uintptr_t callback_id);
+
 // uwsgo_res_remote_addr writes the formatted peer IP into buffer (returns
 // the size needed if buffer is too small or NULL). uWS caches the
 // formatted string on first call so this is effectively free for any

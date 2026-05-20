@@ -2299,6 +2299,82 @@ func (s *streamWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// BufferedAmount returns the byte count uWS has accepted for
+// sending but not yet flushed to the kernel socket. Grows when
+// the client isn't draining fast enough — the standard
+// backpressure signal — and shrinks as the OS acknowledges
+// sends.
+//
+// Intended use is from inside a Stream callback to decide
+// whether to pause emitting more bytes:
+//
+//	res.Stream(200, "text/event-stream", func(w io.Writer) error {
+//	    for event := range events {
+//	        // Yield to the loop when uWS has > 1 MiB buffered;
+//	        // otherwise a slow client can OOM the server with
+//	        // queued chunks.
+//	        if err := res.AwaitDrain(1 << 20); err != nil {
+//	            return err
+//	        }
+//	        if _, err := w.Write([]byte(event)); err != nil {
+//	            return err
+//	        }
+//	    }
+//	    return nil
+//	})
+//
+// The read is sampled from a worker goroutine without a loop
+// hop — uWS's internal counter is an atomic-aligned size_t in
+// uSockets, so reads are coherent but may lag by a few
+// microseconds. Adequate for throttling decisions; do not use
+// for transactional accounting.
+func (r *Response) BufferedAmount() uint64 {
+	return innerBufferedAmount(r.inner)
+}
+
+// AwaitDrain blocks the caller until BufferedAmount falls below
+// threshold, or returns nil immediately if it's already below.
+// Implemented as a one-shot onWritable callback installed on the
+// uWS loop — the goroutine parks on a channel rather than busy-
+// polling, so back-to-back writes against a slow client don't
+// burn CPU.
+//
+// Only valid while a Stream is in flight (r.async != nil); calling
+// outside that scope returns nil with no work done.
+//
+// Returns context.Canceled (well, a sentinel "stream aborted"
+// error) when the client disconnects before the buffer drains —
+// callers in a streaming loop should propagate the error to break
+// out of their generator.
+func (r *Response) AwaitDrain(threshold uint64) error {
+	if r.async == nil {
+		return nil
+	}
+	if r.BufferedAmount() <= threshold {
+		return nil
+	}
+	wake := make(chan struct{})
+	asyncDeferDrainSignal(r.async.loopPtr, r.async.ctxHandle, newDrainHandle(wake))
+	<-wake
+	// Recheck after wake — onWritable can fire even when the
+	// buffer is still above threshold (uWS schedules the
+	// notification at a lower watermark). Loop until we're
+	// actually below, or until the response was aborted.
+	for r.BufferedAmount() > threshold {
+		if r.async == nil {
+			return errStreamAborted
+		}
+		wake = make(chan struct{})
+		asyncDeferDrainSignal(r.async.loopPtr, r.async.ctxHandle, newDrainHandle(wake))
+		<-wake
+	}
+	return nil
+}
+
+// errStreamAborted is the sentinel returned by AwaitDrain when
+// the response went away while the goroutine was parked.
+var errStreamAborted = errors.New("gogo: stream aborted while waiting on backpressure drain")
+
 // JSONP writes a JSONP response — the JSON-encoded value v wrapped in
 // a function call named callback, served with Content-Type
 // application/javascript. Useful for cross-origin reads from older

@@ -601,6 +601,42 @@ func asyncDeferStreamEnd(loopPtr, ctxHandle uintptr) {
 	)
 }
 
+// innerBufferedAmount samples uWS's send-queue depth in bytes
+// via the C-side responseNative pointer. Used by
+// Response.BufferedAmount to detect backpressure on streaming
+// responses. The underlying read is a single naturally-aligned
+// size_t in uSockets; calling from a worker goroutine (not the
+// loop thread) returns a possibly-stale but coherent value —
+// fine for "should I throttle?" decisions.
+func innerBufferedAmount(rn responseNative) uint64 {
+	if rn.ptr == nil {
+		return 0
+	}
+	return uint64(C.uwsgo_res_buffered_amount(rn.ptr))
+}
+
+// newDrainHandle wraps a wake channel into a cgo.Handle that the
+// loop-side onWritable lambda can resolve. Defined here so the
+// types.go AwaitDrain implementation stays free of the cgo
+// dependency (it lives in a file compiled by both the cgo and
+// non-cgo builds).
+func newDrainHandle(wake chan struct{}) uintptr {
+	return uintptr(cgo.NewHandle(wake))
+}
+
+// asyncDeferDrainSignal arms a one-shot drain notifier on the loop
+// thread. uwsgoHandleDrain (Go //export below) fires the next time
+// uWS reports the send buffer drained below its high-water mark.
+// Used by Response.AwaitDrain to block a worker until the network
+// catches up.
+func asyncDeferDrainSignal(loopPtr, ctxHandle, callbackID uintptr) {
+	C.uwsgo_res_defer_drain_signal(
+		(*C.uwsgo_loop_t)(unsafe.Pointer(loopPtr)),
+		unsafe.Pointer(ctxHandle),
+		C.uintptr_t(callbackID),
+	)
+}
+
 func asyncCtxRelease(ctxHandle uintptr) {
 	C.uwsgo_async_ctx_release(unsafe.Pointer(ctxHandle))
 }
@@ -1237,6 +1273,28 @@ func uwsgoHandleCork(callbackID C.uintptr_t) {
 		}
 	}()
 	fn()
+}
+
+//export uwsgoHandleDrain
+func uwsgoHandleDrain(callbackID C.uintptr_t) {
+	h := cgo.Handle(callbackID)
+	value := h.Value()
+	h.Delete()
+	switch cb := value.(type) {
+	case func():
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				reportPanic(recovered)
+			}
+		}()
+		cb()
+	case chan struct{}:
+		// Non-blocking close so a re-arm-after-cancel path that
+		// already drained doesn't deadlock; subsequent close
+		// panics are recovered above.
+		defer func() { _ = recover() }()
+		close(cb)
+	}
 }
 
 //export uwsgoReleaseHandle
