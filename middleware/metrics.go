@@ -145,7 +145,7 @@ func (m *Metrics) Middleware() mwhint.Hinted {
 			// later mutates req via SetLocal can't leak the read
 			// into the deferred recorder.
 			method := req.Method()
-			defer func() {
+			record := func() {
 				mm.inflight.Add(-1)
 				dur := time.Since(start)
 				status := res.StatusCode()
@@ -153,7 +153,18 @@ func (m *Metrics) Middleware() mwhint.Hinted {
 					status = 200
 				}
 				mm.observe(method, status, dur)
-			}()
+			}
+			// Register via OnFinish through a defer so we cover both
+			// branches:
+			//   - normal return → defer fires → OnFinish runs inline
+			//     for sync responses, queues for async (incl. handlers
+			//     that upgraded via Response.Async)
+			//   - handler panic → defer still fires on the unwind
+			//     before the framework's outer recover catches and
+			//     emits a 500, so the metric is recorded
+			// Reading res.StatusCode() inside the closure picks up the
+			// final status regardless of which path got us there.
+			defer res.OnFinish(record)
 			next(res, req)
 		}
 	})}

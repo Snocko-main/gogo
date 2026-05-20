@@ -39,6 +39,7 @@ It is intentionally thin:
 - [Middleware](#middleware)
   - [Sync middleware](#sync-middleware)
   - [Async middleware](#async-middleware)
+  - [Post-handler cleanup with `Response.OnFinish`](#post-handler-cleanup-with-responseonfinish)
   - [Bundled middleware](#bundled-middleware)
   - [RequestID — 128-bit IDs](#requestid--128-bit-ids)
   - [RateLimit memory cap](#ratelimit-memory-cap)
@@ -477,6 +478,118 @@ app.GetAsync("/api/me", func(res *gogo.Response, req *gogo.Request) {
 })
 ```
 
+### Post-handler cleanup with `Response.OnFinish`
+
+Middleware that runs **after** the handler — saving session state,
+flushing metrics, closing a tracing span, recording an audit line —
+faces a subtle lifecycle bug if you write it as the naive `next; cleanup`
+pattern:
+
+```go
+// ⚠️ Footgun — cleanup may run BEFORE the handler's real work
+app.Use(func(next gogo.Handler) gogo.Handler {
+    return func(res *gogo.Response, req *gogo.Request) {
+        state := beginRequest(req)
+        next(res, req)
+        commit(state)                  // ← runs when next() returns
+    }
+})
+```
+
+The problem appears when the handler calls `res.Async(fn)`:
+
+```go
+app.Get("/job", func(res *gogo.Response, req *gogo.Request) {
+    res.Async(func() {
+        time.Sleep(50 * time.Millisecond)
+        mutate(state)                  // happens AFTER commit(state) above
+    })
+})
+```
+
+`res.Async` spawns a goroutine and returns immediately. From the
+middleware's point of view, `next` has finished — but the user's real
+work hasn't started yet. `commit(state)` saves stale state.
+
+`Response.OnFinish(fn func())` is the safe hook for this pattern. It
+picks the right moment automatically:
+
+- **Sync handler** (no `res.Async` upgrade): `fn` runs inline when
+  registered — equivalent to the original `next; cleanup` ordering.
+- **Async handler** (`GetAsync` / `PostAsync`, or sync handler that
+  upgraded via `res.Async`): `fn` is queued and fires after the
+  goroutine completes, via the framework's `finishAsync` cleanup.
+- **Late registration** (rare — goroutine finished before middleware
+  reached `OnFinish`): `fn` runs inline so it's never orphaned.
+
+Rewrite the custom middleware:
+
+```go
+// ✅ Correct — cleanup runs after the handler (incl. any res.Async) finishes
+app.Use(func(next gogo.Handler) gogo.Handler {
+    return func(res *gogo.Response, req *gogo.Request) {
+        state := beginRequest(req)
+        next(res, req)
+        res.OnFinish(func() { commit(state) })
+    }
+})
+```
+
+Real-world example — an audit middleware that records the final
+response status and the user ID set by an auth middleware deeper in
+the chain:
+
+```go
+app.Use(func(next gogo.Handler) gogo.Handler {
+    return func(res *gogo.Response, req *gogo.Request) {
+        start := time.Now()
+        next(res, req)
+        res.OnFinish(func() {
+            user, _ := req.Local("user").(*User)
+            log.Printf("audit method=%s path=%s status=%d user=%v dur=%s",
+                req.Method(), req.URL(), res.StatusCode(), user, time.Since(start))
+        })
+    }
+})
+```
+
+The status / user ID / duration now reflect the post-handler state
+regardless of whether the handler upgraded to async.
+
+**Multiple registrations** fire FIFO — middleware higher in the chain
+registers first and runs first. Panics inside an `OnFinish` callback
+are caught by the framework's panic handler and don't prevent later
+callbacks from firing, mirroring `http.ResponseWriter` recovery
+semantics.
+
+**Recording the panic case** — if you want the cleanup to fire even
+when the handler panics, register via `defer`:
+
+```go
+app.Use(func(next gogo.Handler) gogo.Handler {
+    return func(res *gogo.Response, req *gogo.Request) {
+        start := time.Now()
+        defer res.OnFinish(func() {
+            log.Printf("status=%d dur=%s", res.StatusCode(), time.Since(start))
+        })
+        next(res, req)
+    }
+})
+```
+
+A bare `next(res, req); res.OnFinish(...)` is skipped on panic because
+the panic unwinds past the registration. `defer res.OnFinish(...)`
+registers on the unwind, before the framework's outer panic handler
+catches and emits the 500. Use the defer form for observability
+middleware (metrics, audit, tracing); use the inline form for state-
+commit middleware where panic = "don't persist".
+
+**Built-in middleware** using this hook: `mw.NewSession` (commits
+state inline post-handler — panics are intentionally NOT persisted),
+`mw.NewMetrics` (records the final status / duration even on panic
+via the defer form). Custom middleware following either shape should
+do the same.
+
 ### Bundled middleware
 
 The `middleware` subpackage ships production-ready middleware:
@@ -635,6 +748,33 @@ app.GetAsync("/me", func(res *gogo.Response, req *gogo.Request) {
         return
     }
     res.JSON(200, map[string]any{"user_id": uid})
+})
+```
+
+Sessions persist automatically at request completion via
+`Response.OnFinish` — that means mutations made inside a
+`res.Async(...)` goroutine are saved correctly (the persist call
+fires after the goroutine finishes, not after `next` returns).
+
+For handlers that need an explicit mid-flight commit — checkpointing
+before launching a background job, persisting auth state before an
+SSE stream starts emitting events — call `sess.Save()`:
+
+```go
+app.Get("/checkpoint", func(res *gogo.Response, req *gogo.Request) {
+    s := req.Local(mw.SessionLocalKey).(*mw.Session)
+    s.Set("phase", "starting")
+    s.Save()                          // commits to the store NOW
+
+    res.Async(func() {
+        // The background goroutine can rely on the row being
+        // visible to other requests that arrive while it runs.
+        runJob(s.ID)
+        s.Set("phase", "done")
+        res.Send(200, "text/plain", "ok\n")
+    })
+    // OnFinish still saves the "done" state when the goroutine
+    // completes — no extra Save() needed at the end.
 })
 ```
 
@@ -1165,6 +1305,11 @@ app.MethodNotAllowed(func(res *gogo.Response, req *gogo.Request) {
 - `mw.RateLimit()` caps the in-memory store at 100k buckets — raise via
   `MaxBuckets` or plug a Redis store for high-cardinality keys. See
   [RateLimit memory cap](#ratelimit-memory-cap).
+- Custom middleware that runs cleanup AFTER the handler must use
+  `Response.OnFinish` (not `next; cleanup` directly) — otherwise a
+  handler that upgrades via `res.Async` will run its real work after
+  cleanup already fired. See
+  [Post-handler cleanup](#post-handler-cleanup-with-responseonfinish).
 
 ## Examples
 
