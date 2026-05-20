@@ -372,13 +372,22 @@ type asyncMiddlewareEntry struct {
 // only get added here when they need a single, app-wide value.
 type Config struct {
 	// BodyLimit caps the request-body bytes a Post / Any route will
-	// accept. The framework rejects oversized requests with 413 at
-	// arrival by checking the Content-Length header on the C++ side
-	// before dispatching to Go — zero per-request cost beyond the
-	// existing header lookup. Chunked transfer-encoded requests with
-	// no Content-Length bypass this check; handlers that accept those
-	// must call res.Body(maxN, ...) for protection. Set to 0 to
-	// disable. Default 4 MiB.
+	// accept. Enforced at three layers so every intake shape gets the
+	// same upper bound:
+	//
+	//   - Content-Length declared: rejected with 413 at arrival on the
+	//     C++ side before any cgo crossing — zero per-request cost
+	//     beyond the existing header lookup.
+	//   - Chunked transfer-encoded + Response.OnData: the Go-side
+	//     accumulator inside OnData totals chunk sizes and emits
+	//     413 + close as soon as the running total crosses the cap.
+	//   - Chunked transfer-encoded + Response.Body: the caller-supplied
+	//     maxBytes is clamped down by BodyLimit when BodyLimit is
+	//     smaller, so handlers that ask Body(10 MiB) on an app capped
+	//     at 1 MiB top out at 1 MiB.
+	//
+	// Set to 0 to disable the cap entirely (not recommended outside
+	// tests). Default 4 MiB.
 	BodyLimit int
 
 	// BindAddr is the local interface to bind on. Empty string means
@@ -2044,6 +2053,12 @@ type Response struct {
 	// so a callback registered after the goroutine ran ahead of the
 	// middleware fires inline instead of being orphaned.
 	finished bool
+
+	// abort holds Go-side callbacks registered against uWS's single
+	// onAborted slot. uWS only stores one handler, so Response-level
+	// users must multiplex rather than calling r.inner.onAborted from
+	// multiple features and overwriting each other.
+	abort *responseAbortState
 }
 
 // bodyEncoder is the staging buffer + transformer used to defer
@@ -2061,6 +2076,12 @@ type asyncState struct {
 	contentType string
 	body        strings.Builder
 	sent        bool
+}
+
+type responseAbortState struct {
+	mu        sync.Mutex
+	callbacks []func()
+	fired     bool
 }
 
 // Status sets the HTTP status code. The standard reason phrase from
@@ -3206,6 +3227,7 @@ func (r *Response) releaseRef() {
 		r.pendingHeaders = r.pendingHeaders[:0]
 	}
 	r.encoder = nil
+	r.abort = nil
 	// Reset the finish state for the next pool use — we already
 	// drained above, but the recycled wrapper needs a clean slate.
 	r.finishMu.Lock()
@@ -3389,8 +3411,61 @@ func (r *Response) Loop() *Loop {
 // synchronously inside the route handler when responding asynchronously.
 func (r *Response) OnAborted() *Aborted {
 	state := &Aborted{}
-	r.inner.onAborted(state)
+	r.onAbort(func() {
+		state.state.Store(true)
+	})
 	return state
+}
+
+func (r *Response) onAbort(fn func()) {
+	if fn == nil {
+		return
+	}
+	state := r.abort
+	if state == nil {
+		state = &responseAbortState{}
+		r.abort = state
+		r.inner.onAborted(func() {
+			state.run()
+		})
+	}
+	state.add(fn)
+}
+
+func (s *responseAbortState) add(fn func()) {
+	s.mu.Lock()
+	if s.fired {
+		s.mu.Unlock()
+		runAbortCallback(fn)
+		return
+	}
+	s.callbacks = append(s.callbacks, fn)
+	s.mu.Unlock()
+}
+
+func (s *responseAbortState) run() {
+	s.mu.Lock()
+	if s.fired {
+		s.mu.Unlock()
+		return
+	}
+	s.fired = true
+	fns := s.callbacks
+	s.callbacks = nil
+	s.mu.Unlock()
+
+	for _, fn := range fns {
+		runAbortCallback(fn)
+	}
+}
+
+func runAbortCallback(fn func()) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			reportPanic(rec)
+		}
+	}()
+	fn()
 }
 
 // Cork batches all response writes inside fn into a single packet. Required
@@ -3419,11 +3494,64 @@ func (r *Response) Cork(fn func()) {
 // fires the ref is held until the response is destroyed; for the
 // Body() collector that case is covered explicitly via its own onAborted.
 func (r *Response) OnData(fn func(chunk []byte, isLast bool)) {
+	// Mirror the C++ side's Content-Length-based body_limit_rejects
+	// gate for chunked transfer-encoded requests, which have no
+	// Content-Length and therefore slip past that pre-handler check.
+	// Without this, a handler that called OnData against an
+	// unbounded chunked upload would keep accumulating bytes
+	// forever — the C++ comment acknowledged the gap and told the
+	// caller to police it themselves; we now police it here so
+	// every OnData consumer inherits the same cap as Post/Any
+	// routes with a known Content-Length.
+	//
+	// Body(maxBytes, done) already enforces its own cap; this gate
+	// applies on top, so a handler that asks for 10 MiB max but the
+	// app config sets BodyLimit=4 MiB still tops out at 4 MiB.
+	var bodyLimit int
+	if r.app != nil {
+		bodyLimit = r.app.cfg.BodyLimit
+	}
+	var total int
+	var exceeded bool
+	var released bool
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		r.releaseRef()
+	}
 	r.acquireRef()
+	// uWS rejects handler returns without either a response or an
+	// abort handler ("Returning from a request handler without
+	// responding or attaching an abort handler is forbidden!").
+	// OnData is the "I'll respond later from a chunk callback"
+	// shape, so we register a no-op aborted handler here to satisfy
+	// that check — without it, a connection abort mid-body crashes
+	// the process. The handler also releases our pinned ref so the
+	// wrapper can recycle even when the client disconnects.
+	r.onAbort(release)
 	r.inner.onData(func(chunk []byte, isLast bool) {
+		if exceeded {
+			// Already emitted 413 — swallow tail chunks until
+			// isLast so we can release the wrapper ref once.
+			if isLast {
+				release()
+			}
+			return
+		}
+		total += len(chunk)
+		if bodyLimit > 0 && total > bodyLimit {
+			exceeded = true
+			r.Send(413, "text/plain; charset=utf-8", "payload too large\n")
+			if isLast {
+				release()
+			}
+			return
+		}
 		fn(chunk, isLast)
 		if isLast {
-			r.releaseRef()
+			release()
 		}
 	})
 }
@@ -3437,11 +3565,29 @@ type errFramework string
 func (e errFramework) Error() string { return string(e) }
 
 // Body collects the full request body and invokes done once it has arrived.
-// If the body exceeds maxBytes, done is called with err = ErrBodyTooLarge and
-// the response is closed without sending. Call inside the route handler
-// before it returns; done runs on the loop thread (spawn a goroutine for
-// blocking work).
+// If the body exceeds the effective limit, done is called with err =
+// ErrBodyTooLarge and the response is closed without sending. Call inside
+// the route handler before it returns; done runs on the loop thread (spawn
+// a goroutine for blocking work).
+//
+// The effective limit is the LOWER of maxBytes and Config.BodyLimit when
+// BOTH are positive. A handler that asks for 10 MiB on an app configured
+// with BodyLimit=1 MiB tops out at 1 MiB — the app cap wins. This
+// mirrors the OnData and Content-Length gates so all three intake paths
+// enforce the same upper bound; without the clamp here, a chunked upload
+// (which sidesteps the C++ Content-Length pre-check) could exceed the
+// app's BodyLimit whenever the handler's local cap was larger.
+//
+// maxBytes <= 0 is honored literally and NOT widened by Config.BodyLimit:
+// Body(0, ...) accepts a zero-byte body and rejects everything else;
+// Body(-1, ...) rejects every chunk. Clamping is one-directional — the
+// app cap can tighten the caller's request, never loosen it.
 func (r *Response) Body(maxBytes int, done func(body []byte, err error)) {
+	if r.app != nil && maxBytes > 0 {
+		if bl := r.app.cfg.BodyLimit; bl > 0 && bl < maxBytes {
+			maxBytes = bl
+		}
+	}
 	var buf []byte
 	var finished bool
 	aborted := &Aborted{}
@@ -3458,7 +3604,7 @@ func (r *Response) Body(maxBytes int, done func(body []byte, err error)) {
 		finished = true
 		r.releaseRef()
 	}
-	r.inner.onAborted(func() {
+	r.onAbort(func() {
 		aborted.state.Store(true)
 		release()
 	})
@@ -3681,7 +3827,6 @@ func (r *Request) resetForPool() {
 		delete(r.locals, k)
 	}
 }
-
 
 // URL returns the request URL path. Query string is exposed separately via
 // Query(); URL() does not include it.
