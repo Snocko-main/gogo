@@ -176,10 +176,17 @@ var (
 // to restore the default.
 type PanicHandler func(recovered any)
 
-var (
-	panicHandlerMu sync.RWMutex
-	panicHandlerFn PanicHandler = defaultPanicHandler
-)
+// panicHandlerFn is the active panic handler. Read on every panic-recover
+// site across the framework (HTTP / async / WebSocket / defer / body /
+// OnFinish / OnData / etc.) — atomic.Pointer keeps the read lock-free
+// instead of the RWMutex.RLock+defer pair that used to bracket every
+// access. Writes go through SetPanicHandler which is rare.
+var panicHandlerFn atomic.Pointer[PanicHandler]
+
+func init() {
+	fn := PanicHandler(defaultPanicHandler)
+	panicHandlerFn.Store(&fn)
+}
 
 // defaultPanicHandler writes the recovered value and a goroutine stack
 // trace to stderr. Matches the format Go's runtime uses for unrecovered
@@ -193,19 +200,14 @@ func defaultPanicHandler(recovered any) {
 // restore the default stderr logger. The handler must not panic itself
 // (any panic inside it is recovered silently).
 func SetPanicHandler(fn PanicHandler) {
-	panicHandlerMu.Lock()
 	if fn == nil {
-		panicHandlerFn = defaultPanicHandler
-	} else {
-		panicHandlerFn = fn
+		fn = defaultPanicHandler
 	}
-	panicHandlerMu.Unlock()
+	panicHandlerFn.Store(&fn)
 }
 
 func getPanicHandler() PanicHandler {
-	panicHandlerMu.RLock()
-	defer panicHandlerMu.RUnlock()
-	return panicHandlerFn
+	return *panicHandlerFn.Load()
 }
 
 func reportPanic(recovered any) {
