@@ -353,6 +353,56 @@ func TestRequestContextCancelsOnClientAbort(t *testing.T) {
 	}
 }
 
+func TestRequestContextAsyncDoesNotCrash(t *testing.T) {
+	const iterations = 50
+
+	ctxCanceled := make(chan error, iterations)
+	handlerEntered := make(chan struct{}, iterations)
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.GetAsync("/abort", func(res *gogo.Response, req *gogo.Request) {
+			ctx := req.Context()
+			handlerEntered <- struct{}{}
+			select {
+			case <-ctx.Done():
+				ctxCanceled <- ctx.Err()
+			case <-time.After(2 * time.Second):
+				ctxCanceled <- nil
+			}
+		})
+	})
+	defer teardown()
+
+	for i := 0; i < iterations; i++ {
+		conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err != nil {
+			t.Fatalf("dial %d: %v", i, err)
+		}
+		_, err = conn.Write([]byte("GET /abort HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+		if err != nil {
+			conn.Close()
+			t.Fatalf("write %d: %v", i, err)
+		}
+
+		select {
+		case <-handlerEntered:
+		case <-time.After(2 * time.Second):
+			conn.Close()
+			t.Fatalf("handler did not run for request %d", i)
+		}
+
+		conn.Close()
+
+		select {
+		case err := <-ctxCanceled:
+			if err == nil {
+				t.Fatalf("req.Context() did not cancel after client abort for request %d", i)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("ctxCanceled receive timed out for request %d", i)
+		}
+	}
+}
+
 func TestPanicRecoveryInSharedHandler(t *testing.T) {
 	var panicked atomic.Int32
 	gogo.SetPanicHandler(func(recovered any) {
