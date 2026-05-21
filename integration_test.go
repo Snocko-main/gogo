@@ -2296,6 +2296,69 @@ func TestClientAbortDuringPostBodyThenServerContinues(t *testing.T) {
 	}
 }
 
+// TestBodyReadTimeout: a slow client that opens a POST, sends a
+// Content-Length, then drips a few bytes and stalls must see the
+// server short-circuit with ErrBodyTimeout once Config.BodyReadTimeout
+// elapses — instead of holding the goroutine forever (slow-loris).
+func TestBodyReadTimeout(t *testing.T) {
+	timedOut := make(chan error, 1)
+	port, teardown := startAppCfg(t, gogo.Config{BodyReadTimeout: 150 * time.Millisecond}, func(app *gogo.App) {
+		app.Post("/slow", func(res *gogo.Response, req *gogo.Request) {
+			res.Body(64*1024, func(body []byte, err error) {
+				timedOut <- err
+				if err != nil {
+					res.Send(408, "text/plain", err.Error())
+					return
+				}
+				res.Send(200, "text/plain", "ok")
+			})
+		})
+	})
+	defer teardown()
+
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	// Promise a 1 KiB body, send only the first 5 bytes, then go silent.
+	fmt.Fprintf(conn, "POST /slow HTTP/1.1\r\nHost: x\r\nContent-Length: 1024\r\nConnection: close\r\n\r\nhello")
+
+	select {
+	case err := <-timedOut:
+		if err != gogo.ErrBodyTimeout {
+			t.Fatalf("expected ErrBodyTimeout, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("body read timeout did not fire within 2s")
+	}
+}
+
+// TestBodyReadTimeoutDoesNotFireOnNormalUpload: a well-behaved POST
+// that finishes promptly must NOT see the timeout error — the timer
+// has to stop on the success path.
+func TestBodyReadTimeoutDoesNotFireOnNormalUpload(t *testing.T) {
+	port, teardown := startAppCfg(t, gogo.Config{BodyReadTimeout: 500 * time.Millisecond}, func(app *gogo.App) {
+		app.Post("/fast", func(res *gogo.Response, req *gogo.Request) {
+			res.Body(64*1024, func(body []byte, err error) {
+				if err != nil {
+					res.Send(500, "text/plain", "unexpected: "+err.Error())
+					return
+				}
+				res.Send(200, "text/plain", fmt.Sprintf("got %d", len(body)))
+			})
+		})
+	})
+	defer teardown()
+
+	status, body := httpPost(t, port, "/fast", "text/plain", []byte("hello"))
+	if status != 200 || body != "got 5" {
+		t.Fatalf("got %d %q", status, body)
+	}
+	// Give any stray timer a chance to misfire.
+	time.Sleep(600 * time.Millisecond)
+}
+
 func TestHeaderInjectionRejected(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.GetAsync("/inject", func(res *gogo.Response, req *gogo.Request) {

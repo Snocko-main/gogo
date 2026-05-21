@@ -415,6 +415,23 @@ type Config struct {
 	// tests). Default 4 MiB.
 	BodyLimit int
 
+	// BodyReadTimeout caps the wall-clock time the framework will
+	// wait for a request body to finish arriving. Applied per call
+	// to Response.Body: a timer starts when Body registers its
+	// chunk listener and fires done(nil, ErrBodyTimeout) if the
+	// last chunk hasn't landed by the deadline. Defeats slow-loris
+	// drip uploads where the client keeps the request open but
+	// sends bytes too slowly to ever exhaust BodyLimit.
+	//
+	// Zero (default) disables the timeout — preserving existing
+	// behavior. Reasonable production values fall between 10s for
+	// API endpoints and 60s+ for legitimate upload flows. The
+	// timer fires on a goroutine that hands the cancellation back
+	// to the loop thread via Loop.Defer so done() and the
+	// connection close run serially with onData / onAborted —
+	// callers don't have to think about races.
+	BodyReadTimeout time.Duration
+
 	// BindAddr is the local interface to bind on. Empty string means
 	// "all interfaces" (uWS default 0.0.0.0). Use "127.0.0.1" for a
 	// localhost-only service. Applied at Listen time.
@@ -3747,6 +3764,12 @@ func (r *Response) OnData(fn func(chunk []byte, isLast bool)) {
 // caller-supplied max size.
 var ErrBodyTooLarge = errFramework("body exceeds max size")
 
+// ErrBodyTimeout is reported by Body when the request body does not
+// finish arriving within Config.BodyReadTimeout. The handler sees the
+// error in its done callback exactly once; later chunks from the
+// slow client are dropped on the floor.
+var ErrBodyTimeout = errFramework("body read deadline exceeded")
+
 type errFramework string
 
 func (e errFramework) Error() string { return string(e) }
@@ -3775,26 +3798,51 @@ func (r *Response) Body(maxBytes int, done func(body []byte, err error)) {
 			maxBytes = bl
 		}
 	}
-	var buf []byte
-	var finished bool
+	var (
+		buf      []byte
+		finished bool
+		timer    *time.Timer
+	)
 	aborted := &Aborted{}
 	// Body takes one wrapper ref that's released exactly once on whichever
-	// of these fires first: the final chunk, body-too-large, or abort.
-	// Going through r.inner.onData directly (instead of Response.OnData)
-	// keeps that release symmetric — Response.OnData would release on
-	// isLast on its own and double-release with us on bodyTooLarge/abort.
+	// of these fires first: the final chunk, body-too-large, abort, or
+	// timeout. Going through r.inner.onData directly (instead of
+	// Response.OnData) keeps that release symmetric — Response.OnData
+	// would release on isLast on its own and double-release with us on
+	// bodyTooLarge/abort.
 	r.acquireRef()
 	release := func() {
 		if finished {
 			return
 		}
 		finished = true
+		if timer != nil {
+			timer.Stop()
+		}
 		r.releaseRef()
 	}
 	r.onAbort(func() {
 		aborted.state.Store(true)
 		release()
 	})
+
+	// Arm a body-read deadline if Config.BodyReadTimeout is set.
+	// Timer fires on a goroutine; we hand the cancellation back to
+	// the loop thread via Loop.Defer so done() and release run
+	// serialized with the onData / onAborted callbacks above.
+	if r.app != nil && r.app.cfg.BodyReadTimeout > 0 {
+		loop := r.Loop()
+		timer = time.AfterFunc(r.app.cfg.BodyReadTimeout, func() {
+			loop.Defer(func() {
+				if finished {
+					return
+				}
+				done(nil, ErrBodyTimeout)
+				release()
+			})
+		})
+	}
+
 	r.inner.onData(func(chunk []byte, isLast bool) {
 		if finished || aborted.Load() {
 			return
