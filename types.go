@@ -162,7 +162,22 @@ var (
 	}}
 	requestPool    = sync.Pool{New: func() any { return &Request{} }}
 	asyncStatePool = sync.Pool{New: func() any { return &asyncState{} }}
+
+	// bodyEncoderPool recycles the bodyEncoder staging buffer used by
+	// Compress middleware. Each encoder is ~24 bytes plus a growable
+	// []byte. Recycling the struct avoids one heap allocation per
+	// compressed response; the []byte's backing array is also retained
+	// (up to bodyEncoderMaxCap) so typical-size payloads pay zero
+	// buffer alloc after warm-up.
+	bodyEncoderPool = sync.Pool{New: func() any { return &bodyEncoder{} }}
 )
+
+// bodyEncoderMaxCap caps the bodyEncoder.buf slice we retain in the
+// pool. A pathological request that compresses a 4 MiB body would
+// otherwise leave a 4 MiB buffer alive in the pool indefinitely; the
+// 64 KiB ceiling fits the overwhelming majority of HTML/JSON
+// responses while keeping pool memory predictable under spike loads.
+const bodyEncoderMaxCap = 64 * 1024
 
 // PanicHandler is invoked when user code panics inside an HTTP, async,
 // WebSocket, defer, or body callback. HTTP paths emit a best-effort 500 when a
@@ -2070,8 +2085,12 @@ type Response struct {
 
 // bodyEncoder is the staging buffer + transformer used to defer
 // response body emission until middleware can compress it.
+//
+// buf is a plain []byte rather than strings.Builder so the wrapper
+// can be pooled and its backing array reused across requests —
+// strings.Builder.Reset() drops its buffer, defeating the pool.
 type bodyEncoder struct {
-	buf     strings.Builder
+	buf     []byte
 	encode  func(body []byte, contentType string) (encoded []byte, contentEncoding string)
 	max     int
 	applied bool
@@ -3296,7 +3315,10 @@ func (r *Response) releaseRef() {
 	if r.pendingHeaders != nil {
 		r.pendingHeaders = r.pendingHeaders[:0]
 	}
-	r.encoder = nil
+	if r.encoder != nil {
+		releaseBodyEncoder(r.encoder)
+		r.encoder = nil
+	}
 	r.abort = nil
 	// Reset the finish state for the next pool use — we already
 	// drained above, but the recycled wrapper needs a clean slate.
@@ -3336,23 +3358,51 @@ func (r *Response) SetBodyEncoder(encode func(body []byte, contentType string) (
 // pre-compression staging buffer.
 func (r *Response) SetBodyEncoderLimit(maxBytes int, encode func(body []byte, contentType string) (encoded []byte, contentEncoding string)) {
 	if encode == nil {
-		r.encoder = nil
+		// Replacing an installed encoder with nil — return the previous
+		// one to the pool so its backing buffer can be reused.
+		if r.encoder != nil {
+			releaseBodyEncoder(r.encoder)
+			r.encoder = nil
+		}
 		return
 	}
 	if maxBytes < 0 {
 		maxBytes = 0
 	}
-	r.encoder = &bodyEncoder{encode: encode, max: maxBytes}
+	e := bodyEncoderPool.Get().(*bodyEncoder)
+	e.encode = encode
+	e.max = maxBytes
+	e.applied = false
+	// Truncate keeps capacity; the previous request's bytes (if any)
+	// are overwritten by subsequent appends.
+	e.buf = e.buf[:0]
+	r.encoder = e
+}
+
+// releaseBodyEncoder clears the encoder's fields and returns it to
+// the pool. The backing buffer is dropped if it exceeds
+// bodyEncoderMaxCap so a single huge response can't anchor a large
+// allocation in the pool indefinitely.
+func releaseBodyEncoder(e *bodyEncoder) {
+	if cap(e.buf) > bodyEncoderMaxCap {
+		e.buf = nil
+	} else {
+		e.buf = e.buf[:0]
+	}
+	e.encode = nil
+	e.max = 0
+	e.applied = false
+	bodyEncoderPool.Put(e)
 }
 
 func (e *bodyEncoder) writeString(s string) (prefix string, overflow bool) {
-	if e.max > 0 && len(s) > e.max-e.buf.Len() {
+	if e.max > 0 && len(s) > e.max-len(e.buf) {
 		e.applied = true
-		prefix = e.buf.String()
-		e.buf.Reset()
+		prefix = string(e.buf)
+		e.buf = e.buf[:0]
 		return prefix, true
 	}
-	e.buf.WriteString(s)
+	e.buf = append(e.buf, s...)
 	return "", false
 }
 
@@ -3381,7 +3431,7 @@ func (r *Response) applyEncoder(contentTypeHint string) string {
 			}
 		}
 	}
-	encoded, contentEncoding := e.encode([]byte(e.buf.String()), ct)
+	encoded, contentEncoding := e.encode(e.buf, ct)
 	e.applied = true
 	if contentEncoding != "" {
 		r.pendingHeaders = append(r.pendingHeaders,
