@@ -249,6 +249,9 @@ func runSharedHandler(handler AsyncHandler, ctxPtr uintptr) {
 	// readSharedReqBody copies it out into a Go slice so the
 	// handler can read it via req.Body() after ctx release.
 	reqWrap.body = readSharedReqBody(ctxPtr)
+	// Back-pointer for req.Context() so a client abort propagates
+	// cancellation into downstream context-aware calls.
+	reqWrap.res = resWrap
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -1172,6 +1175,12 @@ func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req
 	// additional ref; the wrapper is returned to the pool by whichever
 	// releaseRef drops the count to zero.
 	resWrap.refs.Store(1)
+
+	// Back-pointer for req.Context() so a client abort propagates
+	// cancellation into downstream context-aware calls. Set after
+	// resWrap is acquired so the link is in place before user code
+	// runs.
+	reqWrap.res = resWrap
 
 	defer func() {
 		if recovered := recover(); recovered != nil {
