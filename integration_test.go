@@ -202,6 +202,87 @@ func TestSharedDispatch(t *testing.T) {
 	}
 }
 
+// TestRequestContextSyncHandler: a sync handler that completes
+// normally should still observe its req.Context() cancel on pool
+// release, so background goroutines kicked off with the context
+// don't leak past the request.
+func TestRequestContextSyncHandler(t *testing.T) {
+	canceled := make(chan struct{}, 1)
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/ctx", func(res *gogo.Response, req *gogo.Request) {
+			ctx := req.Context()
+			go func() {
+				<-ctx.Done()
+				canceled <- struct{}{}
+			}()
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	status, body := httpGet(t, port, "/ctx")
+	if status != 200 || body != "ok" {
+		t.Fatalf("got %d %q", status, body)
+	}
+	select {
+	case <-canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("req.Context() did not cancel after handler completion")
+	}
+}
+
+// TestRequestContextCancelsOnClientAbort: when the client closes
+// the connection before the async handler responds, the context
+// returned by req.Context() should fire with a non-nil Err.
+func TestRequestContextCancelsOnClientAbort(t *testing.T) {
+	ctxCanceled := make(chan error, 1)
+	handlerEntered := make(chan struct{}, 1)
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.GetAsync("/slow", func(res *gogo.Response, req *gogo.Request) {
+			ctx := req.Context()
+			handlerEntered <- struct{}{}
+			select {
+			case <-ctx.Done():
+				ctxCanceled <- ctx.Err()
+			case <-time.After(3 * time.Second):
+				ctxCanceled <- nil
+			}
+			// Best-effort send — connection is gone but uWS swallows it.
+			res.Send(200, "text/plain", "late")
+		})
+	})
+	defer teardown()
+
+	// Dial raw so we can close mid-flight before the server replies.
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	_, err = conn.Write([]byte("GET /slow HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+	if err != nil {
+		conn.Close()
+		t.Fatalf("write: %v", err)
+	}
+
+	select {
+	case <-handlerEntered:
+	case <-time.After(2 * time.Second):
+		conn.Close()
+		t.Fatal("handler did not run")
+	}
+
+	conn.Close()
+
+	select {
+	case err := <-ctxCanceled:
+		if err == nil {
+			t.Fatal("req.Context() did not cancel within 3s after client abort")
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("ctxCanceled receive timed out")
+	}
+}
+
 func TestPanicRecoveryInSharedHandler(t *testing.T) {
 	var panicked atomic.Int32
 	gogo.SetPanicHandler(func(recovered any) {

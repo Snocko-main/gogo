@@ -2,6 +2,7 @@ package gogo
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1002,6 +1003,7 @@ func (a *App) GetAsync(pattern string, handler AsyncHandler) {
 		res.Async(func() {
 			snapReq := requestPool.Get().(*Request)
 			snapReq.snap = snap
+			snapReq.res = res
 			wrappedAsync(res, snapReq)
 			snapReq.resetForPool()
 			requestPool.Put(snapReq)
@@ -1076,6 +1078,7 @@ func (a *App) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandl
 				snapReq := requestPool.Get().(*Request)
 				snapReq.snap = snap
 				snapReq.body = body
+				snapReq.res = res
 				wrappedAsync(res, snapReq)
 				snapReq.resetForPool()
 				requestPool.Put(snapReq)
@@ -1469,6 +1472,7 @@ func (r *Router) GetAsync(pattern string, handler AsyncHandler) {
 		res.Async(func() {
 			snapReq := requestPool.Get().(*Request)
 			snapReq.snap = snap
+			snapReq.res = res
 			wrappedAsync(res, snapReq)
 			snapReq.resetForPool()
 			requestPool.Put(snapReq)
@@ -1502,6 +1506,7 @@ func (r *Router) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHa
 				snapReq := requestPool.Get().(*Request)
 				snapReq.snap = snap
 				snapReq.body = body
+				snapReq.res = res
 				wrappedAsync(res, snapReq)
 				snapReq.resetForPool()
 				requestPool.Put(snapReq)
@@ -3834,6 +3839,24 @@ type Request struct {
 	// an index lookup. Nil for routes that have no named params or
 	// for legacy code paths that bypass the wrapper.
 	paramNames []string
+
+	// res is the back-pointer to the Response wrapper for this
+	// request, set by the dispatch site before user middleware /
+	// handlers run. Used by Context() to register a cancellation
+	// hook against the response's onAborted multiplexer. Nil for
+	// requests that bypass the dispatch path (test fixtures); in
+	// that case Context() returns a non-cancelable background
+	// context so handlers still get a usable value.
+	res *Response
+
+	// ctx / ctxCancel back Request.Context(). Lazy-initialized on
+	// the first Context() call so handlers that never touch it pay
+	// nothing. ctxCancel is hooked to the Response's onAborted
+	// callback list, so a client disconnect cancels the context and
+	// propagates to any db.QueryContext / http.NewRequestWithContext
+	// downstream of it.
+	ctx       context.Context
+	ctxCancel context.CancelFunc
 }
 
 // requestSnapshot holds the Go-side captured copy of an HttpRequest, used by
@@ -3885,6 +3908,37 @@ func (r *Request) Body() []byte {
 	return r.body
 }
 
+// Context returns a context.Context bound to this request's lifetime.
+// It is canceled (with a non-nil Err) when the client aborts the
+// connection before the response is sent, so downstream calls that
+// accept a context — db.QueryContext, http.NewRequestWithContext,
+// rate-limited goroutines — will short-circuit instead of doing wasted
+// work on behalf of a vanished caller.
+//
+// The context is lazy: created on the first call and reused for
+// subsequent calls on the same request. Handlers that never touch it
+// pay nothing. It is canceled both on client abort and on handler
+// completion (via the pool reset), so callbacks registered via
+// context.AfterFunc fire reliably even on the success path.
+//
+// For requests constructed outside the dispatch pipeline (e.g. test
+// fixtures that allocate a Request directly), Context() returns
+// context.Background() — usable but non-cancelable.
+func (r *Request) Context() context.Context {
+	if r.ctx != nil {
+		return r.ctx
+	}
+	if r.res == nil {
+		// No back-pointer means there's no response to hook onAborted
+		// against; hand the caller a usable background context rather
+		// than panicking. Test code and legacy callers land here.
+		return context.Background()
+	}
+	r.ctx, r.ctxCancel = context.WithCancel(context.Background())
+	r.res.onAbort(r.ctxCancel)
+	return r.ctx
+}
+
 // resetForPool clears every request-scoped field so the wrapper can return
 // to the sync.Pool without leaking the previous request's data into the
 // next user. Keeping the locals map alive avoids re-allocating on the next
@@ -3916,6 +3970,15 @@ func (r *Request) resetForPool() {
 	r.ipCached = false
 	r.trustProxy = false
 	r.paramNames = nil
+	// Cancel any live request context so goroutines blocked on
+	// req.Context().Done() unblock and release. Idempotent; safe to
+	// call when the context already fired from onAborted.
+	if r.ctxCancel != nil {
+		r.ctxCancel()
+	}
+	r.ctx = nil
+	r.ctxCancel = nil
+	r.res = nil
 	for k := range r.locals {
 		delete(r.locals, k)
 	}
