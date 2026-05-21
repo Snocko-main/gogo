@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -42,6 +43,7 @@ extern "C" void uwsgoHandleCork(uintptr_t callback_id);
 extern "C" void uwsgoHandleDrain(uintptr_t callback_id);
 extern "C" void uwsgoHandleData(uintptr_t callback_id, const char *data, size_t len, int is_last);
 extern "C" void uwsgoReleaseHandle(uintptr_t callback_id);
+extern "C" void us_internal_free_closed_sockets(us_loop_t *loop);
 
 namespace {
 
@@ -233,6 +235,9 @@ struct uwsgo_app_t {
     uWS::Loop *loop = nullptr;
     us_listen_socket_t *listen_socket = nullptr;
     std::vector<std::unique_ptr<StaticResponse>> static_responses;
+    std::mutex app_mu;
+    std::atomic<bool> accepting_work = true;
+    bool has_websocket = false;
 
     // Per-App response ring + drain timer. Each native App owns its own
     // pending ring so SendShared can safely write from a worker thread and
@@ -481,6 +486,7 @@ extern "C" void uwsgo_app_set_capture_peer_ip(uwsgo_app_t *app, int enable) {
 extern "C" void uwsgo_app_ws(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id,
     size_t max_payload, int idle_seconds, size_t max_backpressure,
     int send_pings_automatically, int with_upgrade) {
+    app->has_websocket = true;
     uWS::App::WebSocketBehavior<uwsgo_ws_data_t> behavior = {};
 
     behavior.maxPayloadLength = static_cast<unsigned int>(max_payload);
@@ -639,7 +645,25 @@ extern "C" int uwsgo_app_listen(uwsgo_app_t *app, const char *host, int port) {
 }
 
 extern "C" void uwsgo_app_run(uwsgo_app_t *app) {
+    if (app == nullptr || app->app == nullptr) {
+        return;
+    }
     app->app->run();
+    app->accepting_work.store(false, std::memory_order_release);
+    us_internal_free_closed_sockets(reinterpret_cast<us_loop_t *>(app->loop));
+    // uWS::App owns the WebSocket TopicTree and unregisters its loop
+    // pre/post handlers in the App destructor via Loop::get(). That must run
+    // on the loop thread; deleting the App later from Go's caller goroutine can
+    // leave dangling TopicTree handlers on this loop and crash the next run.
+    std::lock_guard<std::mutex> lock(app->app_mu);
+    if (app->app != nullptr) {
+        app->app.reset();
+        app->listen_socket = nullptr;
+    }
+    if (app->has_websocket && app->loop != nullptr) {
+        app->loop->free();
+        app->loop = nullptr;
+    }
 }
 
 // Closes the App (which closes the listen socket and all active connection
@@ -648,10 +672,12 @@ extern "C" void uwsgo_app_run(uwsgo_app_t *app) {
 // are dispatched via Loop::defer because they mutate loop state and must run
 // on the loop thread. Safe to call from any goroutine. Idempotent.
 extern "C" void uwsgo_app_stop(uwsgo_app_t *app) {
-    if (app->loop == nullptr) {
+    if (app == nullptr || app->loop == nullptr) {
         return;
     }
+    app->accepting_work.store(false, std::memory_order_release);
     app->loop->defer([app]() {
+        std::lock_guard<std::mutex> lock(app->app_mu);
         if (app->app != nullptr) {
             app->app->close();
             app->listen_socket = nullptr;
@@ -669,10 +695,15 @@ extern "C" void uwsgo_app_stop(uwsgo_app_t *app) {
 // point the uWS loop's fd count drops to zero and run() returns. Calling
 // uwsgo_app_stop afterwards force-closes any remaining stragglers.
 extern "C" void uwsgo_app_close_listen(uwsgo_app_t *app) {
-    if (app->loop == nullptr) {
+    if (app == nullptr || app->loop == nullptr) {
         return;
     }
+    app->accepting_work.store(false, std::memory_order_release);
     app->loop->defer([app]() {
+        std::lock_guard<std::mutex> lock(app->app_mu);
+        if (app->app == nullptr) {
+            return;
+        }
         if (app->listen_socket) {
             us_listen_socket_close(0, app->listen_socket);
             app->listen_socket = nullptr;
@@ -1769,6 +1800,9 @@ extern "C" int uwsgo_ws_publish(uwsgo_ws_t *ws, const char *topic, size_t topic_
 
 extern "C" void uwsgo_app_publish(uwsgo_app_t *app, const char *topic, size_t topic_len,
         const char *message, size_t message_len, int opcode) {
+    if (app == nullptr) {
+        return;
+    }
     // Topic + message copied onto the heap because the cgo caller's
     // buffers go out of scope as soon as this function returns; the
     // deferred publish runs on the loop later. uWS::Loop::defer is
@@ -1784,8 +1818,16 @@ extern "C" void uwsgo_app_publish(uwsgo_app_t *app, const char *topic, size_t to
     std::string topic_copy(topic, topic_len);
     std::string message_copy(message, message_len);
     auto op = static_cast<uWS::OpCode>(opcode);
+    std::lock_guard<std::mutex> lock(app->app_mu);
+    if (app->app == nullptr || app->loop == nullptr ||
+            !app->accepting_work.load(std::memory_order_acquire)) {
+        return;
+    }
     app->loop->defer([app, t = std::move(topic_copy), m = std::move(message_copy), op]() {
-        app->app->publish(t, m, op);
+        std::lock_guard<std::mutex> lock(app->app_mu);
+        if (app->app != nullptr && app->accepting_work.load(std::memory_order_acquire)) {
+            app->app->publish(t, m, op);
+        }
     });
 }
 
@@ -1793,6 +1835,9 @@ extern "C" void uwsgo_app_publish_batch(
         uwsgo_app_t *app,
         const char *bytes, size_t bytes_len,
         const uwsgo_batch_item_t *items, size_t count) {
+    if (app == nullptr) {
+        return;
+    }
     if (count == 0) {
         return;
     }
@@ -1810,14 +1855,23 @@ extern "C" void uwsgo_app_publish_batch(
         memcpy(buf + items_bytes, bytes, bytes_len);
     }
 
+    std::lock_guard<std::mutex> lock(app->app_mu);
+    if (app->app == nullptr || app->loop == nullptr ||
+            !app->accepting_work.load(std::memory_order_acquire)) {
+        ::operator delete(buf);
+        return;
+    }
     app->loop->defer([app, buf, count]() {
         const auto *items = reinterpret_cast<const uwsgo_batch_item_t *>(buf);
         const char *bytes = buf + count * sizeof(uwsgo_batch_item_t);
-        for (size_t i = 0; i < count; i++) {
-            app->app->publish(
-                std::string_view(bytes + items[i].topic_off, items[i].topic_len),
-                std::string_view(bytes + items[i].message_off, items[i].message_len),
-                static_cast<uWS::OpCode>(items[i].opcode));
+        std::lock_guard<std::mutex> lock(app->app_mu);
+        if (app->app != nullptr && app->accepting_work.load(std::memory_order_acquire)) {
+            for (size_t i = 0; i < count; i++) {
+                app->app->publish(
+                    std::string_view(bytes + items[i].topic_off, items[i].topic_len),
+                    std::string_view(bytes + items[i].message_off, items[i].message_len),
+                    static_cast<uWS::OpCode>(items[i].opcode));
+            }
         }
         ::operator delete(buf);
     });
