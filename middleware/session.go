@@ -422,6 +422,27 @@ func verifySessionID(secret []byte, signed string) (string, bool) {
 // sweeps expired entries, then evicts the oldest-expires entry
 // remaining to make room. Worst-case memory therefore stays
 // predictable even under high-cardinality session-id spam.
+//
+// # Scale guidance
+//
+// Every Load and Save acquires the single mutex. The critical section
+// is small (map probe + a few atomic loads) but for session-heavy
+// workloads at high RPS the lock can show up as the dominant CPU
+// cost in profiles — typically beyond ~50 k authenticated RPS per
+// process.
+//
+// Beyond that, prefer:
+//
+//   - A Redis or other shared SessionStore for horizontal scale;
+//     the network round-trip is more expensive per call but
+//     parallelizes across cores and stops being a single-process
+//     bottleneck.
+//   - A sharded in-process implementation: N independent stores
+//     keyed by hash(id) % N. Each shard has its own mutex.
+//     Reasonable when sessions must stay process-local.
+//
+// The pattern is identical to MemoryRateLimitStore — see its
+// "Scale guidance" comment for the same trade-offs.
 type MemorySessionStore struct {
 	mu         sync.Mutex
 	entries    map[string]*sessionEntry

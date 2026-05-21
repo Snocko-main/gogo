@@ -147,6 +147,25 @@ func RateLimit(opt RateLimitOptions) mwhint.Hinted {
 //
 // GC may also be called manually to reclaim space before the cap is
 // hit; otherwise the lazy sweep inside Hit covers the common case.
+//
+// # Scale guidance
+//
+// Every Hit acquires a single mutex. On a single host with one or two
+// dozen cores this is fine well past 50 k RPS — the critical section
+// is < 1 µs (map probe + count++) and Go's mutex is fair under
+// moderate contention. Above ~100 k RPS the lock starts to show up in
+// CPU profiles; above ~250 k RPS it dominates.
+//
+// Beyond those thresholds, prefer:
+//
+//   - A Redis-backed Store for shared counters across a fleet. The
+//     network round-trip costs more per call but parallelizes across
+//     cores, and you can swap atomic.Int64 in Redis or use INCR with
+//     EXPIRE for the same algorithm.
+//   - Shard your own map[string]*rateBucket across N independent
+//     stores keyed by hash(key) % N. Each shard has its own mutex.
+//     Useful when you must stay in-process but contention shows up
+//     in profiles.
 type MemoryRateLimitStore struct {
 	mu         sync.Mutex
 	buckets    map[string]*rateBucket
