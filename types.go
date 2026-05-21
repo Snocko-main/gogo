@@ -395,6 +395,34 @@ type asyncMiddlewareEntry struct {
 // is a safe production default. Pass to NewApp; values are applied at
 // app creation and bind time. The struct is intentionally narrow — knobs
 // only get added here when they need a single, app-wide value.
+//
+// # Connection-level timeouts and limits
+//
+// A few knobs that look like they belong here are deliberately not
+// exposed:
+//
+//   - HTTP idle timeout (TCP connection sits open without sending a
+//     request, or keep-alive between requests). Fixed by uWebSockets
+//     at 10 seconds via the HTTP_IDLE_TIMEOUT_S constant in
+//     HttpContext.h — a connection that goes silent for 10 s is closed
+//     automatically. Exposing this as a config knob would require
+//     patching vendored uWS source or wiring up the uWS filter
+//     mechanism through the C++ bridge; the default is aggressive
+//     enough that this hasn't been done yet. If you need a longer
+//     idle for a legitimate long-poll-style workload, use a WebSocket
+//     route (WebSocketBehavior.IdleTimeout is configurable).
+//
+//   - Maximum concurrent connections. Not implemented in this
+//     framework because the bound that matters in practice is the OS
+//     file-descriptor limit (`ulimit -n`) and any reverse proxy in
+//     front (nginx `limit_conn_zone`, etc.). uWS holds an idle TCP
+//     connection in ~10 KB of RAM, so 100k connections is ~1 GB —
+//     usually the FD cap fires long before that. If you genuinely
+//     need application-level admission control, terminate at a proxy
+//     and apply limits there.
+//
+//   - Slow-loris on the request body itself IS covered: see
+//     BodyReadTimeout below.
 type Config struct {
 	// BodyLimit caps the request-body bytes a Post / Any route will
 	// accept. Enforced at three layers so every intake shape gets the
