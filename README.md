@@ -1496,69 +1496,87 @@ lookup), and tears it down. See the script header for the env knobs.
 
 ### Results
 
-Median req/s across `wrk -t {1,2,4,8} -c 500 -d 10s`, Intel Xeon (Skylake)
-4 vCPU @ 2.80 GHz, Linux 6.18.
+Median across `wrk -t {1,2,4,8} -c 500 -d 10s`. Each cell shows req/s
+on the first line, `p50 / p99` latency on the second.
 
 - `POST /echo` — sync handler reads the body and writes it back
   unchanged (50-byte JSON). Exercises the pure body-collection +
-  response-write path.
-- `POST /query` — body carries an integer id, handler parses it and
+  response-write path. gogo uses `app.Post` here (no goroutine
+  handoff).
+- `POST /query` — body carries an integer id; handler parses it and
   runs `SELECT … FROM users WHERE id = ?` against SQLite, returns the
-  row. Realistic API shape: body parse + blocking I/O + JSON response.
-  gogo's `PostAsync` is built for exactly this — body fits the
+  row. Realistic API shape: body parse + blocking I/O + JSON
+  response. gogo uses `PostAsync` here — the small body fits the
   shared-dispatch cap so the request crosses zero cgo callbacks on
   the hot path, and the handler runs on a worker goroutine so the
   blocking `sql.DB.QueryRow` doesn't pin the loop thread.
 
+> **Hardware note** — these numbers come from a shared-tenant Linux
+> container (Intel Xeon 4 vCPU @ 2.10 GHz). The container has shown
+> 2× drift between runs depending on co-tenant load, so treat absolute
+> rps as ±20% on this hardware. Relative ordering and the latency
+> *shape* are stable across runs.
+
 #### Single worker (1 thread / event loop)
 
-| framework  | language | `/hello` | `/hello/:name` | `/db` | `POST /echo` | `POST /query` |
-|------------|----------|---------:|---------------:|------:|-------------:|--------------:|
-| uwsjs      | JS (Node)| **270,427** | **262,978**  | **158,177** | **222,397** | **133,137** |
-| **gogo**   | Go (cgo) |  259,363 |   243,730      | 123,901 | 191,158      | 127,692       |
-| actix      | Rust     |  120,514 |   113,815      |  49,172 |  94,187      |  43,064       |
-| bun+elysia | TS (Bun) |  102,971 |    97,675      |  56,005 |  64,306      |  46,407       |
-| fiber      | Go       |   96,832 |    96,550      |  34,433 |  95,737      |  33,134       |
-| net/http   | Go       |   51,489 |    51,708      |  24,525 |  45,568      |  23,961       |
+| framework  | language | `/hello`                          | `/hello/:name`                    | `/db`                              | `POST /echo`                       | `POST /query`                      |
+|------------|----------|----------------------------------:|----------------------------------:|-----------------------------------:|-----------------------------------:|-----------------------------------:|
+| uwsjs      | JS (Node)| **268k** rps<br>p50 1.3 / p99 4.1 ms | **262k** rps<br>p50 1.4 / p99 4.1 ms | **162k** rps<br>p50 2.7 / p99 6.1 ms | **223k** rps<br>p50 1.7 / p99 4.6 ms | **131k** rps<br>p50 3.4 / p99 7.6 ms |
+| **gogo**   | Go (cgo) | 258k rps<br>p50 1.3 / p99 4.2 ms     | 240k rps<br>p50 1.4 / p99 4.6 ms     | 127k rps<br>p50 3.2 / p99 10.0 ms    | 189k rps<br>p50 2.1 / p99 6.6 ms     | 126k rps<br>p50 3.2 / p99 10.1 ms    |
+| actix      | Rust     | 119k rps<br>p50 4.0 / p99 5.2 ms     | 110k rps<br>p50 4.1 / p99 6.1 ms     |  47k rps<br>p50 9.7 / p99 18.5 ms    |  83k rps<br>p50 4.4 / p99 7.8 ms     |  42k rps<br>p50 11.0 / p99 17.9 ms   |
+| bun+elysia | TS (Bun) |  99k rps<br>p50 4.7 / p99 8.5 ms     |  91k rps<br>p50 4.8 / p99 8.7 ms     |  54k rps<br>p50 8.5 / p99 12.7 ms    |  63k rps<br>p50 7.3 / p99 12.1 ms    |  42k rps<br>p50 9.6 / p99 14.4 ms    |
+| fiber      | Go       |  89k rps<br>p50 4.7 / p99 7.6 ms     |  92k rps<br>p50 4.8 / p99 8.3 ms     |  34k rps<br>p50 14.0 / p99 20.9 ms   |  90k rps<br>p50 4.9 / p99 7.7 ms     |  32k rps<br>p50 14.4 / p99 21.1 ms   |
+| net/http   | Go       |  48k rps<br>p50 9.0 / p99 15.8 ms    |  49k rps<br>p50 9.0 / p99 16.3 ms    |  24k rps<br>p50 19.4 / p99 33.9 ms   |  43k rps<br>p50 10.2 / p99 18.5 ms   |  24k rps<br>p50 19.7 / p99 34.8 ms   |
 
 #### Multi-worker (NumCPU = 4 workers)
 
-| framework  | language | `/hello` | `/hello/:name` | `/db` | `POST /echo` | `POST /query` |
-|------------|----------|---------:|---------------:|------:|-------------:|--------------:|
-| **gogo**   | Go (cgo) | **244,204** | **232,710** | **105,121** | **187,774** | **104,655** |
-| uwsjs      | JS (Node)|  158,184 |   153,933      |  69,939 |  120,744     |   61,809      |
-| actix      | Rust     |  124,021 |   111,442      |  50,072 |  110,288     |   44,490      |
-| bun+elysia | TS (Bun) |  108,310 |   102,407      |  53,134 |   59,898     |   46,633      |
-| fiber      | Go       |  104,269 |   102,868      |  32,895 |   95,622     |   33,267      |
-| net/http   | Go       |   50,558 |    48,868      |  24,634 |   46,061     |   24,281      |
+| framework  | language | `/hello`                          | `/hello/:name`                    | `/db`                              | `POST /echo`                       | `POST /query`                      |
+|------------|----------|----------------------------------:|----------------------------------:|-----------------------------------:|-----------------------------------:|-----------------------------------:|
+| **gogo**   | Go (cgo) | **223k** rps<br>p50 1.1 / p99 6.8 ms | **211k** rps<br>p50 1.1 / p99 6.7 ms |  **99k** rps<br>p50 3.6 / p99 15.7 ms | **177k** rps<br>p50 1.6 / p99 10.3 ms | **103k** rps<br>p50 3.6 / p99 15.3 ms |
+| uwsjs      | JS (Node)| 157k rps<br>p50 3.0 / p99 5.4 ms     | 150k rps<br>p50 3.0 / p99 5.8 ms     |  61k rps<br>p50 6.8 / p99 10.4 ms    | 119k rps<br>p50 3.8 / p99 6.9 ms     |  48k rps<br>p50 6.9 / p99 11.8 ms    |
+| actix      | Rust     | 118k rps<br>p50 3.8 / p99 5.6 ms     | 103k rps<br>p50 4.1 / p99 5.6 ms     |  49k rps<br>p50 9.6 / p99 18.3 ms    | 101k rps<br>p50 4.0 / p99 6.2 ms     |  43k rps<br>p50 10.7 / p99 17.3 ms   |
+| bun+elysia | TS (Bun) | 105k rps<br>p50 4.2 / p99 7.7 ms     | 100k rps<br>p50 4.3 / p99 8.3 ms     |  51k rps<br>p50 9.2 / p99 13.7 ms    |  51k rps<br>p50 7.7 / p99 12.5 ms    |  42k rps<br>p50 9.9 / p99 14.8 ms    |
+| fiber      | Go       |  98k rps<br>p50 4.5 / p99 6.7 ms     |  96k rps<br>p50 4.5 / p99 7.2 ms     |  32k rps<br>p50 14.6 / p99 21.6 ms   |  91k rps<br>p50 4.9 / p99 7.9 ms     |  32k rps<br>p50 14.2 / p99 22.3 ms   |
+| net/http   | Go       |  49k rps<br>p50 9.4 / p99 17.1 ms    |  48k rps<br>p50 9.8 / p99 17.7 ms    |  24k rps<br>p50 19.7 / p99 34.4 ms   |  44k rps<br>p50 10.1 / p99 18.5 ms   |  24k rps<br>p50 20.2 / p99 36.1 ms   |
 
 `/db` reads one row from a 1000-row SQLite table with a random id —
 exercises the framework + driver, not just the HTTP layer.
 
 Notes on the spread:
 
-- **gogo vs uwsjs**: same uWebSockets core underneath, same shape on
-  GETs. uwsjs edges single-worker (no Go scheduler latency on the
-  hot path), gogo's lead opens up in multi-worker (cluster IPC + V8
-  contention cap Node's scaling, while gogo's shared-dispatch ring +
-  goroutine workers scale linearly across cores).
+- **Throughput**: gogo and uwsjs share the same uWebSockets core, so
+  single-worker GETs are within a few percent of each other. gogo's
+  lead opens up in multi-worker — Go's runtime schedules goroutines
+  across cores cleanly, while Node's `cluster` adds IPC + V8
+  contention between worker processes.
+- **Tail latency (p99)**: uwsjs has the tightest p99 in single-worker
+  mode (4–6 ms on GETs, 5–8 ms on POSTs) because a single-process
+  Node event loop has no GC pause on the hot path. gogo's multi-worker
+  p99 widens to 7–16 ms — the cost of Go's goroutine scheduler
+  waking workers across cores. When latency consistency matters more
+  than raw throughput, single-worker gogo or uwsjs are both excellent
+  choices.
 - **POST /echo (sync)** — gogo's sync `app.Post` + `Response.Body`
   collects the body on the loop thread and writes it back without a
-  goroutine handoff. Beats actix ~2× single and ~1.7× multi. Earlier
+  goroutine handoff. Beats actix ~2× on rps with similar p99. Earlier
   versions of this benchmark used `PostAsync` for /echo and lost to
   actix here; the fair-comparison shape is sync for pure echo.
-- **POST /query (PostAsync + SQLite)** — body is tiny (≤ 256 B) so
-  it fits gogo's shared-dispatch fast path: zero cgo callbacks on the
-  body-collection path, then the handler runs on a worker goroutine
-  so the blocking `sql.DB.QueryRow` doesn't stall the loop. gogo wins
-  ~2.4× over actix here in both modes — exactly the workload
-  `PostAsync` is designed for (small body, blocking I/O, JSON
-  response).
-- **fiber's /db & /query** — fasthttp routing is fast, but a single
-  shared SQLite connection bottlenecks everything that touches the DB
-  in both single and multi modes.
-- **net/http** — modest across the board; standard library baseline
-  for context, not a serious competitor on raw throughput.
+- **POST /query (PostAsync + SQLite)** — gogo wins ~3× over actix on
+  rps in both modes, because the small body hits the shared-dispatch
+  fast path (zero cgo callbacks) and the blocking SQLite query runs
+  on a worker goroutine without stalling the loop. p99 is ~10–15 ms
+  vs actix's ~17 ms — gogo is faster AND has tighter tail here.
+- **actix Rust** scales well across cores (single ≈ multi for
+  /hello) and has consistent p99 — Tokio doesn't have the
+  goroutine-scheduling jitter Go does. Its absolute rps lags uWS
+  stacks because Tokio's task scheduling pays per-request overhead
+  that uWS's single-loop model skips.
+- **fiber's /db & /query** bottleneck on a single shared SQLite
+  connection in both modes; p99 climbs to 20+ ms. gogo's `sql.DB`
+  pool spreads the lock across goroutines.
+- **net/http** — standard library baseline. Throughput is half of
+  gogo and p99 is 3–4× wider, but it ships with the Go standard
+  library and needs no native bindings.
 
 To reproduce:
 
