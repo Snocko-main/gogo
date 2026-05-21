@@ -1477,13 +1477,15 @@ turns the parts Go needs into a small C ABI.
 
 ## Benchmarking
 
-There are five comparable HTTP benchmark servers:
+There are six comparable HTTP benchmark servers, spanning Go, Node,
+Bun, and Rust:
 
 - `benchmark/gogo`: this binding
 - `benchmark/nethttp`: Go standard library `net/http`
 - `benchmark/fiber`: gofiber/fiber on fasthttp
 - `benchmark/node-uwebsockets`: uWebSockets.js on Node
 - `benchmark/bun-elysia`: Elysia on Bun
+- `benchmark/actix`: actix-web 4 on Rust (release build, fat LTO)
 
 `scripts/bench_wrk.sh` starts each server, hits `/hello`, `/hello/:name`,
 and `/db` with `wrk`, then tears it down. See the script header for the
@@ -1491,23 +1493,43 @@ env knobs.
 
 ### Results
 
-Single-worker, median req/s across `wrk -t {1,2,4,8} -c 500 -d 15s`,
-Apple M3 8-core, macOS 26.
+Single-worker, median req/s across `wrk -t {1,2,4,8} -c 500 -d 10s`,
+Intel Xeon (Skylake) 4 vCPU @ 2.80 GHz, Linux 6.18.
 
 | framework  |       `/hello` | `/hello/:name` |          `/db` |
 |------------|---------------:|---------------:|---------------:|
-| **gogo**   |    **296,793** |    **273,654** |    **192,319** |
-| uwsjs      |        248,810 |        246,972 |        167,335 |
-| fiber      |        243,596 |        227,940 |         98,999 |
-| bun+elysia |        210,421 |        201,456 |        131,955 |
-| net/http   |        148,165 |        142,569 |         74,639 |
+| **gogo**   |    **145,249** |        137,425 |     **97,673** |
+| uwsjs      |        119,444 |    **143,244** |         43,171 |
+| actix      |         98,563 |         91,094 |         48,548 |
+| fiber      |         70,623 |         72,802 |         22,690 |
+| bun+elysia |         59,240 |         64,770 |         37,616 |
+| net/http   |         39,567 |         35,911 |         16,770 |
 
 `/db` reads one row from a 1000-row SQLite table with a random id —
 exercises the framework + driver, not just the HTTP layer.
+
+Notes on the spread:
+
+- **gogo vs actix on /hello**: ~1.47× (peak at -t1: 165k vs 118k).
+  Actix is the strongest Rust framework on TechEmpower-style benchmarks;
+  this gap is the cost of Tokio's per-request scheduling versus uWS's
+  single-threaded event loop with zero-cgo shared dispatch on the
+  hot path.
+- **gogo vs uwsjs**: same uWebSockets core underneath. uwsjs edges
+  ahead on `/hello/:name` (path-param parsing on the C++ side without a
+  Go callback), gogo wins `/db` ~2.3× because the Go sql driver is
+  faster than node-sqlite3 and our shared-dispatch worker pool avoids
+  a per-request V8 callback.
+- **fiber's /db**: fasthttp routing is fast, but the single shared
+  SQLite connection bottlenecks all four endpoints on the same lock.
+  gogo's `sql.DB` pool spreads the lock across goroutines.
 
 To reproduce:
 
 ```sh
 export CGO_ENABLED=1
+# Pre-build the Actix release binary once (skip if you don't want
+# to compare against Rust):
+cargo build --release --manifest-path benchmark/actix/Cargo.toml
 ./scripts/bench_wrk.sh
 ```

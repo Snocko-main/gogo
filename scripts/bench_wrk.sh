@@ -22,7 +22,8 @@
 #   RESULTS_DIR  where to write logs              (default benchmark/results)
 #
 # Prereqs: wrk, go, node (+ npm install in benchmark/node-uwebsockets),
-# bun (+ bun install in benchmark/bun-elysia).
+# bun (+ bun install in benchmark/bun-elysia), and the Actix release
+# binary (cargo build --release --manifest-path benchmark/actix/Cargo.toml).
 
 set -eu
 
@@ -33,7 +34,7 @@ DURATION="${DURATION:-15}"
 THREADS="${THREADS:-1 2 4 8}"
 CONN="${CONN:-500}"
 ENDPOINTS="${ENDPOINTS:-/hello /hello/inon /db}"
-FRAMEWORKS="${FRAMEWORKS:-gogo fiber nethttp uwsjs bun}"
+FRAMEWORKS="${FRAMEWORKS:-gogo fiber nethttp uwsjs bun actix}"
 MODES="${MODES:-single multi}"
 WARMUP="${WARMUP:-2}"
 RESULTS_DIR="${RESULTS_DIR:-benchmark/results}"
@@ -138,6 +139,17 @@ start_server() {
 	bun:multi)
 		PORT=3005
 		( BUN_WORKERS="$NCPU" bun run benchmark/bun-elysia/server.ts >/tmp/bench-bun.log 2>&1 ) &
+		SERVER_PID=$!
+		;;
+	actix:single)
+		PORT=3006
+		# Release binary must be pre-built: cargo build --release --manifest-path benchmark/actix/Cargo.toml
+		( ACTIX_WORKERS=1 PORT=3006 benchmark/actix/target/release/actix-bench >/tmp/bench-actix.log 2>&1 ) &
+		SERVER_PID=$!
+		;;
+	actix:multi)
+		PORT=3006
+		( ACTIX_WORKERS="$NCPU" PORT=3006 benchmark/actix/target/release/actix-bench >/tmp/bench-actix.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	*)
