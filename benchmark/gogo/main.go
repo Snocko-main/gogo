@@ -115,6 +115,12 @@ func main() {
 			res.Send(200, "application/json",
 				fmt.Sprintf(`{"id":%q}`+"\n", req.Parameter(0)))
 		})
+		// POST /echo: read the body, write it back unchanged.
+		// Exercises the body-collection path (Response.Body) and the
+		// async dispatch handoff after the body completes.
+		app.PostAsync("/echo", 64*1024, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			res.Send(200, "application/json", string(body))
+		})
 	}
 
 	if n == 1 {

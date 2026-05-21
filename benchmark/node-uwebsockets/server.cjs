@@ -108,6 +108,25 @@ uWS
       });
     }, 2);
   })
+  // POST /echo: read the body, write it back unchanged.
+  // uWS streams body chunks via onData; accumulate then reply on isLast.
+  .post("/echo", (res) => {
+    res.onAborted(() => {
+      res.aborted = true;
+    });
+    let buf = Buffer.alloc(0);
+    res.onData((chunk, isLast) => {
+      buf = Buffer.concat([buf, Buffer.from(chunk)]);
+      if (isLast && !res.aborted) {
+        res.cork(() => {
+          res
+            .writeStatus("200 OK")
+            .writeHeader("Content-Type", "application/json")
+            .end(buf);
+        });
+      }
+    });
+  })
   .listen(port, workers > 1 ? uWS.LIBUS_LISTEN_EXCLUSIVE_PORT : 0, (token) => {
     if (!token) {
       console.error(`failed to listen on :${port}`);

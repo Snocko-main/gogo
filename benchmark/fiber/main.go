@@ -115,6 +115,12 @@ func main() {
 		return c.SendString(fmt.Sprintf(`{"id":%d,"name":%q,"email":%q,"role":%q}`+"\n", id, name, email, role))
 	})
 
+	// POST /echo echoes the request body back unchanged.
+	app.Post("/echo", func(c *fiber.Ctx) error {
+		c.Set("Content-Type", "application/json")
+		return c.Send(c.Body())
+	})
+
 	if prefork {
 		log.Println("Fiber listening on http://localhost:3004 (prefork)")
 	} else {

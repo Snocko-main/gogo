@@ -1480,49 +1480,72 @@ turns the parts Go needs into a small C ABI.
 There are six comparable HTTP benchmark servers, spanning Go, Node,
 Bun, and Rust:
 
-- `benchmark/gogo`: this binding
-- `benchmark/nethttp`: Go standard library `net/http`
-- `benchmark/fiber`: gofiber/fiber on fasthttp
-- `benchmark/node-uwebsockets`: uWebSockets.js on Node
-- `benchmark/bun-elysia`: Elysia on Bun
-- `benchmark/actix`: actix-web 4 on Rust (release build, fat LTO)
+| benchmark dir | framework | language / runtime |
+|---|---|---|
+| `benchmark/gogo`            | this binding (uWebSockets) | Go (cgo → C++) |
+| `benchmark/actix`           | actix-web 4 (release + fat LTO) | Rust |
+| `benchmark/fiber`           | gofiber/fiber (fasthttp)     | Go |
+| `benchmark/node-uwebsockets`| uWebSockets.js               | JavaScript (Node) |
+| `benchmark/bun-elysia`      | Elysia                       | TypeScript (Bun) |
+| `benchmark/nethttp`         | Go standard library `net/http` | Go |
 
 `scripts/bench_wrk.sh` starts each server, hits `/hello`, `/hello/:name`,
-and `/db` with `wrk`, then tears it down. See the script header for the
-env knobs.
+`/db`, and `POST /echo` with `wrk`, then tears it down. See the script
+header for the env knobs.
 
 ### Results
 
-Single-worker, median req/s across `wrk -t {1,2,4,8} -c 500 -d 10s`,
-Intel Xeon (Skylake) 4 vCPU @ 2.80 GHz, Linux 6.18.
+Median req/s across `wrk -t {1,2,4,8} -c 500 -d 10s`, Intel Xeon (Skylake)
+4 vCPU @ 2.80 GHz, Linux 6.18. `POST /echo` sends a 50-byte JSON body
+that the server reads and writes back unchanged — exercises the
+body-collection path.
 
-| framework  |       `/hello` | `/hello/:name` |          `/db` |
-|------------|---------------:|---------------:|---------------:|
-| **gogo**   |    **145,249** |        137,425 |     **97,673** |
-| uwsjs      |        119,444 |    **143,244** |         43,171 |
-| actix      |         98,563 |         91,094 |         48,548 |
-| fiber      |         70,623 |         72,802 |         22,690 |
-| bun+elysia |         59,240 |         64,770 |         37,616 |
-| net/http   |         39,567 |         35,911 |         16,770 |
+#### Single worker (1 thread / event loop)
+
+| framework  | language | `/hello` | `/hello/:name` | `/db` | `POST /echo` |
+|------------|----------|---------:|---------------:|------:|-------------:|
+| **gogo**   | Go (cgo) | **113,897** | **97,103**  | **76,792** | 49,246 |
+| uwsjs      | JS (Node)|  93,315  |   95,102       | 40,805 | 62,038       |
+| actix      | Rust     |  72,495  |   70,298       | 34,713 | **68,482**   |
+| fiber      | Go       |  60,519  |   61,755       | 18,346 | 52,198       |
+| bun+elysia | TS (Bun) |  49,672  |   38,910       | 24,753 | 25,184       |
+| net/http   | Go       |  29,669  |   29,853       | 13,852 | 26,745       |
+
+#### Multi-worker (NumCPU = 4 workers)
+
+| framework  | language | `/hello` | `/hello/:name` | `/db` | `POST /echo` |
+|------------|----------|---------:|---------------:|------:|-------------:|
+| actix      | Rust     | **180,885** |   161,706   | 33,594 | **150,654** |
+| **gogo**   | Go (cgo) |  160,945 | **181,104**    | **73,433** | 69,218  |
+| fiber      | Go       |  151,766 |   142,613      | 68,911 | 127,678      |
+| bun+elysia | TS (Bun) |  121,432 |   121,793      | **79,705** | 94,760  |
+| nethttp    | Go       |  102,595 |   104,520      | 34,038 | 78,733       |
+| uwsjs      | JS (Node)|   94,644 |    89,161      | 37,181 | 68,665       |
 
 `/db` reads one row from a 1000-row SQLite table with a random id —
 exercises the framework + driver, not just the HTTP layer.
 
 Notes on the spread:
 
-- **gogo vs actix on /hello**: ~1.47× (peak at -t1: 165k vs 118k).
-  Actix is the strongest Rust framework on TechEmpower-style benchmarks;
-  this gap is the cost of Tokio's per-request scheduling versus uWS's
-  single-threaded event loop with zero-cgo shared dispatch on the
-  hot path.
-- **gogo vs uwsjs**: same uWebSockets core underneath. uwsjs edges
-  ahead on `/hello/:name` (path-param parsing on the C++ side without a
-  Go callback), gogo wins `/db` ~2.3× because the Go sql driver is
-  faster than node-sqlite3 and our shared-dispatch worker pool avoids
-  a per-request V8 callback.
-- **fiber's /db**: fasthttp routing is fast, but the single shared
-  SQLite connection bottlenecks all four endpoints on the same lock.
-  gogo's `sql.DB` pool spreads the lock across goroutines.
+- **Single worker**: gogo dominates because uWS's single-threaded event
+  loop is hard to beat on cold sockets — Tokio's task scheduling and
+  Node's libuv both add per-request overhead actix and uwsjs only
+  recoup at higher worker counts. POST /echo is the one endpoint where
+  Tokio's async body handling pulls ahead: gogo's `PostAsync` chain
+  pays the body-collection cost on the loop thread.
+- **Multi-worker**: actix takes the /hello lead because Tokio scales
+  near-linearly across CPUs, but gogo wins `/hello/:name` (uWS parses
+  path params in C++ with no per-request handler upcall) and crushes
+  `/db` ~2.2× — Go's `sql.DB` connection pool spreads the SQLite lock
+  across goroutines, whereas Rust's `rusqlite` + `web::block` hands a
+  single mutex-guarded connection across worker threads.
+- **bun's /db (multi: 79k)** is the surprise: Bun's native `bun:sqlite`
+  binding is genuinely fast — it just doesn't get the chance to shine
+  when the framework's per-request CPU overhead caps throughput on
+  cheaper endpoints.
+- **fiber's /db (single: 18k)** bottlenecks on the single SQLite
+  connection it serializes through; the multi-worker number recovers
+  to 69k once prefork spreads the lock.
 
 To reproduce:
 

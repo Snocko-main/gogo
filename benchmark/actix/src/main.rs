@@ -1,12 +1,13 @@
 // Actix-web HTTP benchmark mirror — same shape as benchmark/gogo:
-//   GET /hello              → "hello world\n"
-//   GET /hello/:name        → "hello <name>\n"
-//   GET /db                 → random row from a 1000-row sqlite table
+//   GET  /hello             → "hello world\n"
+//   GET  /hello/:name       → "hello <name>\n"
+//   GET  /db                → random row from a 1000-row sqlite table
+//   POST /echo              → echo the request body back unchanged
 //
 // Single-worker by default to match the gogo single-core run. Set
 // ACTIX_WORKERS=N to widen.
 
-use actix_web::{get, web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder};
 use once_cell::sync::OnceCell;
 use rand::Rng;
 use rusqlite::{params, Connection};
@@ -97,6 +98,14 @@ async fn db_row() -> impl Responder {
     }
 }
 
+// POST /echo: read the request body and write it back unchanged.
+// Exercises the request-body collection path. The 64 KiB cap matches
+// the gogo PostAsync limit so all benchmarks share the same ceiling.
+#[post("/echo")]
+async fn echo(body: web::Bytes) -> impl Responder {
+    HttpResponse::Ok().content_type("application/json").body(body)
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let db_path = env::var("BENCH_DB").unwrap_or_else(|_| "/tmp/uwsbench/sample.db".to_string());
@@ -117,9 +126,15 @@ async fn main() -> std::io::Result<()> {
 
     println!("actix listening on 0.0.0.0:{} (workers={})", port, workers);
 
-    HttpServer::new(|| App::new().service(hello).service(hello_name).service(db_row))
-        .workers(workers)
-        .bind(("0.0.0.0", port))?
-        .run()
-        .await
+    HttpServer::new(|| {
+        App::new()
+            .service(hello)
+            .service(hello_name)
+            .service(db_row)
+            .service(echo)
+    })
+    .workers(workers)
+    .bind(("0.0.0.0", port))?
+    .run()
+    .await
 }

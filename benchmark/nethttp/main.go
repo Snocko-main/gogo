@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"io"
 	"log"
 	"math/rand/v2"
 	"net/http"
@@ -91,6 +92,17 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"id":%d,"name":%q,"email":%q,"role":%q}`+"\n", id, name, email, role)
+	})
+
+	// POST /echo: read the body, write it back unchanged.
+	mux.HandleFunc("POST /echo", func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64*1024))
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(body)
 	})
 
 	server := &http.Server{

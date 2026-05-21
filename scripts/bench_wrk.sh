@@ -1,25 +1,29 @@
 #!/usr/bin/env bash
 #
-# wrk benchmark matrix across gogo, fiber, node+uWebSockets.js, bun+elysia.
+# wrk benchmark matrix across gogo, fiber, nethttp, node+uWebSockets.js,
+# bun+elysia, and actix-web.
 #
-# Endpoints:   /hello, /hello/:name, /db
+# Endpoints:   /hello, /hello/:name, /db (GET) + /echo (POST)
 # Threads:     1, 2, 4, 8     (wrk -t)
 # Connections: 500            (wrk -c)
 # Modes:       single (1 worker) and multi (NumCPU workers)
 #
-# Each server is started, warmed, benchmarked, then killed before moving
-# to the next. Per-run stdout (request rate, latency) is appended to
+# /echo POSTs a fixed 50-byte JSON body via scripts/wrk_post.lua so each
+# server's body-collection path is exercised. Each server is started,
+# warmed, benchmarked, then killed before moving to the next. Per-run
+# stdout (request rate, latency) is appended to
 # benchmark/results/wrk-<framework>-<mode>.log.
 #
 # Env knobs:
-#   DURATION  seconds per wrk run                 (default 15)
-#   THREADS   space-separated thread counts       (default "1 2 4 8")
-#   CONN      connections                         (default 500)
-#   ENDPOINTS endpoints to hit                    (default "/hello /hello/inon /db")
-#   FRAMEWORKS subset to run                      (default "gogo fiber uwsjs bun")
-#   MODES     subset to run                       (default "single multi")
-#   WARMUP    seconds of warmup hits before timing (default 2)
-#   RESULTS_DIR  where to write logs              (default benchmark/results)
+#   DURATION       seconds per wrk run                  (default 15)
+#   THREADS        space-separated thread counts        (default "1 2 4 8")
+#   CONN           connections                          (default 500)
+#   ENDPOINTS      GET endpoints to hit                 (default "/hello /hello/inon /db")
+#   POST_ENDPOINTS POST endpoints to hit                (default "/echo")
+#   FRAMEWORKS     subset to run                        (default "gogo fiber nethttp uwsjs bun actix")
+#   MODES          subset to run                        (default "single multi")
+#   WARMUP         seconds of warmup hits before timing (default 2)
+#   RESULTS_DIR    where to write logs                  (default benchmark/results)
 #
 # Prereqs: wrk, go, node (+ npm install in benchmark/node-uwebsockets),
 # bun (+ bun install in benchmark/bun-elysia), and the Actix release
@@ -34,6 +38,8 @@ DURATION="${DURATION:-15}"
 THREADS="${THREADS:-1 2 4 8}"
 CONN="${CONN:-500}"
 ENDPOINTS="${ENDPOINTS:-/hello /hello/inon /db}"
+POST_ENDPOINTS="${POST_ENDPOINTS:-/echo}"
+POST_LUA="${POST_LUA:-$REPO_ROOT/scripts/wrk_post.lua}"
 FRAMEWORKS="${FRAMEWORKS:-gogo fiber nethttp uwsjs bun actix}"
 MODES="${MODES:-single multi}"
 WARMUP="${WARMUP:-2}"
@@ -171,19 +177,27 @@ bench_one() {
 	port="$3"
 	endpoint="$4"
 	threads="$5"
+	post="${6:-0}"
 	log="$RESULTS_DIR/wrk-${fw}-${mode}.log"
 
-	header="== $fw [$mode] $endpoint  t=$threads c=$CONN d=${DURATION}s =="
+	method="GET"
+	wrk_extra=()
+	if [ "$post" = 1 ]; then
+		method="POST"
+		wrk_extra=(-s "$POST_LUA")
+	fi
+
+	header="== $fw [$mode] $method $endpoint  t=$threads c=$CONN d=${DURATION}s =="
 	echo
 	echo "$header"
 	echo "$header" >> "$log"
 
 	# warmup
 	if [ "$WARMUP" -gt 0 ]; then
-		wrk -t1 -c10 -d"${WARMUP}s" "http://127.0.0.1:$port$endpoint" >/dev/null 2>&1 || true
+		wrk -t1 -c10 -d"${WARMUP}s" "${wrk_extra[@]}" "http://127.0.0.1:$port$endpoint" >/dev/null 2>&1 || true
 	fi
 
-	wrk -t"$threads" -c"$CONN" -d"${DURATION}s" --latency "http://127.0.0.1:$port$endpoint" | tee -a "$log"
+	wrk -t"$threads" -c"$CONN" -d"${DURATION}s" --latency "${wrk_extra[@]}" "http://127.0.0.1:$port$endpoint" | tee -a "$log"
 }
 
 for fw in $FRAMEWORKS; do
@@ -198,7 +212,12 @@ for fw in $FRAMEWORKS; do
 		sleep 1
 		for endpoint in $ENDPOINTS; do
 			for t in $THREADS; do
-				bench_one "$fw" "$mode" "$PORT" "$endpoint" "$t"
+				bench_one "$fw" "$mode" "$PORT" "$endpoint" "$t" 0
+			done
+		done
+		for endpoint in $POST_ENDPOINTS; do
+			for t in $THREADS; do
+				bench_one "$fw" "$mode" "$PORT" "$endpoint" "$t" 1
 			done
 		done
 		cleanup

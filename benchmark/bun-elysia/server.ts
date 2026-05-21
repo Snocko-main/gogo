@@ -79,6 +79,15 @@ const app = new Elysia()
       { headers: { "Content-Type": "application/json" } }
     );
   })
+  // POST /echo: read the body, echo back. Elysia exposes parsed body
+  // via the destructured `body` arg; we ask Bun.serve to skip parsing
+  // and just hand back the bytes.
+  .post("/echo", async ({ request }) => {
+    const buf = await request.arrayBuffer();
+    return new Response(buf, {
+      headers: { "Content-Type": "application/json" },
+    });
+  })
   .listen({ port, reusePort: workers > 1 });
 
 const tag = workers > 1 ? ` (worker ${process.pid})` : "";
