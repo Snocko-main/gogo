@@ -52,6 +52,17 @@ type RateLimitOptions struct {
 	// Negative disables the cap (not recommended outside tests).
 	// Only consulted when Store is the default MemoryRateLimitStore.
 	MaxBuckets int
+
+	// AsyncStore places the middleware in the async chain only. Enable
+	// this when Store.Hit may block on Redis, Memcache, SQL, or network
+	// I/O so the hit check runs on the worker goroutine instead of the
+	// uWS event-loop thread.
+	//
+	// Async-placed middleware fires only on GetAsync / PostAsync routes;
+	// sync routes do not see it. Keep the default false for the built-in
+	// in-memory store or for fast non-blocking custom stores where early
+	// sync rejection is desired.
+	AsyncStore bool
 }
 
 // RateLimitStore abstracts the bucket backend so production
@@ -103,7 +114,11 @@ func RateLimit(opt RateLimitOptions) mwhint.Hinted {
 	}
 	maxStr := strconv.Itoa(opt.Max)
 
-	return mwhint.Hinted{Place: mwhint.Sync, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler {
+	placement := mwhint.Sync
+	if opt.AsyncStore {
+		placement = mwhint.Async
+	}
+	return mwhint.Hinted{Place: placement, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler {
 		return func(res *gogo.Response, req *gogo.Request) {
 			if opt.SkipFunc != nil && opt.SkipFunc(req) {
 				next(res, req)

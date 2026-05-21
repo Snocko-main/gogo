@@ -158,6 +158,50 @@ func TestSSEMultiLineData(t *testing.T) {
 	}
 }
 
+func TestSSECarriageReturnDataSplitsIntoDataLines(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.GetAsync("/events", func(res *gogo.Response, req *gogo.Request) {
+			res.SSE(func(s *gogo.SSEStream) error {
+				return s.Send("line one\rline two\r\nline three")
+			})
+		})
+	})
+	defer teardown()
+
+	resp, _ := http.Get(fmt.Sprintf("http://127.0.0.1:%d/events", port))
+	defer resp.Body.Close()
+	frame := readSSEFrame(t, bufio.NewReader(resp.Body), 2*time.Second)
+	want := "data: line one\ndata: line two\ndata: line three\n\n"
+	if frame != want {
+		t.Errorf("frame = %q\nwant %q", frame, want)
+	}
+}
+
+func TestSSERejectsInjectedMetadataFields(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.GetAsync("/events", func(res *gogo.Response, req *gogo.Request) {
+			_ = res.SSE(func(s *gogo.SSEStream) error {
+				return s.SendEvent(gogo.SSEEvent{
+					ID:    "42\nevent: injected",
+					Event: "tick",
+					Data:  "ok",
+				})
+			})
+		})
+	})
+	defer teardown()
+
+	resp, _ := http.Get(fmt.Sprintf("http://127.0.0.1:%d/events", port))
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(body), "event: injected") {
+		t.Fatalf("metadata injection reached stream: %q", body)
+	}
+	if len(body) != 0 {
+		t.Fatalf("body = %q, want empty stream after rejected metadata", body)
+	}
+}
+
 // TestSSEComment checks the comment frame shape — `: text\n\n` —
 // and that multi-line comments fan out the same way data does.
 func TestSSEComment(t *testing.T) {

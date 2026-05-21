@@ -95,6 +95,17 @@ type SessionOptions struct {
 	//
 	// Only consulted when Store is the default MemorySessionStore.
 	MaxEntries int
+
+	// AsyncStore places the middleware in the async chain only. Enable
+	// this when Store may block on Redis, SQL, disk, or network I/O so
+	// Load / Save / Delete run on the worker goroutine instead of the
+	// uWS event-loop thread.
+	//
+	// Async-placed middleware fires only on GetAsync / PostAsync routes;
+	// sync routes do not see it. Keep the default false for the built-in
+	// in-memory store or for fast non-blocking custom stores that must
+	// protect sync routes too.
+	AsyncStore bool
 }
 
 // Session is the per-request session handle handlers manipulate
@@ -271,9 +282,13 @@ func NewSession(opt SessionOptions) mwhint.Hinted {
 	// in-memory store doesn't block, so the middleware is safe
 	// either on the loop thread (sync routes) or in the worker
 	// (async routes). Deployments with a DB-backed Store that does
-	// block should wrap the bare closure with middleware.Async so
-	// the middleware only runs in the worker goroutine.
-	return mwhint.Hinted{Place: mwhint.Both, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler {
+	// block should set AsyncStore so the middleware only runs in
+	// the worker goroutine.
+	placement := mwhint.Both
+	if opt.AsyncStore {
+		placement = mwhint.Async
+	}
+	return mwhint.Hinted{Place: placement, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler {
 		return func(res *gogo.Response, req *gogo.Request) {
 			if opt.SkipFunc != nil && opt.SkipFunc(req) {
 				next(res, req)

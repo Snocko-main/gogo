@@ -26,3 +26,10 @@ func TestRateLimitConfiguredUsesSyncPlacement(t *testing.T) {
 		t.Fatalf("configured RateLimit placement = %v, want Sync", h.Place)
 	}
 }
+
+func TestRateLimitAsyncStoreUsesAsyncPlacement(t *testing.T) {
+	h := RateLimit(RateLimitOptions{Max: 10, Window: time.Minute, AsyncStore: true})
+	if h.Place != mwhint.Async {
+		t.Fatalf("AsyncStore RateLimit placement = %v, want Async", h.Place)
+	}
+}

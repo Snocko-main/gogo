@@ -104,11 +104,17 @@ func (s *SSEStream) SendEvent(e SSEEvent) error {
 	// medium ones.
 	b.Grow(256)
 	if e.ID != "" {
+		if !validSSEFieldValue(e.ID) {
+			return fmt.Errorf("gogo: SSE: id contains CR, LF, or NUL")
+		}
 		b.WriteString("id: ")
 		b.WriteString(e.ID)
 		b.WriteByte('\n')
 	}
 	if e.Event != "" {
+		if !validSSEFieldValue(e.Event) {
+			return fmt.Errorf("gogo: SSE: event contains CR, LF, or NUL")
+		}
 		b.WriteString("event: ")
 		b.WriteString(e.Event)
 		b.WriteByte('\n')
@@ -125,7 +131,7 @@ func (s *SSEStream) SendEvent(e SSEEvent) error {
 	// strings.Split keeps trailing empty entries, which we want —
 	// "a\nb\n" → ["a", "b", ""] → "data: a\ndata: b\ndata: \n",
 	// matching browser handling of the trailing newline-as-empty.
-	for _, line := range strings.Split(payload, "\n") {
+	for _, line := range splitSSELines(payload) {
 		b.WriteString("data: ")
 		b.WriteString(line)
 		b.WriteByte('\n')
@@ -147,7 +153,7 @@ func (s *SSEStream) SendEvent(e SSEEvent) error {
 func (s *SSEStream) Comment(text string) error {
 	var b strings.Builder
 	b.Grow(len(text) + 16)
-	for _, line := range strings.Split(text, "\n") {
+	for _, line := range splitSSELines(text) {
 		b.WriteString(": ")
 		b.WriteString(line)
 		b.WriteByte('\n')
@@ -187,6 +193,25 @@ func encodeSSEData(v any) (string, error) {
 		}
 		return string(buf), nil
 	}
+}
+
+func validSSEFieldValue(s string) bool {
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\r', '\n', 0:
+			return false
+		}
+	}
+	return true
+}
+
+func splitSSELines(s string) []string {
+	if strings.IndexByte(s, '\r') < 0 {
+		return strings.Split(s, "\n")
+	}
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	return strings.Split(s, "\n")
 }
 
 // SSE prepares the response as a Server-Sent Events stream and

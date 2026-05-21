@@ -108,6 +108,12 @@ func NewMetrics(opts ...MetricsOptions) *Metrics {
 	if o.Namespace == "" {
 		o.Namespace = "http"
 	}
+	if !validPromMetricNamePart(o.Namespace) {
+		panic("gogo/middleware: Metrics Namespace must match Prometheus metric-name characters")
+	}
+	if o.Subsystem != "" && !validPromMetricNamePart(o.Subsystem) {
+		panic("gogo/middleware: Metrics Subsystem must match Prometheus metric-name characters")
+	}
 	buckets := o.Buckets
 	if len(buckets) == 0 {
 		buckets = defaultMetricsBuckets
@@ -125,6 +131,23 @@ func NewMetrics(opts ...MetricsOptions) *Metrics {
 		bucketCounts: bucketCounts,
 		startedAt:    time.Now(),
 	}
+}
+
+func validPromMetricNamePart(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || c == ':' {
+			continue
+		}
+		if i > 0 && c >= '0' && c <= '9' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // Middleware returns the request-instrumenting middleware. Install
