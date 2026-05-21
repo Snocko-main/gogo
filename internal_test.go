@@ -17,8 +17,8 @@ func TestBodyEncoderOverflowReturnsPrefixOnly(t *testing.T) {
 	if prefix != "abc" {
 		t.Fatalf("overflow prefix = %q, want buffered prefix only", prefix)
 	}
-	if enc.buf.Len() != 0 {
-		t.Fatalf("buffer len after overflow = %d, want 0", enc.buf.Len())
+	if len(enc.buf) != 0 {
+		t.Fatalf("buffer len after overflow = %d, want 0", len(enc.buf))
 	}
 }
 
