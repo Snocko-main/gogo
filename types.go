@@ -478,6 +478,12 @@ type App struct {
 	// cgo-mediated loop close doesn't provide.
 	closed        atomic.Bool
 	pendingTimers atomic.Int32
+	// workerRefAcquired / workerRefDropped pair a shared-dispatch
+	// worker-pool reference with Apps that actually register at
+	// least one shared fast-path route. Sync-only Apps must not hold
+	// the pool open.
+	workerRefAcquired atomic.Bool
+	workerRefDropped  atomic.Bool
 	// routeMethods maps a LITERAL pattern to the set of HTTP methods
 	// registered against it. Used by the catch-all at Listen time to
 	// distinguish "path exists but the method is wrong" (→ 405 with
@@ -532,6 +538,12 @@ func NewApp(cfg ...Config) (*App, error) {
 	inner.setBodyLimit(c.BodyLimit)
 	inner.setCapturePeerIP(c.CapturePeerIP)
 	return &App{inner: inner, cfg: c}, nil
+}
+
+func (a *App) acquireSharedWorkerRef() {
+	if !a.workerRefAcquired.Swap(true) {
+		acquireSharedWorkerAppRef()
+	}
 }
 
 // Reply is a static response captured once at registration time. Routes
@@ -1003,6 +1015,7 @@ func (a *App) GetAsync(pattern string, handler AsyncHandler) {
 		// snap.paramNames and runs typed-param validation inside the
 		// worker (the snapshot built in C++ has no Go-side meta).
 		wrappedAsync := a.applyAppRefAsync(a.applyMetaAsync(meta, a.wrapAsync(uwsPattern, handler)))
+		a.acquireSharedWorkerRef()
 		a.inner.getShared(uwsPattern, wrappedAsync)
 		return
 	}
@@ -1070,6 +1083,7 @@ func (a *App) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandl
 	if maxBodyBytes > 0 && maxBodyBytes <= postSharedBodyCap &&
 		meta == nil && !a.hasMatchingMiddleware(uwsPattern) {
 		wrappedAsync := a.applyAppRefAsync(a.applyMetaAsync(meta, a.wrapAsync(uwsPattern, finalAsync)))
+		a.acquireSharedWorkerRef()
 		a.inner.postShared(uwsPattern, wrappedAsync, maxBodyBytes)
 		return
 	}
@@ -1474,6 +1488,7 @@ func (r *Router) GetAsync(pattern string, handler AsyncHandler) {
 		// typed validation inside the worker; applyAppRefAsync sets
 		// res.app so Response.Render works on async fast-path routes.
 		wrappedAsync := r.app.applyAppRefAsync(r.app.applyMetaAsync(meta, r.app.wrapAsync(full, r.wrapGroupAsync(handler))))
+		r.app.acquireSharedWorkerRef()
 		r.app.inner.getShared(full, wrappedAsync)
 		return
 	}
@@ -1899,6 +1914,13 @@ func (a *App) ShutdownGracefully(timeout time.Duration) {
 // before Run if the app was never started. Waits for any in-flight
 // ShutdownGracefully force-close goroutine to settle so a delayed
 // timer can't make a cgo call against a freed app pointer.
+//
+// Drops this App's reference on the shared-dispatch worker pool if
+// it registered any shared fast-path routes. When the last shared
+// App in the process is closed the worker goroutines exit cleanly so
+// long-running supervisors (tests, hot-reload, multi-tenant hosts)
+// don't accumulate dead workers spinning against a ring no app is
+// feeding anymore.
 func (a *App) Close() {
 	a.closed.Store(true)
 	// Drain any in-flight ShutdownGracefully timer goroutine before
@@ -1909,6 +1931,12 @@ func (a *App) Close() {
 		runtime.Gosched()
 	}
 	a.inner.close()
+	// Drop the worker pool reference exactly once per shared App.
+	// Multiple Close calls (defensive teardown, force-close timer
+	// overlap) must not over-decrement the global active-apps counter.
+	if a.workerRefAcquired.Load() && !a.workerRefDropped.Swap(true) {
+		stopSharedWorkersIfIdle()
+	}
 }
 
 // MultiCoreHandle controls a group of App instances started by RunMultiCore.

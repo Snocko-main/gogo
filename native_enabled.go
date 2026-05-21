@@ -70,9 +70,29 @@ var (
 	sharedHandlers     []AsyncHandler
 	sharedHandlersMu   sync.Mutex
 	sharedHandlersSnap atomic.Pointer[[]AsyncHandler]
-	sharedWorkersOnce  sync.Once
 	sharedActive       atomic.Bool // true once a Shared route has been registered
+
+	// sharedWorkerLifecycleMu guards the start / stop transition of the
+	// worker pool. Read-mostly: NewApp / App.Close transitions are rare
+	// compared to ensureSharedWorkers fast-path checks of the started
+	// flag (which uses atomic load + acquire-on-mu only on the first
+	// shared registration of an app).
+	sharedWorkerLifecycleMu sync.Mutex
+	sharedWorkersStarted    bool
+	sharedWorkerGen         *sharedWorkerGeneration
+	sharedWorkerGens        []*sharedWorkerGeneration
+	// sharedActiveApps counts Apps that registered at least one route
+	// on the shared-dispatch fast path. Plain sync apps do not hold a
+	// worker-pool reference; otherwise a long-lived sync-only App would
+	// keep workers spinning after the last shared App closed.
+	sharedActiveApps atomic.Int32
 )
+
+type sharedWorkerGeneration struct {
+	stop    chan struct{}
+	drained chan struct{}
+	live    atomic.Int32
+}
 
 func init() {
 	// Initialize the atomic snapshot with an empty slice so workers can
@@ -143,15 +163,129 @@ func SetWorkerCount(n int) {
 }
 
 func ensureSharedWorkers() {
-	sharedWorkersOnce.Do(func() {
-		n := int(workerCount.Load())
-		if n == 0 {
-			n = runtime.NumCPU()
+	sharedWorkerLifecycleMu.Lock()
+	defer sharedWorkerLifecycleMu.Unlock()
+	if sharedWorkersStarted {
+		return
+	}
+	n := int(workerCount.Load())
+	if n == 0 {
+		n = runtime.NumCPU()
+	}
+	gen := &sharedWorkerGeneration{
+		stop:    make(chan struct{}),
+		drained: make(chan struct{}),
+	}
+	gen.live.Store(int32(n))
+	sharedWorkerGen = gen
+	sharedWorkerGens = append(sharedWorkerGens, gen)
+	sharedWorkersStarted = true
+	for i := 0; i < n; i++ {
+		go func() {
+			defer sharedWorkerDone(gen)
+			sharedWorker(gen.stop)
+		}()
+	}
+}
+
+func acquireSharedWorkerAppRef() {
+	sharedWorkerLifecycleMu.Lock()
+	sharedActiveApps.Add(1)
+	sharedWorkerLifecycleMu.Unlock()
+}
+
+func sharedWorkerDone(gen *sharedWorkerGeneration) {
+	if gen.live.Add(-1) != 0 {
+		return
+	}
+	close(gen.drained)
+
+	sharedWorkerLifecycleMu.Lock()
+	defer sharedWorkerLifecycleMu.Unlock()
+	for i, candidate := range sharedWorkerGens {
+		if candidate == gen {
+			sharedWorkerGens = append(sharedWorkerGens[:i], sharedWorkerGens[i+1:]...)
+			break
 		}
-		for i := 0; i < n; i++ {
-			go sharedWorker()
+	}
+	if sharedWorkerGen == gen && !sharedWorkersStarted {
+		sharedWorkerGen = nil
+	}
+}
+
+// stopSharedWorkersIfIdle drops one app's reference to the worker
+// pool. When the count reaches zero the stop channel is closed so
+// workers exit on their next idle-path check.
+//
+// Fire-and-forget: Close does not wait for workers to drain because
+// they may be inside a user handler (long-poll, SSE stream) that
+// doesn't return until the client disconnects. Blocking Close on
+// such handlers would defeat the point of having a fast Close path.
+// Workers receive the signal and exit asynchronously; a subsequent
+// App.Listen on a shared route lazy-restarts the pool. Call
+// WaitForSharedWorkers if a process really must observe the drain
+// (cleanup tests, supervisor handoff).
+//
+// Safe to call multiple times for a single App via the per-App
+// idempotency guard in App.Close.
+func stopSharedWorkersIfIdle() {
+	sharedWorkerLifecycleMu.Lock()
+	defer sharedWorkerLifecycleMu.Unlock()
+	if sharedActiveApps.Add(-1) > 0 {
+		return
+	}
+	if !sharedWorkersStarted {
+		return
+	}
+	close(sharedWorkerGen.stop)
+	sharedWorkersStarted = false
+}
+
+// WaitForSharedWorkers blocks until every shared-dispatch worker
+// goroutine has exited, or timeout elapses (zero = wait forever).
+// Returns true when the pool drained cleanly, false on timeout.
+//
+// Use this only when the caller has already arranged for all live
+// handlers to return (e.g. forced socket close, request drain). The
+// idle worker path itself wakes within at most one polling interval
+// (~500 µs), so this returns quickly for processes that aren't
+// holding goroutines hostage inside user code.
+func WaitForSharedWorkers(timeout time.Duration) bool {
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
+	for {
+		sharedWorkerLifecycleMu.Lock()
+		gens := append([]*sharedWorkerGeneration(nil), sharedWorkerGens...)
+		sharedWorkerLifecycleMu.Unlock()
+		if len(gens) == 0 {
+			return true
 		}
-	})
+
+		for _, gen := range gens {
+			if timeout <= 0 {
+				<-gen.drained
+				continue
+			}
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return false
+			}
+			timer := time.NewTimer(remaining)
+			select {
+			case <-gen.drained:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+			case <-timer.C:
+				return false
+			}
+		}
+	}
 }
 
 // sharedWorker polls the request ring with adaptive back-off. Spin a handful
@@ -162,7 +296,11 @@ func ensureSharedWorkers() {
 // On handler panic, the worker recovers, sends a 500 response (if the
 // response hasn't already been written), releases the ctx, and continues
 // the loop — a single bad request never tears down a worker.
-func sharedWorker() {
+//
+// The stop channel is checked only on the idle / back-off branch (a
+// closed channel makes the non-blocking select fall through to the
+// exit path). Hot-path requests are never delayed by the check.
+func sharedWorker(stop <-chan struct{}) {
 	const spinLimit = 256
 
 	headAddr := (*atomic.Uint64)(unsafe.Pointer(shared.requestRing + shared.headOffset))
@@ -180,6 +318,13 @@ func sharedWorker() {
 			// head, which will reflect the consumer that just claimed the slot.
 			spins++
 			if spins > spinLimit {
+				// Check for shutdown only here, on the idle path —
+				// hot requests never pay for the select.
+				select {
+				case <-stop:
+					return
+				default:
+				}
 				if idleSleep == 0 {
 					idleSleep = 10 * time.Microsecond
 				} else if idleSleep < 500*time.Microsecond {
