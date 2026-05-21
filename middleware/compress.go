@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -176,11 +177,8 @@ func encodingQValue(params string) float64 {
 		if err != nil {
 			return 0
 		}
-		if q < 0 {
+		if math.IsNaN(q) || math.IsInf(q, 0) || q < 0 || q > 1 {
 			return 0
-		}
-		if q > 1 {
-			return 1
 		}
 		return q
 	}

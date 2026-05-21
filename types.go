@@ -10,6 +10,7 @@ import (
 	"mime"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1720,7 +1721,7 @@ func (a *App) URL(name string, params map[string]string) (string, error) {
 			if !ok {
 				return "", fmt.Errorf("gogo: URL: route %q requires param %q", name, pName)
 			}
-			out.WriteString(val)
+			out.WriteString(url.PathEscape(val))
 			i = j
 		default:
 			out.WriteByte(c)

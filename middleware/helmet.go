@@ -88,6 +88,9 @@ func Helmet(opts ...HelmetOptions) mwhint.Hinted {
 		opt = opts[0]
 	}
 	headers := buildHelmetHeaders(opt)
+	for _, h := range headers {
+		validateHelmetHeaderValue(h.key, h.value)
+	}
 
 	return mwhint.Hinted{Place: mwhint.Both, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler {
 		return func(res *gogo.Response, req *gogo.Request) {
@@ -97,6 +100,15 @@ func Helmet(opts ...HelmetOptions) mwhint.Hinted {
 			next(res, req)
 		}
 	})}
+}
+
+func validateHelmetHeaderValue(key, value string) {
+	for i := 0; i < len(value); i++ {
+		switch value[i] {
+		case '\r', '\n', 0:
+			panic("gogo/middleware: Helmet " + key + " contains a control character")
+		}
+	}
 }
 
 type helmetHeader struct{ key, value string }

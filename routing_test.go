@@ -251,6 +251,8 @@ func TestNamedRoutesAndURL(t *testing.T) {
 	}{
 		{"single param", "user.show", map[string]string{"id": "42"}, "/users/42", false},
 		{"multi param", "post.show", map[string]string{"userID": "alice", "postID": "9"}, "/users/alice/posts/9", false},
+		{"escape slash", "user.show", map[string]string{"id": "../admin"}, "/users/..%2Fadmin", false},
+		{"escape percent slash", "user.show", map[string]string{"id": "%2f"}, "/users/%252f", false},
 		{"unknown name", "missing", map[string]string{}, "", true},
 		{"missing param", "user.show", map[string]string{}, "", true},
 	}

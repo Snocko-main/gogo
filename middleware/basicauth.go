@@ -44,7 +44,13 @@ type BasicAuthOptions struct {
 	// authentication for that request. Useful to expose /healthz
 	// without credentials while protecting the rest of the app.
 	SkipFunc func(*gogo.Request) bool
+
+	// MaxCredentialBytes caps the base64 credentials payload before
+	// decoding. Default 8 KiB. Set negative to disable.
+	MaxCredentialBytes int
 }
+
+const defaultBasicAuthMaxCredentialBytes = 8 << 10
 
 // BasicAuth returns a Middleware that enforces HTTP Basic
 // authentication (RFC 7617). Requests without a valid Authorization
@@ -69,6 +75,9 @@ func BasicAuth(opt BasicAuthOptions) mwhint.Hinted {
 	}
 	if opt.LocalKey == "" {
 		opt.LocalKey = BasicAuthLocalKey
+	}
+	if opt.MaxCredentialBytes == 0 {
+		opt.MaxCredentialBytes = defaultBasicAuthMaxCredentialBytes
 	}
 	// RFC 7235 quoted-string grammar — realm is bound by double
 	// quotes, and any " or \ in the value must be backslash-escaped.
@@ -99,7 +108,7 @@ func BasicAuth(opt BasicAuthOptions) mwhint.Hinted {
 				next(res, req)
 				return
 			}
-			user, pass, ok := parseBasicAuth(req.Header("authorization"))
+			user, pass, ok := parseBasicAuth(req.Header("authorization"), opt.MaxCredentialBytes)
 			if !ok || !verify(user, pass) {
 				res.Header("WWW-Authenticate", challenge)
 				res.Send(401, "text/plain; charset=utf-8", "Unauthorized\n")
@@ -114,7 +123,7 @@ func BasicAuth(opt BasicAuthOptions) mwhint.Hinted {
 // parseBasicAuth pulls (user, pass) out of an Authorization header
 // value. Returns ok=false if the scheme is not Basic, the base64
 // payload is invalid, or the decoded payload has no ":" separator.
-func parseBasicAuth(auth string) (user, pass string, ok bool) {
+func parseBasicAuth(auth string, maxCredentialBytes int) (user, pass string, ok bool) {
 	const prefix = "Basic "
 	if len(auth) < len(prefix) {
 		return "", "", false
@@ -123,7 +132,11 @@ func parseBasicAuth(auth string) (user, pass string, ok bool) {
 	if !strings.EqualFold(auth[:len(prefix)], prefix) {
 		return "", "", false
 	}
-	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(auth[len(prefix):]))
+	encoded := strings.TrimSpace(auth[len(prefix):])
+	if maxCredentialBytes >= 0 && len(encoded) > maxCredentialBytes {
+		return "", "", false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
 		return "", "", false
 	}
