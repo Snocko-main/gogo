@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -305,7 +306,7 @@ func HTTPAdapter(h http.Handler) Handler {
 			res.Send(500, "text/plain; charset=utf-8", "Internal Server Error\n")
 			return
 		}
-		rec := newHTTPAdapterRecorder(MaxHTTPAdapterBodyBytes)
+		rec := newHTTPAdapterRecorder(GetMaxHTTPAdapterBodyBytes())
 		h.ServeHTTP(rec, httpReq)
 		flushAdapterRecorder(res, rec)
 	}
@@ -332,7 +333,7 @@ func HTTPAdapterWithBody(h http.Handler, body []byte) Handler {
 			res.Send(500, "text/plain; charset=utf-8", "Internal Server Error\n")
 			return
 		}
-		rec := newHTTPAdapterRecorder(MaxHTTPAdapterBodyBytes)
+		rec := newHTTPAdapterRecorder(GetMaxHTTPAdapterBodyBytes())
 		h.ServeHTTP(rec, httpReq)
 		flushAdapterRecorder(res, rec)
 	}
@@ -378,11 +379,27 @@ func buildAdapterRequest(req *Request, body []byte) (*http.Request, error) {
 
 // MaxHTTPAdapterBodyBytes caps the response body staged by HTTPAdapter before
 // it is copied into a gogo.Response. Negative disables the cap.
+//
+// Deprecated for runtime mutation: direct assignment remains supported for
+// startup-time configuration. Use SetMaxHTTPAdapterBodyBytes /
+// GetMaxHTTPAdapterBodyBytes for changes while requests may be running.
 var MaxHTTPAdapterBodyBytes int64 = 8 << 20
 
 // ErrHTTPAdapterBodyTooLarge is recorded when a wrapped stdlib handler writes
 // more than MaxHTTPAdapterBodyBytes.
 var ErrHTTPAdapterBodyTooLarge = errors.New("gogo: HTTPAdapter response body exceeds MaxHTTPAdapterBodyBytes")
+
+// SetMaxHTTPAdapterBodyBytes updates the HTTPAdapter response staging cap
+// atomically. Negative disables the cap.
+func SetMaxHTTPAdapterBodyBytes(maxBytes int64) {
+	atomic.StoreInt64(&MaxHTTPAdapterBodyBytes, maxBytes)
+}
+
+// GetMaxHTTPAdapterBodyBytes returns the current HTTPAdapter response staging
+// cap.
+func GetMaxHTTPAdapterBodyBytes() int64 {
+	return atomic.LoadInt64(&MaxHTTPAdapterBodyBytes)
+}
 
 type httpAdapterRecorder struct {
 	header   http.Header
@@ -390,6 +407,7 @@ type httpAdapterRecorder struct {
 	code     int
 	maxBytes int64
 	tooLarge bool
+	flushed  bool
 }
 
 func newHTTPAdapterRecorder(maxBytes int64) *httpAdapterRecorder {
@@ -414,6 +432,9 @@ func (r *httpAdapterRecorder) Write(p []byte) (int, error) {
 	if r.code == 0 {
 		r.code = 200
 	}
+	if len(p) > 0 && r.header.Get("Content-Type") == "" {
+		r.header.Set("Content-Type", http.DetectContentType(p))
+	}
 	if r.tooLarge {
 		return 0, ErrHTTPAdapterBodyTooLarge
 	}
@@ -428,6 +449,17 @@ func (r *httpAdapterRecorder) Write(p []byte) (int, error) {
 		return allowed, ErrHTTPAdapterBodyTooLarge
 	}
 	return r.body.Write(p)
+}
+
+func (r *httpAdapterRecorder) WriteString(s string) (int, error) {
+	return r.Write([]byte(s))
+}
+
+func (r *httpAdapterRecorder) Flush() {
+	if r.code == 0 {
+		r.code = 200
+	}
+	r.flushed = true
 }
 
 // flushAdapterRecorder copies the recorded status, headers, and body from the

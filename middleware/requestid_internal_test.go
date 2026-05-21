@@ -128,3 +128,43 @@ func TestFastRequestIDGeneratorConcurrentPure(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestRequestIDRejectsUnsafeGeneratedValues(t *testing.T) {
+	const max = 16
+	acceptAll := func(string) bool { return true }
+
+	if validRequestIDValue("bad\r\nid", max, acceptAll) {
+		t.Fatal("validRequestIDValue accepted CRLF")
+	}
+	if validRequestIDValue("bad id", max, acceptAll) {
+		t.Fatal("validRequestIDValue accepted whitespace")
+	}
+	if validRequestIDValue("0123456789abcdef0", max, acceptAll) {
+		t.Fatal("validRequestIDValue accepted overlong value")
+	}
+	if !validRequestIDValue("0123456789abcdef", max, acceptAll) {
+		t.Fatal("validRequestIDValue rejected safe value")
+	}
+}
+
+func TestRequestIDFallsBackWhenGeneratorReturnsUnsafeValue(t *testing.T) {
+	opt := RequestIDOptions{
+		Generator: func() string { return "bad\r\nid" },
+		Validator: func(string) bool {
+			return true
+		},
+	}
+	h := RequestID(opt)
+	if h.Mw == nil {
+		t.Fatal("RequestID returned nil middleware")
+	}
+
+	id := opt.Generator()
+	if validRequestIDValue(id, 128, opt.Validator) {
+		t.Fatal("test generator unexpectedly produced a safe value")
+	}
+	fallback := defaultRequestID()
+	if !validRequestIDValue(fallback, 128, opt.Validator) {
+		t.Fatal("default fallback request ID is not safe")
+	}
+}

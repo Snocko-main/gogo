@@ -80,8 +80,11 @@ func RequestID(opts ...RequestIDOptions) mwhint.Hinted {
 	return mwhint.Hinted{Place: mwhint.Both, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler {
 		return func(res *gogo.Response, req *gogo.Request) {
 			id := req.Header(lookupName)
-			if id == "" || requestIDTooLong(id, opt.MaxLength) || !opt.Validator(id) {
+			if !validRequestIDValue(id, opt.MaxLength, opt.Validator) {
 				id = opt.Generator()
+			}
+			if !validRequestIDValue(id, opt.MaxLength, opt.Validator) {
+				id = defaultRequestID()
 			}
 			req.SetLocal(RequestIDLocalKey, id)
 			res.Header(opt.Header, id)
@@ -92,6 +95,20 @@ func RequestID(opts ...RequestIDOptions) mwhint.Hinted {
 
 func requestIDTooLong(id string, max int) bool {
 	return max >= 0 && len(id) > max
+}
+
+func validRequestIDValue(id string, max int, validator func(string) bool) bool {
+	return id != "" && !requestIDTooLong(id, max) && validRequestIDHeaderValue(id) && validator(id)
+}
+
+func validRequestIDHeaderValue(id string) bool {
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if c <= ' ' || c >= 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 func validateRequestIDHeaderName(name string) {

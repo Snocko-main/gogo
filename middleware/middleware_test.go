@@ -757,6 +757,39 @@ func TestRequestIDRejectsInvalidIncoming(t *testing.T) {
 	}
 }
 
+func TestRequestIDRejectsUnsafeGeneratedID(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.RequestID(middleware.RequestIDOptions{
+			Generator: func() string { return "bad\r\nid" },
+			Validator: func(string) bool {
+				return true
+			},
+		}))
+		app.Get("/r", func(res *gogo.Response, req *gogo.Request) {
+			id, _ := req.Local(middleware.RequestIDLocalKey).(string)
+			res.Send(200, "text/plain", id)
+		})
+	})
+	defer teardown()
+
+	resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/r", port))
+	if err != nil {
+		t.Fatalf("GET /r: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	id := resp.Header.Get("X-Request-ID")
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200; body=%q", resp.StatusCode, string(body))
+	}
+	if id == "" || strings.ContainsAny(id, "\r\n ") {
+		t.Fatalf("unsafe response request id %q", id)
+	}
+	if string(body) != id {
+		t.Errorf("Locals ID %q != header ID %q", string(body), id)
+	}
+}
+
 // TestRequestIDCustomHeader: the Header option points at a different
 // header (X-Correlation-ID); both incoming and outgoing use that name.
 func TestRequestIDCustomHeader(t *testing.T) {

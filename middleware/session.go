@@ -276,6 +276,7 @@ func NewSession(opt SessionOptions) mwhint.Hinted {
 	if opt.LocalKey == "" {
 		opt.LocalKey = SessionLocalKey
 	}
+	validateSessionOptions(opt)
 	maxAge := int(opt.TTL.Seconds())
 
 	// Default placement registers Session in both chains — the
@@ -374,6 +375,20 @@ func expireSessionCookie(res *gogo.Response, opt SessionOptions) {
 		HttpOnly: true,
 		SameSite: opt.CookieSameSite,
 	})
+}
+
+func validateSessionOptions(opt SessionOptions) {
+	validateMiddlewareCookieName("Session CookieName", opt.CookieName)
+	if opt.CookiePath != "" {
+		validateMiddlewareCookiePath("Session CookiePath", opt.CookiePath)
+	}
+	if opt.CookieDomain != "" {
+		validateMiddlewareCookieDomain("Session CookieDomain", opt.CookieDomain)
+	}
+	validateMiddlewareCookieSameSite("Session CookieSameSite", opt.CookieSameSite)
+	if opt.CookieSameSite == gogo.SameSiteNone && !opt.CookieSecure {
+		panic("gogo/middleware: Session CookieSameSite=None requires CookieSecure=true")
+	}
 }
 
 func persistSession(s *Session, opt SessionOptions) {

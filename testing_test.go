@@ -374,10 +374,46 @@ func TestHTTPAdapterWithBody(t *testing.T) {
 	}
 }
 
+func TestHTTPAdapterSupportsFlushAndContentTypeSniff(t *testing.T) {
+	stdHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "no flusher", 500)
+			return
+		}
+		flusher.Flush()
+		_, _ = io.WriteString(w, "<html><body>ok</body></html>")
+	})
+
+	ts, err := gogo.NewTestServer(func(app *gogo.App) {
+		app.Get("/legacy", gogo.HTTPAdapter(stdHandler))
+	})
+	if err != nil {
+		t.Fatalf("NewTestServer: %v", err)
+	}
+	defer ts.Close()
+
+	resp, err := ts.Get("/legacy")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if string(body) != "<html><body>ok</body></html>" {
+		t.Errorf("body = %q", string(body))
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Errorf("Content-Type = %q, want text/html sniffed", ct)
+	}
+}
+
 func TestHTTPAdapterRejectsOversizeResponseBody(t *testing.T) {
-	old := gogo.MaxHTTPAdapterBodyBytes
-	gogo.MaxHTTPAdapterBodyBytes = 8
-	t.Cleanup(func() { gogo.MaxHTTPAdapterBodyBytes = old })
+	old := gogo.GetMaxHTTPAdapterBodyBytes()
+	gogo.SetMaxHTTPAdapterBodyBytes(8)
+	t.Cleanup(func() { gogo.SetMaxHTTPAdapterBodyBytes(old) })
 
 	stdHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)

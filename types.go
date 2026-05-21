@@ -565,11 +565,10 @@ type App struct {
 	// don't carry them.
 	namedRoutes map[string]string
 
-	// templateEngine is the TemplateEngine installed via
-	// SetTemplateEngine. Read by Response.Render. nil means "no
-	// engine installed" — Render then responds 500 with an
+	// templateEngine is the TemplateEngine installed via SetTemplateEngine.
+	// nil means "no engine installed" — Render then responds 500 with an
 	// operator-visible error logged via reportPanic.
-	templateEngine TemplateEngine
+	templateEngine atomic.Pointer[templateEngineSlot]
 }
 
 const defaultBodyReadTimeout = 30 * time.Second
@@ -2987,6 +2986,10 @@ func (r *Response) Redirect(location string, code int) {
 // legitimately serves bigger blobs.
 //
 // Default 100 MiB.
+//
+// Deprecated for runtime mutation: direct assignment remains supported for
+// startup-time configuration. Use SetMaxSendFileBytes / GetMaxSendFileBytes
+// for changes while requests may be running.
 var MaxSendFileBytes int64 = 100 << 20
 
 // SendFileChunkBytes is the buffer size used for each disk read +
@@ -2995,7 +2998,11 @@ var MaxSendFileBytes int64 = 100 << 20
 // grows up to SendFileBackpressureBytes before AwaitDrain parks the
 // goroutine). 64 KiB matches the typical filesystem read-ahead
 // granularity and uWS's default send-batch size.
-var SendFileChunkBytes int = 64 << 10
+//
+// Deprecated for runtime mutation: direct assignment remains supported for
+// startup-time configuration. Use SetSendFileChunkBytes /
+// GetSendFileChunkBytes for changes while requests may be running.
+var SendFileChunkBytes int64 = 64 << 10
 
 // SendFileBackpressureBytes is the high-water mark for uWS's
 // per-socket send buffer. When the buffer climbs above this value
@@ -3003,11 +3010,63 @@ var SendFileChunkBytes int = 64 << 10
 // it the buffer has drained — this keeps a slow consumer from
 // holding the goroutine hostage AND keeps the kernel buffer bounded
 // at the same level regardless of file size.
+//
+// Deprecated for runtime mutation: direct assignment remains supported for
+// startup-time configuration. Use SetSendFileBackpressureBytes /
+// GetSendFileBackpressureBytes for changes while requests may be running.
 var SendFileBackpressureBytes uint64 = 1 << 20
 
 // ErrFileTooLarge is returned by SendFile / Download when the target
 // file is larger than MaxSendFileBytes.
 var ErrFileTooLarge = errors.New("gogo: file exceeds MaxSendFileBytes")
+
+// SetMaxSendFileBytes updates the SendFile / Download file-size cap
+// atomically.
+func SetMaxSendFileBytes(maxBytes int64) {
+	atomic.StoreInt64(&MaxSendFileBytes, maxBytes)
+}
+
+// GetMaxSendFileBytes returns the current SendFile / Download file-size cap.
+func GetMaxSendFileBytes() int64 {
+	return atomic.LoadInt64(&MaxSendFileBytes)
+}
+
+// SetSendFileChunkBytes updates the per-read SendFile buffer size atomically.
+// Values at or below zero restore the default.
+func SetSendFileChunkBytes(chunkBytes int) {
+	if chunkBytes <= 0 {
+		chunkBytes = 64 << 10
+	}
+	atomic.StoreInt64(&SendFileChunkBytes, int64(chunkBytes))
+}
+
+// GetSendFileChunkBytes returns the current per-read SendFile buffer size.
+func GetSendFileChunkBytes() int {
+	current := atomic.LoadInt64(&SendFileChunkBytes)
+	if current <= 0 {
+		return 64 << 10
+	}
+	return int(current)
+}
+
+// SetSendFileBackpressureBytes updates the SendFile buffered-byte high-water
+// mark atomically. Zero restores the default.
+func SetSendFileBackpressureBytes(backpressureBytes uint64) {
+	if backpressureBytes == 0 {
+		backpressureBytes = 1 << 20
+	}
+	atomic.StoreUint64(&SendFileBackpressureBytes, backpressureBytes)
+}
+
+// GetSendFileBackpressureBytes returns the current SendFile backpressure
+// high-water mark.
+func GetSendFileBackpressureBytes() uint64 {
+	v := atomic.LoadUint64(&SendFileBackpressureBytes)
+	if v == 0 {
+		return 1 << 20
+	}
+	return v
+}
 
 // SendFile reads path from disk and writes it as the response body.
 // Content-Type is picked from the file extension via mime.TypeByExtension;
@@ -3076,7 +3135,7 @@ func (r *Response) sendFile(req *Request, path, filename string, attachment bool
 		return fmt.Errorf("gogo: SendFile: %s is a directory", path)
 	}
 	size := info.Size()
-	if size > MaxSendFileBytes {
+	if size > GetMaxSendFileBytes() {
 		f.Close()
 		return ErrFileTooLarge
 	}
@@ -3187,14 +3246,8 @@ func (r *Response) sendFile(req *Request, path, filename string, attachment bool
 					return err
 				}
 			}
-			chunk := SendFileChunkBytes
-			if chunk <= 0 {
-				chunk = 64 << 10
-			}
-			backpressure := SendFileBackpressureBytes
-			if backpressure == 0 {
-				backpressure = 1 << 20
-			}
+			chunk := GetSendFileChunkBytes()
+			backpressure := GetSendFileBackpressureBytes()
 			buf := make([]byte, chunk)
 			remaining := contentLength
 			for remaining > 0 {

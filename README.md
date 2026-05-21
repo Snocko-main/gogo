@@ -363,7 +363,11 @@ func safePublicPath(root, name string) (string, error) {
 ```
 
 `SendFile` intentionally opens the path you pass it; path allow-listing belongs
-in the route because different apps expose different roots.
+in the route because different apps expose different roots. Large-file serving
+is governed by atomic knobs: `SetMaxSendFileBytes`, `SetSendFileChunkBytes`,
+and `SetSendFileBackpressureBytes`. The legacy package variables still work
+for startup-time configuration, but prefer the setters if the server may be
+serving requests.
 
 ### Streaming
 
@@ -406,9 +410,10 @@ app.Get("/", func(res *gogo.Response, req *gogo.Request) {
 
 Templates are named by their path relative to `Root` with the suffix stripped
 — `views/user/profile.tmpl` is rendered as `user/profile`. Render output is
-capped by `gogo.MaxRenderBytes` (default 8 MiB; set negative to disable) before
-it is sent, so oversized templates fail with a generic 500 instead of staging
-unbounded memory. Bring your own engine by implementing `TemplateEngine`:
+capped by `gogo.GetMaxRenderBytes()` (default 8 MiB; set negative via
+`gogo.SetMaxRenderBytes(-1)` to disable) before it is sent, so oversized
+templates fail with a generic 500 instead of staging unbounded memory. Bring
+your own engine by implementing `TemplateEngine`:
 
 ```go
 type TemplateEngine interface {
@@ -1352,7 +1357,8 @@ themselves, accepting that any client can forge the value.
 `gogo.HTTPAdapter(h)` and `gogo.HTTPAdapterWithBody(h, body)` are migration
 helpers for small stdlib handlers. They stage the wrapped handler's response
 before sending it through gogo, so the staged body is capped by
-`gogo.MaxHTTPAdapterBodyBytes` (default 8 MiB; set negative to disable).
+`gogo.GetMaxHTTPAdapterBodyBytes()` (default 8 MiB; set negative via
+`gogo.SetMaxHTTPAdapterBodyBytes(-1)` to disable).
 Handlers that stream large downloads should be ported to native gogo streaming
 APIs instead of going through the adapter.
 

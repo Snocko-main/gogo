@@ -224,15 +224,15 @@ func csrfTokenTooLong(tok string, maxBytes int) bool {
 }
 
 func validateCSRFOptions(opt CSRFOptions) {
-	validateCSRFCookieName(opt.CookieName)
-	validateCSRFHeaderName(opt.HeaderName)
+	validateMiddlewareCookieName("CSRF CookieName", opt.CookieName)
+	validateMiddlewareHeaderName("CSRF HeaderName", opt.HeaderName)
 	if opt.CookiePath != "" {
-		validateCSRFCookiePath(opt.CookiePath)
+		validateMiddlewareCookiePath("CSRF CookiePath", opt.CookiePath)
 	}
 	if opt.CookieDomain != "" {
-		validateCSRFCookieDomain(opt.CookieDomain)
+		validateMiddlewareCookieDomain("CSRF CookieDomain", opt.CookieDomain)
 	}
-	validateCSRFCookieSameSite(opt.CookieSameSite)
+	validateMiddlewareCookieSameSite("CSRF CookieSameSite", opt.CookieSameSite)
 	if opt.CookieSameSite == gogo.SameSiteNone && !opt.CookieSecure {
 		panic("gogo/middleware: CSRF CookieSameSite=None requires CookieSecure=true")
 	}
@@ -241,55 +241,55 @@ func validateCSRFOptions(opt CSRFOptions) {
 	}
 }
 
-func validateCSRFCookieName(name string) {
+func validateMiddlewareCookieName(field, name string) {
 	if name == "" {
-		panic("gogo/middleware: CSRF CookieName is empty")
+		panic("gogo/middleware: " + field + " is empty")
 	}
 	for i := 0; i < len(name); i++ {
 		c := name[i]
 		if c < 0x20 || c == 0x7f {
-			panic(fmt.Sprintf("gogo/middleware: CSRF CookieName %q contains a control character", name))
+			panic(fmt.Sprintf("gogo/middleware: %s %q contains a control character", field, name))
 		}
 		switch c {
 		case '(', ')', '<', '>', '@', ',', ';', ':', '\\', '"', '/', '[', ']', '?', '=', '{', '}', ' ', '\t':
-			panic(fmt.Sprintf("gogo/middleware: CSRF CookieName %q contains an invalid byte 0x%02x", name, c))
+			panic(fmt.Sprintf("gogo/middleware: %s %q contains an invalid byte 0x%02x", field, name, c))
 		}
 	}
 }
 
-func validateCSRFHeaderName(name string) {
+func validateMiddlewareHeaderName(field, name string) {
 	if name == "" {
-		panic("gogo/middleware: CSRF HeaderName is empty")
+		panic("gogo/middleware: " + field + " is empty")
 	}
 	for i := 0; i < len(name); i++ {
 		if !isHTTPTokenChar(name[i]) {
-			panic(fmt.Sprintf("gogo/middleware: CSRF HeaderName %q contains invalid byte 0x%02x", name, name[i]))
+			panic(fmt.Sprintf("gogo/middleware: %s %q contains invalid byte 0x%02x", field, name, name[i]))
 		}
 	}
 }
 
-func validateCSRFCookiePath(path string) {
+func validateMiddlewareCookiePath(field, path string) {
 	for i := 0; i < len(path); i++ {
 		c := path[i]
 		if c < 0x20 || c == 0x7f || c == ';' {
-			panic(fmt.Sprintf("gogo/middleware: CSRF CookiePath %q contains invalid byte 0x%02x", path, c))
+			panic(fmt.Sprintf("gogo/middleware: %s %q contains invalid byte 0x%02x", field, path, c))
 		}
 	}
 }
 
-func validateCSRFCookieDomain(domain string) {
+func validateMiddlewareCookieDomain(field, domain string) {
 	for i := 0; i < len(domain); i++ {
 		c := domain[i]
 		if c < 0x20 || c == 0x7f || c == ';' || c == ',' || c == ' ' || c == '\t' {
-			panic(fmt.Sprintf("gogo/middleware: CSRF CookieDomain %q contains invalid byte 0x%02x", domain, c))
+			panic(fmt.Sprintf("gogo/middleware: %s %q contains invalid byte 0x%02x", field, domain, c))
 		}
 	}
 }
 
-func validateCSRFCookieSameSite(s gogo.SameSite) {
+func validateMiddlewareCookieSameSite(field string, s gogo.SameSite) {
 	switch s {
 	case "", gogo.SameSiteStrict, gogo.SameSiteLax, gogo.SameSiteNone:
 		return
 	}
-	panic(fmt.Sprintf("gogo/middleware: CSRF CookieSameSite %q must be one of \"\", \"Strict\", \"Lax\", \"None\"", s))
+	panic(fmt.Sprintf("gogo/middleware: %s %q must be one of \"\", \"Strict\", \"Lax\", \"None\"", field, s))
 }

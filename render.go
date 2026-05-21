@@ -34,6 +34,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // TemplateEngine is the contract every templating implementation
@@ -61,21 +62,44 @@ type LimitedTemplateEngine interface {
 // MaxRenderBytes caps the bytes Response.Render will stage before sending the
 // rendered body. Negative disables the cap. The default bounds accidental or
 // maliciously large template output while staying generous for normal pages.
+//
+// Deprecated for runtime mutation: direct assignment remains supported for
+// startup-time configuration. Use SetMaxRenderBytes / GetMaxRenderBytes for
+// changes while requests may be running.
 var MaxRenderBytes int64 = 8 << 20
 
 // ErrRenderTooLarge is reported when rendered template output exceeds
 // MaxRenderBytes.
 var ErrRenderTooLarge = errors.New("gogo: rendered template exceeds MaxRenderBytes")
 
+type templateEngineSlot struct {
+	engine TemplateEngine
+}
+
+// SetMaxRenderBytes updates the Response.Render staging cap atomically.
+// Negative disables the cap.
+func SetMaxRenderBytes(maxBytes int64) {
+	atomic.StoreInt64(&MaxRenderBytes, maxBytes)
+}
+
+// GetMaxRenderBytes returns the current Response.Render staging cap.
+func GetMaxRenderBytes() int64 {
+	return atomic.LoadInt64(&MaxRenderBytes)
+}
+
 // SetTemplateEngine installs e as the active template engine for
 // this App. Subsequent Response.Render calls use it. Passing nil
 // clears the engine, which causes Render to respond with 500.
 //
 // Engines are intended to be configured once at startup. Swapping
-// engines at runtime is safe (the field is guarded by an
-// atomic.Pointer) but not a recommended pattern.
+// engines at runtime is safe (the field is published atomically) but
+// not a recommended pattern.
 func (a *App) SetTemplateEngine(e TemplateEngine) {
-	a.templateEngine = e
+	if e == nil {
+		a.templateEngine.Store(nil)
+		return
+	}
+	a.templateEngine.Store(&templateEngineSlot{engine: e})
 }
 
 // Render renders a named template with data and writes the result
@@ -97,13 +121,19 @@ func (a *App) SetTemplateEngine(e TemplateEngine) {
 //	    res.Render("user/profile", map[string]any{"user": u})
 //	})
 func (r *Response) Render(name string, data any) {
-	if r.app == nil || r.app.templateEngine == nil {
+	if r.app == nil {
+		reportPanic(fmt.Errorf("gogo: Render: no template engine installed; call App.SetTemplateEngine"))
+		r.Send(500, "text/plain; charset=utf-8", "Internal Server Error\n")
+		return
+	}
+	slot := r.app.templateEngine.Load()
+	if slot == nil || slot.engine == nil {
 		reportPanic(fmt.Errorf("gogo: Render: no template engine installed; call App.SetTemplateEngine"))
 		r.Send(500, "text/plain; charset=utf-8", "Internal Server Error\n")
 		return
 	}
 	var buf bytes.Buffer
-	if err := renderTemplate(r.app.templateEngine, &buf, name, data, MaxRenderBytes); err != nil {
+	if err := renderTemplate(slot.engine, &buf, name, data, GetMaxRenderBytes()); err != nil {
 		reportPanic(fmt.Errorf("gogo: Render(%q): %w", name, err))
 		r.Send(500, "text/plain; charset=utf-8", "Internal Server Error\n")
 		return

@@ -202,9 +202,9 @@ func TestRenderMissingTemplate(t *testing.T) {
 }
 
 func TestRenderRejectsOversizeTemplateOutput(t *testing.T) {
-	old := gogo.MaxRenderBytes
-	gogo.MaxRenderBytes = 8
-	t.Cleanup(func() { gogo.MaxRenderBytes = old })
+	old := gogo.GetMaxRenderBytes()
+	gogo.SetMaxRenderBytes(8)
+	t.Cleanup(func() { gogo.SetMaxRenderBytes(old) })
 
 	dir := t.TempDir()
 	mustWrite(t, filepath.Join(dir, "big.tmpl"), strings.Repeat("x", 32))
@@ -225,6 +225,26 @@ func TestRenderRejectsOversizeTemplateOutput(t *testing.T) {
 	}
 	if body != "Internal Server Error\n" {
 		t.Errorf("body = %q, want generic 500 body", body)
+	}
+}
+
+func TestSetTemplateEngineCanClearEngine(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "x.tmpl"), `ok`)
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.SetTemplateEngine(gogo.NewHTMLTemplateEngine(gogo.HTMLTemplateOptions{Root: dir}))
+		app.SetTemplateEngine(nil)
+		app.Get("/x", func(res *gogo.Response, req *gogo.Request) {
+			res.Render("x", nil)
+		})
+	})
+	defer teardown()
+
+	r, _ := http.Get(fmt.Sprintf("http://127.0.0.1:%d/x", port))
+	r.Body.Close()
+	if r.StatusCode != 500 {
+		t.Errorf("status = %d, want 500", r.StatusCode)
 	}
 }
 

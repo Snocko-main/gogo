@@ -4733,9 +4733,9 @@ func TestSendFileDirectory(t *testing.T) {
 // ErrFileTooLarge without sending a body.
 func TestSendFileTooLarge(t *testing.T) {
 	// Temporarily lower the ceiling for the duration of this test.
-	orig := gogo.MaxSendFileBytes
-	gogo.MaxSendFileBytes = 16
-	t.Cleanup(func() { gogo.MaxSendFileBytes = orig })
+	orig := gogo.GetMaxSendFileBytes()
+	gogo.SetMaxSendFileBytes(16)
+	t.Cleanup(func() { gogo.SetMaxSendFileBytes(orig) })
 
 	path := writeTempFile(t, ".bin", make([]byte, 64))
 
