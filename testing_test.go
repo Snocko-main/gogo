@@ -374,6 +374,38 @@ func TestHTTPAdapterWithBody(t *testing.T) {
 	}
 }
 
+func TestHTTPAdapterRejectsOversizeResponseBody(t *testing.T) {
+	old := gogo.MaxHTTPAdapterBodyBytes
+	gogo.MaxHTTPAdapterBodyBytes = 8
+	t.Cleanup(func() { gogo.MaxHTTPAdapterBodyBytes = old })
+
+	stdHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, strings.Repeat("x", 32))
+	})
+
+	ts, err := gogo.NewTestServer(func(app *gogo.App) {
+		app.Get("/legacy", gogo.HTTPAdapter(stdHandler))
+	})
+	if err != nil {
+		t.Fatalf("NewTestServer: %v", err)
+	}
+	defer ts.Close()
+
+	resp, err := ts.Get("/legacy")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 500 {
+		t.Errorf("status = %d, want 500", resp.StatusCode)
+	}
+	if string(body) != "Internal Server Error\n" {
+		t.Errorf("body = %q, want generic 500 body", string(body))
+	}
+}
+
 // TestHTTPAdapterPanicsOnNil ensures HTTPAdapter(nil) panics
 // loudly rather than silently producing a broken route.
 func TestHTTPAdapterPanicsOnNil(t *testing.T) {

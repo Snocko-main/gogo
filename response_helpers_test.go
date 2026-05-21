@@ -201,6 +201,33 @@ func TestRenderMissingTemplate(t *testing.T) {
 	}
 }
 
+func TestRenderRejectsOversizeTemplateOutput(t *testing.T) {
+	old := gogo.MaxRenderBytes
+	gogo.MaxRenderBytes = 8
+	t.Cleanup(func() { gogo.MaxRenderBytes = old })
+
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "big.tmpl"), strings.Repeat("x", 32))
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.SetTemplateEngine(gogo.NewHTMLTemplateEngine(gogo.HTMLTemplateOptions{Root: dir}))
+		app.Get("/big", func(res *gogo.Response, req *gogo.Request) {
+			res.Render("big", nil)
+		})
+	})
+	defer teardown()
+
+	r, _ := http.Get(fmt.Sprintf("http://127.0.0.1:%d/big", port))
+	body := readAllString(t, r)
+	r.Body.Close()
+	if r.StatusCode != 500 {
+		t.Errorf("status = %d, want 500", r.StatusCode)
+	}
+	if body != "Internal Server Error\n" {
+		t.Errorf("body = %q, want generic 500 body", body)
+	}
+}
+
 // TestRenderNoEngineInstalled returns 500 when no engine has been
 // configured.
 func TestRenderNoEngineInstalled(t *testing.T) {

@@ -15,6 +15,7 @@ import (
 	"net/textproto"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -3858,6 +3859,38 @@ func TestIPsRequiresTrustProxy(t *testing.T) {
 	}
 	if got.ips != nil {
 		t.Errorf("IPs() returned %v with TrustProxy=false; want nil so spoofed X-Forwarded-For is not exposed", got.ips)
+	}
+}
+
+func TestIPsNormalizesAndDropsInvalidForwardedEntries(t *testing.T) {
+	type result struct {
+		ips []string
+	}
+	var captured atomic.Pointer[result]
+
+	port, teardown := startAppCfg(t, gogo.Config{CapturePeerIP: true, TrustProxy: true}, func(app *gogo.App) {
+		app.Get("/", func(res *gogo.Response, req *gogo.Request) {
+			captured.Store(&result{ips: req.IPs()})
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/", port), nil)
+	req.Header.Set("X-Forwarded-For", "bad, 203.0.113.5:443, [2001:db8::1]:8443, ::ffff:192.0.2.9")
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	resp.Body.Close()
+
+	got := captured.Load()
+	if got == nil {
+		t.Fatal("handler did not record IPs result")
+	}
+	want := []string{"203.0.113.5", "2001:db8::1", "192.0.2.9"}
+	if !reflect.DeepEqual(got.ips, want) {
+		t.Errorf("IPs() = %v, want %v", got.ips, want)
 	}
 }
 

@@ -26,8 +26,10 @@ package gogo
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	htmltmpl "html/template"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,6 +48,24 @@ import (
 type TemplateEngine interface {
 	Render(w *bytes.Buffer, name string, data any) error
 }
+
+// LimitedTemplateEngine is an optional extension for engines that can stop
+// rendering before a response grows past a framework cap. Engines that do not
+// implement it still work through TemplateEngine; Response.Render checks the
+// final buffer size before sending.
+type LimitedTemplateEngine interface {
+	TemplateEngine
+	RenderLimited(w *bytes.Buffer, name string, data any, maxBytes int64) error
+}
+
+// MaxRenderBytes caps the bytes Response.Render will stage before sending the
+// rendered body. Negative disables the cap. The default bounds accidental or
+// maliciously large template output while staying generous for normal pages.
+var MaxRenderBytes int64 = 8 << 20
+
+// ErrRenderTooLarge is reported when rendered template output exceeds
+// MaxRenderBytes.
+var ErrRenderTooLarge = errors.New("gogo: rendered template exceeds MaxRenderBytes")
 
 // SetTemplateEngine installs e as the active template engine for
 // this App. Subsequent Response.Render calls use it. Passing nil
@@ -83,12 +103,25 @@ func (r *Response) Render(name string, data any) {
 		return
 	}
 	var buf bytes.Buffer
-	if err := r.app.templateEngine.Render(&buf, name, data); err != nil {
+	if err := renderTemplate(r.app.templateEngine, &buf, name, data, MaxRenderBytes); err != nil {
 		reportPanic(fmt.Errorf("gogo: Render(%q): %w", name, err))
 		r.Send(500, "text/plain; charset=utf-8", "Internal Server Error\n")
 		return
 	}
 	r.Send(200, "text/html; charset=utf-8", buf.String())
+}
+
+func renderTemplate(e TemplateEngine, buf *bytes.Buffer, name string, data any, maxBytes int64) error {
+	if limited, ok := e.(LimitedTemplateEngine); ok {
+		return limited.RenderLimited(buf, name, data, maxBytes)
+	}
+	if err := e.Render(buf, name, data); err != nil {
+		return err
+	}
+	if maxBytes >= 0 && int64(buf.Len()) > maxBytes {
+		return ErrRenderTooLarge
+	}
+	return nil
 }
 
 // HTMLTemplateOptions configures NewHTMLTemplateEngine.
@@ -141,6 +174,17 @@ type htmlEngine struct {
 }
 
 func (e *htmlEngine) Render(w *bytes.Buffer, name string, data any) error {
+	return e.render(w, name, data)
+}
+
+func (e *htmlEngine) RenderLimited(w *bytes.Buffer, name string, data any, maxBytes int64) error {
+	if maxBytes < 0 {
+		return e.render(w, name, data)
+	}
+	return e.render(&limitedTemplateWriter{w: w, remaining: maxBytes}, name, data)
+}
+
+func (e *htmlEngine) render(w io.Writer, name string, data any) error {
 	if e.opt.Reload {
 		if err := e.reload(); err != nil {
 			return err
@@ -157,6 +201,28 @@ func (e *htmlEngine) Render(w *bytes.Buffer, name string, data any) error {
 		return fmt.Errorf("template %q not found", name)
 	}
 	return tmpl.Execute(w, data)
+}
+
+type limitedTemplateWriter struct {
+	w         io.Writer
+	remaining int64
+}
+
+func (w *limitedTemplateWriter) Write(p []byte) (int, error) {
+	if int64(len(p)) <= w.remaining {
+		n, err := w.w.Write(p)
+		w.remaining -= int64(n)
+		return n, err
+	}
+	if w.remaining > 0 {
+		n, err := w.w.Write(p[:w.remaining])
+		w.remaining -= int64(n)
+		if err != nil {
+			return n, err
+		}
+		return n, ErrRenderTooLarge
+	}
+	return 0, ErrRenderTooLarge
 }
 
 // reload walks Root and parses every file with the configured

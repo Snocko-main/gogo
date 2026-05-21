@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"mime"
+	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -496,8 +497,7 @@ type Config struct {
 	// to the application:
 	//
 	//   - req.Protocol() / req.Secure() honor X-Forwarded-Proto.
-	//   - req.IPs() and the head of the X-Forwarded-For chain are
-	//     already exposed; this flag does not enable them.
+	//   - req.IPs() exposes the normalized X-Forwarded-For chain.
 	//
 	// Leave OFF when the server is directly internet-facing — otherwise
 	// any client can spoof their apparent protocol / origin by sending
@@ -4661,10 +4661,10 @@ func normalizePeerIP(ip string) string {
 	return addr.String()
 }
 
-// IPs parses the X-Forwarded-For header into a slice of IPs in the order
-// the proxies appended them (leftmost = original client). Returns nil if
-// the header is absent or empty. Trim trailing whitespace and strip the
-// optional port suffix on each entry.
+// IPs parses the X-Forwarded-For header into a slice of normalized IPs in the
+// order the proxies appended them (leftmost = original client). Returns nil if
+// the header is absent, empty, or contains no valid IP entries. Empty and
+// malformed entries are skipped; IPv4-mapped IPv6 addresses are unmapped.
 //
 // Returns nil when Config.TrustProxy is false — without that flag, the
 // X-Forwarded-For header is attacker-controlled and any IP in it should
@@ -4683,20 +4683,40 @@ func (r *Request) IPs() []string {
 	parts := strings.Split(xff, ",")
 	out := make([]string, 0, len(parts))
 	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
+		ip, ok := normalizeForwardedIP(p)
+		if !ok {
 			continue
 		}
-		// Strip ":port" if present (IPv4-only — IPv6 needs bracket parsing).
-		if i := strings.LastIndexByte(p, ':'); i >= 0 && strings.IndexByte(p, '.') >= 0 {
-			p = p[:i]
-		}
-		out = append(out, p)
+		out = append(out, ip)
 	}
 	if len(out) == 0 {
 		return nil
 	}
 	return out
+}
+
+func normalizeForwardedIP(raw string) (string, bool) {
+	p := strings.TrimSpace(raw)
+	if p == "" {
+		return "", false
+	}
+	if host, _, err := net.SplitHostPort(p); err == nil {
+		p = host
+	} else if strings.HasPrefix(p, "[") && strings.HasSuffix(p, "]") {
+		p = strings.TrimPrefix(strings.TrimSuffix(p, "]"), "[")
+	} else if strings.IndexByte(p, '.') >= 0 && strings.Count(p, ":") == 1 {
+		if i := strings.LastIndexByte(p, ':'); i >= 0 {
+			p = p[:i]
+		}
+	}
+	addr, err := netip.ParseAddr(p)
+	if err != nil {
+		return "", false
+	}
+	if addr.Is4In6() {
+		addr = addr.Unmap()
+	}
+	return addr.String(), true
 }
 
 // Parameter returns a route parameter by index. Returns "" for negative or

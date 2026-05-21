@@ -6,11 +6,11 @@ package gogo
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"runtime"
 	"strconv"
 	"sync"
@@ -305,7 +305,7 @@ func HTTPAdapter(h http.Handler) Handler {
 			res.Send(500, "text/plain; charset=utf-8", "Internal Server Error\n")
 			return
 		}
-		rec := httptest.NewRecorder()
+		rec := newHTTPAdapterRecorder(MaxHTTPAdapterBodyBytes)
 		h.ServeHTTP(rec, httpReq)
 		flushAdapterRecorder(res, rec)
 	}
@@ -332,7 +332,7 @@ func HTTPAdapterWithBody(h http.Handler, body []byte) Handler {
 			res.Send(500, "text/plain; charset=utf-8", "Internal Server Error\n")
 			return
 		}
-		rec := httptest.NewRecorder()
+		rec := newHTTPAdapterRecorder(MaxHTTPAdapterBodyBytes)
 		h.ServeHTTP(rec, httpReq)
 		flushAdapterRecorder(res, rec)
 	}
@@ -376,9 +376,68 @@ func buildAdapterRequest(req *Request, body []byte) (*http.Request, error) {
 	return httpReq, nil
 }
 
-// flushAdapterRecorder copies the recorded status, headers, and
-// body from a httptest.ResponseRecorder onto the gogo.Response.
-func flushAdapterRecorder(res *Response, rec *httptest.ResponseRecorder) {
+// MaxHTTPAdapterBodyBytes caps the response body staged by HTTPAdapter before
+// it is copied into a gogo.Response. Negative disables the cap.
+var MaxHTTPAdapterBodyBytes int64 = 8 << 20
+
+// ErrHTTPAdapterBodyTooLarge is recorded when a wrapped stdlib handler writes
+// more than MaxHTTPAdapterBodyBytes.
+var ErrHTTPAdapterBodyTooLarge = errors.New("gogo: HTTPAdapter response body exceeds MaxHTTPAdapterBodyBytes")
+
+type httpAdapterRecorder struct {
+	header   http.Header
+	body     bytes.Buffer
+	code     int
+	maxBytes int64
+	tooLarge bool
+}
+
+func newHTTPAdapterRecorder(maxBytes int64) *httpAdapterRecorder {
+	return &httpAdapterRecorder{
+		header:   make(http.Header),
+		maxBytes: maxBytes,
+	}
+}
+
+func (r *httpAdapterRecorder) Header() http.Header {
+	return r.header
+}
+
+func (r *httpAdapterRecorder) WriteHeader(code int) {
+	if r.code != 0 {
+		return
+	}
+	r.code = code
+}
+
+func (r *httpAdapterRecorder) Write(p []byte) (int, error) {
+	if r.code == 0 {
+		r.code = 200
+	}
+	if r.tooLarge {
+		return 0, ErrHTTPAdapterBodyTooLarge
+	}
+	if r.maxBytes >= 0 && int64(r.body.Len()+len(p)) > r.maxBytes {
+		allowed := int(r.maxBytes - int64(r.body.Len()))
+		if allowed > 0 {
+			_, _ = r.body.Write(p[:allowed])
+		} else {
+			allowed = 0
+		}
+		r.tooLarge = true
+		return allowed, ErrHTTPAdapterBodyTooLarge
+	}
+	return r.body.Write(p)
+}
+
+// flushAdapterRecorder copies the recorded status, headers, and body from the
+// adapter recorder onto the gogo.Response.
+func flushAdapterRecorder(res *Response, rec *httpAdapterRecorder) {
+	if rec.tooLarge {
+		reportPanic(ErrHTTPAdapterBodyTooLarge)
+		res.Send(500, "text/plain; charset=utf-8", "Internal Server Error\n")
+		return
+	}
 	contentType := rec.Header().Get("Content-Type")
 	for key, values := range rec.Header() {
 		if key == "Content-Type" || key == "Content-Length" {
@@ -388,11 +447,11 @@ func flushAdapterRecorder(res *Response, rec *httptest.ResponseRecorder) {
 			res.Header(key, v)
 		}
 	}
-	code := rec.Code
+	code := rec.code
 	if code == 0 {
 		code = 200
 	}
-	res.Send(code, contentType, rec.Body.String())
+	res.Send(code, contentType, rec.body.String())
 }
 
 // copyHeadersFromRequest packs every header on req into the

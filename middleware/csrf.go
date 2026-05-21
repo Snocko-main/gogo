@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/Snocko-main/gogo"
@@ -57,6 +58,11 @@ type CSRFOptions struct {
 	// CookieMaxAge sets Max-Age in seconds. Default 86400 (1 day).
 	CookieMaxAge int
 
+	// MaxTokenBytes caps the CSRF token read from the Cookie and header
+	// before signature verification or constant-time comparison. Zero uses
+	// a conservative default; negative disables the cap.
+	MaxTokenBytes int
+
 	// SkipFunc, when non-nil and returning true, bypasses CSRF
 	// entirely. Useful to allow specific routes (e.g. signed
 	// webhook endpoints) to skip the check.
@@ -66,6 +72,10 @@ type CSRFOptions struct {
 	// Default CSRFLocalKey.
 	LocalKey string
 }
+
+const defaultCSRFMaxTokenBytes = 256
+
+const csrfGeneratedTokenBytes = 22 + 1 + 43 // base64url(16 random bytes) + "." + base64url(sha256)
 
 // CSRF returns a Middleware that enforces the double-submit-cookie
 // pattern: the server issues a signed random token in a non-HttpOnly
@@ -107,9 +117,13 @@ func CSRF(opt CSRFOptions) mwhint.Hinted {
 	if opt.CookieMaxAge == 0 {
 		opt.CookieMaxAge = 86400
 	}
+	if opt.MaxTokenBytes == 0 {
+		opt.MaxTokenBytes = defaultCSRFMaxTokenBytes
+	}
 	if opt.LocalKey == "" {
 		opt.LocalKey = CSRFLocalKey
 	}
+	validateCSRFOptions(opt)
 	headerLookup := lowercaseAscii(opt.HeaderName)
 
 	return mwhint.Hinted{Place: mwhint.Sync, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler {
@@ -120,11 +134,12 @@ func CSRF(opt CSRFOptions) mwhint.Hinted {
 			}
 
 			cookieVal := req.Cookie(opt.CookieName)
-			validIncoming := cookieVal != "" && verifyCSRFToken(opt.Secret, cookieVal) == nil
+			validIncoming := cookieVal != "" && !csrfTokenTooLong(cookieVal, opt.MaxTokenBytes) &&
+				verifyCSRFToken(opt.Secret, cookieVal, opt.MaxTokenBytes) == nil
 
 			if csrfIsUnsafe(req.Method()) {
 				headerVal := req.Header(headerLookup)
-				if !validIncoming || headerVal == "" ||
+				if !validIncoming || headerVal == "" || csrfTokenTooLong(headerVal, opt.MaxTokenBytes) ||
 					subtle.ConstantTimeCompare([]byte(headerVal), []byte(cookieVal)) != 1 {
 					res.Send(403, "text/plain; charset=utf-8", "Forbidden: invalid CSRF token\n")
 					return
@@ -182,7 +197,10 @@ func newCSRFToken(secret []byte) (string, error) {
 	return randPart + "." + sig, nil
 }
 
-func verifyCSRFToken(secret []byte, tok string) error {
+func verifyCSRFToken(secret []byte, tok string, maxBytes int) error {
+	if csrfTokenTooLong(tok, maxBytes) {
+		return errors.New("token too large")
+	}
 	dot := strings.IndexByte(tok, '.')
 	if dot <= 0 || dot == len(tok)-1 {
 		return errors.New("malformed token")
@@ -199,4 +217,79 @@ func verifyCSRFToken(secret []byte, tok string) error {
 		return errors.New("signature mismatch")
 	}
 	return nil
+}
+
+func csrfTokenTooLong(tok string, maxBytes int) bool {
+	return maxBytes >= 0 && len(tok) > maxBytes
+}
+
+func validateCSRFOptions(opt CSRFOptions) {
+	validateCSRFCookieName(opt.CookieName)
+	validateCSRFHeaderName(opt.HeaderName)
+	if opt.CookiePath != "" {
+		validateCSRFCookiePath(opt.CookiePath)
+	}
+	if opt.CookieDomain != "" {
+		validateCSRFCookieDomain(opt.CookieDomain)
+	}
+	validateCSRFCookieSameSite(opt.CookieSameSite)
+	if opt.CookieSameSite == gogo.SameSiteNone && !opt.CookieSecure {
+		panic("gogo/middleware: CSRF CookieSameSite=None requires CookieSecure=true")
+	}
+	if opt.MaxTokenBytes >= 0 && opt.MaxTokenBytes < csrfGeneratedTokenBytes {
+		panic("gogo/middleware: CSRF MaxTokenBytes is smaller than generated token length")
+	}
+}
+
+func validateCSRFCookieName(name string) {
+	if name == "" {
+		panic("gogo/middleware: CSRF CookieName is empty")
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c < 0x20 || c == 0x7f {
+			panic(fmt.Sprintf("gogo/middleware: CSRF CookieName %q contains a control character", name))
+		}
+		switch c {
+		case '(', ')', '<', '>', '@', ',', ';', ':', '\\', '"', '/', '[', ']', '?', '=', '{', '}', ' ', '\t':
+			panic(fmt.Sprintf("gogo/middleware: CSRF CookieName %q contains an invalid byte 0x%02x", name, c))
+		}
+	}
+}
+
+func validateCSRFHeaderName(name string) {
+	if name == "" {
+		panic("gogo/middleware: CSRF HeaderName is empty")
+	}
+	for i := 0; i < len(name); i++ {
+		if !isHTTPTokenChar(name[i]) {
+			panic(fmt.Sprintf("gogo/middleware: CSRF HeaderName %q contains invalid byte 0x%02x", name, name[i]))
+		}
+	}
+}
+
+func validateCSRFCookiePath(path string) {
+	for i := 0; i < len(path); i++ {
+		c := path[i]
+		if c < 0x20 || c == 0x7f || c == ';' {
+			panic(fmt.Sprintf("gogo/middleware: CSRF CookiePath %q contains invalid byte 0x%02x", path, c))
+		}
+	}
+}
+
+func validateCSRFCookieDomain(domain string) {
+	for i := 0; i < len(domain); i++ {
+		c := domain[i]
+		if c < 0x20 || c == 0x7f || c == ';' || c == ',' || c == ' ' || c == '\t' {
+			panic(fmt.Sprintf("gogo/middleware: CSRF CookieDomain %q contains invalid byte 0x%02x", domain, c))
+		}
+	}
+}
+
+func validateCSRFCookieSameSite(s gogo.SameSite) {
+	switch s {
+	case "", gogo.SameSiteStrict, gogo.SameSiteLax, gogo.SameSiteNone:
+		return
+	}
+	panic(fmt.Sprintf("gogo/middleware: CSRF CookieSameSite %q must be one of \"\", \"Strict\", \"Lax\", \"None\"", s))
 }

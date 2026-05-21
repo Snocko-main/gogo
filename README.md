@@ -405,14 +405,19 @@ app.Get("/", func(res *gogo.Response, req *gogo.Request) {
 ```
 
 Templates are named by their path relative to `Root` with the suffix stripped
-— `views/user/profile.tmpl` is rendered as `user/profile`. Bring your own
-engine by implementing `TemplateEngine`:
+— `views/user/profile.tmpl` is rendered as `user/profile`. Render output is
+capped by `gogo.MaxRenderBytes` (default 8 MiB; set negative to disable) before
+it is sent, so oversized templates fail with a generic 500 instead of staging
+unbounded memory. Bring your own engine by implementing `TemplateEngine`:
 
 ```go
 type TemplateEngine interface {
     Render(w *bytes.Buffer, name string, data any) error
 }
 ```
+
+Custom engines that can stop early may also implement `LimitedTemplateEngine`;
+the built-in HTML engine does this so the cap is enforced while rendering.
 
 ## Request Body Parsing
 
@@ -683,7 +688,10 @@ app.GetAsync("/api/me", func(res *gogo.Response, req *gogo.Request) {
 })
 
 // CSRF — double-submit cookie pattern.
-app.Use(mw.CSRF(mw.CSRFOptions{Secret: []byte("32-byte-secret-...")}))
+app.Use(mw.CSRF(mw.CSRFOptions{
+    Secret:        []byte("32-byte-secret-..."),
+    MaxTokenBytes: 256, // default; negative disables the token length cap
+}))
 
 // Prometheus-flavored metrics with /metrics handler.
 metrics := mw.NewMetrics()
@@ -1317,8 +1325,9 @@ When `TrustProxy` is **off** (the default), the framework treats every
 
 Turn `TrustProxy` **on** only when the server actually sits behind a
 trusted reverse proxy (nginx, an L7 load balancer, a CDN with origin
-shielding). Once on, the leftmost entry in `req.IPs()` is the client IP
-as reported by your proxy chain.
+shielding). Once on, `req.IPs()` normalizes valid IP entries from
+`X-Forwarded-For`, drops malformed entries, and returns the chain in order;
+the leftmost entry is the client IP as reported by your proxy chain.
 
 ```go
 // Behind a CDN — opt in so req.IPs() returns the real client.
@@ -1337,6 +1346,15 @@ app.Get("/whoami", func(res *gogo.Response, req *gogo.Request) {
 Internet-facing servers that read X-Forwarded-For anyway (against
 recommendation) must call `req.Header("x-forwarded-for")` and parse it
 themselves, accepting that any client can forge the value.
+
+### net/http adapter body cap
+
+`gogo.HTTPAdapter(h)` and `gogo.HTTPAdapterWithBody(h, body)` are migration
+helpers for small stdlib handlers. They stage the wrapped handler's response
+before sending it through gogo, so the staged body is capped by
+`gogo.MaxHTTPAdapterBodyBytes` (default 8 MiB; set negative to disable).
+Handlers that stream large downloads should be ported to native gogo streaming
+APIs instead of going through the adapter.
 
 ### Redirect and open redirects
 
