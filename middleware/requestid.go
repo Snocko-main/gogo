@@ -84,7 +84,7 @@ func RequestID(opts ...RequestIDOptions) mwhint.Hinted {
 				id = opt.Generator()
 			}
 			if !validRequestIDValue(id, opt.MaxLength, opt.Validator) {
-				id = defaultRequestID()
+				id = fallbackRequestID(opt.MaxLength, opt.Validator)
 			}
 			req.SetLocal(RequestIDLocalKey, id)
 			res.Header(opt.Header, id)
@@ -109,6 +109,34 @@ func validRequestIDHeaderValue(id string) bool {
 		}
 	}
 	return true
+}
+
+func fallbackRequestID(max int, validator func(string) bool) string {
+	id := boundedDefaultRequestID(max)
+	if validRequestIDValue(id, max, validator) {
+		return id
+	}
+	// A custom validator can reject every generated shape. At this point the
+	// framework still must not echo an unsafe or overlong header, so return a
+	// bounded visible-ASCII fallback even if it does not satisfy the validator.
+	if max == 0 {
+		max = 128
+	}
+	if max > 0 {
+		return "0"
+	}
+	return defaultRequestID()
+}
+
+func boundedDefaultRequestID(max int) string {
+	id := defaultRequestID()
+	if max < 0 || len(id) <= max {
+		return id
+	}
+	if max == 0 {
+		return id
+	}
+	return id[:max]
 }
 
 func validateRequestIDHeaderName(name string) {

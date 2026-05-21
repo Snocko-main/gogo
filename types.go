@@ -211,6 +211,7 @@ var panicHandlerFn atomic.Pointer[PanicHandler]
 func init() {
 	fn := PanicHandler(defaultPanicHandler)
 	panicHandlerFn.Store(&fn)
+	sendFileChunkBytesAtomic.Store(int64(SendFileChunkBytes))
 }
 
 // defaultPanicHandler writes the recovered value and a goroutine stack
@@ -2707,7 +2708,23 @@ func (r *Response) Stream(status int, contentType string, fn func(w io.Writer) e
 // The same threshold protects every Stream / SSE caller — file
 // serving paths still use SendFileBackpressureBytes for its own
 // reads-from-disk loop.
+//
+// Deprecated for runtime mutation: direct assignment remains supported for
+// startup-time configuration. Use SetStreamBackpressureBytes /
+// GetStreamBackpressureBytes for changes while requests may be running.
 var StreamBackpressureBytes uint64 = 1 << 20
+
+// SetStreamBackpressureBytes updates the automatic Stream / SSE backpressure
+// threshold atomically. Zero disables the automatic check.
+func SetStreamBackpressureBytes(backpressureBytes uint64) {
+	atomic.StoreUint64(&StreamBackpressureBytes, backpressureBytes)
+}
+
+// GetStreamBackpressureBytes returns the current automatic Stream / SSE
+// backpressure threshold.
+func GetStreamBackpressureBytes() uint64 {
+	return atomic.LoadUint64(&StreamBackpressureBytes)
+}
 
 // streamWriter is the io.Writer handed to Stream's callback. Each
 // Write call schedules a defer to the uWS loop thread that calls
@@ -2733,7 +2750,7 @@ func (s *streamWriter) Write(p []byte) (int, error) {
 		return len(p), nil
 	}
 	asyncDeferStreamWrite(s.r.async.loopPtr, s.r.async.ctxHandle, string(p))
-	threshold := StreamBackpressureBytes
+	threshold := GetStreamBackpressureBytes()
 	if threshold == 0 {
 		return len(p), nil
 	}
@@ -3002,7 +3019,7 @@ var MaxSendFileBytes int64 = 100 << 20
 // Deprecated for runtime mutation: direct assignment remains supported for
 // startup-time configuration. Use SetSendFileChunkBytes /
 // GetSendFileChunkBytes for changes while requests may be running.
-var SendFileChunkBytes int64 = 64 << 10
+var SendFileChunkBytes int = 64 << 10
 
 // SendFileBackpressureBytes is the high-water mark for uWS's
 // per-socket send buffer. When the buffer climbs above this value
@@ -3019,6 +3036,11 @@ var SendFileBackpressureBytes uint64 = 1 << 20
 // ErrFileTooLarge is returned by SendFile / Download when the target
 // file is larger than MaxSendFileBytes.
 var ErrFileTooLarge = errors.New("gogo: file exceeds MaxSendFileBytes")
+
+var (
+	sendFileChunkBytesAtomic atomic.Int64
+	sendFileChunkBytesSet    atomic.Bool
+)
 
 // SetMaxSendFileBytes updates the SendFile / Download file-size cap
 // atomically.
@@ -3037,16 +3059,25 @@ func SetSendFileChunkBytes(chunkBytes int) {
 	if chunkBytes <= 0 {
 		chunkBytes = 64 << 10
 	}
-	atomic.StoreInt64(&SendFileChunkBytes, int64(chunkBytes))
+	sendFileChunkBytesSet.Store(true)
+	sendFileChunkBytesAtomic.Store(int64(chunkBytes))
 }
 
 // GetSendFileChunkBytes returns the current per-read SendFile buffer size.
 func GetSendFileChunkBytes() int {
-	current := atomic.LoadInt64(&SendFileChunkBytes)
-	if current <= 0 {
+	if sendFileChunkBytesSet.Load() {
+		current := sendFileChunkBytesAtomic.Load()
+		if current <= 0 {
+			return 64 << 10
+		}
+		return int(current)
+	}
+	// Legacy direct assignment is supported for startup-time configuration.
+	// Use SetSendFileChunkBytes once requests may be running.
+	if SendFileChunkBytes <= 0 {
 		return 64 << 10
 	}
-	return int(current)
+	return SendFileChunkBytes
 }
 
 // SetSendFileBackpressureBytes updates the SendFile buffered-byte high-water

@@ -89,10 +89,19 @@ func (p *MultipartPart) IsFile() bool { return p.FileName != "" }
 // the write fails.
 //
 // Convenience for the common "save uploaded file to disk" path.
-// Callers that need different perms / append behavior / streaming
-// should use os.OpenFile directly with p.Data.
+// SECURITY: SaveAt overwrites existing files and follows symlinks. Do not pass
+// a path derived from client input unless you have already constrained it to a
+// safe directory. Prefer SaveInto for file uploads, or SaveAtNew when the
+// destination must not already exist.
 func (p *MultipartPart) SaveAt(dst string) error {
 	return os.WriteFile(dst, p.Data, 0o644)
+}
+
+// SaveAtNew writes the part's Data to dst only when dst does not already
+// exist. The file is opened with O_CREATE|O_EXCL so existing files and symlinks
+// are not overwritten.
+func (p *MultipartPart) SaveAtNew(dst string) error {
+	return writeNewFile(dst, p.Data)
 }
 
 // SaveInto writes the part's Data into dir, using the basename of

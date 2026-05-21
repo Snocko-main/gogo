@@ -163,8 +163,29 @@ func TestRequestIDFallsBackWhenGeneratorReturnsUnsafeValue(t *testing.T) {
 	if validRequestIDValue(id, 128, opt.Validator) {
 		t.Fatal("test generator unexpectedly produced a safe value")
 	}
-	fallback := defaultRequestID()
+	fallback := fallbackRequestID(128, opt.Validator)
 	if !validRequestIDValue(fallback, 128, opt.Validator) {
 		t.Fatal("default fallback request ID is not safe")
+	}
+}
+
+func TestRequestIDFallbackHonorsMaxLength(t *testing.T) {
+	acceptAll := func(string) bool { return true }
+	for _, max := range []int{1, 8, 16, 31} {
+		id := fallbackRequestID(max, acceptAll)
+		if len(id) > max {
+			t.Fatalf("fallbackRequestID(%d) length = %d, id=%q", max, len(id), id)
+		}
+		if !validRequestIDHeaderValue(id) {
+			t.Fatalf("fallbackRequestID(%d) returned unsafe id %q", max, id)
+		}
+	}
+}
+
+func TestRequestIDFallbackSurvivesRejectAllValidator(t *testing.T) {
+	rejectAll := func(string) bool { return false }
+	id := fallbackRequestID(8, rejectAll)
+	if id == "" || len(id) > 8 || !validRequestIDHeaderValue(id) {
+		t.Fatalf("fallbackRequestID reject-all = %q, want bounded safe ID", id)
 	}
 }

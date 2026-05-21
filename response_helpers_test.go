@@ -633,7 +633,7 @@ func TestStreamDefaultBackpressureBounds(t *testing.T) {
 	// for the wake-and-recheck race, but tight enough that the
 	// "no backpressure" regression (peak ≈ stream total) shows up
 	// as a failure.
-	cap := gogo.StreamBackpressureBytes * 4
+	cap := gogo.GetStreamBackpressureBytes() * 4
 	if peak > cap {
 		t.Errorf("peak BufferedAmount %d > 4×threshold %d; backpressure not enforced", peak, cap)
 	}
@@ -646,9 +646,9 @@ func TestStreamDefaultBackpressureBounds(t *testing.T) {
 // drain check (the producer races ahead) by confirming a known-fast
 // completion time for a small payload.
 func TestStreamBackpressureOptOut(t *testing.T) {
-	saved := gogo.StreamBackpressureBytes
-	gogo.StreamBackpressureBytes = 0
-	defer func() { gogo.StreamBackpressureBytes = saved }()
+	saved := gogo.GetStreamBackpressureBytes()
+	gogo.SetStreamBackpressureBytes(0)
+	defer func() { gogo.SetStreamBackpressureBytes(saved) }()
 
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.GetAsync("/opt-out", func(res *gogo.Response, req *gogo.Request) {
