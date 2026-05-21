@@ -1714,6 +1714,84 @@ func TestResponseJSON(t *testing.T) {
 	}
 }
 
+// TestResponseJSONBytes confirms the pre-marshaled JSON shortcut emits
+// the exact bytes with Content-Type: application/json. Useful for
+// cached responses and faster encoders.
+func TestResponseJSONBytes(t *testing.T) {
+	preMarshaled := []byte(`{"cached":true,"items":[1,2,3]}`)
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/", func(res *gogo.Response, req *gogo.Request) {
+			res.JSONBytes(200, preMarshaled)
+		})
+	})
+	defer teardown()
+
+	resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/", port))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("status: got %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type: got %q, want application/json", ct)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !bytes.Equal(body, preMarshaled) {
+		t.Errorf("body: got %q, want %q", body, preMarshaled)
+	}
+}
+
+// TestResponseJSONStream exercises the streaming encoder path —
+// avoids the per-response buffer allocation json.Marshal makes
+// for large bodies. Asserts each Encode call lands on the wire as
+// a newline-delimited JSON value.
+func TestResponseJSONStream(t *testing.T) {
+	type item struct {
+		ID   int    `json:"id"`
+		Name string `json:"name"`
+	}
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.GetAsync("/items", func(res *gogo.Response, req *gogo.Request) {
+			_ = res.JSONStream(200, func(enc *json.Encoder) error {
+				for i := 1; i <= 3; i++ {
+					if err := enc.Encode(item{ID: i, Name: fmt.Sprintf("n-%d", i)}); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+		})
+	})
+	defer teardown()
+
+	resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/items", port))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("Content-Type: got %q, want application/json", ct)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	lines := strings.Split(strings.TrimRight(string(body), "\n"), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("ndjson lines: got %d, want 3 (body=%q)", len(lines), body)
+	}
+	for i, line := range lines {
+		var got item
+		if err := json.Unmarshal([]byte(line), &got); err != nil {
+			t.Errorf("line %d %q: %v", i, line, err)
+			continue
+		}
+		want := item{ID: i + 1, Name: fmt.Sprintf("n-%d", i+1)}
+		if got != want {
+			t.Errorf("line %d: got %+v, want %+v", i, got, want)
+		}
+	}
+}
+
 func TestRequestCookie(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.Get("/r", func(res *gogo.Response, req *gogo.Request) {
