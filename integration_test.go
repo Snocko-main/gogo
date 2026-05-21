@@ -5760,6 +5760,57 @@ func TestWebSocketPublishAfterCloseNoop(t *testing.T) {
 	})
 }
 
+func TestWebSocketPublishRaceWithClose(t *testing.T) {
+	appCh := make(chan *gogo.App, 1)
+	port, teardown := startApp(t, func(app *gogo.App) {
+		appCh <- app
+		app.WebSocket("/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				ws.Subscribe("race-close")
+			},
+			MaxBackpressure: 64 * 1024 * 1024,
+		})
+	})
+	app := <-appCh
+
+	sub, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer sub.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	var stop atomic.Bool
+	var publishers sync.WaitGroup
+	publishers.Add(10)
+	for i := 0; i < 10; i++ {
+		go func() {
+			defer publishers.Done()
+			batch := []gogo.PublishMessage{
+				{Topic: "race-close", Message: []byte("batch"), OpCode: gogo.Text},
+			}
+			for !stop.Load() {
+				app.Publish("race-close", []byte("single"), gogo.Text)
+				app.PublishBatch(batch)
+			}
+			app.Publish("race-close", []byte("after-stop"), gogo.Text)
+			app.PublishBatch(batch)
+		}()
+	}
+
+	time.Sleep(25 * time.Millisecond)
+	sub.Close()
+	time.Sleep(25 * time.Millisecond)
+	stop.Store(true)
+	done := make(chan struct{})
+	go func() {
+		teardown()
+		close(done)
+	}()
+	publishers.Wait()
+	<-done
+}
+
 // TestWebSocketPublishConcurrent verifies the thread-safety claim
 // on App.Publish and App.PublishBatch: dozens of worker goroutines
 // can hammer them simultaneously without a race and every message

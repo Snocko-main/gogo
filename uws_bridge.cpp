@@ -1800,15 +1800,8 @@ extern "C" int uwsgo_ws_publish(uwsgo_ws_t *ws, const char *topic, size_t topic_
 
 extern "C" void uwsgo_app_publish(uwsgo_app_t *app, const char *topic, size_t topic_len,
         const char *message, size_t message_len, int opcode) {
-    if (app == nullptr || app->loop == nullptr ||
-            !app->accepting_work.load(std::memory_order_acquire)) {
+    if (app == nullptr) {
         return;
-    }
-    {
-        std::lock_guard<std::mutex> lock(app->app_mu);
-        if (app->app == nullptr) {
-            return;
-        }
     }
     // Topic + message copied onto the heap because the cgo caller's
     // buffers go out of scope as soon as this function returns; the
@@ -1825,6 +1818,11 @@ extern "C" void uwsgo_app_publish(uwsgo_app_t *app, const char *topic, size_t to
     std::string topic_copy(topic, topic_len);
     std::string message_copy(message, message_len);
     auto op = static_cast<uWS::OpCode>(opcode);
+    std::lock_guard<std::mutex> lock(app->app_mu);
+    if (app->app == nullptr || app->loop == nullptr ||
+            !app->accepting_work.load(std::memory_order_acquire)) {
+        return;
+    }
     app->loop->defer([app, t = std::move(topic_copy), m = std::move(message_copy), op]() {
         std::lock_guard<std::mutex> lock(app->app_mu);
         if (app->app != nullptr && app->accepting_work.load(std::memory_order_acquire)) {
@@ -1837,18 +1835,11 @@ extern "C" void uwsgo_app_publish_batch(
         uwsgo_app_t *app,
         const char *bytes, size_t bytes_len,
         const uwsgo_batch_item_t *items, size_t count) {
-    if (app == nullptr || app->loop == nullptr ||
-            !app->accepting_work.load(std::memory_order_acquire)) {
+    if (app == nullptr) {
         return;
     }
     if (count == 0) {
         return;
-    }
-    {
-        std::lock_guard<std::mutex> lock(app->app_mu);
-        if (app->app == nullptr) {
-            return;
-        }
     }
     // One alloc owns the items array + byte blob. The per-publish
     // overhead the single-message path pays (mutex, wakeup, lambda
@@ -1864,6 +1855,12 @@ extern "C" void uwsgo_app_publish_batch(
         memcpy(buf + items_bytes, bytes, bytes_len);
     }
 
+    std::lock_guard<std::mutex> lock(app->app_mu);
+    if (app->app == nullptr || app->loop == nullptr ||
+            !app->accepting_work.load(std::memory_order_acquire)) {
+        ::operator delete(buf);
+        return;
+    }
     app->loop->defer([app, buf, count]() {
         const auto *items = reinterpret_cast<const uwsgo_batch_item_t *>(buf);
         const char *bytes = buf + count * sizeof(uwsgo_batch_item_t);

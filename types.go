@@ -513,15 +513,19 @@ type App struct {
 	// and the user's handler should win.
 	userCatchAllRegistered bool
 
-	// closed + pendingTimers coordinate ShutdownGracefully's
-	// force-close goroutine with Close. Without this, a force-close
-	// timer that fires after the user has already called Close races
-	// against the freed appNative.ptr inside a cgo call.
+	// stopping flips as soon as Shutdown / ShutdownGracefully starts,
+	// so cross-thread producers stop enqueueing native work before
+	// the loop begins closing sockets. closed + pendingTimers
+	// coordinate ShutdownGracefully's force-close goroutine with
+	// Close. Without this, a force-close timer that fires after the
+	// user has already called Close races against the freed
+	// appNative.ptr inside a cgo call.
 	//
 	// Atomic Int32 instead of WaitGroup so the happens-before edge
 	// between Add and Close's drain is purely Go-side; WaitGroup's
 	// Add/Wait race detector requires a happens-before that the
 	// cgo-mediated loop close doesn't provide.
+	stopping      atomic.Bool
 	closed        atomic.Bool
 	pendingTimers atomic.Int32
 	// nativeMu serializes App.Close with cross-thread native calls that keep
@@ -1247,7 +1251,7 @@ func (a *App) WebSocket(pattern string, behavior WebSocketBehavior) {
 // There is no error / delivery-count return because the loop may not
 // have processed the publish yet when this returns; uWS itself does
 // not surface that count back to the publisher.
-// Calls after Close are ignored.
+// Calls after Shutdown, ShutdownGracefully, or Close are ignored.
 //
 // Performance — pick the right entry point:
 //   - Inside an Open/Message/Close handler (loop thread): prefer
@@ -1264,9 +1268,12 @@ func (a *App) WebSocket(pattern string, behavior WebSocketBehavior) {
 //     to ~8x faster at N=100. See PublishBatch's godoc for the full
 //     measured curve.
 func (a *App) Publish(topic string, message []byte, opcode OpCode) {
+	if a.closed.Load() || a.stopping.Load() {
+		return
+	}
 	a.nativeMu.RLock()
 	defer a.nativeMu.RUnlock()
-	if a.closed.Load() {
+	if a.closed.Load() || a.stopping.Load() {
 		return
 	}
 	a.inner.publish(topic, message, opcode)
@@ -1314,12 +1321,15 @@ type PublishMessage struct {
 // Mixed Text/Binary opcodes in one batch are fine.
 //
 // Returns immediately. Like Publish, delivery happens later on the
-// loop and there is no per-message delivery-count. Calls after Close
-// are ignored.
+// loop and there is no per-message delivery-count. Calls after
+// Shutdown, ShutdownGracefully, or Close are ignored.
 func (a *App) PublishBatch(msgs []PublishMessage) {
+	if a.closed.Load() || a.stopping.Load() {
+		return
+	}
 	a.nativeMu.RLock()
 	defer a.nativeMu.RUnlock()
-	if a.closed.Load() {
+	if a.closed.Load() || a.stopping.Load() {
 		return
 	}
 	a.inner.publishBatch(msgs)
@@ -1945,9 +1955,10 @@ func (a *App) Shutdown() {
 	if a.closed.Load() {
 		return
 	}
+	a.stopping.Store(true)
 	a.fireShutdownHooks()
-	a.nativeMu.RLock()
-	defer a.nativeMu.RUnlock()
+	a.nativeMu.Lock()
+	defer a.nativeMu.Unlock()
 	if a.closed.Load() {
 		return
 	}
@@ -1971,14 +1982,15 @@ func (a *App) ShutdownGracefully(timeout time.Duration) {
 	if a.closed.Load() {
 		return
 	}
+	a.stopping.Store(true)
 	a.fireShutdownHooks()
-	a.nativeMu.RLock()
+	a.nativeMu.Lock()
 	if a.closed.Load() {
-		a.nativeMu.RUnlock()
+		a.nativeMu.Unlock()
 		return
 	}
 	a.inner.closeListen()
-	a.nativeMu.RUnlock()
+	a.nativeMu.Unlock()
 	if timeout <= 0 {
 		return
 	}
@@ -1989,8 +2001,8 @@ func (a *App) ShutdownGracefully(timeout time.Duration) {
 		if a.closed.Load() {
 			return
 		}
-		a.nativeMu.RLock()
-		defer a.nativeMu.RUnlock()
+		a.nativeMu.Lock()
+		defer a.nativeMu.Unlock()
 		if a.closed.Load() {
 			return
 		}
@@ -2010,6 +2022,7 @@ func (a *App) ShutdownGracefully(timeout time.Duration) {
 // don't accumulate dead workers spinning against a ring no app is
 // feeding anymore.
 func (a *App) Close() {
+	a.stopping.Store(true)
 	a.closed.Store(true)
 	// Drain any in-flight ShutdownGracefully timer goroutine before
 	// freeing native resources. Spin with Gosched — the only callers

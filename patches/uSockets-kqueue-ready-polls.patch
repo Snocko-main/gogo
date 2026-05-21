@@ -1,0 +1,46 @@
+diff --git a/src/eventing/epoll_kqueue.c b/src/eventing/epoll_kqueue.c
+index 72c6118..5e9438a 100644
+--- a/src/eventing/epoll_kqueue.c
++++ b/src/eventing/epoll_kqueue.c
+@@ -355,0 +356,8 @@ void us_timer_close(struct us_timer_t *timer) {
++    us_internal_loop_update_pending_ready_polls(
++        internal_cb->loop,
++        (struct us_poll_t *) timer,
++        0,
++        LIBUS_SOCKET_READABLE,
++        0);
++    internal_cb->cb = 0;
++
+@@ -437,0 +446,8 @@ void us_internal_async_close(struct us_internal_async *a) {
++    us_internal_loop_update_pending_ready_polls(
++        internal_cb->loop,
++        (struct us_poll_t *) a,
++        0,
++        LIBUS_SOCKET_READABLE,
++        0);
++    internal_cb->cb = 0;
++
+diff --git a/src/loop.c b/src/loop.c
+index 8f3b696..29693b6 100644
+--- a/src/loop.c
++++ b/src/loop.c
+@@ -228,0 +229,3 @@ void us_internal_dispatch_ready_poll(struct us_poll_t *p, int error, int events)
++            if (cb->cb == 0) {
++                return;
++            }
+@@ -239,0 +243,4 @@ void us_internal_dispatch_ready_poll(struct us_poll_t *p, int error, int events)
++            struct us_socket_t *s = (struct us_socket_t *) p;
++            if (us_socket_is_closed(0, s)) {
++                return;
++            }
+@@ -243,2 +249,0 @@ void us_internal_dispatch_ready_poll(struct us_poll_t *p, int error, int events)
+-                struct us_socket_t *s = (struct us_socket_t *) p;
+-
+@@ -301,0 +307,3 @@ void us_internal_dispatch_ready_poll(struct us_poll_t *p, int error, int events)
++            if (us_socket_is_closed(0, s)) {
++                return;
++            }
+@@ -396 +404 @@ void *us_loop_ext(struct us_loop_t *loop) {
+-#endif
+\ No newline at end of file
++#endif
