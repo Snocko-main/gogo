@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -91,6 +92,7 @@ func CORS(opts ...CORSOptions) mwhint.Hinted {
 	if opt.AllowCredentials && len(opt.AllowOrigins) == 1 && opt.AllowOrigins[0] == "*" {
 		panic("gogo/middleware: AllowCredentials=true cannot be combined with AllowOrigins={\"*\"}; list explicit origins")
 	}
+	allowOrigins := normalizeCORSOriginPatterns(opt.AllowOrigins)
 	validateCORSMethods(opt.AllowMethods)
 	validateCORSHeaders("AllowHeaders", opt.AllowHeaders, true)
 	validateCORSHeaders("ExposeHeaders", opt.ExposeHeaders, false)
@@ -102,12 +104,12 @@ func CORS(opts ...CORSOptions) mwhint.Hinted {
 	if opt.MaxAge > 0 {
 		maxAgeStr = strconv.Itoa(opt.MaxAge)
 	}
-	allowAny := len(opt.AllowOrigins) == 1 && opt.AllowOrigins[0] == "*"
+	allowAny := len(allowOrigins) == 1 && allowOrigins[0] == "*"
 	// Compile patterns ONCE at construction so the request hot
 	// path is a single ToLower(origin) plus direct == / HasPrefix
 	// / HasSuffix comparisons. The old EqualFold-per-pattern
 	// path repeated the same case-folding work on every request.
-	compiledOrigins := compileOrigins(opt.AllowOrigins)
+	compiledOrigins := compileOrigins(allowOrigins)
 
 	// Lowercase set of allowed request headers, used at preflight to
 	// filter Access-Control-Request-Headers against the configured
@@ -238,6 +240,48 @@ func validateCORSHeaders(field string, headers []string, allowWildcard bool) {
 			}
 		}
 	}
+}
+
+func normalizeCORSOriginPatterns(patterns []string) []string {
+	out := make([]string, 0, len(patterns))
+	for _, pattern := range patterns {
+		normalized, ok := normalizeCORSOriginPattern(pattern)
+		if !ok {
+			panic("gogo/middleware: CORS AllowOrigins contains an invalid origin")
+		}
+		out = append(out, normalized)
+	}
+	return out
+}
+
+func normalizeCORSOriginPattern(pattern string) (string, bool) {
+	for i := 0; i < len(pattern); i++ {
+		if pattern[i] < 0x20 || pattern[i] == 0x7f {
+			return "", false
+		}
+	}
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "*" {
+		return "*", true
+	}
+	if !strings.Contains(pattern, "*") {
+		return normalizeOriginValue(pattern)
+	}
+	idx := strings.Index(pattern, "://*.")
+	if idx <= 0 || strings.Contains(pattern[idx+len("://*."):], "*") {
+		return "", false
+	}
+	scheme := pattern[:idx]
+	suffix := strings.TrimSuffix(pattern[idx+len("://*."):], "/")
+	if suffix == "" {
+		return "", false
+	}
+	parsed, err := url.Parse(scheme + "://wildcard." + suffix)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil ||
+		parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", false
+	}
+	return strings.ToLower(parsed.Scheme) + "://*." + strings.TrimPrefix(strings.ToLower(parsed.Host), "wildcard."), true
 }
 
 // compiledOrigin is the parsed-once form of an AllowOrigins entry.

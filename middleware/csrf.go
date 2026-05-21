@@ -102,6 +102,7 @@ func CSRF(opt CSRFOptions) mwhint.Hinted {
 	if len(opt.Secret) == 0 {
 		panic("gogo/middleware: CSRF requires a Secret")
 	}
+	opt.Secret = append([]byte(nil), opt.Secret...)
 	if opt.CookieName == "" {
 		opt.CookieName = "csrf_token"
 	}

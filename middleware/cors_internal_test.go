@@ -46,6 +46,56 @@ func TestCORSAcceptsWildcardAllowHeaders(t *testing.T) {
 	})
 }
 
+func TestCORSRejectsInvalidConfiguredOrigins(t *testing.T) {
+	cases := []string{
+		"",
+		"https://app.example.com/path",
+		"https://app.example.com?x=1",
+		"https://app.example.com#frag",
+		"https://user@app.example.com",
+		"https://app.example.com\n",
+		"https://*.example.com/path",
+		"https://*.",
+		"https://foo.*.example.com",
+	}
+	for _, origin := range cases {
+		t.Run(origin, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("CORS did not panic")
+				}
+			}()
+			_ = CORS(CORSOptions{AllowOrigins: []string{origin}})
+		})
+	}
+}
+
+func TestCORSNormalizesConfiguredOrigins(t *testing.T) {
+	compiled := compileOrigins(normalizeCORSOriginPatterns([]string{
+		"https://APP.example.com/",
+		"https://*.TRUSTED.example/",
+		"null",
+	}))
+	for _, origin := range []string{
+		"https://app.example.com",
+		"https://api.trusted.example",
+		"null",
+	} {
+		if !matchCompiledOrigin(compiled, origin) {
+			t.Fatalf("compiled origins did not match %q", origin)
+		}
+	}
+	for _, origin := range []string{
+		"https://app.example.com/path",
+		"https://trusted.example",
+		"https://evil.example",
+	} {
+		if matchCompiledOrigin(compiled, origin) {
+			t.Fatalf("compiled origins matched invalid origin %q", origin)
+		}
+	}
+}
+
 func TestFilterRequestedHeadersDropsInvalidTokens(t *testing.T) {
 	got := filterRequestedHeaders("X-Good, bad header, X-Also-Good, evil\nname")
 	want := "X-Good, X-Also-Good"

@@ -249,6 +249,7 @@ func NewSession(opt SessionOptions) mwhint.Hinted {
 	if len(opt.Secret) == 0 {
 		panic("gogo/middleware: Session requires a Secret")
 	}
+	opt.Secret = append([]byte(nil), opt.Secret...)
 	if opt.Store == nil {
 		mem := NewMemorySessionStore()
 		switch {
