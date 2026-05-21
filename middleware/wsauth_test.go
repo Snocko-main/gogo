@@ -167,6 +167,38 @@ func TestWebSocketAuthAllowMissingOriginCLI(t *testing.T) {
 	}
 }
 
+func TestWebSocketAuthChecksLegacyOriginWhenMissingOriginAllowed(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.WebSocket("/ws", gogo.WebSocketBehavior{
+			Upgrade: middleware.WebSocketAuth(middleware.WebSocketAuthOptions{
+				AllowedOrigins:     []string{"https://app.example.com"},
+				AllowMissingOrigin: true,
+			}),
+		})
+	})
+	defer teardown()
+
+	resp, err := wsHandshake(port, "/ws", map[string]string{
+		"Sec-WebSocket-Origin": "https://evil.example",
+	})
+	if err != nil {
+		t.Fatalf("handshake (legacy evil origin): %v", err)
+	}
+	if resp.StatusCode != 403 {
+		t.Fatalf("legacy evil origin: got %d, want 403", resp.StatusCode)
+	}
+
+	resp, err = wsHandshake(port, "/ws", map[string]string{
+		"Sec-WebSocket-Origin": "https://app.example.com",
+	})
+	if err != nil {
+		t.Fatalf("handshake (legacy allowed origin): %v", err)
+	}
+	if resp.StatusCode != 101 {
+		t.Fatalf("legacy allowed origin: got %d, want 101", resp.StatusCode)
+	}
+}
+
 // TestWebSocketAuthAllowWildcard: AllowedOrigins=["*"] accepts any
 // origin. Opt-in for endpoints that are explicitly cross-origin
 // (e.g. public APIs) and that don't rely on ambient cookie auth.

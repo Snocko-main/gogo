@@ -91,7 +91,19 @@ func NewTestServer(setup func(*App)) (*TestServer, error) {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 
-		app, err := NewApp(Config{BindAddr: "127.0.0.1"})
+		var app *App
+		defer func() {
+			if r := recover(); r != nil {
+				if app != nil {
+					app.Close()
+				}
+				listenErr <- fmt.Errorf("setup panic: %v", r)
+				close(runDone)
+			}
+		}()
+
+		var err error
+		app, err = NewApp(Config{BindAddr: "127.0.0.1"})
 		if err != nil {
 			listenErr <- fmt.Errorf("NewApp: %w", err)
 			close(runDone)
@@ -386,75 +398,12 @@ func flushAdapterRecorder(res *Response, rec *httptest.ResponseRecorder) {
 // copyHeadersFromRequest packs every header on req into the
 // destination http.Header map. The snapshot path stores headers as
 // a NUL-separated blob; sync mode uses a different read path but
-// we go through Request.Header which abstracts both.
+// Request.Headers abstracts both without one lookup per known name.
 func copyHeadersFromRequest(dst http.Header, req *Request) {
-	// Common headers we always probe — these cover the bulk of
-	// what stdlib handlers tend to read. For everything else the
-	// snapshot exposes them directly.
-	for _, name := range commonAdapterHeaders {
-		if v := req.Header(name); v != "" {
-			dst.Set(canonicalHeaderName(name), v)
-		}
-	}
-	// If the request is in snapshot mode (async path), walk the
-	// packed blob too so non-common headers reach the adapter.
-	if req.snap != nil {
-		walkSnapshotHeaders(req.snap.headers, func(k, v string) {
-			if dst.Get(canonicalHeaderName(k)) == "" {
-				dst.Set(canonicalHeaderName(k), v)
-			}
-		})
-	}
-}
-
-// commonAdapterHeaders is the set of headers stdlib handlers most
-// frequently read. Probed unconditionally so handlers behind
-// HTTPAdapter see them even on sync routes where the snapshot
-// blob isn't built.
-var commonAdapterHeaders = []string{
-	"accept",
-	"accept-encoding",
-	"accept-language",
-	"authorization",
-	"cache-control",
-	"content-type",
-	"content-length",
-	"cookie",
-	"host",
-	"if-modified-since",
-	"if-none-match",
-	"origin",
-	"range",
-	"referer",
-	"user-agent",
-	"x-forwarded-for",
-	"x-forwarded-proto",
-	"x-real-ip",
-	"x-request-id",
-}
-
-// walkSnapshotHeaders iterates the packed name\0value\0 blob the
-// snapshot path produces, calling fn for each header pair.
-func walkSnapshotHeaders(blob []byte, fn func(name, value string)) {
-	buf := blob
-	for len(buf) > 0 {
-		j := indexOfZero(buf)
-		if j < 0 {
-			return
-		}
-		name := string(buf[:j])
-		buf = buf[j+1:]
-		if len(buf) == 0 {
-			return
-		}
-		j = indexOfZero(buf)
-		if j < 0 {
-			return
-		}
-		value := string(buf[:j])
-		buf = buf[j+1:]
-		fn(name, value)
-	}
+	req.Headers(func(name, value string) bool {
+		dst.Set(canonicalHeaderName(name), value)
+		return true
+	})
 }
 
 // upperASCII upper-cases a method string without touching non-ASCII

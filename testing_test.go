@@ -46,6 +46,21 @@ func TestTestServerBasic(t *testing.T) {
 	}
 }
 
+func TestNewTestServerSetupPanicReturnsError(t *testing.T) {
+	ts, err := gogo.NewTestServer(func(app *gogo.App) {
+		panic("boom")
+	})
+	if ts != nil {
+		ts.Close()
+	}
+	if err == nil {
+		t.Fatal("NewTestServer returned nil error after setup panic")
+	}
+	if !strings.Contains(err.Error(), "setup panic: boom") {
+		t.Fatalf("NewTestServer error = %q, want setup panic", err)
+	}
+}
+
 // TestTestServerDo rewrites a httptest.NewRequest URL to point at
 // the running server and ships custom headers / body through Do.
 func TestTestServerDo(t *testing.T) {
@@ -209,14 +224,14 @@ func TestHTTPAdapterBasic(t *testing.T) {
 	}
 }
 
-// TestHTTPAdapterHeadersIn ensures the wrapped handler sees the
-// inbound request's headers (the common-headers probe pulls them
-// out of the live Request even on sync routes).
+// TestHTTPAdapterHeadersIn ensures the wrapped handler sees inbound
+// headers, including custom names, even on sync routes.
 func TestHTTPAdapterHeadersIn(t *testing.T) {
 	stdHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Saw-Authorization", r.Header.Get("Authorization"))
 		w.Header().Set("X-Saw-Cookie", r.Header.Get("Cookie"))
 		w.Header().Set("X-Saw-UA", r.Header.Get("User-Agent"))
+		w.Header().Set("X-Saw-Tenant", r.Header.Get("X-Tenant"))
 		w.WriteHeader(200)
 	})
 
@@ -232,6 +247,7 @@ func TestHTTPAdapterHeadersIn(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer abc")
 	req.Header.Set("Cookie", "session=xyz")
 	req.Header.Set("User-Agent", "gogo-test/1.0")
+	req.Header.Set("X-Tenant", "acme")
 	resp, err := ts.Do(req)
 	if err != nil {
 		t.Fatalf("do: %v", err)
@@ -245,6 +261,9 @@ func TestHTTPAdapterHeadersIn(t *testing.T) {
 	}
 	if got := resp.Header.Get("X-Saw-UA"); got != "gogo-test/1.0" {
 		t.Errorf("User-Agent passthrough: %q", got)
+	}
+	if got := resp.Header.Get("X-Saw-Tenant"); got != "acme" {
+		t.Errorf("custom header passthrough: %q", got)
 	}
 }
 

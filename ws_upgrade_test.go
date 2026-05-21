@@ -118,6 +118,33 @@ func TestWSSubprotocolNegotiation(t *testing.T) {
 	}
 }
 
+func TestWSUpgradeRejectsInvalidAcceptedSubprotocol(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.WebSocket("/ws", gogo.WebSocketBehavior{
+			Upgrade: func(ctx *gogo.UpgradeContext) {
+				ctx.Accept("chat\r\nX-Bad: injected")
+			},
+		})
+	})
+	defer teardown()
+
+	resp, _, conn, err := dialWSWithHeaders(port, "/ws", nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	conn.Close()
+	if resp.StatusCode != 400 {
+		t.Fatalf("status = %d, body=%q, want 400", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("Sec-WebSocket-Protocol"); got != "" {
+		t.Fatalf("Sec-WebSocket-Protocol = %q, want empty", got)
+	}
+	if !strings.Contains(string(body), "invalid subprotocol") {
+		t.Fatalf("body = %q, want invalid subprotocol", body)
+	}
+}
+
 // TestWSUpgradeRejection: callback calls Reject; client sees the
 // HTTP status and body, no protocol switch.
 func TestWSUpgradeRejection(t *testing.T) {

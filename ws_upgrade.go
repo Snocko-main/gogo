@@ -138,6 +138,10 @@ func (c *UpgradeContext) Accept(protocol string) {
 		return
 	}
 	c.done = true
+	if !validWebSocketSubprotocol(protocol) {
+		upgradeReject(c.ctxPtr, statusLine(400), "invalid subprotocol")
+		return
+	}
 
 	var handle uintptr
 	if c.userData != nil {
@@ -178,9 +182,24 @@ func parseSubprotocolList(raw string) []string {
 		if t == "" {
 			continue
 		}
+		if !validWebSocketSubprotocol(t) {
+			continue
+		}
 		out = append(out, t)
 	}
 	return out
+}
+
+func validWebSocketSubprotocol(protocol string) bool {
+	if protocol == "" {
+		return true
+	}
+	for i := 0; i < len(protocol); i++ {
+		if !isHTTPTokenChar(protocol[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // lowercaseAsciiString is an allocation-friendly twin of

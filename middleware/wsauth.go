@@ -37,12 +37,12 @@ type WebSocketAuthOptions struct {
 	// when you understand the risk.
 	AllowedOrigins []string
 
-	// AllowMissingOrigin permits handshakes that arrive with no
-	// Origin header at all. Default false. Useful for CLI tooling
-	// (websocat, curl --include) that doesn't set Origin, but
-	// dangerous if any of your real clients are browsers — browser
-	// requests always carry an Origin and a request without one is
-	// either a non-browser or a stripped-down forgery.
+	// AllowMissingOrigin permits handshakes that arrive with neither
+	// Origin nor legacy Sec-WebSocket-Origin. Default false. Useful
+	// for CLI tooling (websocat, curl --include) that doesn't set
+	// Origin, but dangerous if any of your real clients are browsers
+	// — browser requests always carry an Origin and a request without
+	// one is either a non-browser or a stripped-down forgery.
 	AllowMissingOrigin bool
 
 	// Verify, when non-nil, runs after the Origin check passes and
@@ -110,6 +110,9 @@ func WebSocketAuth(opt WebSocketAuthOptions) func(*gogo.UpgradeContext) {
 
 	return func(ctx *gogo.UpgradeContext) {
 		origin := ctx.Header("origin")
+		if origin == "" {
+			origin = ctx.Header("sec-websocket-origin")
+		}
 		if origin == "" {
 			if !opt.AllowMissingOrigin {
 				ctx.Reject(403, "missing Origin")
