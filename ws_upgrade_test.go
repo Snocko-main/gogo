@@ -80,14 +80,14 @@ func expectedAccept(key string) string {
 // "chat"]; server's Upgrade callback picks "graphql-ws" and the
 // server's 101 response echoes it back in Sec-WebSocket-Protocol.
 func TestWSSubprotocolNegotiation(t *testing.T) {
-	var pickedFromCallback string
+	pickedCh := make(chan string, 1)
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.WebSocket("/ws", gogo.WebSocketBehavior{
 			Upgrade: func(ctx *gogo.UpgradeContext) {
 				offered := ctx.Protocols()
 				for _, p := range offered {
 					if p == "graphql-ws" {
-						pickedFromCallback = p
+						pickedCh <- p
 						ctx.Accept(p)
 						return
 					}
@@ -113,8 +113,8 @@ func TestWSSubprotocolNegotiation(t *testing.T) {
 	if got := resp.Header.Get("Sec-WebSocket-Protocol"); got != "graphql-ws" {
 		t.Errorf("Sec-WebSocket-Protocol = %q, want graphql-ws", got)
 	}
-	if pickedFromCallback != "graphql-ws" {
-		t.Errorf("callback picked %q, want graphql-ws", pickedFromCallback)
+	if picked := <-pickedCh; picked != "graphql-ws" {
+		t.Errorf("callback picked %q, want graphql-ws", picked)
 	}
 }
 
@@ -236,11 +236,11 @@ func TestWSUpgradeHeaderAccess(t *testing.T) {
 
 // TestWSQueryParam exposes the parsed query helper.
 func TestWSQueryParam(t *testing.T) {
-	var token string
+	tokenCh := make(chan string, 1)
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.WebSocket("/ws", gogo.WebSocketBehavior{
 			Upgrade: func(ctx *gogo.UpgradeContext) {
-				token = ctx.QueryParam("token")
+				tokenCh <- ctx.QueryParam("token")
 				ctx.Accept("")
 			},
 		})
@@ -255,7 +255,7 @@ func TestWSQueryParam(t *testing.T) {
 	if resp.StatusCode != 101 {
 		t.Fatalf("status = %d, want 101", resp.StatusCode)
 	}
-	if token != "abc" {
+	if token := <-tokenCh; token != "abc" {
 		t.Errorf("QueryParam(token) = %q, want abc", token)
 	}
 }

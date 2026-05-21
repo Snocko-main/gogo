@@ -524,6 +524,9 @@ type App struct {
 	// cgo-mediated loop close doesn't provide.
 	closed        atomic.Bool
 	pendingTimers atomic.Int32
+	// nativeMu serializes App.Close with cross-thread native calls that keep
+	// using the app pointer after leaving Go, such as WebSocket publishes.
+	nativeMu sync.RWMutex
 	// workerRefAcquired / workerRefDropped pair a shared-dispatch
 	// worker-pool reference with Apps that actually register at
 	// least one shared fast-path route. Sync-only Apps must not hold
@@ -1244,6 +1247,7 @@ func (a *App) WebSocket(pattern string, behavior WebSocketBehavior) {
 // There is no error / delivery-count return because the loop may not
 // have processed the publish yet when this returns; uWS itself does
 // not surface that count back to the publisher.
+// Calls after Close are ignored.
 //
 // Performance — pick the right entry point:
 //   - Inside an Open/Message/Close handler (loop thread): prefer
@@ -1260,6 +1264,11 @@ func (a *App) WebSocket(pattern string, behavior WebSocketBehavior) {
 //     to ~8x faster at N=100. See PublishBatch's godoc for the full
 //     measured curve.
 func (a *App) Publish(topic string, message []byte, opcode OpCode) {
+	a.nativeMu.RLock()
+	defer a.nativeMu.RUnlock()
+	if a.closed.Load() {
+		return
+	}
 	a.inner.publish(topic, message, opcode)
 }
 
@@ -1305,8 +1314,14 @@ type PublishMessage struct {
 // Mixed Text/Binary opcodes in one batch are fine.
 //
 // Returns immediately. Like Publish, delivery happens later on the
-// loop and there is no per-message delivery-count.
+// loop and there is no per-message delivery-count. Calls after Close
+// are ignored.
 func (a *App) PublishBatch(msgs []PublishMessage) {
+	a.nativeMu.RLock()
+	defer a.nativeMu.RUnlock()
+	if a.closed.Load() {
+		return
+	}
 	a.inner.publishBatch(msgs)
 }
 
@@ -1927,7 +1942,15 @@ func (a *App) Run() {
 // call Close after Run returns to free native resources. Registered
 // OnShutdown hooks fire synchronously before the close is dispatched.
 func (a *App) Shutdown() {
+	if a.closed.Load() {
+		return
+	}
 	a.fireShutdownHooks()
+	a.nativeMu.RLock()
+	defer a.nativeMu.RUnlock()
+	if a.closed.Load() {
+		return
+	}
 	a.inner.stop()
 }
 
@@ -1945,8 +1968,17 @@ func (a *App) Shutdown() {
 // resources, so it is always safe to call Close after Run returns
 // regardless of how the loop exited.
 func (a *App) ShutdownGracefully(timeout time.Duration) {
+	if a.closed.Load() {
+		return
+	}
 	a.fireShutdownHooks()
+	a.nativeMu.RLock()
+	if a.closed.Load() {
+		a.nativeMu.RUnlock()
+		return
+	}
 	a.inner.closeListen()
+	a.nativeMu.RUnlock()
 	if timeout <= 0 {
 		return
 	}
@@ -1954,6 +1986,11 @@ func (a *App) ShutdownGracefully(timeout time.Duration) {
 	go func() {
 		defer a.pendingTimers.Add(-1)
 		time.Sleep(timeout)
+		if a.closed.Load() {
+			return
+		}
+		a.nativeMu.RLock()
+		defer a.nativeMu.RUnlock()
 		if a.closed.Load() {
 			return
 		}
@@ -1981,7 +2018,9 @@ func (a *App) Close() {
 	for a.pendingTimers.Load() > 0 {
 		runtime.Gosched()
 	}
+	a.nativeMu.Lock()
 	a.inner.close()
+	a.nativeMu.Unlock()
 	// Drop the worker pool reference exactly once per shared App.
 	// Multiple Close calls (defensive teardown, force-close timer
 	// overlap) must not over-decrement the global active-apps counter.
@@ -2441,6 +2480,9 @@ func (r *Response) Send(code int, contentType, body string) {
 	// Content-Encoding/Vary or any middleware-buffered headers force the
 	// defer-send-with-headers route).
 	if r.async != nil && !r.async.sent {
+		if r.dropAsyncIfAborted() {
+			return
+		}
 		if len(r.pendingHeaders) == 0 {
 			if asyncSendShared(r.async.ctxHandle, line, contentType, body) {
 				r.async.sent = true
@@ -2598,6 +2640,9 @@ func (r *Response) Stream(status int, contentType string, fn func(w io.Writer) e
 	if contentType != "" {
 		validateHeaderValue("Content-Type", contentType)
 	}
+	if r.dropAsyncIfAborted() {
+		return nil
+	}
 
 	// Pack pendingHeaders for the initial frame so middleware-set
 	// headers (RequestID echo, CSP, etc.) ship with the status line
@@ -2623,7 +2668,9 @@ func (r *Response) Stream(status int, contentType string, fn func(w io.Writer) e
 	// Always close — even on user error — so the response doesn't
 	// hang the connection. The user's error is propagated back to
 	// the caller for logging / metrics.
-	asyncDeferStreamEnd(r.async.loopPtr, r.async.ctxHandle)
+	if !asyncCtxAborted(r.async.ctxHandle) {
+		asyncDeferStreamEnd(r.async.loopPtr, r.async.ctxHandle)
+	}
 	return fnErr
 }
 
@@ -2661,6 +2708,9 @@ type streamWriter struct {
 func (s *streamWriter) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
+	}
+	if asyncCtxAborted(s.r.async.ctxHandle) {
+		return len(p), nil
 	}
 	asyncDeferStreamWrite(s.r.async.loopPtr, s.r.async.ctxHandle, string(p))
 	threshold := StreamBackpressureBytes
@@ -3381,6 +3431,9 @@ func (r *Response) flushAsync() {
 	if a.sent {
 		return
 	}
+	if r.dropAsyncIfAborted() {
+		return
+	}
 	if len(r.pendingHeaders) > 0 {
 		// Pack buffered headers as name\0value\0... and route through the
 		// defer-send-with-headers cgo shim. Used by Compress (which emits
@@ -3400,6 +3453,16 @@ func (r *Response) flushAsync() {
 		asyncDeferSend(a.loopPtr, a.ctxHandle, a.status, a.contentType, a.body.String())
 	}
 	a.sent = true
+}
+
+func (r *Response) dropAsyncIfAborted() bool {
+	a := r.async
+	if a == nil || a.sent || !asyncCtxAborted(a.ctxHandle) {
+		return false
+	}
+	asyncCtxRelease(a.ctxHandle)
+	a.sent = true
+	return true
 }
 
 // acquireRef adds one to the wrapper's refcount. Callers must pair every

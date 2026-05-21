@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	gogo "github.com/Snocko-main/gogo"
@@ -103,10 +104,10 @@ func TestParamIntByName(t *testing.T) {
 // reach the handler, non-numeric IDs get a 404 from the framework
 // without the handler running.
 func TestTypedParamInt(t *testing.T) {
-	var handlerCalled bool
+	var handlerCalled atomic.Bool
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.Get("/users/:id<int>", func(res *gogo.Response, req *gogo.Request) {
-			handlerCalled = true
+			handlerCalled.Store(true)
 			res.Send(200, "text/plain", "got "+req.Param("id"))
 		})
 	})
@@ -118,18 +119,18 @@ func TestTypedParamInt(t *testing.T) {
 	if r1.StatusCode != 200 {
 		t.Errorf("numeric id status = %d, want 200", r1.StatusCode)
 	}
-	if !handlerCalled {
+	if !handlerCalled.Load() {
 		t.Errorf("handler should have run for numeric id")
 	}
 
 	// Non-numeric → 404, handler did NOT run.
-	handlerCalled = false
+	handlerCalled.Store(false)
 	r2, _ := http.Get(fmt.Sprintf("http://127.0.0.1:%d/users/alice", port))
 	r2.Body.Close()
 	if r2.StatusCode != 404 {
 		t.Errorf("non-numeric id status = %d, want 404", r2.StatusCode)
 	}
-	if handlerCalled {
+	if handlerCalled.Load() {
 		t.Errorf("handler should NOT have run for non-numeric id")
 	}
 }
@@ -162,11 +163,11 @@ func TestTypedParamUUID(t *testing.T) {
 // validation short-circuits BEFORE middleware fires — the whole
 // point of the constraint is cheap rejection.
 func TestTypedParamConstraintRunsBeforeMiddleware(t *testing.T) {
-	var mwHits int
+	var mwHits atomic.Int32
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.Use(func(next gogo.Handler) gogo.Handler {
 			return func(res *gogo.Response, req *gogo.Request) {
-				mwHits++
+				mwHits.Add(1)
 				next(res, req)
 			}
 		})
@@ -182,15 +183,15 @@ func TestTypedParamConstraintRunsBeforeMiddleware(t *testing.T) {
 	if r1.StatusCode != 404 {
 		t.Errorf("status = %d, want 404", r1.StatusCode)
 	}
-	if mwHits != 0 {
-		t.Errorf("middleware fired on rejected request: hits=%d", mwHits)
+	if got := mwHits.Load(); got != 0 {
+		t.Errorf("middleware fired on rejected request: hits=%d", got)
 	}
 
 	// Valid id → middleware fires.
 	r2, _ := http.Get(fmt.Sprintf("http://127.0.0.1:%d/users/42", port))
 	r2.Body.Close()
-	if mwHits != 1 {
-		t.Errorf("middleware should have fired once: hits=%d", mwHits)
+	if got := mwHits.Load(); got != 1 {
+		t.Errorf("middleware should have fired once: hits=%d", got)
 	}
 }
 

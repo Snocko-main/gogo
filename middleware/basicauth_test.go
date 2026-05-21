@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	gogo "github.com/Snocko-main/gogo"
@@ -89,11 +90,11 @@ func TestBasicAuthBadPassword(t *testing.T) {
 }
 
 func TestBasicAuthValidatorCallback(t *testing.T) {
-	calls := 0
+	var calls atomic.Int32
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.Use(middleware.BasicAuth(middleware.BasicAuthOptions{
 			Validator: func(u, p string) bool {
-				calls++
+				calls.Add(1)
 				return u == "admin" && p == "secret"
 			},
 		}))
@@ -110,8 +111,8 @@ func TestBasicAuthValidatorCallback(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatalf("got %d", resp.StatusCode)
 	}
-	if calls != 1 {
-		t.Errorf("validator calls=%d", calls)
+	if got := calls.Load(); got != 1 {
+		t.Errorf("validator calls=%d", got)
 	}
 }
 

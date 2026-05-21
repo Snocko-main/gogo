@@ -374,15 +374,17 @@ func TestStreamLargeBody(t *testing.T) {
 // stream, rise after writes, and (with a fast localhost client)
 // stay small because uWS drains immediately.
 func TestStreamBufferedAmount(t *testing.T) {
-	var samples []uint64
+	samplesCh := make(chan []uint64, 1)
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.GetAsync("/buf", func(res *gogo.Response, req *gogo.Request) {
+			var samples []uint64
 			res.Stream(200, "application/octet-stream", func(w io.Writer) error {
 				samples = append(samples, res.BufferedAmount())
 				_, _ = w.Write([]byte(strings.Repeat("x", 64*1024)))
 				samples = append(samples, res.BufferedAmount())
 				return nil
 			})
+			samplesCh <- samples
 		})
 	})
 	defer teardown()
@@ -396,6 +398,7 @@ func TestStreamBufferedAmount(t *testing.T) {
 	if len(body) != 64*1024 {
 		t.Errorf("body length = %d, want %d", len(body), 64*1024)
 	}
+	samples := <-samplesCh
 	if len(samples) != 2 {
 		t.Fatalf("samples = %d, want 2", len(samples))
 	}
