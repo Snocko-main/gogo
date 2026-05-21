@@ -2401,6 +2401,43 @@ func (r *Response) JSON(code int, v any) {
 	r.Send(code, "application/json", string(data))
 }
 
+// JSONBytes writes a pre-marshaled JSON body. Skips json.Marshal so
+// handlers that already hold an encoded payload — cached responses,
+// proxied bytes from another service, custom-encoder output (sonic,
+// segmentio, etc.) — don't pay the reflection cost a second time.
+//
+// The caller is responsible for the bytes being valid JSON; the
+// framework does not validate. Content-Type is set to
+// application/json automatically.
+func (r *Response) JSONBytes(code int, b []byte) {
+	r.Send(code, "application/json", bytesAsString(b))
+}
+
+// JSONStream emits a JSON body through a streaming encoder, avoiding
+// the staging-buffer allocation that json.Marshal makes for the
+// whole document. Useful for large arrays, NDJSON-style feeds, or
+// any response whose JSON would otherwise dominate the handler's
+// memory peak.
+//
+// fn receives a *json.Encoder writing through a chunked response
+// stream — each Encode call emits one JSON value followed by a
+// newline (json.Encoder's default). For a single top-level array
+// the caller is responsible for writing the framing characters
+// themselves; for newline-delimited feeds Encode is enough.
+//
+// Async only — call from GetAsync/PostAsync or wrap a sync handler
+// in Response.Async. The underlying Response.Stream applies the
+// default backpressure cap (StreamBackpressureBytes), so a slow
+// consumer parks the producer goroutine rather than spiking memory.
+func (r *Response) JSONStream(code int, fn func(*json.Encoder) error) error {
+	return r.Stream(code, "application/json", func(w io.Writer) error {
+		if fn == nil {
+			return nil
+		}
+		return fn(json.NewEncoder(w))
+	})
+}
+
 // Stream writes a chunked HTTP/1.1 response by handing the caller an
 // io.Writer that buffers each Write call onto the uWS loop's
 // deferred-write queue. Order is preserved (FIFO), so chunks reach
