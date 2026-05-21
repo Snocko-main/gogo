@@ -12,6 +12,7 @@ package gogo
 import "C"
 
 import (
+	"fmt"
 	"runtime"
 	"runtime/cgo"
 	"sync"
@@ -19,6 +20,13 @@ import (
 	"time"
 	"unsafe"
 )
+
+// maxInt32 caps C.size_t → C.int conversions on the cgo body callback
+// path so a malicious or malfunctioning peer cannot drive a silent
+// truncation of a chunk write. The cap is symbolic — uWS's per-
+// connection backpressure (default 64 KiB) and kernel socket buffer
+// keep real chunks several orders of magnitude smaller.
+const maxInt32 = 1<<31 - 1
 
 type appNative struct {
 	ptr     *C.uwsgo_app_t
@@ -1374,6 +1382,20 @@ func uwsgoHandleData(callbackID C.uintptr_t, data *C.char, size C.size_t, isLast
 	h := cgo.Handle(callbackID)
 	fn := h.Value().(func([]byte, bool))
 	// Copy the chunk into Go memory — uWS reuses its buffer after this call.
+	//
+	// uWS's read chunks are bounded by its per-connection backpressure
+	// (default 64 KiB) and the kernel socket buffer, so C.size_t fitting
+	// in a C.int is overwhelmingly the common case. We still bounds-check
+	// explicitly because a silent truncation here would copy only part
+	// of the buffer into Go memory while the caller thinks all bytes
+	// arrived — defense-in-depth costs one branch on the cold path.
+	if size > C.size_t(maxInt32) {
+		reportPanic(fmt.Errorf("gogo: uwsgoHandleData chunk size %d exceeds int32 max — refusing to truncate", uint64(size)))
+		if isLast != 0 {
+			h.Delete()
+		}
+		return
+	}
 	var chunk []byte
 	if size > 0 {
 		chunk = C.GoBytes(unsafe.Pointer(data), C.int(size))
