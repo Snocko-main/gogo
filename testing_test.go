@@ -5,15 +5,19 @@ package gogo_test
 import (
 	"encoding/json"
 	"expvar"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	gogo "github.com/Snocko-main/gogo"
 	"github.com/Snocko-main/gogo/middleware"
 )
+
+var expvarMarkerSeq atomic.Uint64
 
 // TestTestServerBasic spins up a TestServer, hits a sync route,
 // closes cleanly.
@@ -279,9 +283,10 @@ func TestHTTPAdapterMethodAndURL(t *testing.T) {
 // stdlib handler — and verifies it serves its JSON payload.
 func TestHTTPAdapterStdlibHandler(t *testing.T) {
 	// Register a known expvar so the JSON body has predictable
-	// content. Use Init to ignore re-registration panics across
-	// tests run in the same process.
-	v := expvar.NewString("gogo_test_marker")
+	// content. expvar names are process-global, so make the marker
+	// unique for -count=N runs.
+	markerName := fmt.Sprintf("gogo_test_marker_%d", expvarMarkerSeq.Add(1))
+	v := expvar.NewString(markerName)
 	v.Set("hello-from-test")
 
 	ts, err := gogo.NewTestServer(func(app *gogo.App) {
@@ -305,7 +310,7 @@ func TestHTTPAdapterStdlibHandler(t *testing.T) {
 	if err := json.Unmarshal(body, &decoded); err != nil {
 		t.Fatalf("expvar response not JSON: %v\nbody=%s", err, string(body))
 	}
-	if got := decoded["gogo_test_marker"]; got != "hello-from-test" {
+	if got := decoded[markerName]; got != "hello-from-test" {
 		t.Errorf("expvar marker = %v, want hello-from-test", got)
 	}
 }
