@@ -1289,7 +1289,7 @@ func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req
 	methodPtr *C.char, methodLen C.size_t,
 	urlPtr *C.char, urlLen C.size_t,
 	queryPtr *C.char, queryLen C.size_t,
-	headersBlobPtr *C.char, headersLen C.size_t,
+	headersBlobPtr *C.char, headersLen C.size_t, headersComplete C.int,
 	p0Ptr *C.char, p0Len C.size_t,
 	p1Ptr *C.char, p1Len C.size_t,
 	p2Ptr *C.char, p2Len C.size_t,
@@ -1313,6 +1313,7 @@ func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req
 	reqWrap.syncQueryLen = int(queryLen)
 	reqWrap.syncHeadersPtr = unsafe.Pointer(headersBlobPtr)
 	reqWrap.syncHeadersLen = int(headersLen)
+	reqWrap.syncHeadersComplete = headersComplete != 0
 	reqWrap.syncParamPtrs[0] = unsafe.Pointer(p0Ptr)
 	reqWrap.syncParamLens[0] = int(p0Len)
 	reqWrap.syncParamPtrs[1] = unsafe.Pointer(p1Ptr)

@@ -45,6 +45,28 @@ func TestDefaultConfigKeepsExplicitBodyReadTimeout(t *testing.T) {
 	}
 }
 
+func TestHostnameFromHostHeader(t *testing.T) {
+	tests := []struct {
+		name string
+		host string
+		want string
+	}{
+		{name: "host without port", host: "api.example.com", want: "api.example.com"},
+		{name: "host with port", host: "api.example.com:8443", want: "api.example.com"},
+		{name: "bracketed ipv6 with port", host: "[::1]:3000", want: "::1"},
+		{name: "bracketed ipv6 without port", host: "[2001:db8::1]", want: "2001:db8::1"},
+		{name: "unbracketed ipv6 literal", host: "2001:db8::1", want: "2001:db8::1"},
+		{name: "trim whitespace", host: " api.example.com:443 ", want: "api.example.com"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hostnameFromHostHeader(tt.host); got != tt.want {
+				t.Fatalf("hostnameFromHostHeader(%q) = %q, want %q", tt.host, got, tt.want)
+			}
+		})
+	}
+}
+
 // FuzzParseCookieValue feeds arbitrary Cookie header content + arbitrary
 // names; the parser must never panic, must always return a string, and
 // must agree with a slow reference implementation for ASCII inputs.

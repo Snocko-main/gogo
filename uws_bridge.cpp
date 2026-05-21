@@ -20,7 +20,7 @@ extern "C" void uwsgoHandleHTTP(uintptr_t handler_id, uwsgo_res_t *res, uwsgo_re
     const char *method, size_t method_len,
     const char *url, size_t url_len,
     const char *query, size_t query_len,
-    const char *headers_blob, size_t headers_len,
+    const char *headers_blob, size_t headers_len, int headers_complete,
     const char *p0, size_t p0_len,
     const char *p1, size_t p1_len,
     const char *p2, size_t p2_len,
@@ -337,6 +337,7 @@ static inline void dispatch_sync(uintptr_t handler_id, uWS::HttpResponse<false> 
     // ends with a NUL pair).
     char headers_buf[HEADERS_SCRATCH_SIZE];
     size_t headers_len = 0;
+    int headers_complete = 1;
     for (auto it = req->begin(); it != req->end(); ++it) {
         auto pair = *it;
         auto name = pair.first;
@@ -346,6 +347,7 @@ static inline void dispatch_sync(uintptr_t handler_id, uWS::HttpResponse<false> 
             // Don't truncate mid-pair — leave the buffer at the last
             // complete entry so the Go-side scanner never sees a
             // dangling key with no terminator.
+            headers_complete = 0;
             break;
         }
         std::memcpy(headers_buf + headers_len, name.data(), name.size());
@@ -362,7 +364,7 @@ static inline void dispatch_sync(uintptr_t handler_id, uWS::HttpResponse<false> 
         method.data(), method.size(),
         url.data(), url.size(),
         query.data(), query.size(),
-        headers_buf, headers_len,
+        headers_buf, headers_len, headers_complete,
         p0.data(), p0.size(),
         p1.data(), p1.size(),
         p2.data(), p2.size(),

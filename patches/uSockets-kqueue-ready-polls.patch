@@ -2,7 +2,10 @@ diff --git a/src/eventing/epoll_kqueue.c b/src/eventing/epoll_kqueue.c
 index 72c6118..5e9438a 100644
 --- a/src/eventing/epoll_kqueue.c
 +++ b/src/eventing/epoll_kqueue.c
-@@ -355,0 +356,8 @@ void us_timer_close(struct us_timer_t *timer) {
+@@ -353,6 +353,14 @@ void us_timer_close(struct us_timer_t *timer) {
+     EV_SET(&event, (uintptr_t) internal_cb, EVFILT_TIMER, EV_DELETE, 0, 0, internal_cb);
+     kevent(internal_cb->loop->fd, &event, 1, NULL, 0, NULL);
+
 +    us_internal_loop_update_pending_ready_polls(
 +        internal_cb->loop,
 +        (struct us_poll_t *) timer,
@@ -11,7 +14,13 @@ index 72c6118..5e9438a 100644
 +        0);
 +    internal_cb->cb = 0;
 +
-@@ -437,0 +446,8 @@ void us_internal_async_close(struct us_internal_async *a) {
+     /* (regular) sockets are the only polls which are not freed immediately */
+     us_poll_free((struct us_poll_t *) timer, internal_cb->loop);
+ }
+@@ -435,6 +443,14 @@ void us_internal_async_close(struct us_internal_async *a) {
+     EV_SET(&event, (uintptr_t) internal_cb, EVFILT_USER, EV_DELETE, 0, 0, internal_cb);
+     kevent(internal_cb->loop->fd, &event, 1, NULL, 0, NULL);
+
 +    us_internal_loop_update_pending_ready_polls(
 +        internal_cb->loop,
 +        (struct us_poll_t *) a,
@@ -20,27 +29,53 @@ index 72c6118..5e9438a 100644
 +        0);
 +    internal_cb->cb = 0;
 +
+     /* (regular) sockets are the only polls which are not freed immediately */
+     us_poll_free((struct us_poll_t *) a, internal_cb->loop);
+ }
 diff --git a/src/loop.c b/src/loop.c
 index 8f3b696..29693b6 100644
 --- a/src/loop.c
 +++ b/src/loop.c
-@@ -228,0 +229,3 @@ void us_internal_dispatch_ready_poll(struct us_poll_t *p, int error, int events)
+@@ -226,6 +226,9 @@ void us_internal_dispatch_ready_poll(struct us_poll_t *p, int error, int events)
+     switch (us_internal_poll_type(p)) {
+     case POLL_TYPE_CALLBACK: {
+             struct us_internal_callback_t *cb = (struct us_internal_callback_t *) p;
 +            if (cb->cb == 0) {
 +                return;
 +            }
-@@ -239,0 +243,4 @@ void us_internal_dispatch_ready_poll(struct us_poll_t *p, int error, int events)
+             /* Timers, asyncs should accept (read), while UDP sockets should obviously not */
+             if (!cb->leave_poll_ready) {
+                 /* Let's just have this macro to silence the CodeQL alert regarding empty function when using libuv */
+@@ -237,11 +240,13 @@ void us_internal_dispatch_ready_poll(struct us_poll_t *p, int error, int events)
+         }
+         break;
+     case POLL_TYPE_SEMI_SOCKET: {
 +            struct us_socket_t *s = (struct us_socket_t *) p;
 +            if (us_socket_is_closed(0, s)) {
 +                return;
 +            }
-@@ -243,2 +249,0 @@ void us_internal_dispatch_ready_poll(struct us_poll_t *p, int error, int events)
+             /* Both connect and listen sockets are semi-sockets
+              * but they poll for different events */
+             if (us_poll_events(p) == LIBUS_SOCKET_WRITABLE) {
 -                struct us_socket_t *s = (struct us_socket_t *) p;
 -
-@@ -301,0 +307,3 @@ void us_internal_dispatch_ready_poll(struct us_poll_t *p, int error, int events)
+                 /* It is perfectly possible to come here with an error */
+                 if (error) {
+                     /* Emit error, close without emitting on_close */
+@@ -299,6 +304,9 @@ void us_internal_dispatch_ready_poll(struct us_poll_t *p, int error, int events)
+     case POLL_TYPE_SOCKET: {
+             /* We should only use s, no p after this point */
+             struct us_socket_t *s = (struct us_socket_t *) p;
 +            if (us_socket_is_closed(0, s)) {
 +                return;
 +            }
-@@ -396 +404 @@ void *us_loop_ext(struct us_loop_t *loop) {
+
+             /* Such as epollerr epollhup */
+             if (error) {
+@@ -393,4 +401,4 @@ void *us_loop_ext(struct us_loop_t *loop) {
+     return loop + 1;
+ }
+
 -#endif
 \ No newline at end of file
 +#endif

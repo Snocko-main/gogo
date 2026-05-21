@@ -4097,16 +4097,16 @@ type Request struct {
 	// syncHeadersPtr / syncHeadersLen point at the per-request
 	// `name\0value\0name\0value\0…` blob that dispatch_sync packs in
 	// a stack scratch buffer before calling into Go. Request.Header
-	// scans this blob first and falls back to the cgo getHeader
-	// helper only on a miss — middleware that reads several headers
-	// in series pays one cgo crossing for the whole request instead
-	// of one per Header(name) call.
+	// scans this blob first and falls back to the cgo getHeader helper
+	// only when the C++ scratch buffer overflowed. Middleware that
+	// probes optional headers avoids a cgo call on ordinary misses.
 	//
 	// The pointer is valid only for the lifetime of the cgo
 	// callback (= the lifetime of reqWrap before it returns to the
 	// pool). resetForPool clears it on return.
-	syncHeadersPtr unsafe.Pointer
-	syncHeadersLen int
+	syncHeadersPtr      unsafe.Pointer
+	syncHeadersLen      int
+	syncHeadersComplete bool
 
 	// syncResPtr is the live uWS response pointer for sync-mode handlers.
 	// req.IP() uses it to lazily fetch the peer address via cgo on demand
@@ -4288,6 +4288,7 @@ func (r *Request) resetForPool() {
 	r.syncQueryLen = 0
 	r.syncHeadersPtr = nil
 	r.syncHeadersLen = 0
+	r.syncHeadersComplete = false
 	r.syncParamPtrs = [4]unsafe.Pointer{}
 	r.syncParamLens = [4]int{}
 	r.syncResPtr = nil
@@ -4371,22 +4372,27 @@ func (r *Request) Method() string {
 // handlers parse the snapshot buffer on every call; cache the value if you
 // need it multiple times.
 //
-// In sync mode the C++ dispatcher packs every header into a stack
+// In sync mode the C++ dispatcher packs request headers into a stack
 // scratch blob before calling into Go, so this scan is allocation-free
-// and pays zero cgo per call. Headers that overflow the 8 KB scratch
-// buffer fall back to the uWS getHeader helper via cgo — a rare path
-// on real-world requests.
+// and pays zero cgo per call. Ordinary misses return from Go; only
+// requests whose headers overflow the 8 KB scratch buffer fall back to
+// the uWS getHeader helper via cgo.
 func (r *Request) Header(name string) string {
 	if r.snap != nil {
 		return r.snap.lookupHeader(name)
 	}
-	if r.syncHeadersPtr != nil && r.syncHeadersLen > 0 {
-		if v, ok := lookupHeaderInSyncBlob(r.syncHeadersPtr, r.syncHeadersLen, name); ok {
-			return v
+	if r.syncHeadersPtr != nil {
+		if r.syncHeadersLen > 0 {
+			if v, ok := lookupHeaderInSyncBlob(r.syncHeadersPtr, r.syncHeadersLen, name); ok {
+				return v
+			}
 		}
-		// Miss on a packed blob can mean either "header absent" or
-		// "header was past the scratch cap". Fall through to cgo to
-		// distinguish; uWS's own getHeader is the source of truth.
+		if r.syncHeadersComplete {
+			return ""
+		}
+		// Miss on an incomplete packed blob can mean the header was
+		// past the scratch cap. Fall through to cgo so uWS remains
+		// the source of truth for overflow requests.
 	}
 	return r.inner.header(name)
 }
@@ -4473,8 +4479,10 @@ func (r *Request) Headers(fn func(name, value string) bool) int {
 	switch {
 	case r.snap != nil:
 		blob = r.snap.headers
-	case r.syncHeadersPtr != nil && r.syncHeadersLen > 0:
-		blob = unsafe.Slice((*byte)(r.syncHeadersPtr), r.syncHeadersLen)
+	case r.syncHeadersPtr != nil && (r.syncHeadersLen > 0 || r.syncHeadersComplete):
+		if r.syncHeadersLen > 0 {
+			blob = unsafe.Slice((*byte)(r.syncHeadersPtr), r.syncHeadersLen)
+		}
 	default:
 		// No pre-packed blob available — pull the full header
 		// dump via cgo and walk that. Rare path: only fires when
@@ -4514,8 +4522,24 @@ func (r *Request) Hostname() string {
 	if host == "" {
 		return ""
 	}
-	if i := strings.IndexByte(host, ':'); i >= 0 {
-		return host[:i]
+	return hostnameFromHostHeader(host)
+}
+
+func hostnameFromHostHeader(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
+	}
+	if host[0] == '[' {
+		if end := strings.IndexByte(host, ']'); end > 0 {
+			return host[1:end]
+		}
+		return host
+	}
+	if strings.Count(host, ":") == 1 {
+		if i := strings.IndexByte(host, ':'); i >= 0 {
+			return host[:i]
+		}
 	}
 	return host
 }

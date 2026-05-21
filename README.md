@@ -75,8 +75,10 @@ sh scripts/bootstrap_uwebsockets.sh
 ```
 
 Run the same bootstrap step in clean CI jobs before native `-tags gogo`
-tests. The script also applies the local uSockets patch in
-`patches/uSockets-kqueue-ready-polls.patch` before building `uSockets.a`;
+tests. The script checks out a pinned uWebSockets commit, initializes
+submodules, and applies the local uSockets patch in
+`patches/uSockets-kqueue-ready-polls.patch` before building `uSockets.a`.
+Override `UWEBSOCKETS_REF` only when deliberately testing an upstream update.
 Linux builds use the epoll backend and do not hit the macOS/kqueue bug the
 patch fixes, but using the bootstrap script keeps every environment on the
 same vendored dependency setup.
@@ -309,10 +311,20 @@ app.Get("/old", func(res *gogo.Response, req *gogo.Request) {
 // SendFile streams a file from disk with ETag, Last-Modified, and Range
 // negotiation. Download forces an attachment Content-Disposition.
 app.Get("/files/:name", func(res *gogo.Response, req *gogo.Request) {
-    _ = res.SendFile(req, "./public/"+req.Param("name"))
+    path, err := safePublicPath("./public", req.Param("name"))
+    if err != nil {
+        res.Send(404, "text/plain; charset=utf-8", "not found\n")
+        return
+    }
+    _ = res.SendFile(req, path)
 })
 app.Get("/download/:name", func(res *gogo.Response, req *gogo.Request) {
-    _ = res.Download(req, "./public/"+req.Param("name"), req.Param("name"))
+    path, err := safePublicPath("./public", req.Param("name"))
+    if err != nil {
+        res.Send(404, "text/plain; charset=utf-8", "not found\n")
+        return
+    }
+    _ = res.Download(req, path, req.Param("name"))
 })
 
 // JSONP — same as JSON but wrapped in a callback for legacy clients.
@@ -327,6 +339,31 @@ app.Get("/custom", func(res *gogo.Response, req *gogo.Request) {
         Send(202, "text/plain", "queued\n")
 })
 ```
+
+When the filename comes from the URL, do not concatenate it directly onto a
+directory. Clean it first and verify the result still lives under the intended
+root:
+
+```go
+func safePublicPath(root, name string) (string, error) {
+    cleanRoot, err := filepath.Abs(root)
+    if err != nil {
+        return "", err
+    }
+    cleanPath, err := filepath.Abs(filepath.Join(cleanRoot, filepath.Clean("/"+name)))
+    if err != nil {
+        return "", err
+    }
+    rel, err := filepath.Rel(cleanRoot, cleanPath)
+    if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." {
+        return "", os.ErrPermission
+    }
+    return cleanPath, nil
+}
+```
+
+`SendFile` intentionally opens the path you pass it; path allow-listing belongs
+in the route because different apps expose different roots.
 
 ### Streaming
 
