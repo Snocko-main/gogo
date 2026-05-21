@@ -478,6 +478,10 @@ type App struct {
 	// cgo-mediated loop close doesn't provide.
 	closed        atomic.Bool
 	pendingTimers atomic.Int32
+	// workerRefDropped guarantees the shared-dispatch worker pool
+	// refcount is decremented exactly once per App, regardless of
+	// how many times Close is called.
+	workerRefDropped atomic.Bool
 	// routeMethods maps a LITERAL pattern to the set of HTTP methods
 	// registered against it. Used by the catch-all at Listen time to
 	// distinguish "path exists but the method is wrong" (→ 405 with
@@ -531,6 +535,12 @@ func NewApp(cfg ...Config) (*App, error) {
 	c = defaultConfig(c)
 	inner.setBodyLimit(c.BodyLimit)
 	inner.setCapturePeerIP(c.CapturePeerIP)
+	// Register this App as an active user of the shared-dispatch
+	// worker pool. The pool itself is lazy-started by the first
+	// shared route registration; the counter tracks whether any
+	// App is still in scope so Close knows when to tear the pool
+	// down.
+	sharedActiveApps.Add(1)
 	return &App{inner: inner, cfg: c}, nil
 }
 
@@ -1899,6 +1909,12 @@ func (a *App) ShutdownGracefully(timeout time.Duration) {
 // before Run if the app was never started. Waits for any in-flight
 // ShutdownGracefully force-close goroutine to settle so a delayed
 // timer can't make a cgo call against a freed app pointer.
+//
+// Drops this App's reference on the shared-dispatch worker pool. When
+// the last live App in the process is closed the worker goroutines
+// exit cleanly so long-running supervisors (tests, hot-reload, multi-
+// tenant hosts) don't accumulate dead workers spinning against a ring
+// no app is feeding anymore.
 func (a *App) Close() {
 	a.closed.Store(true)
 	// Drain any in-flight ShutdownGracefully timer goroutine before
@@ -1909,6 +1925,12 @@ func (a *App) Close() {
 		runtime.Gosched()
 	}
 	a.inner.close()
+	// Drop the worker pool reference exactly once per App. Multiple
+	// Close calls (defensive teardown, force-close timer overlap)
+	// must not over-decrement the global active-apps counter.
+	if !a.workerRefDropped.Swap(true) {
+		stopSharedWorkersIfIdle()
+	}
 }
 
 // MultiCoreHandle controls a group of App instances started by RunMultiCore.
