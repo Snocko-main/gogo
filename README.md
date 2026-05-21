@@ -74,6 +74,13 @@ One way to set that up:
 sh scripts/bootstrap_uwebsockets.sh
 ```
 
+Run the same bootstrap step in clean CI jobs before native `-tags gogo`
+tests. The script also applies the local uSockets patch in
+`patches/uSockets-kqueue-ready-polls.patch` before building `uSockets.a`;
+Linux builds use the epoll backend and do not hit the macOS/kqueue bug the
+patch fixes, but using the bootstrap script keeps every environment on the
+same vendored dependency setup.
+
 Then run an example:
 
 ```sh
