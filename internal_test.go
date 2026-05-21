@@ -46,6 +46,29 @@ func TestDefaultConfigKeepsExplicitBodyReadTimeout(t *testing.T) {
 	}
 }
 
+func TestHTTPAdapterRecorderRejectsInvalidWriteHeaderCode(t *testing.T) {
+	for _, code := range []int{99, 1000} {
+		t.Run(strconv.Itoa(code), func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("WriteHeader(%d) did not panic", code)
+				}
+			}()
+			rec := newHTTPAdapterRecorder(-1)
+			rec.WriteHeader(code)
+		})
+	}
+}
+
+func TestHTTPAdapterRecorderIgnoresInvalidSecondWriteHeader(t *testing.T) {
+	rec := newHTTPAdapterRecorder(-1)
+	rec.WriteHeader(200)
+	rec.WriteHeader(99)
+	if rec.code != 200 {
+		t.Fatalf("second WriteHeader changed code to %d, want 200", rec.code)
+	}
+}
+
 func TestHostnameFromHostHeader(t *testing.T) {
 	tests := []struct {
 		name string

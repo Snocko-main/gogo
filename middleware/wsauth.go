@@ -35,6 +35,11 @@ type WebSocketAuthOptions struct {
 	// The literal "*" is treated as "allow any origin" and is
 	// intentionally not the zero-value default — opt in explicitly
 	// when you understand the risk.
+	//
+	// Entries must be valid origins ("scheme://host[:port]"), "null",
+	// or "*". Paths other than a single trailing slash, queries,
+	// fragments, userinfo, empty entries, and control characters panic
+	// at middleware construction.
 	AllowedOrigins []string
 
 	// AllowMissingOrigin permits handshakes that arrive with neither
@@ -64,7 +69,9 @@ type WebSocketAuthOptions struct {
 	// first protocol from this list that the client also offered
 	// in ctx.Protocols(). If the client offered no overlap the
 	// connection is rejected with 400. When AllowedSubprotocols is
-	// nil the helper accepts without negotiating a protocol.
+	// nil the helper accepts without negotiating a protocol. Entries
+	// must be valid WebSocket subprotocol tokens; empty or malformed
+	// entries panic at middleware construction.
 	AllowedSubprotocols []string
 }
 
@@ -103,10 +110,15 @@ func WebSocketAuth(opt WebSocketAuthOptions) func(*gogo.UpgradeContext) {
 			allowAny = true
 			continue
 		}
-		allowed = append(allowed, normalizeOriginValue(o))
+		allowed = append(allowed, normalizeAllowedOriginValue(o))
 	}
 	subprotocols := make([]string, len(opt.AllowedSubprotocols))
 	copy(subprotocols, opt.AllowedSubprotocols)
+	for _, protocol := range subprotocols {
+		if !validConfiguredWebSocketSubprotocol(protocol) {
+			panic("gogo/middleware: WebSocketAuth AllowedSubprotocols contains an invalid token")
+		}
+	}
 
 	return func(ctx *gogo.UpgradeContext) {
 		origin := ctx.Header("origin")
@@ -168,26 +180,70 @@ func WebSocketAuth(opt WebSocketAuthOptions) func(*gogo.UpgradeContext) {
 	}
 }
 
-// normalizeOriginValue lower-cases the scheme + host portion and
-// strips any trailing slash so the allow-list comparison is robust
-// against the trivial differences ("HTTPS://APP" vs "https://app/").
-func normalizeOriginValue(o string) string {
-	o = strings.TrimSpace(o)
-	o = strings.TrimSuffix(o, "/")
-	if u, err := url.Parse(o); err == nil && u.Host != "" {
-		return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host)
+// normalizeAllowedOriginValue lower-cases the scheme + host portion and strips
+// a single trailing slash. The allow-list is application-owned config, so
+// fail fast on malformed entries instead of producing a silent runtime reject.
+func normalizeAllowedOriginValue(o string) string {
+	normalized, ok := normalizeOriginValue(o)
+	if !ok {
+		panic("gogo/middleware: WebSocketAuth AllowedOrigins contains an invalid origin")
 	}
-	return strings.ToLower(o)
+	return normalized
+}
+
+// normalizeOriginValue lower-cases the scheme + host portion and strips any
+// trailing slash so the allow-list comparison is robust against trivial
+// differences ("HTTPS://APP" vs "https://app/"). Runtime request origins return
+// ok=false when malformed so a hostile peer cannot turn a bad Origin into a
+// panic.
+func normalizeOriginValue(o string) (string, bool) {
+	if o == "" {
+		return "", false
+	}
+	for i := 0; i < len(o); i++ {
+		if o[i] < 0x20 || o[i] == 0x7f {
+			return "", false
+		}
+	}
+	o = strings.TrimSpace(o)
+	if o == "" {
+		return "", false
+	}
+	if o == "null" {
+		return "null", true
+	}
+	o = strings.TrimSuffix(o, "/")
+	u, err := url.Parse(o)
+	if err != nil || u.Scheme == "" || u.Host == "" || u.User != nil ||
+		u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return "", false
+	}
+	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host), true
 }
 
 // originAllowed reports whether origin matches any entry in
 // allowed (after both sides have been through normalizeOriginValue).
 func originAllowed(origin string, allowed []string) bool {
-	o := normalizeOriginValue(origin)
+	o, ok := normalizeOriginValue(origin)
+	if !ok {
+		return false
+	}
 	for _, a := range allowed {
 		if o == a {
 			return true
 		}
 	}
 	return false
+}
+
+func validConfiguredWebSocketSubprotocol(protocol string) bool {
+	if protocol == "" {
+		return false
+	}
+	for i := 0; i < len(protocol); i++ {
+		if !isHTTPTokenChar(protocol[i]) {
+			return false
+		}
+	}
+	return true
 }

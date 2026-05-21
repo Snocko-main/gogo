@@ -88,7 +88,10 @@ func BasicAuth(opt BasicAuthOptions) mwhint.Hinted {
 
 	verify := opt.Validator
 	if verify == nil {
-		users := opt.Users
+		users := make(map[string]string, len(opt.Users))
+		for user, pass := range opt.Users {
+			users[user] = pass
+		}
 		verify = func(u, p string) bool {
 			expected, ok := users[u]
 			if !ok {

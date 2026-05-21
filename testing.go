@@ -425,6 +425,7 @@ func (r *httpAdapterRecorder) WriteHeader(code int) {
 	if r.code != 0 {
 		return
 	}
+	validateStatusCode(code)
 	r.code = code
 }
 

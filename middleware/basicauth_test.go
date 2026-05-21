@@ -43,6 +43,44 @@ func TestBasicAuthValidCredentials(t *testing.T) {
 	}
 }
 
+func TestBasicAuthCopiesUsersMap(t *testing.T) {
+	users := map[string]string{"alice": "wonderland"}
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.BasicAuth(middleware.BasicAuthOptions{
+			Users: users,
+		}))
+		app.Get("/", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	users["alice"] = "mutated"
+	users["mallory"] = "letmein"
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/", port), nil)
+	req.SetBasicAuth("alice", "wonderland")
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("get original credentials: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("original credentials after map mutation: got %d, want 200", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/", port), nil)
+	req.SetBasicAuth("mallory", "letmein")
+	resp, err = noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("get mutated credentials: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 401 {
+		t.Fatalf("mutated credentials: got %d, want 401", resp.StatusCode)
+	}
+}
+
 func TestBasicAuthMissingCredentials(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.Use(middleware.BasicAuth(middleware.BasicAuthOptions{
