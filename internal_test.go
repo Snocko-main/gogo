@@ -1,6 +1,7 @@
 package gogo
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -606,5 +607,18 @@ func TestStatusLineKnown(t *testing.T) {
 	// Unknown codes fall through to just the number.
 	if got := statusLine(999); got != "999" {
 		t.Errorf("statusLine(999) = %q, want %q", got, "999")
+	}
+}
+
+func TestStatusLineRejectsInvalidCode(t *testing.T) {
+	for _, code := range []int{-1, 0, 99, 1000} {
+		t.Run(strconv.Itoa(code), func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("statusLine(%d) did not panic", code)
+				}
+			}()
+			_ = statusLine(code)
+		})
 	}
 }

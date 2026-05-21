@@ -136,6 +136,69 @@ func TestCompressSkipsNoAcceptEncoding(t *testing.T) {
 	}
 }
 
+func TestCompressHonorsQZero(t *testing.T) {
+	payload := strings.Repeat("q-value-content ", 400)
+	cases := []struct {
+		name   string
+		accept string
+		wantCE string
+	}{
+		{name: "gzip q zero", accept: "gzip;q=0", wantCE: ""},
+		{name: "gzip q zero decimal", accept: "gzip; q=0.0, deflate", wantCE: "deflate"},
+		{name: "both disabled", accept: "gzip;q=0.00, deflate;q=0", wantCE: ""},
+		{name: "extra params", accept: "gzip;foo=bar;q=0, deflate;q=1", wantCE: "deflate"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			port, teardown := startApp(t, func(app *gogo.App) {
+				app.Use(middleware.Compress())
+				app.Get("/", func(res *gogo.Response, req *gogo.Request) {
+					res.Send(200, "text/plain", payload)
+				})
+			})
+			defer teardown()
+
+			req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/", port), nil)
+			req.Header.Set("Accept-Encoding", tc.accept)
+			resp, err := noKeepaliveClient.Do(req)
+			if err != nil {
+				t.Fatalf("do: %v", err)
+			}
+			defer resp.Body.Close()
+			if got := resp.Header.Get("Content-Encoding"); got != tc.wantCE {
+				t.Fatalf("Content-Encoding = %q, want %q", got, tc.wantCE)
+			}
+		})
+	}
+}
+
+func TestCompressSkipsPreEncodedResponse(t *testing.T) {
+	payload := strings.Repeat("already-encoded ", 400)
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.Compress())
+		app.Get("/", func(res *gogo.Response, req *gogo.Request) {
+			res.Header("Content-Encoding", "br")
+			res.Send(200, "text/plain", payload)
+		})
+	})
+	defer teardown()
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/", port), nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer resp.Body.Close()
+	if got := resp.Header.Values("Content-Encoding"); len(got) != 1 || got[0] != "br" {
+		t.Fatalf("Content-Encoding values = %v, want [br]", got)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != payload {
+		t.Fatalf("body mismatch")
+	}
+}
+
 func TestCompressFiltersNonCompressibleContentType(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.Use(middleware.Compress())

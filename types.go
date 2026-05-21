@@ -55,6 +55,7 @@ var commonStatusLines = map[int]string{
 // phrase via net/http; unknown codes fall back to just the number. Common
 // codes hit the cache and avoid all allocation.
 func statusLine(code int) string {
+	validateStatusCode(code)
 	if cached, ok := commonStatusLines[code]; ok {
 		return cached
 	}
@@ -63,6 +64,12 @@ func statusLine(code int) string {
 		return strconv.Itoa(code)
 	}
 	return strconv.Itoa(code) + " " + text
+}
+
+func validateStatusCode(code int) {
+	if code < 100 || code > 999 {
+		panic(fmt.Sprintf("gogo: invalid HTTP status code %d", code))
+	}
 }
 
 // validatePattern rejects registration-time patterns that would crash uWS or
@@ -3630,6 +3637,10 @@ func (r *Response) applyEncoder(contentTypeHint string) string {
 			}
 		}
 	}
+	if r.hasPendingHeader("Content-Encoding") {
+		e.applied = true
+		return string(e.buf)
+	}
 	encoded, contentEncoding := e.encode(e.buf, ct)
 	e.applied = true
 	if contentEncoding != "" {
@@ -3639,6 +3650,15 @@ func (r *Response) applyEncoder(contentTypeHint string) string {
 		)
 	}
 	return string(encoded)
+}
+
+func (r *Response) hasPendingHeader(name string) bool {
+	for _, h := range r.pendingHeaders {
+		if strings.EqualFold(h.name, name) {
+			return true
+		}
+	}
+	return false
 }
 
 // finishAsync returns the asyncState to its pool, then drops one wrapper

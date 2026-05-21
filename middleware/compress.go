@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -128,11 +129,9 @@ func Compress(opts ...CompressOptions) mwhint.Hinted {
 	})}
 }
 
-// negotiateEncoding returns "gzip", "deflate", or "" — picking the
-// first supported encoding announced by the client. We prefer gzip
-// because it's universally supported and slightly cheaper than
-// deflate to produce. q-values aren't honored beyond "q=0" meaning
-// "do not use"; that matches what nginx / fasthttp do.
+// negotiateEncoding returns "gzip", "deflate", or "" — picking a supported
+// encoding with q>0. We prefer gzip whenever it is acceptable because it is
+// universally supported and slightly cheaper than deflate to produce.
 func negotiateEncoding(accept string) string {
 	if accept == "" {
 		return ""
@@ -142,12 +141,10 @@ func negotiateEncoding(accept string) string {
 		coding := strings.TrimSpace(part)
 		var q string
 		if semi := strings.IndexByte(coding, ';'); semi >= 0 {
-			q = strings.TrimSpace(coding[semi+1:])
+			q = coding[semi+1:]
 			coding = strings.TrimSpace(coding[:semi])
 		}
-		// "q=0" means "do not use". Anything else (including no q
-		// parameter) is acceptable for our purposes.
-		if strings.HasPrefix(q, "q=0") && q != "q=0.0" && (q == "q=0" || !strings.ContainsAny(q[2:], "123456789")) {
+		if encodingQValue(q) <= 0 {
 			continue
 		}
 		switch strings.ToLower(coding) {
@@ -164,6 +161,30 @@ func negotiateEncoding(accept string) string {
 		return "deflate"
 	}
 	return ""
+}
+
+func encodingQValue(params string) float64 {
+	if params == "" {
+		return 1
+	}
+	for _, param := range strings.Split(params, ";") {
+		param = strings.TrimSpace(param)
+		if len(param) < 2 || !strings.EqualFold(param[:2], "q=") {
+			continue
+		}
+		q, err := strconv.ParseFloat(strings.TrimSpace(param[2:]), 64)
+		if err != nil {
+			return 0
+		}
+		if q < 0 {
+			return 0
+		}
+		if q > 1 {
+			return 1
+		}
+		return q
+	}
+	return 1
 }
 
 func defaultCompressFilter(contentType string) bool {
