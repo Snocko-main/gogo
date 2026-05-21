@@ -114,7 +114,7 @@ func (p *MultipartPart) SaveInto(dir string) (string, error) {
 		return "", fmt.Errorf("gogo: SaveInto: unsafe filename %q", p.FileName)
 	}
 	full := filepath.Join(dir, base)
-	if err := os.WriteFile(full, p.Data, 0o644); err != nil {
+	if err := writeNewFile(full, p.Data); err != nil {
 		return "", err
 	}
 	return full, nil
@@ -213,16 +213,42 @@ func (p *MultipartStreamPart) SaveInto(dir string) (string, error) {
 		return "", fmt.Errorf("gogo: SaveInto: unsafe filename %q", p.FileName)
 	}
 	full := filepath.Join(dir, base)
-	f, err := os.OpenFile(full, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	f, err := os.OpenFile(full, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return "", err
 	}
 	_, copyErr := io.Copy(f, p.Reader)
 	closeErr := f.Close()
 	if copyErr != nil {
+		_ = os.Remove(full)
 		return "", copyErr
 	}
-	return full, closeErr
+	if closeErr != nil {
+		_ = os.Remove(full)
+		return "", closeErr
+	}
+	return full, nil
+}
+
+func writeNewFile(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	n, writeErr := f.Write(data)
+	if writeErr == nil && n != len(data) {
+		writeErr = io.ErrShortWrite
+	}
+	closeErr := f.Close()
+	if writeErr != nil {
+		_ = os.Remove(path)
+		return writeErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(path)
+		return closeErr
+	}
+	return nil
 }
 
 // ParseMultipartStream iterates multipart parts without materializing each part

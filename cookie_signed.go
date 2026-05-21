@@ -52,7 +52,7 @@ const signedCookieSep = '.'
 //	signed := gogo.SignCookieValue("alice:42", secret)
 //	res.SetCookie(gogo.Cookie{Name: "session", Value: signed, HttpOnly: true})
 func SignCookieValue(value string, secrets ...string) string {
-	if len(secrets) == 0 {
+	if len(secrets) == 0 || secrets[0] == "" {
 		panic("gogo: SignCookieValue requires at least one secret")
 	}
 	mac := hmac.New(sha256.New, []byte(secrets[0]))
@@ -98,6 +98,9 @@ func VerifyCookieValue(signed string, secrets ...string) (string, bool) {
 		return "", false
 	}
 	for _, secret := range secrets {
+		if secret == "" {
+			continue
+		}
 		mac := hmac.New(sha256.New, []byte(secret))
 		mac.Write([]byte(value))
 		if subtle.ConstantTimeCompare(gotSig, mac.Sum(nil)) == 1 {

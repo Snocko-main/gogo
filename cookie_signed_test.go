@@ -3,6 +3,9 @@
 package gogo_test
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
@@ -144,12 +147,30 @@ func TestSignNoSecretsPanic(t *testing.T) {
 	_ = gogo.SignCookieValue("alice")
 }
 
+func TestSignEmptySecretPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic on empty secret")
+		}
+	}()
+	_ = gogo.SignCookieValue("alice", "")
+}
+
 // TestVerifyNoSecretsReturnsFalse confirms verification with zero
 // secrets returns a clean ("", false) — no panic.
 func TestVerifyNoSecretsReturnsFalse(t *testing.T) {
 	signed := gogo.SignCookieValue("alice", "shh")
 	if _, ok := gogo.VerifyCookieValue(signed); ok {
 		t.Errorf("VerifyCookieValue accepted with no secrets")
+	}
+}
+
+func TestVerifyEmptySecretReturnsFalse(t *testing.T) {
+	mac := hmac.New(sha256.New, nil)
+	mac.Write([]byte("admin"))
+	forged := "admin." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	if _, ok := gogo.VerifyCookieValue(forged, ""); ok {
+		t.Errorf("VerifyCookieValue accepted an empty secret")
 	}
 }
 

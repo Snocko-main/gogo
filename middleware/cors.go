@@ -91,6 +91,9 @@ func CORS(opts ...CORSOptions) mwhint.Hinted {
 	if opt.AllowCredentials && len(opt.AllowOrigins) == 1 && opt.AllowOrigins[0] == "*" {
 		panic("gogo/middleware: AllowCredentials=true cannot be combined with AllowOrigins={\"*\"}; list explicit origins")
 	}
+	validateCORSMethods(opt.AllowMethods)
+	validateCORSHeaders("AllowHeaders", opt.AllowHeaders, true)
+	validateCORSHeaders("ExposeHeaders", opt.ExposeHeaders, false)
 
 	methodsCSV := strings.Join(opt.AllowMethods, ", ")
 	headersCSV := strings.Join(opt.AllowHeaders, ", ")
@@ -164,7 +167,9 @@ func CORS(opts ...CORSOptions) mwhint.Hinted {
 							// client asked for so non-safelisted
 							// headers (the whole point of "*") get
 							// through.
-							res.Header("Access-Control-Allow-Headers", reqHeaders)
+							if matched := filterRequestedHeaders(reqHeaders); matched != "" {
+								res.Header("Access-Control-Allow-Headers", matched)
+							}
 						default:
 							if matched := filterAllowedHeaders(reqHeaders, allowHeadersSet); matched != "" {
 								res.Header("Access-Control-Allow-Headers", matched)
@@ -204,6 +209,35 @@ func CORS(opts ...CORSOptions) mwhint.Hinted {
 			next(res, req)
 		}
 	})}
+}
+
+func validateCORSMethods(methods []string) {
+	for _, method := range methods {
+		if method == "" {
+			panic("gogo/middleware: CORS AllowMethods contains an empty method")
+		}
+		for i := 0; i < len(method); i++ {
+			if !isHTTPTokenChar(method[i]) {
+				panic("gogo/middleware: CORS AllowMethods contains an invalid HTTP method token")
+			}
+		}
+	}
+}
+
+func validateCORSHeaders(field string, headers []string, allowWildcard bool) {
+	for _, header := range headers {
+		if allowWildcard && header == "*" {
+			continue
+		}
+		if header == "" {
+			panic("gogo/middleware: CORS " + field + " contains an empty header")
+		}
+		for i := 0; i < len(header); i++ {
+			if !isHTTPTokenChar(header[i]) {
+				panic("gogo/middleware: CORS " + field + " contains an invalid HTTP header token")
+			}
+		}
+	}
 }
 
 // compiledOrigin is the parsed-once form of an AllowOrigins entry.
@@ -258,7 +292,7 @@ func filterAllowedHeaders(raw string, allowed map[string]bool) string {
 	b.Grow(len(raw))
 	for _, p := range strings.Split(raw, ",") {
 		h := strings.TrimSpace(p)
-		if h == "" {
+		if h == "" || !validCORSHeaderToken(h) {
 			continue
 		}
 		if !allowed[strings.ToLower(h)] {
@@ -270,6 +304,34 @@ func filterAllowedHeaders(raw string, allowed map[string]bool) string {
 		b.WriteString(h)
 	}
 	return b.String()
+}
+
+func filterRequestedHeaders(raw string) string {
+	var b strings.Builder
+	b.Grow(len(raw))
+	for _, p := range strings.Split(raw, ",") {
+		h := strings.TrimSpace(p)
+		if h == "" || !validCORSHeaderToken(h) {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(h)
+	}
+	return b.String()
+}
+
+func validCORSHeaderToken(header string) bool {
+	if header == "" {
+		return false
+	}
+	for i := 0; i < len(header); i++ {
+		if !isHTTPTokenChar(header[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // matchCompiledOrigin tests whether origin matches any compiled

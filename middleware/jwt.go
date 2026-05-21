@@ -103,7 +103,13 @@ type JWTOptions struct {
 	// Leeway is the clock-skew tolerance when validating `exp` and
 	// `nbf` claims. Default 0 (strict).
 	Leeway time.Duration
+
+	// MaxTokenBytes caps the compact JWT string before any base64 decode
+	// or JSON parsing. Default 16 KiB. Set negative to disable.
+	MaxTokenBytes int
 }
+
+const defaultJWTMaxTokenBytes = 16 << 10
 
 // JWT returns a Middleware that authenticates requests carrying a
 // JSON Web Token signed with HMAC, RSA, RSA-PSS, or ECDSA. On
@@ -158,6 +164,9 @@ func JWT(opt JWTOptions) mwhint.Hinted {
 	if opt.LocalKey == "" {
 		opt.LocalKey = JWTLocalKey
 	}
+	if opt.MaxTokenBytes == 0 {
+		opt.MaxTokenBytes = defaultJWTMaxTokenBytes
+	}
 	expectedAlg := string(opt.Algorithm)
 
 	return mwhint.Hinted{Place: mwhint.Sync, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler {
@@ -175,7 +184,7 @@ func JWT(opt JWTOptions) mwhint.Hinted {
 				jwtReject(res, "missing token")
 				return
 			}
-			claims, err := verifyJWT(tok, verifier, expectedAlg, opt.Leeway)
+			claims, err := verifyJWT(tok, verifier, expectedAlg, opt.Leeway, opt.MaxTokenBytes)
 			if err != nil {
 				jwtReject(res, err.Error())
 				return
@@ -332,7 +341,10 @@ func jwtBuildVerifier(info jwtAlgInfo, secret []byte, key crypto.PublicKey) (jwt
 // verifier on the signing input, and decodes the payload into a
 // claims map. exp / nbf are checked against the wall clock with the
 // configured leeway.
-func verifyJWT(tok string, verify jwtVerifier, expectedAlg string, leeway time.Duration) (map[string]any, error) {
+func verifyJWT(tok string, verify jwtVerifier, expectedAlg string, leeway time.Duration, maxTokenBytes int) (map[string]any, error) {
+	if maxTokenBytes >= 0 && len(tok) > maxTokenBytes {
+		return nil, errors.New("token too large")
+	}
 	first := strings.IndexByte(tok, '.')
 	if first < 0 {
 		return nil, errors.New("malformed token")
