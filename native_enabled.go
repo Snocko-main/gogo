@@ -79,15 +79,20 @@ var (
 	// shared registration of an app).
 	sharedWorkerLifecycleMu sync.Mutex
 	sharedWorkersStarted    bool
-	sharedWorkerStop        chan struct{}  // closed to signal workers to exit
-	sharedWorkerWG          sync.WaitGroup // tracks running worker goroutines
-	// sharedActiveApps counts Apps currently expected to use the
-	// worker pool. Incremented at NewApp, decremented at App.Close.
-	// When it drops to zero the pool tears down so a long-running
-	// process that recycles Apps (tests, hot-reload) doesn't leak
-	// goroutines that spin against a ring no app is feeding anymore.
+	sharedWorkerGen         *sharedWorkerGeneration
+	sharedWorkerGens        []*sharedWorkerGeneration
+	// sharedActiveApps counts Apps that registered at least one route
+	// on the shared-dispatch fast path. Plain sync apps do not hold a
+	// worker-pool reference; otherwise a long-lived sync-only App would
+	// keep workers spinning after the last shared App closed.
 	sharedActiveApps atomic.Int32
 )
+
+type sharedWorkerGeneration struct {
+	stop    chan struct{}
+	drained chan struct{}
+	live    atomic.Int32
+}
 
 func init() {
 	// Initialize the atomic snapshot with an empty slice so workers can
@@ -167,15 +172,44 @@ func ensureSharedWorkers() {
 	if n == 0 {
 		n = runtime.NumCPU()
 	}
-	stop := make(chan struct{})
-	sharedWorkerStop = stop
-	sharedWorkerWG.Add(n)
+	gen := &sharedWorkerGeneration{
+		stop:    make(chan struct{}),
+		drained: make(chan struct{}),
+	}
+	gen.live.Store(int32(n))
+	sharedWorkerGen = gen
+	sharedWorkerGens = append(sharedWorkerGens, gen)
 	sharedWorkersStarted = true
 	for i := 0; i < n; i++ {
 		go func() {
-			defer sharedWorkerWG.Done()
-			sharedWorker(stop)
+			defer sharedWorkerDone(gen)
+			sharedWorker(gen.stop)
 		}()
+	}
+}
+
+func acquireSharedWorkerAppRef() {
+	sharedWorkerLifecycleMu.Lock()
+	sharedActiveApps.Add(1)
+	sharedWorkerLifecycleMu.Unlock()
+}
+
+func sharedWorkerDone(gen *sharedWorkerGeneration) {
+	if gen.live.Add(-1) != 0 {
+		return
+	}
+	close(gen.drained)
+
+	sharedWorkerLifecycleMu.Lock()
+	defer sharedWorkerLifecycleMu.Unlock()
+	for i, candidate := range sharedWorkerGens {
+		if candidate == gen {
+			sharedWorkerGens = append(sharedWorkerGens[:i], sharedWorkerGens[i+1:]...)
+			break
+		}
+	}
+	if sharedWorkerGen == gen && !sharedWorkersStarted {
+		sharedWorkerGen = nil
 	}
 }
 
@@ -195,16 +229,15 @@ func ensureSharedWorkers() {
 // Safe to call multiple times for a single App via the per-App
 // idempotency guard in App.Close.
 func stopSharedWorkersIfIdle() {
+	sharedWorkerLifecycleMu.Lock()
+	defer sharedWorkerLifecycleMu.Unlock()
 	if sharedActiveApps.Add(-1) > 0 {
 		return
 	}
-	sharedWorkerLifecycleMu.Lock()
-	defer sharedWorkerLifecycleMu.Unlock()
 	if !sharedWorkersStarted {
 		return
 	}
-	close(sharedWorkerStop)
-	sharedWorkerStop = nil
+	close(sharedWorkerGen.stop)
 	sharedWorkersStarted = false
 }
 
@@ -218,20 +251,40 @@ func stopSharedWorkersIfIdle() {
 // (~500 µs), so this returns quickly for processes that aren't
 // holding goroutines hostage inside user code.
 func WaitForSharedWorkers(timeout time.Duration) bool {
-	done := make(chan struct{})
-	go func() {
-		sharedWorkerWG.Wait()
-		close(done)
-	}()
-	if timeout <= 0 {
-		<-done
-		return true
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
 	}
-	select {
-	case <-done:
-		return true
-	case <-time.After(timeout):
-		return false
+	for {
+		sharedWorkerLifecycleMu.Lock()
+		gens := append([]*sharedWorkerGeneration(nil), sharedWorkerGens...)
+		sharedWorkerLifecycleMu.Unlock()
+		if len(gens) == 0 {
+			return true
+		}
+
+		for _, gen := range gens {
+			if timeout <= 0 {
+				<-gen.drained
+				continue
+			}
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return false
+			}
+			timer := time.NewTimer(remaining)
+			select {
+			case <-gen.drained:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+			case <-timer.C:
+				return false
+			}
+		}
 	}
 }
 

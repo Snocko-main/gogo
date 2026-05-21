@@ -227,6 +227,51 @@ func TestSharedWorkersDrainOnAppClose(t *testing.T) {
 	}
 }
 
+func TestSharedWorkersDrainWithSyncOnlyAppOpen(t *testing.T) {
+	syncOnly, err := gogo.NewApp(gogo.Config{BindAddr: "127.0.0.1"})
+	if err != nil {
+		t.Fatalf("NewApp: %v", err)
+	}
+	defer syncOnly.Close()
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.GetAsync("/p", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+
+	status, body := httpGet(t, port, "/p")
+	if status != 200 || body != "ok" {
+		t.Fatalf("got %d %q", status, body)
+	}
+
+	teardown()
+	if !gogo.WaitForSharedWorkers(2 * time.Second) {
+		t.Fatal("shared workers stayed alive while only a sync-only App remained open")
+	}
+}
+
+func TestWaitForSharedWorkersTimeoutWhileAppOpen(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.GetAsync("/p", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+
+	status, body := httpGet(t, port, "/p")
+	if status != 200 || body != "ok" {
+		t.Fatalf("got %d %q", status, body)
+	}
+	if gogo.WaitForSharedWorkers(20 * time.Millisecond) {
+		t.Fatal("workers reported drained while the shared App was still open")
+	}
+
+	teardown()
+	if !gogo.WaitForSharedWorkers(2 * time.Second) {
+		t.Fatal("shared workers did not drain after App.Close")
+	}
+}
+
 // TestRequestContextSyncHandler: a sync handler that completes
 // normally should still observe its req.Context() cancel on pool
 // release, so background goroutines kicked off with the context

@@ -15,6 +15,10 @@ import (
 // agnostic code paths ever reads it; nothing currently does.
 var sharedActiveApps atomic.Int32
 
+func acquireSharedWorkerAppRef() {
+	sharedActiveApps.Add(1)
+}
+
 // stopSharedWorkersIfIdle is a no-op in stub builds — there is no
 // worker pool to tear down without the cgo dispatch ring. Defined so
 // App.Close compiles when the framework is built without the gogo /
