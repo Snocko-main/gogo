@@ -261,6 +261,10 @@ void uwsgo_async_ctx_retain(void *ctx);
 // has already disconnected. It is safe to sample from a worker goroutine.
 int uwsgo_async_ctx_aborted(void *ctx);
 
+// async_ctx_stream_pending_bytes reports body bytes copied into queued stream
+// defers that the loop thread has not yet handed to uWS.
+size_t uwsgo_async_ctx_stream_pending_bytes(void *ctx);
+
 // Memory layout exposed to Go for the shared-memory fast path. Go reads this
 // once at startup, then writes responses directly into ctx memory and pushes
 // onto the shared ring using plain atomic operations — no cgo crossing per

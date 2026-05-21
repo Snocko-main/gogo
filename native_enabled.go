@@ -864,6 +864,13 @@ func asyncCtxAborted(ctxHandle uintptr) bool {
 	return C.uwsgo_async_ctx_aborted(unsafe.Pointer(ctxHandle)) != 0
 }
 
+func asyncCtxStreamPendingBytes(ctxHandle uintptr) uint64 {
+	if ctxHandle == 0 {
+		return 0
+	}
+	return uint64(C.uwsgo_async_ctx_stream_pending_bytes(unsafe.Pointer(ctxHandle)))
+}
+
 // sharedLayout caches struct offsets exposed by C so the hot path can build
 // responses with plain unsafe.Pointer arithmetic and atomic ops, no cgo.
 // Each AsyncCtx carries a pointer to its App's pending ring; asyncSendShared

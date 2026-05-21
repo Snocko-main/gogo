@@ -4513,7 +4513,7 @@ func TestSendFileMalformedRange(t *testing.T) {
 	})
 	defer teardown()
 
-	for _, bad := range []string{"items=0-3", "bytes=0-3,5-7", "bytes=banana", "bytes=", "bytes=100-200"} {
+	for _, bad := range []string{"items=0-3", "bytes=0-3,5-7", "bytes=banana", "bytes="} {
 		req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/r", port), nil)
 		req.Header.Set("Range", bad)
 		resp, err := noKeepaliveClient.Do(req)
@@ -4527,6 +4527,40 @@ func TestSendFileMalformedRange(t *testing.T) {
 		}
 		if string(body) != string(content) {
 			t.Errorf("Range %q: body %q, want %q", bad, body, content)
+		}
+	}
+}
+
+// TestSendFileUnsatisfiableRange: syntactically valid ranges outside the
+// representation are rejected with 416 instead of falling back to a full 200.
+func TestSendFileUnsatisfiableRange(t *testing.T) {
+	content := []byte("abcdefgh")
+	path := writeTempFile(t, ".txt", content)
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/r", func(res *gogo.Response, req *gogo.Request) {
+			_ = res.SendFile(req, path)
+		})
+	})
+	defer teardown()
+
+	for _, hdr := range []string{"bytes=100-200", "bytes=5-4"} {
+		req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/r", port), nil)
+		req.Header.Set("Range", hdr)
+		resp, err := noKeepaliveClient.Do(req)
+		if err != nil {
+			t.Fatalf("Range %q: %v", hdr, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 416 {
+			t.Errorf("Range %q: status %d, want 416", hdr, resp.StatusCode)
+		}
+		if string(body) != "" {
+			t.Errorf("Range %q: body %q, want empty", hdr, body)
+		}
+		if cr := resp.Header.Get("Content-Range"); cr != "bytes */8" {
+			t.Errorf("Range %q: Content-Range %q, want bytes */8", hdr, cr)
 		}
 	}
 }

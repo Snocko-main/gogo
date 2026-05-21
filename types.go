@@ -2737,7 +2737,7 @@ func (s *streamWriter) Write(p []byte) (int, error) {
 	if threshold == 0 {
 		return len(p), nil
 	}
-	if s.r.BufferedAmount() <= threshold {
+	if s.r.streamBufferedAmount() <= threshold {
 		return len(p), nil
 	}
 	// uWS is buffering more than threshold for this socket — park
@@ -2785,6 +2785,18 @@ func (r *Response) BufferedAmount() uint64 {
 	return innerBufferedAmount(r.inner)
 }
 
+func (r *Response) streamBufferedAmount() uint64 {
+	buffered := r.BufferedAmount()
+	if r.async == nil {
+		return buffered
+	}
+	pending := asyncCtxStreamPendingBytes(r.async.ctxHandle)
+	if pending > ^uint64(0)-buffered {
+		return ^uint64(0)
+	}
+	return buffered + pending
+}
+
 // AwaitDrain blocks the caller until BufferedAmount falls below
 // threshold, or returns nil immediately if it's already below.
 // It samples uWS's buffered byte counter at a short interval from the
@@ -2805,7 +2817,7 @@ func (r *Response) AwaitDrain(threshold uint64) error {
 		return nil
 	}
 	return waitForDrain(
-		func() uint64 { return r.BufferedAmount() },
+		func() uint64 { return r.streamBufferedAmount() },
 		func() bool { return r.async == nil || asyncCtxAborted(r.async.ctxHandle) },
 		threshold,
 	)
@@ -3112,7 +3124,18 @@ func (r *Response) sendFile(req *Request, path, filename string, attachment bool
 		status        = 200
 		rangeRespVal  string
 	)
-	if rs, re, ok := parseSingleByteRange(rangeHeader, size); ok {
+	if rs, re, ok, unsatisfiable := parseSingleByteRange(rangeHeader, size); unsatisfiable {
+		f.Close()
+		headers := []responseHeader{
+			{"Accept-Ranges", "bytes"},
+			{"Last-Modified", lastMod},
+			{"ETag", etag},
+			{"Content-Range", fmt.Sprintf("bytes */%d", size)},
+			{"Content-Length", "0"},
+		}
+		r.sendBytes(416, headers, nil)
+		return nil
+	} else if ok {
 		start = rs
 		contentLength = re - rs + 1
 		status = 206
@@ -3284,9 +3307,11 @@ func etagMatch(inm, etag string) bool {
 }
 
 // parseSingleByteRange parses a Range header value with a single byte
-// range. Returns (start, end, true) on success; (0, 0, false) on any
-// parse error, multi-range request, non-bytes unit, or out-of-bounds
-// range. end is inclusive. Accepted forms:
+// range. Returns ok=true with an inclusive [start,end] on success.
+// unsatisfiable=true means the header was syntactically valid but cannot
+// select bytes from this representation; the caller should return 416.
+// Malformed headers, multi-range requests, and non-bytes units return
+// ok=false/unsatisfiable=false and are ignored. Accepted forms:
 //
 //	bytes=start-end      — explicit range
 //	bytes=start-         — start through size-1
@@ -3294,52 +3319,58 @@ func etagMatch(inm, etag string) bool {
 //
 // Per RFC 7233, malformed Range headers are ignored — the caller falls
 // through to a normal 200 response with the full body.
-func parseSingleByteRange(h string, size int64) (start, end int64, ok bool) {
+func parseSingleByteRange(h string, size int64) (start, end int64, ok, unsatisfiable bool) {
 	if h == "" || size == 0 {
-		return 0, 0, false
+		return 0, 0, false, false
 	}
 	const prefix = "bytes="
 	if !strings.HasPrefix(h, prefix) {
-		return 0, 0, false
+		return 0, 0, false, false
 	}
 	spec := h[len(prefix):]
 	if strings.Contains(spec, ",") {
-		return 0, 0, false
+		return 0, 0, false, false
 	}
 	dash := strings.IndexByte(spec, '-')
 	if dash < 0 {
-		return 0, 0, false
+		return 0, 0, false, false
 	}
 	sStr := strings.TrimSpace(spec[:dash])
 	eStr := strings.TrimSpace(spec[dash+1:])
 	if sStr == "" {
 		if eStr == "" {
-			return 0, 0, false
+			return 0, 0, false, false
 		}
 		suffix, err := strconv.ParseInt(eStr, 10, 64)
 		if err != nil || suffix <= 0 {
-			return 0, 0, false
+			return 0, 0, false, false
 		}
 		if suffix > size {
 			suffix = size
 		}
-		return size - suffix, size - 1, true
+		return size - suffix, size - 1, true, false
 	}
 	sVal, err := strconv.ParseInt(sStr, 10, 64)
-	if err != nil || sVal < 0 || sVal >= size {
-		return 0, 0, false
+	if err != nil || sVal < 0 {
+		return 0, 0, false, false
+	}
+	if sVal >= size {
+		return 0, 0, false, true
 	}
 	if eStr == "" {
-		return sVal, size - 1, true
+		return sVal, size - 1, true, false
 	}
 	eVal, err := strconv.ParseInt(eStr, 10, 64)
-	if err != nil || eVal < sVal {
-		return 0, 0, false
+	if err != nil {
+		return 0, 0, false, false
+	}
+	if eVal < sVal {
+		return 0, 0, false, true
 	}
 	if eVal >= size {
 		eVal = size - 1
 	}
-	return sVal, eVal, true
+	return sVal, eVal, true, false
 }
 
 // buildDisposition builds a Content-Disposition header value per RFC 6266.

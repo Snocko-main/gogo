@@ -19,6 +19,7 @@ package middleware
 
 import (
 	"fmt"
+	"math"
 	"runtime"
 	"strconv"
 	"strings"
@@ -118,6 +119,7 @@ func NewMetrics(opts ...MetricsOptions) *Metrics {
 	if len(buckets) == 0 {
 		buckets = defaultMetricsBuckets
 	}
+	validateMetricsBuckets(buckets)
 	// Defensive copy so a caller mutating their slice after
 	// NewMetrics returns doesn't corrupt our state.
 	bucketLE := append([]float64(nil), buckets...)
@@ -148,6 +150,19 @@ func validPromMetricNamePart(s string) bool {
 		return false
 	}
 	return true
+}
+
+func validateMetricsBuckets(buckets []float64) {
+	var prev float64
+	for i, le := range buckets {
+		if le <= 0 || math.IsNaN(le) || math.IsInf(le, 0) {
+			panic("gogo/middleware: Metrics Buckets must contain finite positive values")
+		}
+		if i > 0 && le <= prev {
+			panic("gogo/middleware: Metrics Buckets must be strictly increasing")
+		}
+		prev = le
+	}
 }
 
 // Middleware returns the request-instrumenting middleware. Install

@@ -943,6 +943,7 @@ constexpr size_t SNAP_BODY_CAP = 8192;
 struct AsyncCtx {
     std::atomic<int> refcount{1};
     std::atomic<int32_t> aborted{0};
+    std::atomic<size_t> stream_pending_bytes{0};
     uWS::HttpResponse<false> *response;
     uWS::Loop *loop = nullptr;  // The loop that owns this response (set at creation time)
     PendingRing *pending_ring = nullptr;  // The response ring this ctx must be pushed onto
@@ -995,6 +996,7 @@ struct AsyncCtx {
     void reset_for_pool() {
         refcount.store(1, std::memory_order_relaxed);
         aborted.store(0, std::memory_order_relaxed);
+        stream_pending_bytes.store(0, std::memory_order_relaxed);
         response = nullptr;
         loop = nullptr;
         pending_ring = nullptr;
@@ -1136,6 +1138,14 @@ extern "C" int uwsgo_async_ctx_aborted(void *ctx_handle) {
         return 1;
     }
     return ctx->aborted.load(std::memory_order_acquire) ? 1 : 0;
+}
+
+extern "C" size_t uwsgo_async_ctx_stream_pending_bytes(void *ctx_handle) {
+    auto *ctx = static_cast<AsyncCtx *>(ctx_handle);
+    if (ctx == nullptr) {
+        return 0;
+    }
+    return ctx->stream_pending_bytes.load(std::memory_order_acquire);
 }
 
 extern "C" void uwsgo_shared_layout(uwsgo_shared_layout_t *out) {
@@ -1678,6 +1688,7 @@ extern "C" void uwsgo_res_defer_stream_write(
     auto *l = reinterpret_cast<uWS::Loop *>(loop);
     auto *ctx = static_cast<AsyncCtx *>(ctx_handle);
     ctx->retain();
+    ctx->stream_pending_bytes.fetch_add(chunk_len, std::memory_order_acq_rel);
 
     char *chunk_copy = dup_to_c_heap(chunk, chunk_len);
     size_t copy_len = chunk_len;
@@ -1685,12 +1696,14 @@ extern "C" void uwsgo_res_defer_stream_write(
     l->defer([ctx, chunk_copy, copy_len]() mutable {
         if (ctx->aborted.load(std::memory_order_acquire)) {
             if (chunk_copy) std::free(chunk_copy);
+            ctx->stream_pending_bytes.fetch_sub(copy_len, std::memory_order_acq_rel);
             ctx->release();
             return;
         }
         auto *r = ctx->response;
         r->write(std::string_view(chunk_copy ? chunk_copy : "", copy_len));
         if (chunk_copy) std::free(chunk_copy);
+        ctx->stream_pending_bytes.fetch_sub(copy_len, std::memory_order_acq_rel);
         ctx->release();
     });
 }
