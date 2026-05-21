@@ -4,8 +4,29 @@ package gogo
 
 import (
 	"errors"
+	"sync/atomic"
+	"time"
 	"unsafe"
 )
+
+// sharedActiveApps mirrors the symbol defined in native_enabled.go so
+// NewApp / App.Close compile in stub builds. The counter is kept live
+// (rather than dropped to a no-op) in case anything in the build-tag-
+// agnostic code paths ever reads it; nothing currently does.
+var sharedActiveApps atomic.Int32
+
+// stopSharedWorkersIfIdle is a no-op in stub builds — there is no
+// worker pool to tear down without the cgo dispatch ring. Defined so
+// App.Close compiles when the framework is built without the gogo /
+// cgo tags (e.g. `go vet`, IDE tooling, downstream users that import
+// the package only for its types).
+func stopSharedWorkersIfIdle() {}
+
+// WaitForSharedWorkers always returns true in stub builds: there are
+// no workers, so the pool is by definition drained the moment the
+// caller asks. Keeps the public signature available across both
+// builds so calling code doesn't have to use build tags.
+func WaitForSharedWorkers(time.Duration) bool { return true }
 
 func goStringFromC(_ unsafe.Pointer, _ int) string { return "" }
 func remoteAddrFromPtr(_ unsafe.Pointer) string    { return "" }
