@@ -451,13 +451,14 @@ type Config struct {
 	// drip uploads where the client keeps the request open but
 	// sends bytes too slowly to ever exhaust BodyLimit.
 	//
-	// Zero (default) disables the timeout — preserving existing
-	// behavior. Reasonable production values fall between 10s for
-	// API endpoints and 60s+ for legitimate upload flows. The
-	// timer fires on a goroutine that hands the cancellation back
-	// to the loop thread via Loop.Defer so done() and the
-	// connection close run serially with onData / onAborted —
-	// callers don't have to think about races.
+	// Zero uses the safe default of 30s. Reasonable production values
+	// fall between 10s for API endpoints and 60s+ for legitimate
+	// upload flows. Set a negative value to disable the timeout
+	// explicitly (not recommended outside tests or trusted local
+	// traffic). The timer fires on a goroutine that hands the
+	// cancellation back to the loop thread via Loop.Defer so done()
+	// and the connection close run serially with onData / onAborted
+	// — callers don't have to think about races.
 	BodyReadTimeout time.Duration
 
 	// BindAddr is the local interface to bind on. Empty string means
@@ -556,11 +557,16 @@ type App struct {
 	templateEngine TemplateEngine
 }
 
+const defaultBodyReadTimeout = 30 * time.Second
+
 // defaultConfig fills in safe production defaults for any zero Config
 // fields. Mutates and returns the input.
 func defaultConfig(c Config) Config {
 	if c.BodyLimit == 0 {
 		c.BodyLimit = 4 << 20 // 4 MiB
+	}
+	if c.BodyReadTimeout == 0 {
+		c.BodyReadTimeout = defaultBodyReadTimeout
 	}
 	return c
 }

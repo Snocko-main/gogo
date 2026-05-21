@@ -58,6 +58,24 @@ func TestRequestIDTooLongPolicy(t *testing.T) {
 	}
 }
 
+func TestRequestIDInvalidHeaderPanicsAtConstruction(t *testing.T) {
+	invalid := []string{
+		"X Request ID",
+		"X-Request-ID\r\nX-Evil",
+		"X/Request/ID",
+	}
+	for _, header := range invalid {
+		t.Run(header, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Fatalf("RequestID accepted invalid header %q", header)
+				}
+			}()
+			_ = RequestID(RequestIDOptions{Header: header})
+		})
+	}
+}
+
 func TestFastRequestIDGeneratorShapePure(t *testing.T) {
 	gen := FastRequestIDGenerator()
 	seen := make(map[string]struct{}, 1024)

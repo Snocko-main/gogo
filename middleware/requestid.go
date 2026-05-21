@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	mrand "math/rand/v2"
 	"sync"
 
@@ -61,6 +62,7 @@ func RequestID(opts ...RequestIDOptions) mwhint.Hinted {
 	if opt.Header == "" {
 		opt.Header = "X-Request-ID"
 	}
+	validateRequestIDHeaderName(opt.Header)
 	if opt.Generator == nil {
 		opt.Generator = defaultRequestID
 	}
@@ -90,6 +92,28 @@ func RequestID(opts ...RequestIDOptions) mwhint.Hinted {
 
 func requestIDTooLong(id string, max int) bool {
 	return max >= 0 && len(id) > max
+}
+
+func validateRequestIDHeaderName(name string) {
+	if name == "" {
+		panic("gogo/middleware: RequestID header name is empty")
+	}
+	for i := 0; i < len(name); i++ {
+		if !isHTTPTokenChar(name[i]) {
+			panic(fmt.Sprintf("gogo/middleware: RequestID header name %q contains invalid byte 0x%02x (must be RFC 7230 tchar)", name, name[i]))
+		}
+	}
+}
+
+func isHTTPTokenChar(c byte) bool {
+	if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
+		return true
+	}
+	switch c {
+	case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		return true
+	}
+	return false
 }
 
 func validDefaultRequestID(id string) bool {

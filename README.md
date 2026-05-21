@@ -1240,19 +1240,27 @@ native resources. Both are safe from any goroutine.
 
 ```go
 app, _ := gogo.NewApp(gogo.Config{
-    BodyLimit:     4 << 20,         // 4 MiB; oversize → 413
-    BindAddr:      "127.0.0.1",     // localhost only
-    CapturePeerIP: true,            // populate req.IP() on async paths
-    TrustProxy:    true,            // honor X-Forwarded-*
+    BodyLimit:       4 << 20,          // 4 MiB; oversize -> 413
+    BodyReadTimeout: 30 * time.Second, // slow body upload deadline
+    BindAddr:        "127.0.0.1",      // localhost only
+    CapturePeerIP:   true,             // populate req.IP() on async paths
+    TrustProxy:      true,             // honor X-Forwarded-*
 })
 ```
 
-| Field           | Default | Notes                                                   |
-| --------------- | ------- | ------------------------------------------------------- |
-| `BodyLimit`     | 4 MiB   | Reject Content-Length > limit with 413 on the C++ side  |
-| `BindAddr`      | `""`    | Empty = all interfaces (`0.0.0.0`)                      |
-| `CapturePeerIP` | `false` | Snapshot peer IP for async / shared-dispatch paths      |
-| `TrustProxy`    | `false` | Honor `X-Forwarded-*` in `Protocol()`/`Secure()`/`IPs()` |
+| Field             | Default | Notes                                                   |
+| ----------------- | ------- | ------------------------------------------------------- |
+| `BodyLimit`       | 4 MiB   | Reject Content-Length > limit with 413 on the C++ side  |
+| `BodyReadTimeout` | 30s     | Deadline for `Response.Body` to finish reading the body |
+| `BindAddr`        | `""`    | Empty = all interfaces (`0.0.0.0`)                      |
+| `CapturePeerIP`   | `false` | Snapshot peer IP for async / shared-dispatch paths      |
+| `TrustProxy`      | `false` | Honor `X-Forwarded-*` in `Protocol()`/`Secure()`/`IPs()` |
+
+`BodyReadTimeout` protects `Response.Body` users from slow body uploads that
+drip bytes forever without exceeding `BodyLimit`. Keep the 30s default for
+ordinary APIs, lower it for small JSON-only endpoints, raise it for legitimate
+large uploads, or set a negative value only when intentionally disabling the
+deadline for trusted traffic/tests.
 
 ### TrustProxy and client IPs
 
