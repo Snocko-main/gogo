@@ -98,6 +98,7 @@ func asyncDeferStreamWrite(uintptr, uintptr, string)                            
 func asyncDeferStreamEnd(uintptr, uintptr)                                       {}
 func innerBufferedAmount(responseNative) uint64                                  { return 0 }
 func asyncCtxAborted(ctxHandle uintptr) bool                                     { return ctxHandle == 0 }
+func asyncCtxRetain(uintptr)                                                     {}
 
 func upgradeAccept(uintptr, string, uintptr) {}
 func upgradeReject(uintptr, string, string)  {}

@@ -3698,6 +3698,21 @@ func (r *Response) onAbort(fn func()) {
 	state.add(fn)
 }
 
+func (r *Response) onAbortFirst(fn func()) {
+	if fn == nil {
+		return
+	}
+	state := r.abort
+	if state == nil {
+		state = &responseAbortState{}
+		r.abort = state
+		r.inner.onAborted(func() {
+			state.run()
+		})
+	}
+	state.prepend(fn)
+}
+
 func (s *responseAbortState) add(fn func()) {
 	s.mu.Lock()
 	if s.fired {
@@ -3706,6 +3721,19 @@ func (s *responseAbortState) add(fn func()) {
 		return
 	}
 	s.callbacks = append(s.callbacks, fn)
+	s.mu.Unlock()
+}
+
+func (s *responseAbortState) prepend(fn func()) {
+	s.mu.Lock()
+	if s.fired {
+		s.mu.Unlock()
+		runAbortCallback(fn)
+		return
+	}
+	s.callbacks = append(s.callbacks, nil)
+	copy(s.callbacks[1:], s.callbacks[:len(s.callbacks)-1])
+	s.callbacks[0] = fn
 	s.mu.Unlock()
 }
 
@@ -3796,7 +3824,7 @@ func (r *Response) OnData(fn func(chunk []byte, isLast bool)) {
 	// that check — without it, a connection abort mid-body crashes
 	// the process. The handler also releases our pinned ref so the
 	// wrapper can recycle even when the client disconnects.
-	r.onAbort(release)
+	r.onAbortFirst(release)
 	r.inner.onData(func(chunk []byte, isLast bool) {
 		if exceeded {
 			// Already emitted 413 — swallow tail chunks until
@@ -3883,7 +3911,7 @@ func (r *Response) Body(maxBytes int, done func(body []byte, err error)) {
 		}
 		r.releaseRef()
 	}
-	r.onAbort(func() {
+	r.onAbortFirst(func() {
 		aborted.state.Store(true)
 		release()
 	})
@@ -4050,10 +4078,10 @@ type Request struct {
 
 	// ctx / ctxCancel back Request.Context(). Lazy-initialized on
 	// the first Context() call so handlers that never touch it pay
-	// nothing. ctxCancel is hooked to the Response's onAborted
-	// callback list, so a client disconnect cancels the context and
-	// propagates to any db.QueryContext / http.NewRequestWithContext
-	// downstream of it.
+	// nothing. Sync handlers hook ctxCancel to the Response's
+	// onAborted callback list. Async handlers cannot safely register
+	// uWS onAborted callbacks from worker goroutines, so they watch
+	// the AsyncCtx abort flag instead.
 	ctx       context.Context
 	ctxCancel context.CancelFunc
 }
@@ -4134,8 +4162,38 @@ func (r *Request) Context() context.Context {
 		return context.Background()
 	}
 	r.ctx, r.ctxCancel = context.WithCancel(context.Background())
-	r.res.onAbort(r.ctxCancel)
+	if a := r.res.async; a != nil && a.ctxHandle != 0 {
+		watchAsyncRequestAbort(r.ctx, r.ctxCancel, a.ctxHandle)
+	} else {
+		r.res.onAbort(r.ctxCancel)
+	}
 	return r.ctx
+}
+
+const requestContextAbortPollInterval = time.Millisecond
+
+func watchAsyncRequestAbort(ctx context.Context, cancel context.CancelFunc, ctxHandle uintptr) {
+	if asyncCtxAborted(ctxHandle) {
+		cancel()
+		return
+	}
+	asyncCtxRetain(ctxHandle)
+	go func() {
+		defer asyncCtxRelease(ctxHandle)
+		ticker := time.NewTicker(requestContextAbortPollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if asyncCtxAborted(ctxHandle) {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
 }
 
 // resetForPool clears every request-scoped field so the wrapper can return

@@ -1090,6 +1090,13 @@ extern "C" void uwsgo_async_ctx_release(void *ctx_handle) {
     ctx->release();
 }
 
+extern "C" void uwsgo_async_ctx_retain(void *ctx_handle) {
+    auto *ctx = static_cast<AsyncCtx *>(ctx_handle);
+    if (ctx != nullptr) {
+        ctx->retain();
+    }
+}
+
 extern "C" int uwsgo_async_ctx_aborted(void *ctx_handle) {
     auto *ctx = static_cast<AsyncCtx *>(ctx_handle);
     if (ctx == nullptr) {
@@ -1123,6 +1130,7 @@ extern "C" void uwsgo_shared_layout(uwsgo_shared_layout_t *out) {
     out->ctx_ct_offset = offsetof(AsyncCtx, inline_content_type);
     out->ctx_body_offset = offsetof(AsyncCtx, inline_body);
     out->ctx_handler_id_offset = offsetof(AsyncCtx, handler_id);
+    out->ctx_aborted_offset = offsetof(AsyncCtx, aborted);
     out->ctx_response_offset = offsetof(AsyncCtx, response);
     out->ctx_loop_offset = offsetof(AsyncCtx, loop);
     out->ctx_pending_ring_offset = offsetof(AsyncCtx, pending_ring);

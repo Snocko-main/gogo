@@ -847,9 +847,19 @@ func asyncCtxRelease(ctxHandle uintptr) {
 	C.uwsgo_async_ctx_release(unsafe.Pointer(ctxHandle))
 }
 
+func asyncCtxRetain(ctxHandle uintptr) {
+	if ctxHandle == 0 {
+		return
+	}
+	C.uwsgo_async_ctx_retain(unsafe.Pointer(ctxHandle))
+}
+
 func asyncCtxAborted(ctxHandle uintptr) bool {
 	if ctxHandle == 0 {
 		return true
+	}
+	if sharedReady {
+		return (*atomic.Int32)(unsafe.Pointer(ctxHandle+shared.ctxAbortedOff)).Load() != 0
 	}
 	return C.uwsgo_async_ctx_aborted(unsafe.Pointer(ctxHandle)) != 0
 }
@@ -877,6 +887,7 @@ type sharedLayout struct {
 	ctxCtOff          uintptr
 	ctxBodyOff        uintptr
 	ctxHandlerIDOff   uintptr
+	ctxAbortedOff     uintptr
 	ctxResponseOff    uintptr
 	ctxLoopOff        uintptr
 	statusCap         uintptr
@@ -945,6 +956,7 @@ func initSharedLayoutOnce() {
 		ctxCtOff:          uintptr(raw.ctx_ct_offset),
 		ctxBodyOff:        uintptr(raw.ctx_body_offset),
 		ctxHandlerIDOff:   uintptr(raw.ctx_handler_id_offset),
+		ctxAbortedOff:     uintptr(raw.ctx_aborted_offset),
 		ctxResponseOff:    uintptr(raw.ctx_response_offset),
 		ctxLoopOff:        uintptr(raw.ctx_loop_offset),
 		statusCap:         uintptr(raw.ctx_inline_status_cap),

@@ -253,6 +253,10 @@ void uwsgo_res_defer_stream_end(
 // Call this if a goroutine returns without invoking defer_send.
 void uwsgo_async_ctx_release(void *ctx);
 
+// async_ctx_retain adds a reference to ctx. Used by Go-side helpers that need
+// to poll ctx state after the user handler may have sent the response.
+void uwsgo_async_ctx_retain(void *ctx);
+
 // async_ctx_aborted reports whether the async response's client connection
 // has already disconnected. It is safe to sample from a worker goroutine.
 int uwsgo_async_ctx_aborted(void *ctx);
@@ -280,6 +284,7 @@ typedef struct uwsgo_shared_layout_t {
     size_t ctx_ct_offset;
     size_t ctx_body_offset;
     size_t ctx_handler_id_offset;
+    size_t ctx_aborted_offset;
     size_t ctx_response_offset;
     size_t ctx_loop_offset;
     // Per-App response ring pointer carried inline in each AsyncCtx so Go's
