@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -115,11 +116,38 @@ func main() {
 			res.Send(200, "application/json",
 				fmt.Sprintf(`{"id":%q}`+"\n", req.Parameter(0)))
 		})
-		// POST /echo: read the body, write it back unchanged.
-		// Exercises the body-collection path (Response.Body) and the
-		// async dispatch handoff after the body completes.
-		app.PostAsync("/echo", 64*1024, func(res *gogo.Response, req *gogo.Request, body []byte) {
-			res.Send(200, "application/json", string(body))
+		// POST /echo: sync handler — read body on the loop thread,
+		// write it back unchanged. Pure body+write path, no goroutine
+		// handoff. Matches the "no work" shape of frameworks like
+		// actix where the whole pipeline stays on a single task.
+		app.Post("/echo", func(res *gogo.Response, req *gogo.Request) {
+			res.Body(64*1024, func(body []byte, err error) {
+				if err != nil {
+					res.Send(413, "text/plain", err.Error())
+					return
+				}
+				res.Send(200, "application/json", string(body))
+			})
+		})
+		// POST /query: realistic API shape — small body carries an id,
+		// handler runs a blocking SQLite lookup, returns a JSON row.
+		// PostAsync is built for this: body fits the shared-dispatch
+		// cap so the request crosses zero cgo callbacks on the hot
+		// path, and the handler runs on a worker goroutine so the
+		// blocking sql.DB.QueryRow doesn't pin the loop thread.
+		app.PostAsync("/query", 256, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			id, _ := strconv.Atoi(strings.TrimSpace(string(body)))
+			if id < 1 || id > 1000 {
+				id = 1
+			}
+			var name, email, role string
+			err := dbConn.QueryRow("SELECT name, email, role FROM users WHERE id = ?", id).Scan(&name, &email, &role)
+			if err != nil {
+				res.Send(500, "text/plain", err.Error())
+				return
+			}
+			res.Send(200, "application/json",
+				fmt.Sprintf(`{"id":%d,"name":%q,"email":%q,"role":%q}`+"\n", id, name, email, role))
 		})
 	}
 

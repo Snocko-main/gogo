@@ -38,8 +38,9 @@ DURATION="${DURATION:-15}"
 THREADS="${THREADS:-1 2 4 8}"
 CONN="${CONN:-500}"
 ENDPOINTS="${ENDPOINTS:-/hello /hello/inon /db}"
-POST_ENDPOINTS="${POST_ENDPOINTS:-/echo}"
+POST_ENDPOINTS="${POST_ENDPOINTS:-/echo /query}"
 POST_LUA="${POST_LUA:-$REPO_ROOT/scripts/wrk_post.lua}"
+POST_LUA_QUERY="${POST_LUA_QUERY:-$REPO_ROOT/scripts/wrk_post_db.lua}"
 FRAMEWORKS="${FRAMEWORKS:-gogo fiber nethttp uwsjs bun actix}"
 MODES="${MODES:-single multi}"
 WARMUP="${WARMUP:-2}"
@@ -184,7 +185,15 @@ bench_one() {
 	wrk_extra=()
 	if [ "$post" = 1 ]; then
 		method="POST"
-		wrk_extra=(-s "$POST_LUA")
+		# Pick the right lua per endpoint: /query sends a plain
+		# integer body so each server can do an apples-to-apples
+		# strconv-then-DB-lookup; everything else uses the generic
+		# 50-byte JSON echo body.
+		if [ "$endpoint" = "/query" ]; then
+			wrk_extra=(-s "$POST_LUA_QUERY")
+		else
+			wrk_extra=(-s "$POST_LUA")
+		fi
 	fi
 
 	header="== $fw [$mode] $method $endpoint  t=$threads c=$CONN d=${DURATION}s =="

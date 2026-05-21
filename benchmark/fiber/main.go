@@ -7,6 +7,8 @@ import (
 	"math/rand/v2"
 	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -119,6 +121,22 @@ func main() {
 	app.Post("/echo", func(c *fiber.Ctx) error {
 		c.Set("Content-Type", "application/json")
 		return c.Send(c.Body())
+	})
+
+	// POST /query: body carries an integer id; look it up in SQLite
+	// and return the row as JSON. Realistic API shape.
+	app.Post("/query", func(c *fiber.Ctx) error {
+		id, _ := strconv.Atoi(strings.TrimSpace(string(c.Body())))
+		if id < 1 || id > 1000 {
+			id = 1
+		}
+		var name, email, role string
+		err := dbConn.QueryRow("SELECT name, email, role FROM users WHERE id = ?", id).Scan(&name, &email, &role)
+		if err != nil {
+			return c.Status(500).SendString(err.Error())
+		}
+		c.Set("Content-Type", "application/json")
+		return c.SendString(fmt.Sprintf(`{"id":%d,"name":%q,"email":%q,"role":%q}`+"\n", id, name, email, role))
 	})
 
 	if prefork {

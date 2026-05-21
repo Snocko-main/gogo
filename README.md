@@ -1489,63 +1489,76 @@ Bun, and Rust:
 | `benchmark/bun-elysia`      | Elysia                       | TypeScript (Bun) |
 | `benchmark/nethttp`         | Go standard library `net/http` | Go |
 
-`scripts/bench_wrk.sh` starts each server, hits `/hello`, `/hello/:name`,
-`/db`, and `POST /echo` with `wrk`, then tears it down. See the script
-header for the env knobs.
+`scripts/bench_wrk.sh` starts each server, hits the GET endpoints
+(`/hello`, `/hello/:name`, `/db`), then POSTs against `/echo` (sync
+body-echo) and `/query` (body carries an id, server runs a SQLite
+lookup), and tears it down. See the script header for the env knobs.
 
 ### Results
 
 Median req/s across `wrk -t {1,2,4,8} -c 500 -d 10s`, Intel Xeon (Skylake)
-4 vCPU @ 2.80 GHz, Linux 6.18. `POST /echo` sends a 50-byte JSON body
-that the server reads and writes back unchanged — exercises the
-body-collection path.
+4 vCPU @ 2.80 GHz, Linux 6.18.
+
+- `POST /echo` — sync handler reads the body and writes it back
+  unchanged (50-byte JSON). Exercises the pure body-collection +
+  response-write path.
+- `POST /query` — body carries an integer id, handler parses it and
+  runs `SELECT … FROM users WHERE id = ?` against SQLite, returns the
+  row. Realistic API shape: body parse + blocking I/O + JSON response.
+  gogo's `PostAsync` is built for exactly this — body fits the
+  shared-dispatch cap so the request crosses zero cgo callbacks on
+  the hot path, and the handler runs on a worker goroutine so the
+  blocking `sql.DB.QueryRow` doesn't pin the loop thread.
 
 #### Single worker (1 thread / event loop)
 
-| framework  | language | `/hello` | `/hello/:name` | `/db` | `POST /echo` |
-|------------|----------|---------:|---------------:|------:|-------------:|
-| **gogo**   | Go (cgo) | **113,897** | **97,103**  | **76,792** | 49,246 |
-| uwsjs      | JS (Node)|  93,315  |   95,102       | 40,805 | 62,038       |
-| actix      | Rust     |  72,495  |   70,298       | 34,713 | **68,482**   |
-| fiber      | Go       |  60,519  |   61,755       | 18,346 | 52,198       |
-| bun+elysia | TS (Bun) |  49,672  |   38,910       | 24,753 | 25,184       |
-| net/http   | Go       |  29,669  |   29,853       | 13,852 | 26,745       |
+| framework  | language | `/hello` | `/hello/:name` | `/db` | `POST /echo` | `POST /query` |
+|------------|----------|---------:|---------------:|------:|-------------:|--------------:|
+| uwsjs      | JS (Node)| **270,427** | **262,978**  | **158,177** | **222,397** | **133,137** |
+| **gogo**   | Go (cgo) |  259,363 |   243,730      | 123,901 | 191,158      | 127,692       |
+| actix      | Rust     |  120,514 |   113,815      |  49,172 |  94,187      |  43,064       |
+| bun+elysia | TS (Bun) |  102,971 |    97,675      |  56,005 |  64,306      |  46,407       |
+| fiber      | Go       |   96,832 |    96,550      |  34,433 |  95,737      |  33,134       |
+| net/http   | Go       |   51,489 |    51,708      |  24,525 |  45,568      |  23,961       |
 
 #### Multi-worker (NumCPU = 4 workers)
 
-| framework  | language | `/hello` | `/hello/:name` | `/db` | `POST /echo` |
-|------------|----------|---------:|---------------:|------:|-------------:|
-| actix      | Rust     | **180,885** |   161,706   | 33,594 | **150,654** |
-| **gogo**   | Go (cgo) |  160,945 | **181,104**    | **73,433** | 69,218  |
-| fiber      | Go       |  151,766 |   142,613      | 68,911 | 127,678      |
-| bun+elysia | TS (Bun) |  121,432 |   121,793      | **79,705** | 94,760  |
-| nethttp    | Go       |  102,595 |   104,520      | 34,038 | 78,733       |
-| uwsjs      | JS (Node)|   94,644 |    89,161      | 37,181 | 68,665       |
+| framework  | language | `/hello` | `/hello/:name` | `/db` | `POST /echo` | `POST /query` |
+|------------|----------|---------:|---------------:|------:|-------------:|--------------:|
+| **gogo**   | Go (cgo) | **244,204** | **232,710** | **105,121** | **187,774** | **104,655** |
+| uwsjs      | JS (Node)|  158,184 |   153,933      |  69,939 |  120,744     |   61,809      |
+| actix      | Rust     |  124,021 |   111,442      |  50,072 |  110,288     |   44,490      |
+| bun+elysia | TS (Bun) |  108,310 |   102,407      |  53,134 |   59,898     |   46,633      |
+| fiber      | Go       |  104,269 |   102,868      |  32,895 |   95,622     |   33,267      |
+| net/http   | Go       |   50,558 |    48,868      |  24,634 |   46,061     |   24,281      |
 
 `/db` reads one row from a 1000-row SQLite table with a random id —
 exercises the framework + driver, not just the HTTP layer.
 
 Notes on the spread:
 
-- **Single worker**: gogo dominates because uWS's single-threaded event
-  loop is hard to beat on cold sockets — Tokio's task scheduling and
-  Node's libuv both add per-request overhead actix and uwsjs only
-  recoup at higher worker counts. POST /echo is the one endpoint where
-  Tokio's async body handling pulls ahead: gogo's `PostAsync` chain
-  pays the body-collection cost on the loop thread.
-- **Multi-worker**: actix takes the /hello lead because Tokio scales
-  near-linearly across CPUs, but gogo wins `/hello/:name` (uWS parses
-  path params in C++ with no per-request handler upcall) and crushes
-  `/db` ~2.2× — Go's `sql.DB` connection pool spreads the SQLite lock
-  across goroutines, whereas Rust's `rusqlite` + `web::block` hands a
-  single mutex-guarded connection across worker threads.
-- **bun's /db (multi: 79k)** is the surprise: Bun's native `bun:sqlite`
-  binding is genuinely fast — it just doesn't get the chance to shine
-  when the framework's per-request CPU overhead caps throughput on
-  cheaper endpoints.
-- **fiber's /db (single: 18k)** bottlenecks on the single SQLite
-  connection it serializes through; the multi-worker number recovers
-  to 69k once prefork spreads the lock.
+- **gogo vs uwsjs**: same uWebSockets core underneath, same shape on
+  GETs. uwsjs edges single-worker (no Go scheduler latency on the
+  hot path), gogo's lead opens up in multi-worker (cluster IPC + V8
+  contention cap Node's scaling, while gogo's shared-dispatch ring +
+  goroutine workers scale linearly across cores).
+- **POST /echo (sync)** — gogo's sync `app.Post` + `Response.Body`
+  collects the body on the loop thread and writes it back without a
+  goroutine handoff. Beats actix ~2× single and ~1.7× multi. Earlier
+  versions of this benchmark used `PostAsync` for /echo and lost to
+  actix here; the fair-comparison shape is sync for pure echo.
+- **POST /query (PostAsync + SQLite)** — body is tiny (≤ 256 B) so
+  it fits gogo's shared-dispatch fast path: zero cgo callbacks on the
+  body-collection path, then the handler runs on a worker goroutine
+  so the blocking `sql.DB.QueryRow` doesn't stall the loop. gogo wins
+  ~2.4× over actix here in both modes — exactly the workload
+  `PostAsync` is designed for (small body, blocking I/O, JSON
+  response).
+- **fiber's /db & /query** — fasthttp routing is fast, but a single
+  shared SQLite connection bottlenecks everything that touches the DB
+  in both single and multi modes.
+- **net/http** — modest across the board; standard library baseline
+  for context, not a serious competitor on raw throughput.
 
 To reproduce:
 

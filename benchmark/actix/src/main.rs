@@ -3,6 +3,7 @@
 //   GET  /hello/:name       → "hello <name>\n"
 //   GET  /db                → random row from a 1000-row sqlite table
 //   POST /echo              → echo the request body back unchanged
+//   POST /query             → body carries an integer id; look up row
 //
 // Single-worker by default to match the gogo single-core run. Set
 // ACTIX_WORKERS=N to widen.
@@ -99,11 +100,40 @@ async fn db_row() -> impl Responder {
 }
 
 // POST /echo: read the request body and write it back unchanged.
-// Exercises the request-body collection path. The 64 KiB cap matches
-// the gogo PostAsync limit so all benchmarks share the same ceiling.
+// Exercises the request-body collection path.
 #[post("/echo")]
 async fn echo(body: web::Bytes) -> impl Responder {
     HttpResponse::Ok().content_type("application/json").body(body)
+}
+
+// POST /query: body carries an integer id; look it up in SQLite and
+// return the row as JSON. Offload the blocking sqlite call via
+// web::block so the runtime can keep serving other requests on the
+// same worker.
+#[post("/query")]
+async fn db_query_post(body: web::Bytes) -> impl Responder {
+    let text = std::str::from_utf8(&body).unwrap_or("0");
+    let mut id: i64 = text.trim().parse().unwrap_or(1);
+    if !(1..=1000).contains(&id) {
+        id = 1;
+    }
+    let result = web::block(move || -> rusqlite::Result<String> {
+        let conn = DB.get().expect("db not initialized").lock().unwrap();
+        let (name, email, role): (String, String, String) = conn.query_row(
+            "SELECT name, email, role FROM users WHERE id = ?",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        Ok(format!(
+            "{{\"id\":{},\"name\":\"{}\",\"email\":\"{}\",\"role\":\"{}\"}}\n",
+            id, name, email, role
+        ))
+    })
+    .await;
+    match result {
+        Ok(Ok(s)) => HttpResponse::Ok().content_type("application/json").body(s),
+        _ => HttpResponse::InternalServerError().body("db error"),
+    }
 }
 
 #[actix_web::main]
@@ -132,6 +162,7 @@ async fn main() -> std::io::Result<()> {
             .service(hello_name)
             .service(db_row)
             .service(echo)
+            .service(db_query_post)
     })
     .workers(workers)
     .bind(("0.0.0.0", port))?

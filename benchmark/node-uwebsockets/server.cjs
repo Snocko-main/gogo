@@ -127,6 +127,36 @@ uWS
       }
     });
   })
+  // POST /query: body is an integer id; look it up in SQLite, return row.
+  .post("/query", (res) => {
+    res.onAborted(() => {
+      res.aborted = true;
+    });
+    let buf = Buffer.alloc(0);
+    res.onData((chunk, isLast) => {
+      buf = Buffer.concat([buf, Buffer.from(chunk)]);
+      if (!isLast || res.aborted) return;
+      if (!dbStmt) {
+        res.cork(() =>
+          res.writeStatus("500 Internal Server Error").end("db not available\n")
+        );
+        return;
+      }
+      let id = parseInt(buf.toString("utf8").trim(), 10);
+      if (!Number.isFinite(id) || id < 1 || id > 1000) id = 1;
+      const row = dbStmt.get(id);
+      res.cork(() => {
+        res
+          .writeStatus("200 OK")
+          .writeHeader("Content-Type", "application/json")
+          .end(
+            `{"id":${id},"name":${JSON.stringify(row.name)},"email":${JSON.stringify(
+              row.email
+            )},"role":${JSON.stringify(row.role)}}\n`
+          );
+      });
+    });
+  })
   .listen(port, workers > 1 ? uWS.LIBUS_LISTEN_EXCLUSIVE_PORT : 0, (token) => {
     if (!token) {
       console.error(`failed to listen on :${port}`);
