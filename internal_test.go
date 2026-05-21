@@ -3,6 +3,7 @@ package gogo
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestBodyEncoderOverflowReturnsPrefixOnly(t *testing.T) {
@@ -19,6 +20,28 @@ func TestBodyEncoderOverflowReturnsPrefixOnly(t *testing.T) {
 	}
 	if len(enc.buf) != 0 {
 		t.Fatalf("buffer len after overflow = %d, want 0", len(enc.buf))
+	}
+}
+
+func TestDefaultConfigAppliesSafeBodyReadTimeout(t *testing.T) {
+	cfg := defaultConfig(Config{})
+	if cfg.BodyReadTimeout != defaultBodyReadTimeout {
+		t.Fatalf("BodyReadTimeout default = %s, want %s", cfg.BodyReadTimeout, defaultBodyReadTimeout)
+	}
+	if cfg.BodyReadTimeout <= 0 {
+		t.Fatalf("BodyReadTimeout default must be enabled, got %s", cfg.BodyReadTimeout)
+	}
+}
+
+func TestDefaultConfigKeepsExplicitBodyReadTimeout(t *testing.T) {
+	cfg := defaultConfig(Config{BodyReadTimeout: 10 * time.Second})
+	if cfg.BodyReadTimeout != 10*time.Second {
+		t.Fatalf("BodyReadTimeout = %s, want 10s", cfg.BodyReadTimeout)
+	}
+
+	cfg = defaultConfig(Config{BodyReadTimeout: -1})
+	if cfg.BodyReadTimeout != -1 {
+		t.Fatalf("disabled BodyReadTimeout = %s, want -1", cfg.BodyReadTimeout)
 	}
 }
 
