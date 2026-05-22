@@ -134,8 +134,11 @@ curl http://localhost:3000/
 
 ### Static replies (zero cgo per request)
 
-If the response never changes, register a `gogo.Reply` — it is served
-entirely from C++ with no cgo callback per request:
+If the response never changes, register a `gogo.Reply`. When no matching
+sync middleware is installed, it is served entirely from C++ with no cgo
+callback per request. If middleware such as auth, CORS, logging, or rate
+limiting matches the route, gogo automatically falls back to the dynamic path
+so the middleware still runs:
 
 ```go
 app.Get("/health", gogo.Reply{

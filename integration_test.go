@@ -146,6 +146,41 @@ func TestStaticReply(t *testing.T) {
 	}
 }
 
+func TestAppStaticReplyWithMiddleware(t *testing.T) {
+	var hits atomic.Int32
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				hits.Add(1)
+				res.Header("X-Middleware", "hit")
+				next(res, req)
+			}
+		})
+		app.Get("/health", gogo.Reply{
+			Status:      201,
+			ContentType: "text/plain",
+			Body:        "ok",
+		})
+	})
+	defer teardown()
+
+	resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/health", port))
+	if err != nil {
+		t.Fatalf("/health: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 201 || string(body) != "ok" {
+		t.Fatalf("/health: got %d %q", resp.StatusCode, body)
+	}
+	if resp.Header.Get("X-Middleware") != "hit" {
+		t.Fatalf("static reply bypassed middleware header")
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("middleware hits = %d, want 1", hits.Load())
+	}
+}
+
 func TestSyncHandler(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.Get("/plain", func(res *gogo.Response, req *gogo.Request) {
@@ -2961,6 +2996,37 @@ func TestGroupStaticReplyWithMW(t *testing.T) {
 	}
 	if hits.Load() != 1 {
 		t.Fatalf("group mw hits for static target = %d, want 1", hits.Load())
+	}
+}
+
+func TestGroupStaticReplyWithAppMiddleware(t *testing.T) {
+	var hits atomic.Int32
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				hits.Add(1)
+				res.Header("X-App-MW", "hit")
+				next(res, req)
+			}
+		})
+		app.Group("/api").Get("/health", "ok")
+	})
+	defer teardown()
+
+	resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/api/health", port))
+	if err != nil {
+		t.Fatalf("/api/health: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || string(body) != "ok" {
+		t.Fatalf("/api/health: got %d %q", resp.StatusCode, body)
+	}
+	if resp.Header.Get("X-App-MW") != "hit" {
+		t.Fatalf("group static target bypassed app middleware header")
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("app middleware hits for group static target = %d, want 1", hits.Load())
 	}
 }
 

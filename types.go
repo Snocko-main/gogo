@@ -943,6 +943,30 @@ func (a *App) hasMatchingMiddleware(routePattern string) bool {
 	return false
 }
 
+// hasSyncMiddleware reports whether any sync-side middleware could apply to
+// routePattern. Unlike hasMatchingMiddleware, it includes PlaceBoth entries
+// because static GET fallbacks execute on the sync route path and must not
+// bypass app.Use(auth) / app.Use(logger) just because those middlewares also
+// have an async twin.
+func (a *App) hasSyncMiddleware(routePattern string) bool {
+	if len(a.middlewares) == 0 {
+		return false
+	}
+	dynamic := strings.ContainsAny(routePattern, ":*")
+	for _, e := range a.middlewares {
+		if e.prefix == "" {
+			return true
+		}
+		if dynamic {
+			return true
+		}
+		if mwMatches(e.prefix, routePattern) {
+			return true
+		}
+	}
+	return false
+}
+
 // UseAsync is retained as a thin alias for App.Use to keep existing
 // code compiling. App.Use now handles all middleware: bundled
 // middleware carries its own placement, raw AsyncMiddleware values
@@ -1031,11 +1055,35 @@ func (a *App) Get(pattern string, target any) {
 		if v.ContentType != "" {
 			validateHeaderValue("Content-Type", v.ContentType)
 		}
+		if a.hasSyncMiddleware(uwsPattern) {
+			cType, body := v.ContentType, v.Body
+			h := a.applyMeta(meta, a.wrap(uwsPattern, func(res *Response, req *Request) {
+				res.Send(code, cType, body)
+			}))
+			a.inner.get(uwsPattern, h)
+			return
+		}
 		a.inner.getStatic(uwsPattern, statusLine(code), v.ContentType, v.Body)
 	case string:
+		if a.hasSyncMiddleware(uwsPattern) {
+			body := v
+			h := a.applyMeta(meta, a.wrap(uwsPattern, func(res *Response, req *Request) {
+				res.Send(200, "", body)
+			}))
+			a.inner.get(uwsPattern, h)
+			return
+		}
 		a.inner.getStatic(uwsPattern, statusLine(200), "", v)
 	case []byte:
-		a.inner.getStatic(uwsPattern, statusLine(200), "", string(v))
+		body := string(v)
+		if a.hasSyncMiddleware(uwsPattern) {
+			h := a.applyMeta(meta, a.wrap(uwsPattern, func(res *Response, req *Request) {
+				res.Send(200, "", body)
+			}))
+			a.inner.get(uwsPattern, h)
+			return
+		}
+		a.inner.getStatic(uwsPattern, statusLine(200), "", body)
 	default:
 		panic(fmt.Sprintf("gogo: unsupported Get target type %T for %q", target, pattern))
 	}
@@ -1437,7 +1485,7 @@ func (r *Router) wrapGroupAsync(h AsyncHandler) AsyncHandler {
 // zero-cgo static path or must fall back to a dynamic handler so middleware
 // can intercept.
 func (r *Router) hasGroupOrAppMW(fullPattern string) bool {
-	return len(r.syncMW) > 0 || r.app.hasMatchingMiddleware(fullPattern)
+	return len(r.syncMW) > 0 || r.app.hasSyncMiddleware(fullPattern)
 }
 
 // Get registers a GET route under this Router. Target follows the same rules
