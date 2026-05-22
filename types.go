@@ -256,8 +256,9 @@ type Handler func(*Response, *Request)
 // AsyncHandler handles a request on a goroutine that is free to block.
 // The Response arrives in async mode with the abort context pre-attached.
 // The Request is a snapshot copied from the live uWS request before it was
-// freed; URL/method/query/params/headers are all readable, with fixed caps
-// (URL 256, query 512, each param 64, headers buffer 4 KB).
+// freed. Shared zero-cgo routes reject snapshots past their fixed caps
+// (URL 256, query 512, each param 64, headers buffer 8 KB); middleware
+// fallback snapshots copy the live request fields via cgo before spawning.
 type AsyncHandler func(*Response, *Request)
 
 // OpCode identifies a WebSocket frame type.
@@ -4273,7 +4274,7 @@ func (a *Aborted) Load() bool {
 // request was freed.
 //
 // Both modes expose the same accessors. The shared snapshot has fixed capacity
-// per field (URL 256, query 512, params 64 each up to 8, headers 4 KB total);
+// per field (URL 256, query 512, params 64 each up to 8, headers 8 KB total);
 // requests past those caps are rejected with 431 before reaching user code.
 type Request struct {
 	inner requestNative

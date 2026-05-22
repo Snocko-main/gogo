@@ -54,7 +54,7 @@
 //
 // All async handlers receive a *Request snapshot (URL/method/query/params/
 // headers all captured before uWS freed the live request). Snapshot caps in
-// the zero-cgo shared path: URL 256, query 512, params 8x64, headers 4 KB
+// the zero-cgo shared path: URL 256, query 512, params 8x64, headers 8 KB
 // total; requests that exceed those caps are rejected with 431 rather than
 // being silently truncated. The middleware/PostAsync paths copy headers exactly
 // via cgo so they have no cap.
