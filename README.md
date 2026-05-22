@@ -1461,6 +1461,10 @@ ordinary APIs, lower it for small JSON-only endpoints, raise it for legitimate
 large uploads, or set a negative value only when intentionally disabling the
 deadline for trusted traffic/tests.
 
+`BodyLimit: 0` uses the safe 4 MiB default. Set `BodyLimit: gogo.NoBodyLimit`
+only for trusted deployments that already enforce a request-body cap at an
+external layer such as a reverse proxy.
+
 ### TrustProxy and client IPs
 
 When `TrustProxy` is **off** (the default), the framework treats every

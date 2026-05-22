@@ -405,6 +405,10 @@ type asyncMiddlewareEntry struct {
 	alsoSync bool
 }
 
+// NoBodyLimit disables Config.BodyLimit. Use only behind an external body-size
+// limit, such as a trusted reverse proxy.
+const NoBodyLimit = -1
+
 // Config tunes per-App behavior. All fields are optional; the zero value
 // is a safe production default. Pass to NewApp; values are applied at
 // app creation and bind time. The struct is intentionally narrow — knobs
@@ -453,8 +457,9 @@ type Config struct {
 	//     smaller, so handlers that ask Body(10 MiB) on an app capped
 	//     at 1 MiB top out at 1 MiB.
 	//
-	// Set to 0 to disable the cap entirely (not recommended outside
-	// tests). Default 4 MiB.
+	// Zero uses the safe default of 4 MiB. Set to NoBodyLimit to disable
+	// the cap entirely when an external layer enforces a trusted body-size
+	// limit.
 	BodyLimit int
 
 	// BodyReadTimeout caps the wall-clock time the framework will
@@ -583,6 +588,8 @@ const defaultBodyReadTimeout = 30 * time.Second
 func defaultConfig(c Config) Config {
 	if c.BodyLimit == 0 {
 		c.BodyLimit = 4 << 20 // 4 MiB
+	} else if c.BodyLimit < 0 {
+		c.BodyLimit = 0
 	}
 	if c.BodyReadTimeout == 0 {
 		c.BodyReadTimeout = defaultBodyReadTimeout

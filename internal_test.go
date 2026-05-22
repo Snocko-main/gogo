@@ -83,6 +83,23 @@ func TestDefaultConfigKeepsExplicitBodyReadTimeout(t *testing.T) {
 	}
 }
 
+func TestDefaultConfigBodyLimitDefaultsAndDisableSentinel(t *testing.T) {
+	cfg := defaultConfig(Config{})
+	if cfg.BodyLimit != 4<<20 {
+		t.Fatalf("BodyLimit default = %d, want 4 MiB", cfg.BodyLimit)
+	}
+
+	cfg = defaultConfig(Config{BodyLimit: 1024})
+	if cfg.BodyLimit != 1024 {
+		t.Fatalf("BodyLimit = %d, want 1024", cfg.BodyLimit)
+	}
+
+	cfg = defaultConfig(Config{BodyLimit: NoBodyLimit})
+	if cfg.BodyLimit != 0 {
+		t.Fatalf("NoBodyLimit normalized to %d, want native disabled value 0", cfg.BodyLimit)
+	}
+}
+
 func TestHTTPAdapterRecorderRejectsInvalidWriteHeaderCode(t *testing.T) {
 	for _, code := range []int{99, 1000} {
 		t.Run(strconv.Itoa(code), func(t *testing.T) {
