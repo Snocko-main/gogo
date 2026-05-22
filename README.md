@@ -1500,6 +1500,10 @@ There are five comparable HTTP benchmark servers:
 and `/db` with `wrk`, then tears it down. See the script header for the
 env knobs.
 
+Go benchmark dependencies live in the nested `benchmark` module so importing
+gogo does not pull benchmark-only frameworks or database drivers into your
+application module graph.
+
 ### Results
 
 Single-worker, median req/s across `wrk -t {1,2,4,8} -c 500 -d 15s`,

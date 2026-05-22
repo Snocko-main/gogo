@@ -86,7 +86,7 @@ func main() {
 
 	filePath := os.Getenv("BENCH_FILE")
 	if filePath == "" {
-		filePath = "benchmark/data/sample.json"
+		filePath = "data/sample.json"
 	}
 	app.Get("/file", func(c *fiber.Ctx) error {
 		data, err := os.ReadFile(filePath)

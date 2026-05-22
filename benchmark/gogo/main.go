@@ -57,7 +57,7 @@ func main() {
 
 	filePath := os.Getenv("BENCH_FILE")
 	if filePath == "" {
-		filePath = "benchmark/data/sample.json"
+		filePath = "data/sample.json"
 	}
 
 	// GOGO_CORES=N enables multi-core mode (N independent App instances

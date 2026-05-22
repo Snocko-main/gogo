@@ -92,32 +92,32 @@ start_server() {
 	case "$fw:$mode" in
 	gogo:single)
 		PORT=3002
-		( GOGO_CORES=1 go run -tags gogo ./benchmark/gogo >/tmp/bench-gogo.log 2>&1 ) &
+		( cd benchmark && GOGO_CORES=1 go run -tags gogo ./gogo >/tmp/bench-gogo.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	gogo:multi)
 		PORT=3002
-		( GOGO_CORES="$NCPU" go run -tags gogo ./benchmark/gogo >/tmp/bench-gogo.log 2>&1 ) &
+		( cd benchmark && GOGO_CORES="$NCPU" go run -tags gogo ./gogo >/tmp/bench-gogo.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	fiber:single)
 		PORT=3004
-		( GOMAXPROCS=1 FIBER_PREFORK=0 go run ./benchmark/fiber >/tmp/bench-fiber.log 2>&1 ) &
+		( cd benchmark && GOMAXPROCS=1 FIBER_PREFORK=0 go run ./fiber >/tmp/bench-fiber.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	fiber:multi)
 		PORT=3004
-		( FIBER_PREFORK=1 go run ./benchmark/fiber >/tmp/bench-fiber.log 2>&1 ) &
+		( cd benchmark && FIBER_PREFORK=1 go run ./fiber >/tmp/bench-fiber.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	nethttp:single)
 		PORT=3001
-		( GOMAXPROCS=1 go run ./benchmark/nethttp >/tmp/bench-nethttp.log 2>&1 ) &
+		( cd benchmark && GOMAXPROCS=1 go run ./nethttp >/tmp/bench-nethttp.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	nethttp:multi)
 		PORT=3001
-		( go run ./benchmark/nethttp >/tmp/bench-nethttp.log 2>&1 ) &
+		( cd benchmark && go run ./nethttp >/tmp/bench-nethttp.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	uwsjs:single)
