@@ -1,168 +1,280 @@
-== uwsjs [multi] /hello  t=1 c=500 d=15s ==
-Running 15s test @ http://127.0.0.1:3003/hello
+== uwsjs [multi] GET /hello  t=1 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3003/hello
   1 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.82ms    2.10ms  63.73ms   98.98%
-    Req/Sec   262.73k    23.32k  278.89k    94.67%
+    Latency     1.81ms  846.31us  12.07ms   86.89%
+    Req/Sec   178.96k    25.58k  262.56k    80.00%
   Latency Distribution
-     50%    1.63ms
-     75%    1.85ms
-     90%    2.44ms
-     99%    3.96ms
-  3922157 requests in 15.01s, 546.11MB read
-Requests/sec: 261338.85
-Transfer/sec:     36.39MB
-== uwsjs [multi] /hello  t=2 c=500 d=15s ==
-Running 15s test @ http://127.0.0.1:3003/hello
+     50%    1.50ms
+     75%    2.02ms
+     90%    2.84ms
+     99%    5.12ms
+  1782414 requests in 10.02s, 248.18MB read
+Requests/sec: 177882.02
+Transfer/sec:     24.77MB
+== uwsjs [multi] GET /hello  t=2 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3003/hello
   2 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.89ms  240.58us  12.98ms   96.85%
-    Req/Sec   132.28k     5.67k  139.73k    92.05%
+    Latency     2.72ms  659.14us  17.59ms   90.14%
+    Req/Sec    92.20k    10.56k  104.98k    86.14%
   Latency Distribution
-     50%    1.86ms
-     75%    1.90ms
-     90%    1.95ms
-     99%    2.35ms
-  3974374 requests in 15.10s, 553.38MB read
-Requests/sec: 263168.00
-Transfer/sec:     36.64MB
-== uwsjs [multi] /hello  t=4 c=500 d=15s ==
-Running 15s test @ http://127.0.0.1:3003/hello
+     50%    2.51ms
+     75%    2.80ms
+     90%    3.33ms
+     99%    5.41ms
+  1852338 requests in 10.10s, 257.91MB read
+Requests/sec: 183336.41
+Transfer/sec:     25.53MB
+== uwsjs [multi] GET /hello  t=4 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3003/hello
   4 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.99ms  841.53us  30.13ms   97.54%
-    Req/Sec    63.71k     8.60k  237.23k    93.18%
+    Latency     2.81ms    0.97ms  27.03ms   93.00%
+    Req/Sec    44.81k     6.04k   99.66k    85.07%
   Latency Distribution
-     50%    1.91ms
-     75%    1.98ms
-     90%    2.12ms
-     99%    3.72ms
-  3810823 requests in 15.10s, 530.61MB read
-Requests/sec: 252330.96
-Transfer/sec:     35.13MB
-== uwsjs [multi] /hello  t=8 c=500 d=15s ==
-Running 15s test @ http://127.0.0.1:3003/hello
+     50%    2.58ms
+     75%    2.94ms
+     90%    3.49ms
+     99%    5.79ms
+  1792550 requests in 10.10s, 249.59MB read
+Requests/sec: 177429.74
+Transfer/sec:     24.70MB
+== uwsjs [multi] GET /hello  t=8 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3003/hello
   8 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.97ms  825.23us  31.38ms   98.34%
-    Req/Sec    31.95k     2.68k   41.28k    90.75%
+    Latency     2.61ms  699.86us  13.90ms   89.62%
+    Req/Sec    23.78k     6.79k  189.79k    92.26%
   Latency Distribution
-     50%    1.90ms
-     75%    1.95ms
-     90%    2.01ms
-     99%    3.44ms
-  3820427 requests in 15.04s, 531.94MB read
-Requests/sec: 254052.58
-Transfer/sec:     35.37MB
-== uwsjs [multi] /hello/inon  t=1 c=500 d=15s ==
-Running 15s test @ http://127.0.0.1:3003/hello/inon
+     50%    2.44ms
+     75%    2.72ms
+     90%    3.23ms
+     99%    5.52ms
+  1896365 requests in 10.10s, 264.04MB read
+Requests/sec: 187741.90
+Transfer/sec:     26.14MB
+== uwsjs [multi] GET /hello/inon  t=1 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3003/hello/inon
   1 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.90ms    0.93ms  40.47ms   93.59%
-    Req/Sec   259.57k    21.02k  272.37k    93.38%
+    Latency     2.19ms    1.72ms  50.49ms   96.13%
+    Req/Sec   210.49k    24.48k  229.79k    93.00%
   Latency Distribution
-     50%    1.81ms
-     75%    1.90ms
-     90%    2.04ms
-     99%    3.75ms
-  3902015 requests in 15.11s, 539.58MB read
-Requests/sec: 258323.59
-Transfer/sec:     35.72MB
-== uwsjs [multi] /hello/inon  t=2 c=500 d=15s ==
-Running 15s test @ http://127.0.0.1:3003/hello/inon
+     50%    2.03ms
+     75%    2.27ms
+     90%    3.00ms
+     99%    5.24ms
+  2094539 requests in 10.01s, 289.64MB read
+Requests/sec: 209252.83
+Transfer/sec:     28.94MB
+== uwsjs [multi] GET /hello/inon  t=2 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3003/hello/inon
   2 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     2.04ms    1.14ms  38.49ms   97.14%
-    Req/Sec   126.91k    15.50k  137.83k    92.05%
+    Latency     2.37ms  499.32us  13.03ms   93.19%
+    Req/Sec   105.72k    11.01k  116.94k    93.07%
   Latency Distribution
-     50%    1.89ms
-     75%    1.93ms
-     90%    2.02ms
-     99%    5.60ms
-  3812657 requests in 15.10s, 527.22MB read
-Requests/sec: 252443.44
-Transfer/sec:     34.91MB
-== uwsjs [multi] /hello/inon  t=4 c=500 d=15s ==
-Running 15s test @ http://127.0.0.1:3003/hello/inon
+     50%    2.25ms
+     75%    2.37ms
+     90%    2.67ms
+     99%    4.71ms
+  2124543 requests in 10.10s, 293.79MB read
+Requests/sec: 210283.19
+Transfer/sec:     29.08MB
+== uwsjs [multi] GET /hello/inon  t=4 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3003/hello/inon
   4 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.93ms  336.90us  15.62ms   95.98%
-    Req/Sec    64.86k     7.96k  238.21k    95.84%
+    Latency     2.47ms    0.90ms  29.31ms   94.94%
+    Req/Sec    51.28k     9.99k  212.72k    93.77%
   Latency Distribution
-     50%    1.90ms
-     75%    1.94ms
-     90%    2.01ms
-     99%    2.72ms
-  3880332 requests in 15.10s, 536.58MB read
-Requests/sec: 256941.04
-Transfer/sec:     35.53MB
-== uwsjs [multi] /hello/inon  t=8 c=500 d=15s ==
-Running 15s test @ http://127.0.0.1:3003/hello/inon
+     50%    2.32ms
+     75%    2.50ms
+     90%    2.78ms
+     99%    5.43ms
+  2046743 requests in 10.10s, 283.03MB read
+Requests/sec: 202606.82
+Transfer/sec:     28.02MB
+== uwsjs [multi] GET /hello/inon  t=8 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3003/hello/inon
   8 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     2.00ms    0.96ms  37.54ms   97.01%
-    Req/Sec    31.69k     6.53k  226.55k    93.92%
+    Latency     2.74ms    1.13ms  28.53ms   91.76%
+    Req/Sec    23.10k     4.63k   31.55k    75.38%
   Latency Distribution
-     50%    1.89ms
-     75%    1.95ms
-     90%    2.06ms
-     99%    4.59ms
-  3788459 requests in 15.10s, 523.88MB read
-Requests/sec: 250852.09
-Transfer/sec:     34.69MB
-== uwsjs [multi] /db  t=1 c=500 d=15s ==
-Running 15s test @ http://127.0.0.1:3003/db
+     50%    2.43ms
+     75%    2.77ms
+     90%    3.49ms
+     99%    7.63ms
+  1840445 requests in 10.02s, 254.50MB read
+Requests/sec: 183743.56
+Transfer/sec:     25.41MB
+== uwsjs [multi] GET /db  t=1 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3003/db
   1 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     3.06ms  842.09us  20.00ms   95.13%
-    Req/Sec   165.95k    18.34k  180.74k    84.00%
+    Latency     3.42ms  694.09us  23.36ms   95.53%
+    Req/Sec   147.77k    13.98k  162.33k    94.00%
   Latency Distribution
-     50%    2.87ms
-     75%    2.99ms
-     90%    3.29ms
-     99%    6.97ms
-  2477208 requests in 15.01s, 467.01MB read
-Requests/sec: 165031.75
-Transfer/sec:     31.11MB
-== uwsjs [multi] /db  t=2 c=500 d=15s ==
-Running 15s test @ http://127.0.0.1:3003/db
+     50%    3.28ms
+     75%    3.45ms
+     90%    3.73ms
+     99%    6.52ms
+  1469573 requests in 10.01s, 277.05MB read
+Requests/sec: 146878.54
+Transfer/sec:     27.69MB
+== uwsjs [multi] GET /db  t=2 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3003/db
   2 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     2.91ms  496.76us  21.84ms   97.19%
-    Req/Sec    86.67k     4.83k   90.39k    90.40%
+    Latency     3.63ms  816.01us  26.86ms   95.15%
+    Req/Sec    69.50k     6.58k   77.90k    90.10%
   Latency Distribution
-     50%    2.85ms
-     75%    2.90ms
-     90%    3.02ms
-     99%    4.04ms
-  2604566 requests in 15.10s, 491.02MB read
-Requests/sec: 172458.04
-Transfer/sec:     32.51MB
-== uwsjs [multi] /db  t=4 c=500 d=15s ==
-Running 15s test @ http://127.0.0.1:3003/db
+     50%    3.49ms
+     75%    3.67ms
+     90%    3.98ms
+     99%    7.14ms
+  1396611 requests in 10.10s, 263.29MB read
+Requests/sec: 138244.58
+Transfer/sec:     26.06MB
+== uwsjs [multi] GET /db  t=4 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3003/db
   4 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     3.67ms    3.34ms  58.60ms   95.57%
-    Req/Sec    38.20k     9.02k   52.05k    86.00%
+    Latency     3.73ms    1.11ms  32.47ms   93.24%
+    Req/Sec    33.92k     4.78k   65.04k    87.56%
   Latency Distribution
-     50%    2.92ms
-     75%    3.19ms
-     90%    4.18ms
-     99%   20.69ms
-  2281605 requests in 15.02s, 430.13MB read
-Requests/sec: 151954.69
-Transfer/sec:     28.65MB
-== uwsjs [multi] /db  t=8 c=500 d=15s ==
-Running 15s test @ http://127.0.0.1:3003/db
+     50%    3.50ms
+     75%    3.80ms
+     90%    4.36ms
+     99%    7.64ms
+  1357073 requests in 10.10s, 255.84MB read
+Requests/sec: 134327.51
+Transfer/sec:     25.32MB
+== uwsjs [multi] GET /db  t=8 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3003/db
   8 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     2.89ms  752.96us  32.15ms   98.34%
-    Req/Sec    21.70k     1.54k   43.15k    95.27%
+    Latency     3.75ms    0.89ms  20.41ms   92.98%
+    Req/Sec    16.68k     2.18k   33.98k    94.15%
   Latency Distribution
-     50%    2.85ms
-     75%    2.90ms
-     90%    2.99ms
-     99%    3.48ms
-  2600167 requests in 15.10s, 490.19MB read
-Requests/sec: 172176.22
-Transfer/sec:     32.46MB
+     50%    3.56ms
+     75%    3.84ms
+     90%    4.34ms
+     99%    8.00ms
+  1334164 requests in 10.10s, 251.52MB read
+Requests/sec: 132037.73
+Transfer/sec:     24.89MB
+== uwsjs [multi] POST /echo  t=1 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3003/echo
+  1 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     3.61ms    4.09ms  79.92ms   97.19%
+    Req/Sec   154.27k    33.57k  186.86k    87.00%
+  Latency Distribution
+     50%    2.90ms
+     75%    3.35ms
+     90%    4.14ms
+     99%   15.78ms
+  1533279 requests in 10.02s, 257.36MB read
+Requests/sec: 153081.91
+Transfer/sec:     25.69MB
+== uwsjs [multi] POST /echo  t=2 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3003/echo
+  2 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     3.02ms  605.11us  14.08ms   89.29%
+    Req/Sec    83.22k     8.11k   97.25k    90.59%
+  Latency Distribution
+     50%    2.83ms
+     75%    3.10ms
+     90%    3.63ms
+     99%    5.62ms
+  1672374 requests in 10.10s, 280.70MB read
+Requests/sec: 165511.43
+Transfer/sec:     27.78MB
+== uwsjs [multi] POST /echo  t=4 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3003/echo
+  4 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.87ms  770.65us  30.03ms   93.02%
+    Req/Sec    43.89k     5.32k   90.97k    91.79%
+  Latency Distribution
+     50%    2.74ms
+     75%    2.91ms
+     90%    3.23ms
+     99%    5.69ms
+  1754983 requests in 10.10s, 294.57MB read
+Requests/sec: 173734.79
+Transfer/sec:     29.16MB
+== uwsjs [multi] POST /echo  t=8 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3003/echo
+  8 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.90ms  509.06us  13.28ms   89.71%
+    Req/Sec    21.44k     2.55k   44.68k    93.41%
+  Latency Distribution
+     50%    2.79ms
+     75%    2.98ms
+     90%    3.31ms
+     99%    4.92ms
+  1715103 requests in 10.10s, 287.87MB read
+Requests/sec: 169821.49
+Transfer/sec:     28.50MB
+== uwsjs [multi] POST /query  t=1 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3003/query
+  1 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     4.04ms  747.74us  22.62ms   92.24%
+    Req/Sec   124.69k    14.13k  140.53k    86.00%
+  Latency Distribution
+     50%    3.83ms
+     75%    4.16ms
+     90%    4.65ms
+     99%    7.03ms
+  1239691 requests in 10.01s, 230.54MB read
+Requests/sec: 123905.88
+Transfer/sec:     23.04MB
+== uwsjs [multi] POST /query  t=2 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3003/query
+  2 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     4.22ms    1.16ms  32.91ms   95.24%
+    Req/Sec    60.04k     6.48k   70.44k    85.64%
+  Latency Distribution
+     50%    4.00ms
+     75%    4.28ms
+     90%    4.75ms
+     99%    8.29ms
+  1206261 requests in 10.10s, 224.32MB read
+Requests/sec: 119397.61
+Transfer/sec:     22.20MB
+== uwsjs [multi] POST /query  t=4 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3003/query
+  4 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     4.10ms  611.17us  20.73ms   91.97%
+    Req/Sec    30.59k     2.49k   35.84k    91.25%
+  Latency Distribution
+     50%    3.95ms
+     75%    4.21ms
+     90%    4.59ms
+     99%    6.60ms
+  1217696 requests in 10.01s, 226.45MB read
+Requests/sec: 121704.31
+Transfer/sec:     22.63MB
+== uwsjs [multi] POST /query  t=8 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3003/query
+  8 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     4.08ms    0.98ms  30.93ms   95.82%
+    Req/Sec    15.36k     1.47k   23.66k    92.42%
+  Latency Distribution
+     50%    3.92ms
+     75%    4.15ms
+     90%    4.47ms
+     99%    7.51ms
+  1230234 requests in 10.10s, 228.78MB read
+Requests/sec: 121799.69
+Transfer/sec:     22.65MB

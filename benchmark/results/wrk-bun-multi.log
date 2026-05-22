@@ -1,168 +1,280 @@
-== bun [multi] /hello  t=1 c=500 d=15s ==
-Running 15s test @ http://127.0.0.1:3005/hello
+== bun [multi] GET /hello  t=1 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3005/hello
   1 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     2.33ms  316.83us  12.88ms   96.07%
-    Req/Sec   215.48k     9.79k  235.32k    88.00%
+    Latency     2.87ms  737.40us  28.34ms   93.07%
+    Req/Sec   176.07k    20.29k  228.03k    67.33%
   Latency Distribution
-     50%    2.28ms
-     75%    2.36ms
-     90%    2.47ms
-     99%    3.20ms
-  3216660 requests in 15.00s, 395.73MB read
-Requests/sec: 214378.47
-Transfer/sec:     26.37MB
-== bun [multi] /hello  t=2 c=500 d=15s ==
-Running 15s test @ http://127.0.0.1:3005/hello
+     50%    2.78ms
+     75%    3.04ms
+     90%    3.40ms
+     99%    4.55ms
+  1767201 requests in 10.10s, 217.41MB read
+Requests/sec: 174888.99
+Transfer/sec:     21.52MB
+== bun [multi] GET /hello  t=2 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3005/hello
   2 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     2.65ms    2.60ms  99.17ms   98.37%
-    Req/Sec   102.07k    11.19k  108.65k    90.00%
+    Latency     3.29ms    0.94ms  32.42ms   93.46%
+    Req/Sec    76.84k     9.71k   94.35k    87.13%
   Latency Distribution
-     50%    2.36ms
-     75%    2.44ms
-     90%    2.63ms
-     99%    8.74ms
-  3050532 requests in 15.03s, 375.29MB read
-Requests/sec: 203014.88
-Transfer/sec:     24.98MB
-== bun [multi] /hello  t=4 c=500 d=15s ==
-Running 15s test @ http://127.0.0.1:3005/hello
+     50%    3.06ms
+     75%    3.38ms
+     90%    3.90ms
+     99%    7.02ms
+  1543970 requests in 10.10s, 189.95MB read
+Requests/sec: 152817.43
+Transfer/sec:     18.80MB
+== bun [multi] GET /hello  t=4 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3005/hello
   4 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     2.72ms    2.45ms  76.11ms   99.30%
-    Req/Sec    48.39k     4.83k   89.30k    89.04%
+    Latency     3.12ms  745.81us  31.39ms   92.95%
+    Req/Sec    40.44k     4.00k   55.36k    90.57%
   Latency Distribution
-     50%    2.52ms
-     75%    2.69ms
-     90%    2.88ms
-     99%    3.81ms
-  2900137 requests in 15.10s, 356.79MB read
-Requests/sec: 192032.00
-Transfer/sec:     23.62MB
-== bun [multi] /hello  t=8 c=500 d=15s ==
-Running 15s test @ http://127.0.0.1:3005/hello
+     50%    2.95ms
+     75%    3.23ms
+     90%    3.64ms
+     99%    5.79ms
+  1621607 requests in 10.10s, 199.50MB read
+Requests/sec: 160476.21
+Transfer/sec:     19.74MB
+== bun [multi] GET /hello  t=8 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3005/hello
   8 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     2.68ms    1.12ms  40.16ms   98.15%
-    Req/Sec    23.58k     4.60k  168.57k    96.17%
+    Latency     3.28ms  711.93us  20.25ms   90.54%
+    Req/Sec    18.99k     2.07k   27.99k    86.74%
   Latency Distribution
-     50%    2.57ms
-     75%    2.69ms
-     90%    2.92ms
-     99%    3.88ms
-  2817883 requests in 15.10s, 346.67MB read
-Requests/sec: 186601.88
-Transfer/sec:     22.96MB
-== bun [multi] /hello/inon  t=1 c=500 d=15s ==
-Running 15s test @ http://127.0.0.1:3005/hello/inon
+     50%    3.11ms
+     75%    3.42ms
+     90%    3.89ms
+     99%    6.26ms
+  1525189 requests in 10.11s, 187.63MB read
+Requests/sec: 150918.72
+Transfer/sec:     18.57MB
+== bun [multi] GET /hello/inon  t=1 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3005/hello/inon
   1 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     2.76ms    1.67ms  40.23ms   98.02%
-    Req/Sec   189.43k    22.27k  210.70k    91.33%
+    Latency     3.15ms    1.15ms  31.29ms   96.11%
+    Req/Sec   161.51k    19.20k  184.83k    82.18%
   Latency Distribution
-     50%    2.55ms
-     75%    2.66ms
-     90%    2.86ms
-     99%    7.33ms
-  2826693 requests in 15.02s, 345.06MB read
-Requests/sec: 188187.87
-Transfer/sec:     22.97MB
-== bun [multi] /hello/inon  t=2 c=500 d=15s ==
-Running 15s test @ http://127.0.0.1:3005/hello/inon
+     50%    2.93ms
+     75%    3.23ms
+     90%    3.69ms
+     99%    7.12ms
+  1622298 requests in 10.11s, 198.03MB read
+Requests/sec: 160479.01
+Transfer/sec:     19.59MB
+== bun [multi] GET /hello/inon  t=2 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3005/hello/inon
   2 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     2.47ms  227.15us  16.23ms   94.09%
-    Req/Sec   101.60k     3.89k  109.68k    92.00%
+    Latency     2.99ms  554.07us  17.63ms   91.76%
+    Req/Sec    84.00k     7.69k   96.72k    91.09%
   Latency Distribution
-     50%    2.44ms
-     75%    2.50ms
-     90%    2.63ms
-     99%    2.96ms
-  3032129 requests in 15.01s, 370.13MB read
-Requests/sec: 202055.53
-Transfer/sec:     24.66MB
-== bun [multi] /hello/inon  t=4 c=500 d=15s ==
-Running 15s test @ http://127.0.0.1:3005/hello/inon
+     50%    2.84ms
+     75%    3.10ms
+     90%    3.44ms
+     99%    5.25ms
+  1687920 requests in 10.10s, 206.04MB read
+Requests/sec: 167071.84
+Transfer/sec:     20.39MB
+== bun [multi] GET /hello/inon  t=4 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3005/hello/inon
   4 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     2.44ms  235.18us  12.84ms   94.03%
-    Req/Sec    51.39k     1.97k   57.74k    94.21%
+    Latency     3.24ms  653.82us  22.55ms   90.07%
+    Req/Sec    38.82k     4.18k   50.53k    81.68%
   Latency Distribution
-     50%    2.41ms
-     75%    2.48ms
-     90%    2.59ms
-     99%    2.92ms
-  3088047 requests in 15.10s, 376.96MB read
-Requests/sec: 204475.60
-Transfer/sec:     24.96MB
-== bun [multi] /hello/inon  t=8 c=500 d=15s ==
-Running 15s test @ http://127.0.0.1:3005/hello/inon
+     50%    3.10ms
+     75%    3.41ms
+     90%    3.82ms
+     99%    5.82ms
+  1560302 requests in 10.10s, 190.47MB read
+Requests/sec: 154424.88
+Transfer/sec:     18.85MB
+== bun [multi] GET /hello/inon  t=8 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3005/hello/inon
   8 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     2.46ms  818.29us  36.96ms   98.82%
-    Req/Sec    25.55k     1.74k   38.34k    90.42%
+    Latency     3.09ms  546.85us  18.16ms   90.56%
+    Req/Sec    20.13k     1.77k   26.55k    90.38%
   Latency Distribution
-     50%    2.38ms
-     75%    2.46ms
-     90%    2.60ms
-     99%    3.07ms
-  3052153 requests in 15.01s, 372.58MB read
-Requests/sec: 203350.23
-Transfer/sec:     24.82MB
-== bun [multi] /db  t=1 c=500 d=15s ==
-Running 15s test @ http://127.0.0.1:3005/db
+     50%    2.96ms
+     75%    3.22ms
+     90%    3.56ms
+     99%    5.09ms
+  1602285 requests in 10.00s, 195.59MB read
+Requests/sec: 160182.38
+Transfer/sec:     19.55MB
+== bun [multi] GET /db  t=1 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3005/db
   1 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     4.04ms    1.44ms  37.46ms   96.30%
-    Req/Sec   127.14k    15.77k  138.06k    86.67%
+    Latency     4.79ms    1.70ms  37.75ms   95.87%
+    Req/Sec   107.00k    14.59k  123.52k    87.13%
   Latency Distribution
-     50%    3.75ms
-     75%    3.92ms
-     90%    4.26ms
-     99%   10.72ms
-  1897021 requests in 15.01s, 326.87MB read
-Requests/sec: 126406.30
-Transfer/sec:     21.78MB
-== bun [multi] /db  t=2 c=500 d=15s ==
-Running 15s test @ http://127.0.0.1:3005/db
+     50%    4.45ms
+     75%    4.83ms
+     90%    5.42ms
+     99%   11.86ms
+  1074631 requests in 10.11s, 185.17MB read
+Requests/sec: 106339.63
+Transfer/sec:     18.32MB
+== bun [multi] GET /db  t=2 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3005/db
   2 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     4.38ms    5.16ms 112.05ms   98.15%
-    Req/Sec    63.94k     8.55k   69.62k    92.38%
+    Latency     4.71ms    0.98ms  23.84ms   95.08%
+    Req/Sec    53.48k     5.11k   58.35k    94.06%
   Latency Distribution
-     50%    3.75ms
-     75%    3.89ms
-     90%    4.14ms
-     99%   20.76ms
-  1921745 requests in 15.10s, 331.13MB read
-Requests/sec: 127233.23
-Transfer/sec:     21.92MB
-== bun [multi] /db  t=4 c=500 d=15s ==
-Running 15s test @ http://127.0.0.1:3005/db
+     50%    4.51ms
+     75%    4.86ms
+     90%    5.31ms
+     99%    9.29ms
+  1074713 requests in 10.10s, 185.18MB read
+Requests/sec: 106379.43
+Transfer/sec:     18.33MB
+== bun [multi] GET /db  t=4 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3005/db
   4 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     4.65ms    3.30ms  59.67ms   93.94%
-    Req/Sec    29.20k     7.66k  120.55k    84.86%
+    Latency     5.03ms    1.50ms  22.96ms   92.73%
+    Req/Sec    25.24k     4.08k   30.77k    80.69%
+  Latency Distribution
+     50%    4.61ms
+     75%    5.18ms
+     90%    5.99ms
+     99%   12.53ms
+  1014648 requests in 10.10s, 174.83MB read
+Requests/sec: 100420.79
+Transfer/sec:     17.30MB
+== bun [multi] GET /db  t=8 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3005/db
+  8 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     4.84ms    0.94ms  26.27ms   91.59%
+    Req/Sec    12.88k     1.52k   19.76k    89.45%
+  Latency Distribution
+     50%    4.64ms
+     75%    5.05ms
+     90%    5.54ms
+     99%    8.98ms
+  1033460 requests in 10.11s, 178.08MB read
+Requests/sec: 102226.29
+Transfer/sec:     17.61MB
+== bun [multi] POST /echo  t=1 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3005/echo
+  1 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     3.89ms    0.95ms  23.27ms   94.88%
+    Req/Sec   129.97k    13.81k  151.25k    91.09%
+  Latency Distribution
+     50%    3.68ms
+     75%    4.02ms
+     90%    4.45ms
+     99%    7.89ms
+  1305382 requests in 10.11s, 197.94MB read
+Requests/sec: 129172.45
+Transfer/sec:     19.59MB
+== bun [multi] POST /echo  t=2 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3005/echo
+  2 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     4.05ms  789.43us  22.25ms   93.56%
+    Req/Sec    62.11k     6.32k   69.58k    87.13%
   Latency Distribution
      50%    3.89ms
-     75%    4.15ms
-     90%    5.52ms
-     99%   20.40ms
-  1746085 requests in 15.10s, 300.86MB read
-Requests/sec: 115610.04
-Transfer/sec:     19.92MB
-== bun [multi] /db  t=8 c=500 d=15s ==
-Running 15s test @ http://127.0.0.1:3005/db
+     75%    4.21ms
+     90%    4.60ms
+     99%    7.60ms
+  1248222 requests in 10.10s, 189.27MB read
+Requests/sec: 123546.94
+Transfer/sec:     18.73MB
+== bun [multi] POST /echo  t=4 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3005/echo
+  4 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     4.39ms    1.39ms  31.07ms   90.98%
+    Req/Sec    28.92k     5.52k   79.48k    81.80%
+  Latency Distribution
+     50%    4.04ms
+     75%    4.57ms
+     90%    5.36ms
+     99%   10.85ms
+  1154282 requests in 10.10s, 175.03MB read
+Requests/sec: 114275.42
+Transfer/sec:     17.33MB
+== bun [multi] POST /echo  t=8 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3005/echo
   8 threads and 500 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     3.89ms  734.17us  22.53ms   96.04%
-    Req/Sec    16.08k     1.31k   29.85k    92.61%
+    Latency     4.01ms    0.91ms  22.24ms   94.13%
+    Req/Sec    15.60k     1.82k   20.08k    91.12%
   Latency Distribution
-     50%    3.81ms
-     75%    3.92ms
-     90%    4.09ms
-     99%    6.70ms
-  1926549 requests in 15.10s, 331.96MB read
-Requests/sec: 127549.11
-Transfer/sec:     21.98MB
+     50%    3.80ms
+     75%    4.13ms
+     90%    4.58ms
+     99%    8.16ms
+  1242312 requests in 10.01s, 188.38MB read
+Requests/sec: 124142.19
+Transfer/sec:     18.82MB
+== bun [multi] POST /query  t=1 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3005/query
+  1 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     5.39ms    1.01ms  22.93ms   95.26%
+    Req/Sec    93.62k     9.17k  103.02k    88.00%
+  Latency Distribution
+     50%    5.17ms
+     75%    5.42ms
+     90%    5.89ms
+     99%   10.88ms
+  930561 requests in 10.01s, 157.97MB read
+Requests/sec:  93001.77
+Transfer/sec:     15.79MB
+== bun [multi] POST /query  t=2 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3005/query
+  2 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     5.36ms    1.00ms  20.93ms   95.06%
+    Req/Sec    46.97k     4.44k   50.46k    93.56%
+  Latency Distribution
+     50%    5.17ms
+     75%    5.42ms
+     90%    5.89ms
+     99%   10.25ms
+  944125 requests in 10.10s, 160.27MB read
+Requests/sec:  93441.35
+Transfer/sec:     15.86MB
+== bun [multi] POST /query  t=4 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3005/query
+  4 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     5.57ms    1.57ms  33.71ms   95.17%
+    Req/Sec    22.82k     2.35k   30.13k    87.10%
+  Latency Distribution
+     50%    5.27ms
+     75%    5.61ms
+     90%    6.18ms
+     99%   12.14ms
+  914738 requests in 10.10s, 155.28MB read
+Requests/sec:  90548.46
+Transfer/sec:     15.37MB
+== bun [multi] POST /query  t=8 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3005/query
+  8 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     5.72ms    1.98ms  42.32ms   95.43%
+    Req/Sec    11.05k     1.40k   17.21k    79.75%
+  Latency Distribution
+     50%    5.35ms
+     75%    5.85ms
+     90%    6.46ms
+     99%   12.52ms
+  880779 requests in 10.02s, 149.52MB read
+Requests/sec:  87893.89
+Transfer/sec:     14.92MB

@@ -18,8 +18,19 @@ It is intentionally thin:
 - Async dispatch uses a shared-memory ring so the request hot path crosses
   cgo zero times for shared-mode handlers.
 
+## Benchmark Snapshot
+
+[![gogo single-worker HTTP benchmark throughput](benchmark/results/http-benchmark-throughput.svg)](#benchmarking)
+
+gogo leads every single-worker route in the local HTTP benchmark matrix,
+including static GETs, parameterized routes, SQLite reads, body echo, and
+body-parse + SQLite query paths.
+
+[Jump to benchmark details](#benchmarking)
+
 ## Table of Contents
 
+- [Benchmark Snapshot](#benchmark-snapshot)
 - [Install Native Dependencies](#install-native-dependencies)
 - [Hello World](#hello-world)
 - [Routing](#routing)
@@ -153,6 +164,8 @@ app.Get("/health", gogo.Reply{
 
 ### Basic routes
 
+Sync route handlers run on the uWS loop thread and should stay fast:
+
 ```go
 app.Get("/users", listUsers)
 app.Post("/users", createUser)
@@ -163,6 +176,48 @@ app.Options("/users", optionsUsers)
 app.Head("/users", headUsers)
 app.Any("/echo", anyMethod)
 ```
+
+Async route handlers run on a goroutine and receive a request snapshot:
+
+```go
+app.GetAsync("/users/:id", showUserFromDB)
+app.PostAsync("/uploads", 10<<20, uploadFile) // max body bytes, then handler
+```
+
+The same route registration APIs are available on a `*gogo.Router` returned
+by `Group` or `Mount`, so scoped routes can use sync and async handlers:
+
+```go
+api := app.Group("/api")
+api.Get("/health", health)
+api.GetAsync("/users/:id", showUserFromDB)
+api.Post("/users", createUser)
+api.PostAsync("/uploads", 10<<20, uploadFile)
+```
+
+Route API surface:
+
+| API | `App` | `Router` | handler / target |
+|---|---:|---:|---|
+| `Get(pattern, target)` | yes | yes | `Handler`, `func(*Response, *Request)`, `Reply`, `string`, or `[]byte` |
+| `GetAsync(pattern, handler)` | yes | yes | `AsyncHandler` |
+| `Post(pattern, handler)` | yes | yes | `Handler` |
+| `PostAsync(pattern, maxBodyBytes, handler)` | yes | yes | `PostAsyncHandler` with collected body |
+| `Put(pattern, handler)` | yes | yes | `Handler` |
+| `Patch(pattern, handler)` | yes | yes | `Handler` |
+| `Delete(pattern, handler)` | yes | yes | `Handler` |
+| `Options(pattern, handler)` | yes | yes | `Handler` |
+| `Head(pattern, handler)` | yes | yes | `Handler` |
+| `Any(pattern, handler)` | yes | yes | `Handler` for every HTTP method |
+| `WebSocket(pattern, behavior)` | yes | yes | `WebSocketBehavior` |
+| `Group(prefix, ...middleware)` | yes | yes | returns a scoped `*Router` |
+| `Use(...middleware)` | yes | yes | sync middleware; `App.Use` also supports a path prefix |
+| `UseAsync(...middleware)` | yes | yes | async middleware for `GetAsync` / `PostAsync`; `App.UseAsync` also supports a path prefix |
+| `Mount(prefix, func(*Router))` | yes | no | callback sugar over `Group` |
+| `Name(name, pattern)` | yes | no | names a route pattern for reverse routing |
+| `URL(name, params)` | yes | no | builds a URL for a named route |
+| `NotFound(handler)` | yes | no | fallback for unmatched routes |
+| `MethodNotAllowed(handler)` | yes | no | fallback for known path with unsupported method |
 
 ### Route parameters
 
@@ -1048,10 +1103,24 @@ curl -N http://localhost:3000/events
 
 ## WebSocket
 
+Register a WebSocket route with `app.WebSocket` or `router.WebSocket`.
+Browser clients connect with the normal `WebSocket` API. Because browsers
+send an `Origin` header, browser-facing routes should include an `Upgrade`
+callback that explicitly accepts or rejects the handshake.
+
 ### Echo server
 
 ```go
 app.WebSocket("/ws", gogo.WebSocketBehavior{
+    Upgrade: func(ctx *gogo.UpgradeContext) {
+        // Local dev page served from the same app.
+        origin := ctx.Header("origin")
+        if origin != "" && origin != "http://localhost:3000" {
+            ctx.Reject(403, "bad origin")
+            return
+        }
+        ctx.Accept("")
+    },
     Open: func(ws *gogo.WebSocket) {
         log.Println("client connected")
         ws.SendText("welcome\n")
@@ -1068,6 +1137,70 @@ app.WebSocket("/ws", gogo.WebSocketBehavior{
     IdleTimeout:      120 * time.Second,
     MaxBackpressure:  64 * 1024,
 })
+```
+
+Browser-side:
+
+```html
+<script>
+const ws = new WebSocket('ws://localhost:3000/ws');
+
+ws.addEventListener('open', () => {
+    ws.send('hello from the browser');
+});
+
+ws.addEventListener('message', e => {
+    console.log('server:', e.data);
+});
+</script>
+```
+
+Or from the CLI:
+
+```sh
+websocat ws://localhost:3000/ws
+```
+
+### Upgrade gate
+
+For browser clients, add an `Upgrade` callback and explicitly accept or
+reject the handshake. This is where origin checks, token checks,
+subprotocol negotiation, and per-connection user data belong.
+
+```go
+app.WebSocket("/ws", gogo.WebSocketBehavior{
+    Upgrade: func(ctx *gogo.UpgradeContext) {
+        if ctx.Header("origin") != "https://app.example.com" {
+            ctx.Reject(403, "bad origin")
+            return
+        }
+
+        user, ok := loadUserFromToken(ctx.QueryParam("token"))
+        if !ok {
+            ctx.Reject(401, "bad token")
+            return
+        }
+
+        ctx.SetUserData(user) // available later via ws.UserData()
+        ctx.Accept("")        // accept with no subprotocol
+    },
+    Open: func(ws *gogo.WebSocket) {
+        user := ws.UserData().(*User)
+        ws.SendText("welcome, " + user.Name + "\n")
+    },
+    Message: func(ws *gogo.WebSocket, msg []byte, op gogo.OpCode) {
+        ws.Send(msg, op)
+    },
+})
+```
+
+Browser-side with a token:
+
+```html
+<script>
+const token = encodeURIComponent(window.localStorage.getItem('token') || '');
+const ws = new WebSocket(`wss://api.example.com/ws?token=${token}`);
+</script>
 ```
 
 ### Pub/Sub
@@ -1488,17 +1621,22 @@ turns the parts Go needs into a small C ABI.
 
 ## Benchmarking
 
-There are five comparable HTTP benchmark servers:
+There are six comparable HTTP benchmark servers, spanning Go, Node,
+Bun, and Rust:
 
-- `benchmark/gogo`: this binding
-- `benchmark/nethttp`: Go standard library `net/http`
-- `benchmark/fiber`: gofiber/fiber on fasthttp
-- `benchmark/node-uwebsockets`: uWebSockets.js on Node
-- `benchmark/bun-elysia`: Elysia on Bun
+| benchmark dir | framework | language / runtime |
+|---|---|---|
+| `benchmark/gogo`            | this binding (uWebSockets) | Go (cgo → C++) |
+| `benchmark/actix`           | actix-web 4 (release + fat LTO) | Rust |
+| `benchmark/fiber`           | gofiber/fiber (fasthttp)     | Go |
+| `benchmark/node-uwebsockets`| uWebSockets.js               | JavaScript (Node) |
+| `benchmark/bun-elysia`      | Elysia                       | TypeScript (Bun) |
+| `benchmark/nethttp`         | Go standard library `net/http` | Go |
 
-`scripts/bench_wrk.sh` starts each server, hits `/hello`, `/hello/:name`,
-and `/db` with `wrk`, then tears it down. See the script header for the
-env knobs.
+`scripts/bench_wrk.sh` starts each server, hits the GET endpoints
+(`/hello`, `/hello/:name`, `/db`), then POSTs against `/echo` (sync
+body-echo) and `/query` (body carries an id, server runs a SQLite
+lookup), and tears it down. See the script header for the env knobs.
 
 Go benchmark dependencies live in the nested `benchmark` module so importing
 gogo does not pull benchmark-only frameworks or database drivers into your
@@ -1506,23 +1644,143 @@ application module graph.
 
 ### Results
 
-Single-worker, median req/s across `wrk -t {1,2,4,8} -c 500 -d 15s`,
-Apple M3 8-core, macOS 26.
+Median across `wrk -t {1,2,4,8} -c 500 -d 10s` — this is not an
+average of hand-picked thread counts. Each result comes from the
+same four `wrk` thread counts, sorted, then medianed.
 
-| framework  |       `/hello` | `/hello/:name` |          `/db` |
-|------------|---------------:|---------------:|---------------:|
-| **gogo**   |    **296,793** |    **273,654** |    **192,319** |
-| uwsjs      |        248,810 |        246,972 |        167,335 |
-| fiber      |        243,596 |        227,940 |         98,999 |
-| bun+elysia |        210,421 |        201,456 |        131,955 |
-| net/http   |        148,165 |        142,569 |         74,639 |
+- `POST /echo` — sync handler reads the body and writes it back
+  unchanged (50-byte JSON). Exercises the pure body-collection +
+  response-write path. gogo uses `app.Post` here (no goroutine
+  handoff).
+- `POST /query` — body carries an integer id; handler parses it and
+  runs `SELECT … FROM users WHERE id = ?` against SQLite, returns the
+  row. Realistic API shape: body parse + blocking I/O + JSON
+  response. gogo uses `PostAsync` here — the small body fits the
+  shared-dispatch cap so the request crosses zero cgo callbacks on
+  the hot path, and the handler runs on a worker goroutine so the
+  blocking `sql.DB.QueryRow` doesn't pin the loop thread.
+
+> **Hardware note** — these numbers come from a local Apple M3 laptop
+> (Darwin arm64, 4 performance cores + 4 efficiency cores, 16 GB RAM).
+> The run used Go 1.26.3, Node 22.15.0, Bun 1.3.14, Rust 1.95.0, and
+> `wrk` 4.2.0. Multi-worker mode is capped at 4 server workers/processes
+> for every framework (`MULTI_WORKERS=4`), matching the performance-core
+> count. Using all 8 logical CPUs put event loops on efficiency cores and
+> made the server compete harder with `wrk` and async helper goroutines,
+> which inflated tail latency and made the comparison less fair.
+> Absolute rps is hardware-sensitive; compare the relative shape on your
+> own target machine before making capacity decisions.
+
+#### Highlights
+
+- **gogo has the highest throughput in every single-worker workload**
+  in this matrix.
+- **gogo keeps the top 4-worker throughput in every workload**
+  while staying inside the 4 performance-core cap.
+- **Latency stays competitive while leading throughput**: gogo p99 is
+  within a few milliseconds of the best tail in most routes, and avoids
+  the large SQLite p99 spikes seen in Actix and net/http.
+
+#### Throughput summary
+
+| workload | gogo single | best non-gogo single | gogo 4-worker | best non-gogo 4-worker |
+|---|---:|---:|---:|---:|
+| `GET /hello` | **269k** | uWS.js 206k | **263k** | Actix 192k |
+| `GET /hello/:name` | **254k** | uWS.js 208k | **248k** | uWS.js 206k |
+| `GET /db` | **167k** | uWS.js 140k | **167k** | uWS.js 136k |
+| `POST /echo` | **205k** | Fiber 185k | **199k** | Actix 186k |
+| `POST /query` | **153k** | uWS.js 127k | **132k** | uWS.js 122k |
+
+#### Tail latency summary
+
+Lower p99 is better.
+
+| workload | gogo single p99 | best non-gogo single p99 | gogo 4-worker p99 | best non-gogo 4-worker p99 |
+|---|---:|---:|---:|---:|
+| `GET /hello` | 3.6 ms | uWS.js 3.3 ms | 3.9 ms | Fiber 5.4 ms |
+| `GET /hello/:name` | 3.6 ms | uWS.js 3.8 ms | 3.9 ms | Fiber 4.9 ms |
+| `GET /db` | 7.5 ms | uWS.js 5.1 ms | 7.8 ms | uWS.js 7.4 ms |
+| `POST /echo` | 3.6 ms | uWS.js 3.7 ms | 4.9 ms | uWS.js 5.7 ms |
+| `POST /query` | 8.1 ms | uWS.js 5.3 ms | 10.9 ms | uWS.js 7.3 ms |
+
+<details>
+<summary>Full per-framework median results</summary>
+
+Each cell shows req/s on the first line, `p50 / p99` latency on the
+second.
+
+#### Single worker (1 thread / event loop)
+
+| framework  | language | `/hello`                          | `/hello/:name`                    | `/db`                              | `POST /echo`                       | `POST /query`                      |
+|------------|----------|----------------------------------:|----------------------------------:|-----------------------------------:|-----------------------------------:|-----------------------------------:|
+| **gogo**   | Go (cgo) | 269k rps<br>p50 1.6 / p99 3.6 ms | 254k rps<br>p50 1.8 / p99 3.6 ms | 167k rps<br>p50 2.7 / p99 7.5 ms | 205k rps<br>p50 2.3 / p99 3.6 ms | 153k rps<br>p50 3.0 / p99 8.1 ms |
+| uwsjs      | JS (Node)| 206k rps<br>p50 2.3 / p99 3.3 ms | 208k rps<br>p50 2.3 / p99 3.8 ms | 140k rps<br>p50 3.4 / p99 5.1 ms | 181k rps<br>p50 2.7 / p99 3.7 ms | 127k rps<br>p50 3.8 / p99 5.3 ms |
+| fiber      | Go       | 203k rps<br>p50 2.3 / p99 4.0 ms | 199k rps<br>p50 2.4 / p99 4.0 ms |  87k rps<br>p50 5.5 / p99 7.8 ms | 185k rps<br>p50 2.6 / p99 4.0 ms |  88k rps<br>p50 5.5 / p99 8.3 ms |
+| actix      | Rust     | 177k rps<br>p50 2.6 / p99 5.1 ms | 185k rps<br>p50 2.6 / p99 5.5 ms |  99k rps<br>p50 4.7 / p99 28.0 ms | 170k rps<br>p50 2.8 / p99 5.2 ms |  78k rps<br>p50 5.4 / p99 36.4 ms |
+| bun+elysia | TS (Bun) | 155k rps<br>p50 3.1 / p99 6.4 ms | 146k rps<br>p50 3.2 / p99 7.9 ms | 101k rps<br>p50 4.8 / p99 11.1 ms | 116k rps<br>p50 4.1 / p99 8.7 ms |  87k rps<br>p50 5.5 / p99 12.5 ms |
+| net/http   | Go       | 120k rps<br>p50 3.9 / p99 6.9 ms | 123k rps<br>p50 3.8 / p99 6.1 ms |  64k rps<br>p50 7.6 / p99 10.7 ms | 102k rps<br>p50 4.5 / p99 7.6 ms |  62k rps<br>p50 8.0 / p99 11.2 ms |
+
+#### Multi-worker (4 server workers / processes)
+
+| framework  | language | `/hello`                          | `/hello/:name`                    | `/db`                              | `POST /echo`                       | `POST /query`                      |
+|------------|----------|----------------------------------:|----------------------------------:|-----------------------------------:|-----------------------------------:|-----------------------------------:|
+| **gogo**   | Go (cgo) | 263k rps<br>p50 1.7 / p99 3.9 ms | 248k rps<br>p50 1.8 / p99 3.9 ms | 167k rps<br>p50 2.7 / p99 7.8 ms | 199k rps<br>p50 2.4 / p99 4.9 ms | 132k rps<br>p50 3.4 / p99 10.9 ms |
+| actix      | Rust     | 192k rps<br>p50 1.6 / p99 11.6 ms | 194k rps<br>p50 1.6 / p99 8.0 ms | 114k rps<br>p50 2.8 / p99 34.6 ms | 186k rps<br>p50 1.7 / p99 10.3 ms | 106k rps<br>p50 3.1 / p99 35.6 ms |
+| uwsjs      | JS (Node)| 181k rps<br>p50 2.5 / p99 5.5 ms | 206k rps<br>p50 2.3 / p99 5.3 ms | 136k rps<br>p50 3.5 / p99 7.4 ms | 168k rps<br>p50 2.8 / p99 5.7 ms | 122k rps<br>p50 3.9 / p99 7.3 ms |
+| net/http   | Go       | 179k rps<br>p50 1.8 / p99 7.8 ms | 161k rps<br>p50 2.1 / p99 10.3 ms |  79k rps<br>p50 5.9 / p99 27.5 ms | 153k rps<br>p50 2.3 / p99 9.5 ms |  87k rps<br>p50 5.4 / p99 21.9 ms |
+| fiber      | Go       | 174k rps<br>p50 2.7 / p99 5.4 ms | 193k rps<br>p50 2.5 / p99 4.9 ms |  86k rps<br>p50 5.6 / p99 10.4 ms | 163k rps<br>p50 2.8 / p99 5.9 ms |  71k rps<br>p50 6.7 / p99 13.2 ms |
+| bun+elysia | TS (Bun) | 157k rps<br>p50 3.0 / p99 6.0 ms | 160k rps<br>p50 2.9 / p99 5.5 ms | 104k rps<br>p50 4.6 / p99 10.6 ms | 124k rps<br>p50 3.8 / p99 8.0 ms |  92k rps<br>p50 5.2 / p99 11.5 ms |
+
+</details>
 
 `/db` reads one row from a 1000-row SQLite table with a random id —
 exercises the framework + driver, not just the HTTP layer.
+
+Notes on the spread:
+
+- **Throughput**: gogo leads the single-worker table on all five
+  endpoints and keeps the strongest 4-worker throughput on all five
+  endpoints on this machine. uwsjs remains close on the uWebSockets-shaped
+  routes, while Actix is competitive on pure GET/echo paths and does well
+  on SQLite throughput.
+- **Tail latency (p99)**: single-worker uwsjs has the tightest tail on
+  `/db` and `POST /query`; gogo is close while carrying higher
+  throughput. In 4-worker mode, gogo and uwsjs keep the tightest p99
+  on most routes. Actix and net/http have good median latency and
+  throughput but still show wider p99 on the SQLite endpoints.
+- **POST /echo (sync)** — gogo's sync `app.Post` + `Response.Body`
+  collects the body on the loop thread and writes it back without a
+  goroutine handoff. It is the fastest single-worker echo result here;
+  it also has the top 4-worker echo rps. Earlier versions of this
+  benchmark used `PostAsync` for /echo and lost to actix here; the
+  fair-comparison shape is sync for pure echo.
+- **POST /query (PostAsync + SQLite)** — gogo is the fastest
+  single-worker result and remains near the top in 4-worker mode,
+  because the small body hits the shared-dispatch fast path (zero cgo
+  callbacks) and the blocking SQLite query runs on a worker goroutine
+  without stalling the loop. uwsjs has the tightest 4-worker p99 here;
+  Actix and net/http have higher throughput than before with the
+  4-worker cap, but wider tails.
+- **Actix Rust** posts strong GET and echo throughput, especially with
+  multiple workers, but this run still shows wider SQLite p99 than the
+  uWS-backed servers.
+- **Fiber** is a very strong pure-Go baseline on this Mac: fast on GET
+  and echo, and with consistently tight p99. Its SQLite endpoints still
+  trail gogo and uwsjs on throughput.
+- **net/http** — the standard-library baseline is much faster on this
+  Apple Silicon run than the older Linux-container numbers suggested.
+  The 4-worker cap removes the extreme SQLite p99 spikes seen when
+  all 8 logical CPUs were used, though the SQLite tail is still wider
+  than the uWS-backed servers.
 
 To reproduce:
 
 ```sh
 export CGO_ENABLED=1
+# Pre-build the Actix release binary once (skip if you don't want
+# to compare against Rust):
+cargo build --release --manifest-path benchmark/actix/Cargo.toml
+# On this Apple M3 machine, the default multi-worker cap is 4.
+# Override with MULTI_WORKERS=N if your target host has a different shape.
 ./scripts/bench_wrk.sh
 ```

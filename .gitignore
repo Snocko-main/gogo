@@ -1,4 +1,5 @@
 .tools/
 benchmark/node-uwebsockets/node_modules/
+benchmark/actix/target/
 third_party/
 *node_modules*

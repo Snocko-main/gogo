@@ -3,11 +3,14 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"io"
 	"log"
 	"math/rand/v2"
 	"net/http"
 	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -86,6 +89,38 @@ func main() {
 		var name, email, role string
 		err := dbConn.QueryRow("SELECT name, email, role FROM users WHERE id = ?", id).Scan(&name, &email, &role)
 		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"id":%d,"name":%q,"email":%q,"role":%q}`+"\n", id, name, email, role)
+	})
+
+	// POST /echo: read the body, write it back unchanged.
+	mux.HandleFunc("POST /echo", func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64*1024))
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(body)
+	})
+
+	// POST /query: body is an integer id; look it up in SQLite and
+	// return the row as JSON.
+	mux.HandleFunc("POST /query", func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 256))
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		id, _ := strconv.Atoi(strings.TrimSpace(string(body)))
+		if id < 1 || id > 1000 {
+			id = 1
+		}
+		var name, email, role string
+		if err := dbConn.QueryRow("SELECT name, email, role FROM users WHERE id = ?", id).Scan(&name, &email, &role); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
