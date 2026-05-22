@@ -354,8 +354,11 @@ type WebSocketBehavior struct {
 // from a session token via a DB lookup), use AsyncMiddleware with UseAsync;
 // it runs on a goroutine and is free to block.
 //
-// Static replies (Reply, string, []byte targets of App.Get) and GetShared
-// routes bypass middleware because they have no Go-side handler to wrap.
+// Static replies (Reply, string, []byte targets of App.Get) use their C++
+// fast path only when no matching sync middleware or typed-param constraint
+// needs a Go-side handler. GetAsync / PostAsync keep their shared-memory fast
+// path when only async-capable middleware applies; sync-only middleware makes
+// them fall back to a wrapped sync entry point.
 type Middleware func(next Handler) Handler
 
 // AsyncMiddleware wraps an AsyncHandler the same way Middleware wraps a

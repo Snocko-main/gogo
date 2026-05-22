@@ -95,10 +95,11 @@
 // "/api" mean the same thing — trailing "/*" or "/**" is stripped. Without a
 // pattern, middleware applies to every later-registered route.
 //
-// Path matching happens at route registration, so per-request overhead is
-// just a function call through the matched chain — no string comparison per
-// request. Static replies (Reply, string, []byte targets of app.Get) bypass
-// middleware.
+// Global middleware composes at route registration with no per-request string
+// comparison. Scoped middleware matches the live request URL so dynamic routes
+// cannot bypass a scoped guard. Static replies (Reply, string, []byte targets
+// of app.Get) use the zero-cgo fast path only when no matching sync middleware
+// or typed-param constraint needs to run.
 //
 // # Async middleware
 //
