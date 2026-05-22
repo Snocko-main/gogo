@@ -5,6 +5,7 @@ package gogo_test
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -5826,6 +5827,82 @@ func TestWSHubPublishFromRequiresTrackedSocket(t *testing.T) {
 	}
 	if err := b.expectNoMessage(300 * time.Millisecond); err != nil {
 		t.Errorf("untracked PublishFrom should not broadcast: %v", err)
+	}
+}
+
+type blockingWSHubAdapter struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (a *blockingWSHubAdapter) Start(context.Context, func(gogo.WSHubMessage)) error {
+	return nil
+}
+
+func (a *blockingWSHubAdapter) Publish(context.Context, gogo.WSHubMessage) error {
+	select {
+	case a.entered <- struct{}{}:
+	default:
+	}
+	<-a.release
+	return nil
+}
+
+func (a *blockingWSHubAdapter) Close() error { return nil }
+
+func TestWSHubPublishFromDoesNotBlockOnAdapter(t *testing.T) {
+	adapter := &blockingWSHubAdapter{
+		entered: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	hub := gogo.NewWSHub(
+		gogo.WithWSHubNodeID("test-node"),
+		gogo.WithWSHubAdapter(adapter),
+		gogo.WithWSHubAdapterQueueSize(1),
+	)
+	defer func() {
+		close(adapter.release)
+		if err := hub.Close(); err != nil {
+			t.Errorf("hub.Close: %v", err)
+		}
+	}()
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		hub.WebSocket(app, "/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				hub.Subscribe(ws, "room")
+			},
+			Message: func(ws *gogo.WebSocket, msg []byte, op gogo.OpCode) {
+				if err := hub.PublishFrom(ws, "room", msg, op); err != nil {
+					t.Errorf("PublishFrom: %v", err)
+				}
+				ws.SendText("after")
+			},
+		})
+	})
+	defer teardown()
+
+	a, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial a: %v", err)
+	}
+	defer a.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	if err := a.SendText("hub hello"); err != nil {
+		t.Fatalf("a.SendText: %v", err)
+	}
+	gotA, err := a.ReadText(500 * time.Millisecond)
+	if err != nil {
+		t.Fatalf("PublishFrom blocked on adapter publish: %v", err)
+	}
+	if gotA != "after" {
+		t.Errorf("a received %q, want after", gotA)
+	}
+	select {
+	case <-adapter.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("adapter publish was not queued")
 	}
 }
 

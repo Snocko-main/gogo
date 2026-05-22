@@ -16,10 +16,16 @@ var (
 	// ErrWSHubClosed is returned when a publish or start is attempted after Close.
 	ErrWSHubClosed = errors.New("gogo: websocket hub is closed")
 
+	// ErrWSHubAdapterQueueFull is returned by PublishFrom when the async
+	// adapter queue is full. Local subscribers have already been fanned out.
+	ErrWSHubAdapterQueueFull = errors.New("gogo: websocket hub adapter queue is full")
+
 	// ErrWSHubUntrackedSocket is returned when PublishFrom cannot identify the
 	// sender. Register routes with WSHub.WebSocket or WSHub.Wrap.
 	ErrWSHubUntrackedSocket = errors.New("gogo: websocket hub socket is not tracked; register route with hub.WebSocket or hub.Wrap")
 )
+
+const defaultWSHubAdapterQueueSize = 1024
 
 var fallbackNodeCounter atomic.Uint64
 
@@ -41,6 +47,10 @@ type WSHub struct {
 
 	startMu        sync.Mutex
 	adapterStarted bool
+	adapterQueue   chan WSHubMessage
+	adapterQueueSz int
+	adapterOnce    sync.Once
+	adapterWG      sync.WaitGroup
 	closed         atomic.Bool
 	closeOnce      sync.Once
 	ctx            context.Context
@@ -73,22 +83,37 @@ func WithWSHubAdapter(adapter WSHubAdapter) WSHubOption {
 	}
 }
 
+// WithWSHubAdapterQueueSize sets the bounded async adapter queue used by
+// PublishFrom. Larger queues absorb Redis/network bursts without blocking the
+// WebSocket loop thread.
+func WithWSHubAdapterQueueSize(size int) WSHubOption {
+	return func(h *WSHub) {
+		if size > 0 {
+			h.adapterQueueSz = size
+		}
+	}
+}
+
 // NewWSHub creates a WebSocket hub. With no adapter, it still fans out across
 // every App attached in the current process, which is enough for RunMultiCore.
 func NewWSHub(opts ...WSHubOption) *WSHub {
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &WSHub{
-		nodeID:  randomNodeID(),
-		apps:    make(map[*App]struct{}),
-		sockets: make(map[uintptr]*hubSocket),
-		members: make(map[string]map[uintptr]struct{}),
-		ctx:     ctx,
-		cancel:  cancel,
+		nodeID:         randomNodeID(),
+		apps:           make(map[*App]struct{}),
+		sockets:        make(map[uintptr]*hubSocket),
+		members:        make(map[string]map[uintptr]struct{}),
+		adapterQueueSz: defaultWSHubAdapterQueueSize,
+		ctx:            ctx,
+		cancel:         cancel,
 	}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(h)
 		}
+	}
+	if h.adapter != nil {
+		h.ensureAdapterWorker()
 	}
 	return h
 }
@@ -280,7 +305,7 @@ func (h *WSHub) PublishFrom(ws *WebSocket, topic string, message []byte, opcode 
 		origin.PublishBatch(direct)
 	}
 	h.publishLocal(msg, origin)
-	return h.publishAdapter(msg)
+	return h.publishAdapterAsync(msg)
 }
 
 // Close stops the adapter subscription. It does not close any attached App.
@@ -292,6 +317,7 @@ func (h *WSHub) Close() error {
 	h.closeOnce.Do(func() {
 		h.closed.Store(true)
 		h.cancel()
+		h.adapterWG.Wait()
 		if h.adapter != nil {
 			err = h.adapter.Close()
 		}
@@ -354,7 +380,47 @@ func (h *WSHub) publishAdapter(msg WSHubMessage) error {
 	if err := h.Start(); err != nil {
 		return err
 	}
-	return h.adapter.Publish(h.ctx, msg)
+	return h.adapter.Publish(context.Background(), msg)
+}
+
+func (h *WSHub) publishAdapterAsync(msg WSHubMessage) error {
+	if h.adapter == nil {
+		return nil
+	}
+	if h.closed.Load() {
+		return ErrWSHubClosed
+	}
+	if h.adapterQueue == nil {
+		return h.publishAdapter(msg)
+	}
+	select {
+	case h.adapterQueue <- msg:
+		return nil
+	case <-h.ctx.Done():
+		return ErrWSHubClosed
+	default:
+		return ErrWSHubAdapterQueueFull
+	}
+}
+
+func (h *WSHub) ensureAdapterWorker() {
+	h.adapterOnce.Do(func() {
+		h.adapterQueue = make(chan WSHubMessage, h.adapterQueueSz)
+		h.adapterWG.Add(1)
+		go h.runAdapterWorker()
+	})
+}
+
+func (h *WSHub) runAdapterWorker() {
+	defer h.adapterWG.Done()
+	for {
+		select {
+		case <-h.ctx.Done():
+			return
+		case msg := <-h.adapterQueue:
+			_ = h.publishAdapter(msg)
+		}
+	}
 }
 
 func (h *WSHub) remember(ws *WebSocket, app *App) {

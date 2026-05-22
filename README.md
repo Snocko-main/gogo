@@ -1240,8 +1240,10 @@ hub.WebSocket(app, "/chat", gogo.WebSocketBehavior{
 `PublishFrom` skips the sender and is safe to call from any goroutine. Register
 the route with `hub.WebSocket` or `hub.Wrap`, and subscribe with
 `hub.Subscribe`, so the hub can track socket membership without touching uWS
-socket state from the wrong loop thread. From worker goroutines, scheduled
-jobs, or HTTP handlers, use `hub.Publish` or `hub.PublishBatch`.
+socket state from the wrong loop thread. Adapter publishes from `PublishFrom`
+are queued onto a hub worker, so Redis/network I/O never blocks the WebSocket
+loop. From worker goroutines, scheduled jobs, or HTTP handlers, use
+`hub.Publish` or `hub.PublishBatch`.
 
 ```go
 go func() {
@@ -1272,6 +1274,9 @@ import redisadapter "github.com/Snocko-main/gogo/adapters/redis"
 
 adapter, err := redisadapter.New(redisadapter.Options{
     URL: "redis://localhost:6379/0",
+    // Optional: tune burst absorption before go-redis can drop Pub/Sub
+    // messages because the receive channel is full.
+    ChannelSize: 4096,
 })
 if err != nil {
     log.Fatal(err)

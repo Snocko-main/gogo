@@ -41,3 +41,14 @@ func TestRedisGlobEscape(t *testing.T) {
 		t.Fatalf("redisGlobEscape = %q, want %q", got, want)
 	}
 }
+
+func TestNewSetsDefaultChannelSize(t *testing.T) {
+	adapter, err := New(Options{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer adapter.Close()
+	if adapter.chSize != defaultChannelSize {
+		t.Fatalf("channel size = %d, want %d", adapter.chSize, defaultChannelSize)
+	}
+}

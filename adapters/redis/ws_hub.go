@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	gogo "github.com/Snocko-main/gogo"
 	goredis "github.com/redis/go-redis/v9"
@@ -14,6 +15,7 @@ import (
 
 const (
 	defaultChannelPrefix = "gogo:ws:"
+	defaultChannelSize   = 4096
 	wireVersion          = 1
 )
 
@@ -33,6 +35,13 @@ type Options struct {
 
 	// ChannelPrefix is prepended to every topic. Defaults to "gogo:ws:".
 	ChannelPrefix string
+
+	// ChannelSize is the go-redis Pub/Sub receive buffer. Defaults to 4096.
+	ChannelSize int
+
+	// ChannelSendTimeout is how long go-redis waits for the receive buffer
+	// before dropping a message. Defaults to go-redis's 1 minute.
+	ChannelSendTimeout time.Duration
 }
 
 // Adapter bridges gogo.WSHub messages through Redis Pub/Sub.
@@ -48,8 +57,10 @@ type Adapter struct {
 	client goredis.UniversalClient
 	own    bool
 	prefix string
+	chSize int
+	chSend time.Duration
 
-	mu     sync.Mutex
+	mu     sync.RWMutex
 	pubsub *goredis.PubSub
 	cancel context.CancelFunc
 	closed bool
@@ -61,6 +72,10 @@ func New(opt Options) (*Adapter, error) {
 	prefix := opt.ChannelPrefix
 	if prefix == "" {
 		prefix = defaultChannelPrefix
+	}
+	channelSize := opt.ChannelSize
+	if channelSize <= 0 {
+		channelSize = defaultChannelSize
 	}
 
 	var client goredis.UniversalClient
@@ -86,6 +101,8 @@ func New(opt Options) (*Adapter, error) {
 		client: client,
 		own:    true,
 		prefix: prefix,
+		chSize: channelSize,
+		chSend: opt.ChannelSendTimeout,
 	}, nil
 }
 
@@ -101,6 +118,7 @@ func NewClient(client goredis.UniversalClient, channelPrefix string) (*Adapter, 
 	return &Adapter{
 		client: client,
 		prefix: channelPrefix,
+		chSize: defaultChannelSize,
 	}, nil
 }
 
@@ -137,7 +155,11 @@ func (a *Adapter) Start(ctx context.Context, deliver func(gogo.WSHubMessage)) er
 
 	go func() {
 		defer a.wg.Done()
-		ch := pubsub.Channel()
+		opts := []goredis.ChannelOption{goredis.WithChannelSize(a.chSize)}
+		if a.chSend > 0 {
+			opts = append(opts, goredis.WithChannelSendTimeout(a.chSend))
+		}
+		ch := pubsub.Channel(opts...)
 		for {
 			select {
 			case <-subCtx.Done():
@@ -170,8 +192,8 @@ func (a *Adapter) Publish(ctx context.Context, msg gogo.WSHubMessage) error {
 	if err != nil {
 		return err
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	if a.closed {
 		return errAdapterClosed
 	}
