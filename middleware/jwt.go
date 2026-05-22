@@ -3,6 +3,7 @@ package middleware
 import (
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
@@ -227,41 +228,42 @@ func defaultJWTTokenFunc(req *gogo.Request) string {
 // jwtAlgInfo describes an algorithm: which hash to use and which
 // signature family it belongs to.
 type jwtAlgInfo struct {
-	hashID    crypto.Hash
-	hashNew   func() hash.Hash
-	family    string // "HS", "RS", "PS", "ES"
-	ecdsaSize int    // bytes per r/s component (ES family only)
+	hashID     crypto.Hash
+	hashNew    func() hash.Hash
+	family     string // "HS", "RS", "PS", "ES"
+	ecdsaSize  int    // bytes per r/s component (ES family only)
+	ecdsaCurve string // elliptic curve name from Curve.Params().Name (ES only)
 }
 
 func jwtAlgInfoFor(alg JWTAlgorithm) (jwtAlgInfo, bool) {
 	switch alg {
 	case JWTHS256:
-		return jwtAlgInfo{crypto.SHA256, sha256.New, "HS", 0}, true
+		return jwtAlgInfo{crypto.SHA256, sha256.New, "HS", 0, ""}, true
 	case JWTHS384:
-		return jwtAlgInfo{crypto.SHA384, sha512.New384, "HS", 0}, true
+		return jwtAlgInfo{crypto.SHA384, sha512.New384, "HS", 0, ""}, true
 	case JWTHS512:
-		return jwtAlgInfo{crypto.SHA512, sha512.New, "HS", 0}, true
+		return jwtAlgInfo{crypto.SHA512, sha512.New, "HS", 0, ""}, true
 	case JWTRS256:
-		return jwtAlgInfo{crypto.SHA256, sha256.New, "RS", 0}, true
+		return jwtAlgInfo{crypto.SHA256, sha256.New, "RS", 0, ""}, true
 	case JWTRS384:
-		return jwtAlgInfo{crypto.SHA384, sha512.New384, "RS", 0}, true
+		return jwtAlgInfo{crypto.SHA384, sha512.New384, "RS", 0, ""}, true
 	case JWTRS512:
-		return jwtAlgInfo{crypto.SHA512, sha512.New, "RS", 0}, true
+		return jwtAlgInfo{crypto.SHA512, sha512.New, "RS", 0, ""}, true
 	case JWTPS256:
-		return jwtAlgInfo{crypto.SHA256, sha256.New, "PS", 0}, true
+		return jwtAlgInfo{crypto.SHA256, sha256.New, "PS", 0, ""}, true
 	case JWTPS384:
-		return jwtAlgInfo{crypto.SHA384, sha512.New384, "PS", 0}, true
+		return jwtAlgInfo{crypto.SHA384, sha512.New384, "PS", 0, ""}, true
 	case JWTPS512:
-		return jwtAlgInfo{crypto.SHA512, sha512.New, "PS", 0}, true
+		return jwtAlgInfo{crypto.SHA512, sha512.New, "PS", 0, ""}, true
 	case JWTES256:
-		return jwtAlgInfo{crypto.SHA256, sha256.New, "ES", 32}, true
+		return jwtAlgInfo{crypto.SHA256, sha256.New, "ES", 32, "P-256"}, true
 	case JWTES384:
-		return jwtAlgInfo{crypto.SHA384, sha512.New384, "ES", 48}, true
+		return jwtAlgInfo{crypto.SHA384, sha512.New384, "ES", 48, "P-384"}, true
 	case JWTES512:
 		// P-521 produces 521-bit components → 66 bytes each
 		// rounded up. Yes, ES512 uses P-521, not P-512 — there
 		// is no NIST P-512 curve.
-		return jwtAlgInfo{crypto.SHA512, sha512.New, "ES", 66}, true
+		return jwtAlgInfo{crypto.SHA512, sha512.New, "ES", 66, "P-521"}, true
 	}
 	return jwtAlgInfo{}, false
 }
@@ -316,6 +318,9 @@ func jwtBuildVerifier(info jwtAlgInfo, secret []byte, key crypto.PublicKey) (jwt
 		pk, ok := key.(*ecdsa.PublicKey)
 		if !ok {
 			return nil, errors.New("ES algorithm requires *ecdsa.PublicKey")
+		}
+		if err := jwtValidateECDSACurve(pk.Curve, info.ecdsaCurve); err != nil {
+			return nil, err
 		}
 		size := info.ecdsaSize
 		hashNew := info.hashNew
@@ -482,6 +487,9 @@ func SignJWT(alg JWTAlgorithm, key any, claims map[string]any) (string, error) {
 		if !ok {
 			return "", errors.New("ES SignJWT requires *ecdsa.PrivateKey")
 		}
+		if err := jwtValidateECDSACurve(pk.Curve, info.ecdsaCurve); err != nil {
+			return "", err
+		}
 		h := info.hashNew()
 		h.Write([]byte(signingInput))
 		r, s, signErr := ecdsa.Sign(rand.Reader, pk, h.Sum(nil))
@@ -492,6 +500,9 @@ func SignJWT(alg JWTAlgorithm, key any, claims map[string]any) (string, error) {
 		sig = make([]byte, 2*size)
 		rBytes := r.Bytes()
 		sBytes := s.Bytes()
+		if len(rBytes) > size || len(sBytes) > size {
+			return "", errors.New("ECDSA signature does not fit algorithm size")
+		}
 		copy(sig[size-len(rBytes):], rBytes)
 		copy(sig[2*size-len(sBytes):], sBytes)
 	default:
@@ -499,6 +510,13 @@ func SignJWT(alg JWTAlgorithm, key any, claims map[string]any) (string, error) {
 	}
 
 	return signingInput + "." + base64.RawURLEncoding.EncodeToString(sig), nil
+}
+
+func jwtValidateECDSACurve(curve elliptic.Curve, want string) error {
+	if curve == nil || curve.Params() == nil || curve.Params().Name != want {
+		return errors.New("ECDSA algorithm requires " + want + " key")
+	}
+	return nil
 }
 
 // ParseRSAPublicKey decodes a PEM-encoded RSA public key. Accepts
