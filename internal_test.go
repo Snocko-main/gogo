@@ -77,9 +77,9 @@ func TestDefaultConfigKeepsExplicitBodyReadTimeout(t *testing.T) {
 		t.Fatalf("BodyReadTimeout = %s, want 10s", cfg.BodyReadTimeout)
 	}
 
-	cfg = defaultConfig(Config{BodyReadTimeout: -1})
-	if cfg.BodyReadTimeout != -1 {
-		t.Fatalf("disabled BodyReadTimeout = %s, want -1", cfg.BodyReadTimeout)
+	cfg = defaultConfig(Config{BodyReadTimeout: NoBodyReadTimeout})
+	if cfg.BodyReadTimeout != NoBodyReadTimeout {
+		t.Fatalf("disabled BodyReadTimeout = %s, want %s", cfg.BodyReadTimeout, NoBodyReadTimeout)
 	}
 }
 

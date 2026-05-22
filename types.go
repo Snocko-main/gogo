@@ -405,9 +405,16 @@ type asyncMiddlewareEntry struct {
 	alsoSync bool
 }
 
-// NoBodyLimit disables Config.BodyLimit. Use only behind an external body-size
-// limit, such as a trusted reverse proxy.
-const NoBodyLimit = -1
+const (
+	// NoBodyLimit disables Config.BodyLimit. Use only behind an external
+	// body-size limit, such as a trusted reverse proxy.
+	NoBodyLimit = -1
+
+	// NoBodyReadTimeout disables Config.BodyReadTimeout. Use only for tests,
+	// trusted local traffic, or routes protected by an external upload
+	// deadline.
+	NoBodyReadTimeout time.Duration = -1
+)
 
 // Config tunes per-App behavior. All fields are optional; the zero value
 // is a safe production default. Pass to NewApp; values are applied at
@@ -472,9 +479,9 @@ type Config struct {
 	//
 	// Zero uses the safe default of 30s. Reasonable production values
 	// fall between 10s for API endpoints and 60s+ for legitimate
-	// upload flows. Set a negative value to disable the timeout
-	// explicitly (not recommended outside tests or trusted local
-	// traffic). The timer fires on a goroutine that hands the
+	// upload flows. Set to NoBodyReadTimeout to disable the timeout
+	// explicitly (not recommended outside tests or trusted local traffic).
+	// The timer fires on a goroutine that hands the
 	// cancellation back to the loop thread via Loop.Defer so done()
 	// and the connection close run serially with onData / onAborted
 	// — callers don't have to think about races.

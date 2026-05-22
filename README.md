@@ -1477,8 +1477,8 @@ app, _ := gogo.NewApp(gogo.Config{
 `BodyReadTimeout` protects `Response.Body` users from slow body uploads that
 drip bytes forever without exceeding `BodyLimit`. Keep the 30s default for
 ordinary APIs, lower it for small JSON-only endpoints, raise it for legitimate
-large uploads, or set a negative value only when intentionally disabling the
-deadline for trusted traffic/tests.
+large uploads, or set `BodyReadTimeout: gogo.NoBodyReadTimeout` only when
+intentionally disabling the deadline for trusted traffic/tests.
 
 `BodyLimit: 0` uses the safe 4 MiB default. Set `BodyLimit: gogo.NoBodyLimit`
 only for trusted deployments that already enforce a request-body cap at an
