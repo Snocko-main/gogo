@@ -1207,7 +1207,8 @@ app.PostAsync("/upload", 10<<20, func(res *gogo.Response, req *gogo.Request, bod
 app.PostAsync("/upload-form", 50<<20, func(res *gogo.Response, req *gogo.Request, body []byte) {
     err := req.Multipart(func(p *gogo.MultipartPart) error {
         if p.IsFile() {
-            return p.SaveAt("./uploads/" + filepath.Base(p.FileName))
+            _, err := p.SaveInto("./uploads")
+            return err
         }
         log.Printf("field %s = %s", p.Name, p.Data)
         return nil
