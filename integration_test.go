@@ -5605,6 +5605,54 @@ func TestBodyParserJSONUsesConfiguredDecoder(t *testing.T) {
 	}
 }
 
+func TestBodyParserJSONUsesConfiguredDecoderOnSlowAndRouterPaths(t *testing.T) {
+	type user struct {
+		Name string `json:"name"`
+	}
+	var calls atomic.Int32
+	cfg := gogo.Config{
+		JSONDecoder: func(data []byte, v any) error {
+			calls.Add(1)
+			u := v.(*user)
+			u.Name = "custom"
+			return nil
+		},
+	}
+	port, teardown := startAppCfg(t, cfg, func(app *gogo.App) {
+		app.PostAsync("/slow", 16*1024, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			var u user
+			if err := req.BodyParser(&u); err != nil {
+				res.Send(400, "text/plain", err.Error())
+				return
+			}
+			res.Send(200, "text/plain", u.Name)
+		})
+
+		api := app.Group("/api")
+		api.PostAsync("/u", 1024, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			var u user
+			if err := req.BodyParser(&u); err != nil {
+				res.Send(400, "text/plain", err.Error())
+				return
+			}
+			res.Send(200, "text/plain", u.Name)
+		})
+	})
+	defer teardown()
+
+	status, body := httpPost(t, port, "/slow", "application/json", []byte(`{"name":"ignored"}`))
+	if status != 200 || body != "custom" {
+		t.Fatalf("slow custom decoder: got %d %q, want 200 custom", status, body)
+	}
+	status, body = httpPost(t, port, "/api/u", "application/json", []byte(`{"name":"ignored"}`))
+	if status != 200 || body != "custom" {
+		t.Fatalf("router custom decoder: got %d %q, want 200 custom", status, body)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("decoder calls=%d, want 2", calls.Load())
+	}
+}
+
 // TestBodyParserForm: application/x-www-form-urlencoded into a struct
 // with `form:"name"` tags. Covers scalars, slice, bool aliases, and
 // pointer-to-int.
