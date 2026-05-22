@@ -267,6 +267,43 @@ func TestHTTPAdapterHeadersIn(t *testing.T) {
 	}
 }
 
+func TestHTTPAdapterPreservesHostAndRepeatedHeaders(t *testing.T) {
+	stdHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Saw-Host", r.Host)
+		w.Header().Set("X-Multi-Count", fmt.Sprintf("%d", len(r.Header.Values("X-Multi"))))
+		w.Header().Set("X-Multi-Joined", strings.Join(r.Header.Values("X-Multi"), ","))
+		w.WriteHeader(200)
+	})
+
+	ts, err := gogo.NewTestServer(func(app *gogo.App) {
+		app.Get("/h", gogo.HTTPAdapter(stdHandler))
+	})
+	if err != nil {
+		t.Fatalf("NewTestServer: %v", err)
+	}
+	defer ts.Close()
+
+	req, _ := http.NewRequest("GET", "/h", nil)
+	req.Host = "tenant.example"
+	req.Header.Add("X-Multi", "first")
+	req.Header.Add("X-Multi", "second")
+	resp, err := ts.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	resp.Body.Close()
+
+	if got := resp.Header.Get("X-Saw-Host"); got != "tenant.example" {
+		t.Fatalf("Host = %q, want tenant.example", got)
+	}
+	if got := resp.Header.Get("X-Multi-Count"); got != "2" {
+		t.Fatalf("X-Multi count = %q, want 2", got)
+	}
+	if got := resp.Header.Get("X-Multi-Joined"); got != "first,second" {
+		t.Fatalf("X-Multi values = %q, want first,second", got)
+	}
+}
+
 // TestHTTPAdapterMethodAndURL confirms the wrapped handler sees
 // the original method (upper-cased) and URL (with the query
 // string).

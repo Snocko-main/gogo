@@ -375,6 +375,9 @@ func buildAdapterRequest(req *Request, body []byte) (*http.Request, error) {
 	// often inspect Auth headers, Cookies, etc.) see what the
 	// real client sent.
 	copyHeadersFromRequest(httpReq.Header, req)
+	if host := req.Header("host"); host != "" {
+		httpReq.Host = host
+	}
 	if httpReq.Header.Get("Content-Length") == "" && len(body) > 0 {
 		httpReq.Header.Set("Content-Length", strconv.Itoa(len(body)))
 	}
@@ -496,7 +499,11 @@ func flushAdapterRecorder(res *Response, rec *httpAdapterRecorder) {
 // Request.Headers abstracts both without one lookup per known name.
 func copyHeadersFromRequest(dst http.Header, req *Request) {
 	req.Headers(func(name, value string) bool {
-		dst.Set(canonicalHeaderName(name), value)
+		key := canonicalHeaderName(name)
+		if key == "Host" {
+			return true
+		}
+		dst.Add(key, value)
 		return true
 	})
 }
