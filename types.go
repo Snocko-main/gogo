@@ -3084,6 +3084,11 @@ func (r *Response) Redirect(location string, code int) {
 // for changes while requests may be running.
 var MaxSendFileBytes int64 = 100 << 20
 
+// NoSendFileLimit disables the SendFile / Download file-size cap. Use only
+// for trusted file-serving routes where path allow-listing, authorization, or
+// an external layer already bounds what may be served.
+const NoSendFileLimit int64 = -1
+
 // SendFileChunkBytes is the buffer size used for each disk read +
 // stream write iteration. Memory used per concurrent SendFile call
 // is bounded by this value plus uWS's internal write buffer (which
@@ -3118,7 +3123,7 @@ var (
 )
 
 // SetMaxSendFileBytes updates the SendFile / Download file-size cap
-// atomically.
+// atomically. Set to NoSendFileLimit to disable the cap.
 func SetMaxSendFileBytes(maxBytes int64) {
 	atomic.StoreInt64(&MaxSendFileBytes, maxBytes)
 }
@@ -3126,6 +3131,10 @@ func SetMaxSendFileBytes(maxBytes int64) {
 // GetMaxSendFileBytes returns the current SendFile / Download file-size cap.
 func GetMaxSendFileBytes() int64 {
 	return atomic.LoadInt64(&MaxSendFileBytes)
+}
+
+func sendFileTooLarge(size, maxBytes int64) bool {
+	return maxBytes >= 0 && size > maxBytes
 }
 
 // SetSendFileChunkBytes updates the per-read SendFile buffer size atomically.
@@ -3241,7 +3250,7 @@ func (r *Response) sendFile(req *Request, path, filename string, attachment bool
 		return fmt.Errorf("gogo: SendFile: %s is a directory", path)
 	}
 	size := info.Size()
-	if size > GetMaxSendFileBytes() {
+	if sendFileTooLarge(size, GetMaxSendFileBytes()) {
 		f.Close()
 		return ErrFileTooLarge
 	}

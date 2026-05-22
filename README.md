@@ -426,7 +426,9 @@ in the route because different apps expose different roots. Large-file serving
 is governed by atomic knobs: `SetMaxSendFileBytes`, `SetSendFileChunkBytes`,
 and `SetSendFileBackpressureBytes`. The legacy package variables still work
 for startup-time configuration, but prefer the setters if the server may be
-serving requests.
+serving requests. Use `gogo.NoSendFileLimit` only for trusted file-serving
+routes where path allow-listing, authorization, or an external layer already
+bounds what may be served.
 
 ### Streaming
 

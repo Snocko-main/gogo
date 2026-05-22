@@ -100,6 +100,18 @@ func TestDefaultConfigBodyLimitDefaultsAndDisableSentinel(t *testing.T) {
 	}
 }
 
+func TestSendFileLimitDisableSentinel(t *testing.T) {
+	if sendFileTooLarge(1<<30, NoSendFileLimit) {
+		t.Fatal("NoSendFileLimit rejected a large file")
+	}
+	if !sendFileTooLarge(17, 16) {
+		t.Fatal("cap 16 accepted size 17")
+	}
+	if sendFileTooLarge(16, 16) {
+		t.Fatal("cap 16 rejected exact size 16")
+	}
+}
+
 func TestHTTPAdapterRecorderRejectsInvalidWriteHeaderCode(t *testing.T) {
 	for _, code := range []int{99, 1000} {
 		t.Run(strconv.Itoa(code), func(t *testing.T) {
