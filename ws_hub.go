@@ -967,21 +967,52 @@ func (h *WSHub) addMembership(key uintptr, token uint64, topic string) (uint64, 
 }
 
 func (h *WSHub) removeMembershipIfCurrent(key uintptr, token uint64, topic string) {
+	_, last := h.removeMembershipForUnsubscribe(key, token, topic)
+	if last {
+		h.queueAdapterTopic(topic)
+	}
+}
+
+func (h *WSHub) removeMembershipForUnsubscribe(key uintptr, token uint64, topic string) (bool, bool) {
 	h.mu.Lock()
 	socket := h.sockets[key]
 	if socket == nil {
 		h.mu.Unlock()
-		return
+		return false, false
 	}
 	if token != socket.token {
 		h.mu.Unlock()
-		return
+		return false, false
+	}
+	if _, ok := socket.topics[topic]; !ok {
+		h.mu.Unlock()
+		return false, false
 	}
 	last := h.removeMembershipLocked(key, topic)
 	h.mu.Unlock()
-	if last {
-		h.queueAdapterTopic(topic)
+	return true, last
+}
+
+func (h *WSHub) restoreMembershipIfCurrent(key uintptr, token uint64, topic string) bool {
+	if h.closed.Load() {
+		return false
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	socket := h.sockets[key]
+	if socket == nil || token != socket.token {
+		return false
+	}
+	if _, ok := socket.topics[topic]; ok {
+		return false
+	}
+	socket.topics[topic] = struct{}{}
+	first := len(h.members[topic]) == 0
+	if h.members[topic] == nil {
+		h.members[topic] = make(map[uintptr]struct{})
+	}
+	h.members[topic][key] = struct{}{}
+	return first
 }
 
 func (h *WSHub) removeMembershipLocked(key uintptr, topic string) bool {

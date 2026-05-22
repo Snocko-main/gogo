@@ -5499,8 +5499,24 @@ func (ws *WebSocket) Subscribe(topic string) bool {
 // true when a subscription existed and was removed. Like Subscribe,
 // must be called from a WebSocket handler.
 func (ws *WebSocket) Unsubscribe(topic string) bool {
-	untrackWSHubSubscribe(ws, topic)
-	return ws.inner.unsubscribe(topic)
+	key, h := hubForWebSocket(ws)
+	token := ws.hubToken.Load()
+	removed, last := false, false
+	if h != nil {
+		removed, last = h.removeMembershipForUnsubscribe(key, token, topic)
+	}
+	if !ws.inner.unsubscribe(topic) {
+		if removed && h != nil {
+			if first := h.restoreMembershipIfCurrent(key, token, topic); first {
+				h.queueAdapterTopic(topic)
+			}
+		}
+		return false
+	}
+	if removed && last {
+		h.queueAdapterTopic(topic)
+	}
+	return true
 }
 
 // Publish broadcasts message to every OTHER subscriber of topic.

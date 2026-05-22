@@ -251,6 +251,48 @@ func TestWSHubMembershipRequiresCurrentToken(t *testing.T) {
 	}
 }
 
+func TestWSHubRestoreMembershipAfterUnsubscribeFailure(t *testing.T) {
+	hub := NewWSHub()
+	hub.mu.Lock()
+	hub.sockets[1] = &hubSocket{token: 7, topics: make(map[string]struct{})}
+	hub.mu.Unlock()
+
+	if token, first := hub.addMembership(1, 7, "room"); token != 7 || !first {
+		t.Fatalf("addMembership = token %d first %v, want token 7 first", token, first)
+	}
+	removed, last := hub.removeMembershipForUnsubscribe(1, 7, "room")
+	if !removed || !last {
+		t.Fatalf("removeMembershipForUnsubscribe = removed %v last %v, want true/true", removed, last)
+	}
+	if first := hub.restoreMembershipIfCurrent(1, 7, "room"); !first {
+		t.Fatal("restoreMembershipIfCurrent should restore the first local member")
+	}
+	hub.mu.RLock()
+	_, socketTopic := hub.sockets[1].topics["room"]
+	_, member := hub.members["room"][uintptr(1)]
+	hub.mu.RUnlock()
+	if !socketTopic || !member {
+		t.Fatalf("restored socketTopic=%v member=%v, want both true", socketTopic, member)
+	}
+}
+
+func TestWSHubRestoreMembershipRejectsStaleToken(t *testing.T) {
+	hub := NewWSHub()
+	hub.mu.Lock()
+	hub.sockets[1] = &hubSocket{token: 7, topics: make(map[string]struct{})}
+	hub.mu.Unlock()
+
+	if first := hub.restoreMembershipIfCurrent(1, 6, "room"); first {
+		t.Fatal("restoreMembershipIfCurrent accepted stale token")
+	}
+	hub.mu.RLock()
+	_, member := hub.members["room"][uintptr(1)]
+	hub.mu.RUnlock()
+	if member {
+		t.Fatal("stale restore added membership")
+	}
+}
+
 type ctxBlockingWSHubAdapter struct {
 	entered chan struct{}
 }
