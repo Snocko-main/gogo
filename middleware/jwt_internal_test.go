@@ -30,7 +30,7 @@ func TestVerifyJWTMaxTokenBytesCanBeDisabled(t *testing.T) {
 	verifier := func(signingInput, signature []byte) error {
 		return errors.New("verifier should not run before header decode")
 	}
-	_, err := verifyJWT(strings.Repeat("a", 32)+".b.c", verifier, "HS256", time.Second, -1)
+	_, err := verifyJWT(strings.Repeat("a", 32)+".b.c", verifier, "HS256", time.Second, NoJWTTokenLimit)
 	if err == nil || err.Error() == "token too large" {
 		t.Fatalf("verifyJWT error = %v, want non-size parse error", err)
 	}

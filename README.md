@@ -745,7 +745,8 @@ app.Use(mw.RateLimit(mw.RateLimitOptions{
     MaxBuckets: 100_000,                              // see "RateLimit memory cap" below
 }))
 app.Use("/admin/*", mw.BasicAuth(mw.BasicAuthOptions{
-    Users: map[string]string{"alice": "secret"},
+    Users:              map[string]string{"alice": "secret"},
+    MaxCredentialBytes: 8 << 10, // default; mw.NoBasicAuthCredentialLimit disables the cap
 }))
 
 // JWT verification with HS256 (HMAC).
@@ -761,7 +762,7 @@ app.GetAsync("/api/me", func(res *gogo.Response, req *gogo.Request) {
 // CSRF — double-submit cookie pattern.
 app.Use(mw.CSRF(mw.CSRFOptions{
     Secret:        []byte(os.Getenv("CSRF_SECRET")),
-    MaxTokenBytes: 256, // default; negative disables the token length cap
+    MaxTokenBytes: 256, // default; mw.NoCSRFTokenLimit disables the cap
 }))
 
 // Prometheus-flavored metrics with /metrics handler.

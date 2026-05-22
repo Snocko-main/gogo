@@ -22,6 +22,9 @@ func TestCSRFRejectsOverMaxTokenBytesBeforeDecode(t *testing.T) {
 	if !csrfTokenTooLong(strings.Repeat("a", defaultCSRFMaxTokenBytes+1), defaultCSRFMaxTokenBytes) {
 		t.Fatalf("csrfTokenTooLong did not reject oversized token")
 	}
+	if csrfTokenTooLong(strings.Repeat("a", defaultCSRFMaxTokenBytes+1), NoCSRFTokenLimit) {
+		t.Fatalf("NoCSRFTokenLimit rejected oversized token")
+	}
 }
 
 func TestCSRFRejectsWeakSecret(t *testing.T) {

@@ -105,11 +105,15 @@ type JWTOptions struct {
 	Leeway time.Duration
 
 	// MaxTokenBytes caps the compact JWT string before any base64 decode
-	// or JSON parsing. Default 16 KiB. Set negative to disable.
+	// or JSON parsing. Default 16 KiB. Set to NoJWTTokenLimit to disable.
 	MaxTokenBytes int
 }
 
 const defaultJWTMaxTokenBytes = 16 << 10
+
+// NoJWTTokenLimit disables the compact JWT length cap. Use only behind an
+// external header-size limit.
+const NoJWTTokenLimit = -1
 
 // JWT returns a Middleware that authenticates requests carrying a
 // JSON Web Token signed with HMAC, RSA, RSA-PSS, or ECDSA. On

@@ -61,7 +61,7 @@ type CSRFOptions struct {
 
 	// MaxTokenBytes caps the CSRF token read from the Cookie and header
 	// before signature verification or constant-time comparison. Zero uses
-	// a conservative default; negative disables the cap.
+	// a conservative default; NoCSRFTokenLimit disables the cap.
 	MaxTokenBytes int
 
 	// SkipFunc, when non-nil and returning true, bypasses CSRF
@@ -75,6 +75,10 @@ type CSRFOptions struct {
 }
 
 const defaultCSRFMaxTokenBytes = 256
+
+// NoCSRFTokenLimit disables the CSRF token length cap. Use only behind an
+// external header-size limit.
+const NoCSRFTokenLimit = -1
 
 const csrfGeneratedTokenBytes = 22 + 1 + 43 // base64url(16 random bytes) + "." + base64url(sha256)
 

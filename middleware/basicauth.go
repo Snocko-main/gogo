@@ -48,11 +48,16 @@ type BasicAuthOptions struct {
 	SkipFunc func(*gogo.Request) bool
 
 	// MaxCredentialBytes caps the base64 credentials payload before
-	// decoding. Default 8 KiB. Set negative to disable.
+	// decoding. Default 8 KiB. Set to NoBasicAuthCredentialLimit to
+	// disable.
 	MaxCredentialBytes int
 }
 
 const defaultBasicAuthMaxCredentialBytes = 8 << 10
+
+// NoBasicAuthCredentialLimit disables the BasicAuth credentials payload cap.
+// Use only behind an external header-size limit.
+const NoBasicAuthCredentialLimit = -1
 
 // BasicAuth returns a Middleware that enforces HTTP Basic
 // authentication (RFC 7617). Requests without a valid Authorization
