@@ -1600,6 +1600,7 @@ app.MethodNotAllowed(func(res *gogo.Response, req *gogo.Request) {
 - [`examples/authmw`](examples/authmw) — logger + bearer auth (sync & async middleware)
 - [`examples/upload`](examples/upload) — POST body collection with 413 + streaming OnData
 - [`examples/sse`](examples/sse) — Server-Sent Events with reconnect resume
+- [`examples/websocket`](examples/websocket) — browser WebSocket + upgrade gate + echo
 - [`examples/multicore`](examples/multicore) — `RunMultiCore` + `/metrics` + graceful shutdown
 
 ## Why There Is a C++ Bridge
