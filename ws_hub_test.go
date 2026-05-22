@@ -64,6 +64,7 @@ func waitForAdapterPublish(t *testing.T, adapter *fakeWSHubAdapter, want int) []
 func TestWSHubPublishCopiesMessageBeforeAdapter(t *testing.T) {
 	adapter := &fakeWSHubAdapter{}
 	hub := NewWSHub(WithWSHubNodeID("node-a"), WithWSHubAdapter(adapter))
+	defer hub.Close()
 
 	payload := []byte("hello")
 	if err := hub.Publish("room", payload, Text); err != nil {
@@ -88,7 +89,11 @@ func TestWSHubPublishCopiesMessageBeforeAdapter(t *testing.T) {
 func TestWSHubStartReturnsAdapterError(t *testing.T) {
 	want := errors.New("redis down")
 	adapter := &fakeWSHubAdapter{startErr: want}
-	hub := NewWSHub(WithWSHubAdapter(adapter))
+	hub := NewWSHub(
+		WithWSHubAdapter(adapter),
+		WithWSHubAdapterErrorHandler(nil),
+	)
+	defer hub.Close()
 
 	if err := hub.Start(); !errors.Is(err, want) {
 		t.Fatalf("Start error = %v, want %v", err, want)
