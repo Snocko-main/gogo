@@ -17,7 +17,7 @@ func TestWireRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	out, err := decodeMessage(in.Topic, payload)
+	out, err := decodeMessage(in.Topic, payload, defaultMaxMessage)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -50,5 +50,24 @@ func TestNewSetsDefaultChannelSize(t *testing.T) {
 	defer adapter.Close()
 	if adapter.chSize != defaultChannelSize {
 		t.Fatalf("channel size = %d, want %d", adapter.chSize, defaultChannelSize)
+	}
+	if adapter.maxMsg != defaultMaxMessage {
+		t.Fatalf("max message size = %d, want %d", adapter.maxMsg, defaultMaxMessage)
+	}
+}
+
+func TestDecodeRejectsOversizedMessage(t *testing.T) {
+	in := gogo.WSHubMessage{
+		NodeID:  "node-a",
+		Topic:   "room.general",
+		Message: []byte("hello"),
+		OpCode:  gogo.Text,
+	}
+	payload, err := encodeMessage(in)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if _, err := decodeMessage(in.Topic, payload, len(in.Message)-1); err == nil {
+		t.Fatal("decode succeeded for oversized message")
 	}
 }

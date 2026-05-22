@@ -16,6 +16,7 @@ import (
 const (
 	defaultChannelPrefix = "gogo:ws:"
 	defaultChannelSize   = 4096
+	defaultMaxMessage    = 16 << 20
 	wireVersion          = 1
 )
 
@@ -42,6 +43,10 @@ type Options struct {
 	// ChannelSendTimeout is how long go-redis waits for the receive buffer
 	// before dropping a message. Defaults to go-redis's 1 minute.
 	ChannelSendTimeout time.Duration
+
+	// MaxMessageSize caps the decoded WebSocket payload accepted from Redis.
+	// Defaults to 16 MiB, matching gogo's WebSocket MaxPayloadLength default.
+	MaxMessageSize int
 }
 
 // Adapter bridges gogo.WSHub messages through Redis Pub/Sub.
@@ -59,6 +64,7 @@ type Adapter struct {
 	prefix string
 	chSize int
 	chSend time.Duration
+	maxMsg int
 
 	mu     sync.RWMutex
 	pubsub *goredis.PubSub
@@ -76,6 +82,10 @@ func New(opt Options) (*Adapter, error) {
 	channelSize := opt.ChannelSize
 	if channelSize <= 0 {
 		channelSize = defaultChannelSize
+	}
+	maxMessage := opt.MaxMessageSize
+	if maxMessage <= 0 {
+		maxMessage = defaultMaxMessage
 	}
 
 	var client goredis.UniversalClient
@@ -103,6 +113,7 @@ func New(opt Options) (*Adapter, error) {
 		prefix: prefix,
 		chSize: channelSize,
 		chSend: opt.ChannelSendTimeout,
+		maxMsg: maxMessage,
 	}, nil
 }
 
@@ -119,6 +130,7 @@ func NewClient(client goredis.UniversalClient, channelPrefix string) (*Adapter, 
 		client: client,
 		prefix: channelPrefix,
 		chSize: defaultChannelSize,
+		maxMsg: defaultMaxMessage,
 	}, nil
 }
 
@@ -172,7 +184,7 @@ func (a *Adapter) Start(ctx context.Context, deliver func(gogo.WSHubMessage)) er
 				if !ok {
 					continue
 				}
-				hubMsg, err := decodeMessage(topic, []byte(msg.Payload))
+				hubMsg, err := decodeMessage(topic, []byte(msg.Payload), a.maxMsg)
 				if err != nil {
 					continue
 				}
@@ -259,7 +271,7 @@ func encodeMessage(msg gogo.WSHubMessage) ([]byte, error) {
 	return out, nil
 }
 
-func decodeMessage(topic string, payload []byte) (gogo.WSHubMessage, error) {
+func decodeMessage(topic string, payload []byte, maxMessageSize int) (gogo.WSHubMessage, error) {
 	if len(payload) < 4 {
 		return gogo.WSHubMessage{}, errors.New("gogo/adapters/redis: short message")
 	}
@@ -269,6 +281,10 @@ func decodeMessage(topic string, payload []byte) (gogo.WSHubMessage, error) {
 	nodeLen := int(binary.BigEndian.Uint16(payload[2:4]))
 	if len(payload) < 4+nodeLen {
 		return gogo.WSHubMessage{}, errors.New("gogo/adapters/redis: truncated node id")
+	}
+	msgLen := len(payload) - 4 - nodeLen
+	if maxMessageSize > 0 && msgLen > maxMessageSize {
+		return gogo.WSHubMessage{}, fmt.Errorf("gogo/adapters/redis: message too large: %d > %d", msgLen, maxMessageSize)
 	}
 	msg := gogo.WSHubMessage{
 		NodeID:  string(payload[4 : 4+nodeLen]),

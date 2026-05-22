@@ -1295,6 +1295,8 @@ adapter, err := redisadapter.New(redisadapter.Options{
     // Optional: tune burst absorption before go-redis can drop Pub/Sub
     // messages because the receive channel is full.
     ChannelSize: 4096,
+    // Defaults to 16 MiB, matching WebSocket MaxPayloadLength.
+    MaxMessageSize: 16 << 20,
 })
 if err != nil {
     log.Fatal(err)
