@@ -18,8 +18,19 @@ It is intentionally thin:
 - Async dispatch uses a shared-memory ring so the request hot path crosses
   cgo zero times for shared-mode handlers.
 
+## Benchmark Snapshot
+
+[![gogo single-worker HTTP benchmark throughput](benchmark/results/http-benchmark-throughput.svg)](#benchmarking)
+
+gogo leads every single-worker route in the local HTTP benchmark matrix,
+including static GETs, parameterized routes, SQLite reads, body echo, and
+body-parse + SQLite query paths.
+
+[Jump to benchmark details](#benchmarking)
+
 ## Table of Contents
 
+- [Benchmark Snapshot](#benchmark-snapshot)
 - [Install Native Dependencies](#install-native-dependencies)
 - [Hello World](#hello-world)
 - [Routing](#routing)
@@ -1496,8 +1507,9 @@ lookup), and tears it down. See the script header for the env knobs.
 
 ### Results
 
-Median across `wrk -t {1,2,4,8} -c 500 -d 10s`. Each cell shows req/s
-on the first line, `p50 / p99` latency on the second.
+Median across `wrk -t {1,2,4,8} -c 500 -d 10s` — this is not an
+average of hand-picked thread counts. Each result comes from the
+same four `wrk` thread counts, sorted, then medianed.
 
 - `POST /echo` — sync handler reads the body and writes it back
   unchanged (50-byte JSON). Exercises the pure body-collection +
@@ -1522,6 +1534,44 @@ on the first line, `p50 / p99` latency on the second.
 > Absolute rps is hardware-sensitive; compare the relative shape on your
 > own target machine before making capacity decisions.
 
+#### Highlights
+
+- **gogo has the highest throughput in every single-worker workload**
+  in this matrix.
+- **gogo keeps the top 4-worker throughput in every workload**
+  while staying inside the 4 performance-core cap.
+- **Latency stays competitive while leading throughput**: gogo p99 is
+  within a few milliseconds of the best tail in most routes, and avoids
+  the large SQLite p99 spikes seen in Actix and net/http.
+
+#### Throughput summary
+
+| workload | gogo single | best non-gogo single | gogo 4-worker | best non-gogo 4-worker |
+|---|---:|---:|---:|---:|
+| `GET /hello` | **269k** | uWS.js 206k | **263k** | Actix 192k |
+| `GET /hello/:name` | **254k** | uWS.js 208k | **248k** | uWS.js 206k |
+| `GET /db` | **167k** | uWS.js 140k | **167k** | uWS.js 136k |
+| `POST /echo` | **205k** | Fiber 185k | **199k** | Actix 186k |
+| `POST /query` | **153k** | uWS.js 127k | **132k** | uWS.js 122k |
+
+#### Tail latency summary
+
+Lower p99 is better.
+
+| workload | gogo single p99 | best non-gogo single p99 | gogo 4-worker p99 | best non-gogo 4-worker p99 |
+|---|---:|---:|---:|---:|
+| `GET /hello` | 3.6 ms | uWS.js 3.3 ms | 3.9 ms | Fiber 5.4 ms |
+| `GET /hello/:name` | 3.6 ms | uWS.js 3.8 ms | 3.9 ms | Fiber 4.9 ms |
+| `GET /db` | 7.5 ms | uWS.js 5.1 ms | 7.8 ms | uWS.js 7.4 ms |
+| `POST /echo` | 3.6 ms | uWS.js 3.7 ms | 4.9 ms | uWS.js 5.7 ms |
+| `POST /query` | 8.1 ms | uWS.js 5.3 ms | 10.9 ms | uWS.js 7.3 ms |
+
+<details>
+<summary>Full per-framework median results</summary>
+
+Each cell shows req/s on the first line, `p50 / p99` latency on the
+second.
+
 #### Single worker (1 thread / event loop)
 
 | framework  | language | `/hello`                          | `/hello/:name`                    | `/db`                              | `POST /echo`                       | `POST /query`                      |
@@ -1544,16 +1594,18 @@ on the first line, `p50 / p99` latency on the second.
 | fiber      | Go       | 174k rps<br>p50 2.7 / p99 5.4 ms | 193k rps<br>p50 2.5 / p99 4.9 ms |  86k rps<br>p50 5.6 / p99 10.4 ms | 163k rps<br>p50 2.8 / p99 5.9 ms |  71k rps<br>p50 6.7 / p99 13.2 ms |
 | bun+elysia | TS (Bun) | 157k rps<br>p50 3.0 / p99 6.0 ms | 160k rps<br>p50 2.9 / p99 5.5 ms | 104k rps<br>p50 4.6 / p99 10.6 ms | 124k rps<br>p50 3.8 / p99 8.0 ms |  92k rps<br>p50 5.2 / p99 11.5 ms |
 
+</details>
+
 `/db` reads one row from a 1000-row SQLite table with a random id —
 exercises the framework + driver, not just the HTTP layer.
 
 Notes on the spread:
 
 - **Throughput**: gogo leads the single-worker table on all five
-  endpoints and keeps the strongest multi-worker `/hello`, `/hello/:name`,
-  `/db`, and `POST /echo` throughput on this machine. uwsjs remains close
-  on the uWebSockets-shaped routes, while Actix is competitive on pure
-  GET/echo paths and does well on SQLite throughput.
+  endpoints and keeps the strongest 4-worker throughput on all five
+  endpoints on this machine. uwsjs remains close on the uWebSockets-shaped
+  routes, while Actix is competitive on pure GET/echo paths and does well
+  on SQLite throughput.
 - **Tail latency (p99)**: single-worker uwsjs has the tightest tail on
   `/db` and `POST /query`; gogo is close while carrying higher
   throughput. In 4-worker mode, gogo and uwsjs keep the tightest p99
