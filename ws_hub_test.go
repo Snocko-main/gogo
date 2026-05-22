@@ -163,7 +163,7 @@ func TestWSHubQueuesAdapterTopicSubscriptions(t *testing.T) {
 	hub.sockets[2] = &hubSocket{token: 2, topics: make(map[string]struct{})}
 	hub.mu.Unlock()
 
-	if token, first := hub.addMembership(1, 0, "room"); token == 0 || !first {
+	if token, first := hub.addMembership(1, 1, "room"); token == 0 || !first {
 		t.Fatalf("first membership = token %d first %v, want token and first", token, first)
 	}
 	hub.queueAdapterTopic("room", wsHubAdapterSubscribe)
@@ -172,18 +172,50 @@ func TestWSHubQueuesAdapterTopicSubscriptions(t *testing.T) {
 		t.Fatalf("subs = %#v, want [room]", subs)
 	}
 
-	if _, first := hub.addMembership(2, 0, "room"); first {
+	if _, first := hub.addMembership(2, 2, "room"); first {
 		t.Fatal("second membership should not be first")
 	}
-	hub.removeMembershipIfCurrent(1, 0, "room")
+	hub.removeMembershipIfCurrent(1, 1, "room")
 	_, unsubs := adapter.topicSnapshot()
 	if len(unsubs) != 0 {
 		t.Fatalf("unsubs after first leave = %#v, want none", unsubs)
 	}
-	hub.removeMembershipIfCurrent(2, 0, "room")
+	hub.removeMembershipIfCurrent(2, 2, "room")
 	_, unsubs = waitForAdapterTopics(t, adapter, 1, 1)
 	if len(unsubs) != 1 || unsubs[0] != "room" {
 		t.Fatalf("unsubs = %#v, want [room]", unsubs)
+	}
+}
+
+func TestWSHubMembershipRequiresCurrentToken(t *testing.T) {
+	hub := NewWSHub()
+	hub.mu.Lock()
+	hub.sockets[1] = &hubSocket{token: 7, topics: make(map[string]struct{})}
+	hub.mu.Unlock()
+
+	if token, first := hub.addMembership(1, 0, "room"); token != 0 || first {
+		t.Fatalf("zero-token addMembership = token %d first %v, want rejected", token, first)
+	}
+	if token, first := hub.addMembership(1, 6, "room"); token != 0 || first {
+		t.Fatalf("stale-token addMembership = token %d first %v, want rejected", token, first)
+	}
+	if token, first := hub.addMembership(1, 7, "room"); token != 7 || !first {
+		t.Fatalf("current-token addMembership = token %d first %v, want accepted", token, first)
+	}
+
+	hub.removeMembershipIfCurrent(1, 0, "room")
+	hub.mu.RLock()
+	_, stillMember := hub.members["room"][uintptr(1)]
+	hub.mu.RUnlock()
+	if !stillMember {
+		t.Fatal("zero-token removeMembershipIfCurrent removed current socket")
+	}
+	hub.removeMembershipIfCurrent(1, 7, "room")
+	hub.mu.RLock()
+	_, stillMember = hub.members["room"][uintptr(1)]
+	hub.mu.RUnlock()
+	if stillMember {
+		t.Fatal("current-token removeMembershipIfCurrent did not remove socket")
 	}
 }
 
@@ -301,6 +333,49 @@ func TestWSHubReportsAsyncAdapterError(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("async adapter error was not reported")
+	}
+}
+
+func TestWSHubAdapterErrorRateLimitIsGlobal(t *testing.T) {
+	errs := make(chan error, 4)
+	hub := NewWSHub(WithWSHubAdapterErrorHandler(func(err error) {
+		errs <- err
+	}))
+
+	hub.reportAdapterError(errors.New("redis A"))
+	hub.reportAdapterError(errors.New("redis B"))
+	hub.reportAdapterError(errors.New("redis A"))
+	if got := len(errs); got != 1 {
+		t.Fatalf("reported errors = %d, want 1", got)
+	}
+
+	hub.adapterErrMu.Lock()
+	hub.adapterErrNext = time.Now().Add(-time.Second)
+	hub.adapterErrMu.Unlock()
+	hub.reportAdapterError(errors.New("redis C"))
+	if got := len(errs); got != 2 {
+		t.Fatalf("reported errors after window = %d, want 2", got)
+	}
+	got := <-errs
+	if got.Error() != "redis A" {
+		t.Fatalf("first error = %v, want redis A", got)
+	}
+	got = <-errs
+	if !strings.Contains(got.Error(), "suppressed 2") {
+		t.Fatalf("second error = %v, want suppressed count", got)
+	}
+}
+
+func TestWSHubAdapterPanicBypassesRateLimit(t *testing.T) {
+	errs := make(chan error, 2)
+	hub := NewWSHub(WithWSHubAdapterErrorHandler(func(err error) {
+		errs <- err
+	}))
+
+	hub.reportAdapterError(wsHubAdapterPanicError{recovered: "boom"})
+	hub.reportAdapterError(wsHubAdapterPanicError{recovered: "boom"})
+	if got := len(errs); got != 2 {
+		t.Fatalf("reported panics = %d, want 2", got)
 	}
 }
 

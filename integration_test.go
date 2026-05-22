@@ -5875,6 +5875,43 @@ func TestWSHubPublishFromTracksRawSubscribe(t *testing.T) {
 	}
 }
 
+func TestWSHubCloseSkipsUserCloseWhenOpenDidNotRun(t *testing.T) {
+	hubA := gogo.NewWSHub(gogo.WithWSHubNodeID("hub-a"))
+	defer hubA.Close()
+	hubB := gogo.NewWSHub(gogo.WithWSHubNodeID("hub-b"))
+	defer hubB.Close()
+
+	var opened atomic.Int32
+	var closed atomic.Int32
+	port, teardown := startApp(t, func(app *gogo.App) {
+		behavior := gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				opened.Add(1)
+			},
+			Close: func(ws *gogo.WebSocket, code int, msg []byte) {
+				closed.Add(1)
+			},
+		}
+		app.WebSocket("/ws", hubB.Wrap(app, hubA.Wrap(app, behavior)))
+	})
+	defer teardown()
+
+	client, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+	_, _ = client.ReadText(500 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
+
+	if got := opened.Load(); got != 0 {
+		t.Fatalf("Open calls = %d, want 0", got)
+	}
+	if got := closed.Load(); got != 0 {
+		t.Fatalf("Close calls = %d, want 0", got)
+	}
+}
+
 type blockingWSHubAdapter struct {
 	entered chan struct{}
 	release chan struct{}
