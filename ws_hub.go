@@ -79,6 +79,7 @@ type WSHub struct {
 	adapterTopicDirty    map[string]struct{}
 	adapterTopicBusy     map[string]struct{}
 	adapterTopicApplied  map[string]bool
+	adapterTopicRetryAt  map[string]time.Time
 	adapterQueueSz       int
 	adapterWorkers       int
 	adapterTopicWorkers  int
@@ -285,10 +286,15 @@ func (h *WSHub) Wrap(app *App, behavior WebSocketBehavior) WebSocketBehavior {
 			ws.End(1011, "websocket hub setup failed")
 			return
 		}
-		h.markOpen(ws)
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				h.closeAfterOpenPanic(ws, closeFn, recovered)
+			}
+		}()
 		if open != nil {
 			open(ws)
 		}
+		h.markOpen(ws)
 	}
 	behavior.Close = func(ws *WebSocket, code int, msg []byte) {
 		opened := h.wasOpen(ws)
@@ -301,6 +307,29 @@ func (h *WSHub) Wrap(app *App, behavior WebSocketBehavior) WebSocketBehavior {
 		}
 	}
 	return behavior
+}
+
+func (h *WSHub) closeAfterOpenPanic(ws *WebSocket, closeFn func(*WebSocket, int, []byte), recovered any) {
+	defer h.forget(ws)
+	if closeFn != nil {
+		func() {
+			defer func() {
+				if closeRecovered := recover(); closeRecovered != nil {
+					reportPanic(fmt.Errorf("gogo: websocket hub Close after Open panic also panicked: %v", closeRecovered))
+				}
+			}()
+			closeFn(ws, 1011, []byte("websocket open panic"))
+		}()
+	}
+	func() {
+		defer func() {
+			if endRecovered := recover(); endRecovered != nil {
+				reportPanic(fmt.Errorf("gogo: websocket hub close after Open panic failed: %v", endRecovered))
+			}
+		}()
+		ws.End(1011, "websocket open panic")
+	}()
+	reportPanic(recovered)
 }
 
 // Subscribe enrolls ws in topic. It is a small convenience wrapper around
@@ -594,9 +623,9 @@ func (h *WSHub) queueAdapterTopic(topic string) {
 
 func (h *WSHub) signalAdapterTopic() {
 	h.adapterQueueMu.RLock()
+	defer h.adapterQueueMu.RUnlock()
 	queue := h.adapterTopicQ
 	closed := h.closed.Load()
-	h.adapterQueueMu.RUnlock()
 	if queue == nil || closed {
 		return
 	}
@@ -648,6 +677,7 @@ func (h *WSHub) ensureAdapterWorker() {
 			h.adapterTopicDirty = make(map[string]struct{})
 			h.adapterTopicBusy = make(map[string]struct{})
 			h.adapterTopicApplied = make(map[string]bool)
+			h.adapterTopicRetryAt = make(map[string]time.Time)
 			for range topicWorkers {
 				go h.runAdapterTopicWorker(h.adapterTopicQ)
 			}
@@ -716,6 +746,9 @@ func (h *WSHub) nextAdapterTopic() (string, bool) {
 		if _, busy := h.adapterTopicBusy[topic]; busy {
 			continue
 		}
+		if retryAt := h.adapterTopicRetryAt[topic]; !retryAt.IsZero() && time.Now().Before(retryAt) {
+			continue
+		}
 		delete(h.adapterTopicDirty, topic)
 		h.adapterTopicBusy[topic] = struct{}{}
 		return topic, true
@@ -756,8 +789,10 @@ func (h *WSHub) finishAdapterTopic(topic string, desired bool, err error) {
 		} else {
 			delete(h.adapterTopicApplied, topic)
 		}
+		delete(h.adapterTopicRetryAt, topic)
 	} else {
 		h.adapterTopicDirty[topic] = struct{}{}
+		h.adapterTopicRetryAt[topic] = time.Now().Add(defaultWSHubStartBackoff)
 	}
 	delete(h.adapterTopicBusy, topic)
 	needsSignal := len(h.adapterTopicDirty) > 0 && !h.closed.Load()

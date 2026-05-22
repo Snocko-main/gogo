@@ -330,6 +330,27 @@ func (a *panicOnceTopicWSHubAdapter) Subscribe(ctx context.Context, topic string
 	return a.fakeWSHubAdapter.Subscribe(ctx, topic)
 }
 
+type failingTopicWSHubAdapter struct {
+	fakeWSHubAdapter
+	mu      sync.Mutex
+	subErr  error
+	subCall int
+}
+
+func (a *failingTopicWSHubAdapter) Subscribe(context.Context, string) error {
+	a.mu.Lock()
+	a.subCall++
+	err := a.subErr
+	a.mu.Unlock()
+	return err
+}
+
+func (a *failingTopicWSHubAdapter) subscribeCalls() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.subCall
+}
+
 func TestWSHubCloseBoundsInFlightAdapterPublish(t *testing.T) {
 	adapter := &ctxBlockingWSHubAdapter{entered: make(chan struct{}, 1)}
 	hub := NewWSHub(
@@ -462,6 +483,59 @@ func TestWSHubAdapterWorkerRecoversPanic(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("adapter worker did not publish after panic")
+}
+
+func TestWSHubAdapterTopicRetryUsesBackoff(t *testing.T) {
+	adapter := &failingTopicWSHubAdapter{subErr: errors.New("redis subscribe failed")}
+	hub := NewWSHub(
+		WithWSHubAdapter(adapter),
+		WithWSHubAdapterErrorHandler(nil),
+	)
+	defer hub.Close()
+
+	hub.mu.Lock()
+	hub.sockets[1] = &hubSocket{token: 1, topics: make(map[string]struct{})}
+	hub.mu.Unlock()
+
+	if token, first := hub.addMembership(1, 1, "room"); token == 0 || !first {
+		t.Fatalf("membership = token %d first %v, want token and first", token, first)
+	}
+	hub.queueAdapterTopic("room")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if adapter.subscribeCalls() >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := adapter.subscribeCalls(); got != 1 {
+		t.Fatalf("Subscribe calls before backoff window = %d, want 1", got)
+	}
+	time.Sleep(defaultWSHubStartBackoff / 2)
+	if got := adapter.subscribeCalls(); got != 1 {
+		t.Fatalf("Subscribe calls during backoff = %d, want 1", got)
+	}
+}
+
+func TestWSHubSignalAdapterTopicDoesNotRaceClosedQueue(t *testing.T) {
+	hub := NewWSHub(WithWSHubAdapter(&fakeWSHubAdapter{}))
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < 1000; j++ {
+				hub.signalAdapterTopic()
+			}
+		}()
+	}
+	close(start)
+	if err := hub.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	wg.Wait()
 }
 
 func TestWSHubAdapterTopicWorkerRecoversPanic(t *testing.T) {
