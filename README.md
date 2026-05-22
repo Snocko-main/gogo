@@ -1556,16 +1556,20 @@ app, _ := gogo.NewApp(gogo.Config{
     BindAddr:        "127.0.0.1",      // localhost only
     CapturePeerIP:   true,             // populate req.IP() on async paths
     TrustProxy:      true,             // honor X-Forwarded-*
+    // JSONEncoder:  sonic.Marshal,    // optional: faster JSON responses
+    // JSONDecoder:  sonic.Unmarshal,  // optional: faster BodyParser JSON
 })
 ```
 
-| Field             | Default | Notes                                                   |
-| ----------------- | ------- | ------------------------------------------------------- |
-| `BodyLimit`       | 4 MiB   | Reject Content-Length > limit with 413 on the C++ side  |
-| `BodyReadTimeout` | 30s     | Deadline for `Response.Body` to finish reading the body |
-| `BindAddr`        | `""`    | Empty = all interfaces (`0.0.0.0`)                      |
-| `CapturePeerIP`   | `false` | Snapshot peer IP for async / shared-dispatch paths      |
-| `TrustProxy`      | `false` | Honor `X-Forwarded-*` in `Protocol()`/`Secure()`/`IPs()` |
+| Field             | Default                   | Notes                                                   |
+| ----------------- | ------------------------- | ------------------------------------------------------- |
+| `BodyLimit`       | 4 MiB                     | Reject Content-Length > limit with 413 on the C++ side  |
+| `BodyReadTimeout` | 30s                       | Deadline for `Response.Body` to finish reading the body |
+| `BindAddr`        | `""`                      | Empty = all interfaces (`0.0.0.0`)                      |
+| `CapturePeerIP`   | `false`                   | Snapshot peer IP for async / shared-dispatch paths      |
+| `TrustProxy`      | `false`                   | Honor `X-Forwarded-*` in `Protocol()`/`Secure()`/`IPs()` |
+| `JSONEncoder`     | `encoding/json.Marshal`   | Encoder for `Response.JSON` and `Response.JSONP`        |
+| `JSONDecoder`     | `encoding/json.Unmarshal` | Decoder for `Request.BodyParser` JSON bodies            |
 
 `BodyReadTimeout` protects `Response.Body` users from slow body uploads that
 drip bytes forever without exceeding `BodyLimit`. Keep the 30s default for
@@ -1576,6 +1580,12 @@ intentionally disabling the deadline for trusted traffic/tests.
 `BodyLimit: 0` uses the safe 4 MiB default. Set `BodyLimit: gogo.NoBodyLimit`
 only for trusted deployments that already enforce a request-body cap at an
 external layer such as a reverse proxy.
+
+`JSONEncoder` and `JSONDecoder` let you plug in drop-in JSON libraries such as
+`sonic`, `go-json`, or `jsoniter` without adding a framework dependency. Leave
+them nil for the standard library defaults. `JSONP` still escapes script-breakout
+characters defensively even when a custom encoder does not mirror
+`encoding/json`'s HTML escaping.
 
 ### TrustProxy and client IPs
 
