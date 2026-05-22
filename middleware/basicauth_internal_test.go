@@ -15,7 +15,7 @@ func TestParseBasicAuthRejectsOverMaxCredentialBytes(t *testing.T) {
 
 func TestParseBasicAuthMaxCredentialBytesCanBeDisabled(t *testing.T) {
 	payload := base64.StdEncoding.EncodeToString([]byte("alice:wonderland"))
-	user, pass, ok := parseBasicAuth("Basic "+payload, -1)
+	user, pass, ok := parseBasicAuth("Basic "+payload, NoBasicAuthCredentialLimit)
 	if !ok || user != "alice" || pass != "wonderland" {
 		t.Fatalf("parseBasicAuth disabled cap = (%q, %q, %v)", user, pass, ok)
 	}

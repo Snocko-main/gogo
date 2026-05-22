@@ -386,19 +386,24 @@ func buildAdapterRequest(req *Request, body []byte) (*http.Request, error) {
 }
 
 // MaxHTTPAdapterBodyBytes caps the response body staged by HTTPAdapter before
-// it is copied into a gogo.Response. Negative disables the cap.
+// it is copied into a gogo.Response. NoHTTPAdapterBodyLimit disables the cap.
 //
 // Deprecated for runtime mutation: direct assignment remains supported for
 // startup-time configuration. Use SetMaxHTTPAdapterBodyBytes /
 // GetMaxHTTPAdapterBodyBytes for changes while requests may be running.
 var MaxHTTPAdapterBodyBytes int64 = 8 << 20
 
+// NoHTTPAdapterBodyLimit disables the HTTPAdapter response staging cap. Use
+// only for trusted handlers; streaming or large downloads should use native
+// gogo streaming APIs instead of the adapter.
+const NoHTTPAdapterBodyLimit int64 = -1
+
 // ErrHTTPAdapterBodyTooLarge is recorded when a wrapped stdlib handler writes
 // more than MaxHTTPAdapterBodyBytes.
 var ErrHTTPAdapterBodyTooLarge = errors.New("gogo: HTTPAdapter response body exceeds MaxHTTPAdapterBodyBytes")
 
 // SetMaxHTTPAdapterBodyBytes updates the HTTPAdapter response staging cap
-// atomically. Negative disables the cap.
+// atomically. Set to NoHTTPAdapterBodyLimit to disable the cap.
 func SetMaxHTTPAdapterBodyBytes(maxBytes int64) {
 	atomic.StoreInt64(&MaxHTTPAdapterBodyBytes, maxBytes)
 }

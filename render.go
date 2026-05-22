@@ -60,13 +60,17 @@ type LimitedTemplateEngine interface {
 }
 
 // MaxRenderBytes caps the bytes Response.Render will stage before sending the
-// rendered body. Negative disables the cap. The default bounds accidental or
-// maliciously large template output while staying generous for normal pages.
+// rendered body. NoRenderLimit disables the cap. The default bounds accidental
+// or maliciously large template output while staying generous for normal pages.
 //
 // Deprecated for runtime mutation: direct assignment remains supported for
 // startup-time configuration. Use SetMaxRenderBytes / GetMaxRenderBytes for
 // changes while requests may be running.
 var MaxRenderBytes int64 = 8 << 20
+
+// NoRenderLimit disables the Response.Render staging cap. Use only for trusted
+// templates where output size is bounded by the application.
+const NoRenderLimit int64 = -1
 
 // ErrRenderTooLarge is reported when rendered template output exceeds
 // MaxRenderBytes.
@@ -77,7 +81,7 @@ type templateEngineSlot struct {
 }
 
 // SetMaxRenderBytes updates the Response.Render staging cap atomically.
-// Negative disables the cap.
+// Set to NoRenderLimit to disable the cap.
 func SetMaxRenderBytes(maxBytes int64) {
 	atomic.StoreInt64(&MaxRenderBytes, maxBytes)
 }

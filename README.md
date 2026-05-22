@@ -426,7 +426,9 @@ in the route because different apps expose different roots. Large-file serving
 is governed by atomic knobs: `SetMaxSendFileBytes`, `SetSendFileChunkBytes`,
 and `SetSendFileBackpressureBytes`. The legacy package variables still work
 for startup-time configuration, but prefer the setters if the server may be
-serving requests.
+serving requests. Use `gogo.NoSendFileLimit` only for trusted file-serving
+routes where path allow-listing, authorization, or an external layer already
+bounds what may be served.
 
 ### Streaming
 
@@ -469,10 +471,10 @@ app.Get("/", func(res *gogo.Response, req *gogo.Request) {
 
 Templates are named by their path relative to `Root` with the suffix stripped
 — `views/user/profile.tmpl` is rendered as `user/profile`. Render output is
-capped by `gogo.GetMaxRenderBytes()` (default 8 MiB; set negative via
-`gogo.SetMaxRenderBytes(-1)` to disable) before it is sent, so oversized
-templates fail with a generic 500 instead of staging unbounded memory. Bring
-your own engine by implementing `TemplateEngine`:
+capped by `gogo.GetMaxRenderBytes()` (default 8 MiB; set to
+`gogo.SetMaxRenderBytes(gogo.NoRenderLimit)` to disable) before it is sent, so
+oversized templates fail with a generic 500 instead of staging unbounded memory.
+Bring your own engine by implementing `TemplateEngine`:
 
 ```go
 type TemplateEngine interface {
@@ -513,7 +515,9 @@ Multipart value parts parsed by `BodyParser` and `ParseMultipart` are capped by
 `GetDefaultMultipartPartLimit()` (8 MiB by default). Override the process default
 with `SetDefaultMultipartPartLimit(n)` before registering handlers, or pass
 `MultipartOptions{MaxPartBytes: n}` to multipart APIs for route-specific limits.
-The older `DefaultMultipartPartLimit = n` assignment style still works during
+Use `gogo.NoMultipartPartLimit` only for trusted upload flows where
+`Config.BodyLimit` or an external proxy still bounds total request size. The
+older `DefaultMultipartPartLimit = n` assignment style still works during
 startup, but the setter is preferred for runtime-safe updates.
 
 ## Cookies
@@ -534,14 +538,18 @@ res.SetCookie(gogo.Cookie{
 })
 
 // Signed cookies — tamper-evident with HMAC-SHA256.
-res.SetCookieSigned(gogo.Cookie{Name: "uid", Value: "42"}, "my-secret")
-uid, ok := req.CookieSigned("uid", "my-secret")
+cookieSecret := os.Getenv("COOKIE_SECRET") // at least 32 bytes
+res.SetCookieSigned(gogo.Cookie{Name: "uid", Value: "42"}, cookieSecret)
+uid, ok := req.CookieSigned("uid", cookieSecret)
 if !ok {
     res.Send(401, "text/plain", "bad cookie\n")
     return
 }
 _ = uid
 ```
+
+Signed-cookie secrets shorter than 32 bytes panic when signing and never
+verify when reading; use a secret manager or CSPRNG-generated value.
 
 ## Middleware
 
@@ -737,7 +745,8 @@ app.Use(mw.RateLimit(mw.RateLimitOptions{
     MaxBuckets: 100_000,                              // see "RateLimit memory cap" below
 }))
 app.Use("/admin/*", mw.BasicAuth(mw.BasicAuthOptions{
-    Users: map[string]string{"alice": "secret"},
+    Users:              map[string]string{"alice": "secret"},
+    MaxCredentialBytes: 8 << 10, // default; mw.NoBasicAuthCredentialLimit disables the cap
 }))
 
 // JWT verification with HS256 (HMAC).
@@ -752,8 +761,8 @@ app.GetAsync("/api/me", func(res *gogo.Response, req *gogo.Request) {
 
 // CSRF — double-submit cookie pattern.
 app.Use(mw.CSRF(mw.CSRFOptions{
-    Secret:        []byte("32-byte-secret-..."),
-    MaxTokenBytes: 256, // default; negative disables the token length cap
+    Secret:        []byte(os.Getenv("CSRF_SECRET")),
+    MaxTokenBytes: 256, // default; mw.NoCSRFTokenLimit disables the cap
 }))
 
 // Prometheus-flavored metrics with /metrics handler.
@@ -765,6 +774,11 @@ app.Get("/metrics", metrics.Handler())
 Use `AllowOrigins: []string{"*"}` only by itself for public APIs. gogo
 panics at startup if `"*"` is mixed with explicit origins, or combined with
 `AllowCredentials`, so ambiguous CORS policy fails before serving traffic.
+
+HMAC-backed middleware secrets (`JWT` with HS*, `CSRF`, and `NewSession`)
+must be at least 32 bytes. Generate them from a secret manager or a CSPRNG;
+short demo strings panic at startup instead of silently weakening token
+integrity.
 
 ### RequestID — 128-bit IDs
 
@@ -789,7 +803,9 @@ import (
 app.Use(mw.RequestID(mw.RequestIDOptions{
     Generator: func() string {
         var buf [8]byte
-        rand.Read(buf[:])
+        if _, err := rand.Read(buf[:]); err != nil {
+            panic("request id entropy unavailable: " + err.Error())
+        }
         return hex.EncodeToString(buf[:])   // 16 chars, 64-bit entropy
     },
 }))
@@ -829,8 +845,8 @@ app.Use(mw.RateLimit(mw.RateLimitOptions{
 }))
 ```
 
-Set `MaxBuckets: -1` to disable the cap entirely (tests only — re-introduces
-the OOM risk).
+Set `MaxBuckets: mw.NoRateLimitBucketLimit` to disable the cap entirely
+(tests only — re-introduces the OOM risk).
 
 For multi-instance fleets, plug a Redis-backed `RateLimitStore` instead —
 the cap is irrelevant when state lives in Redis, and counters stay
@@ -878,6 +894,9 @@ app.GetAsync("/me", func(res *gogo.Response, req *gogo.Request) {
 })
 ```
 
+`SESSION_SECRET` must be at least 32 bytes; rotate it intentionally because
+rotation invalidates existing session cookies.
+
 Sessions persist automatically at request completion via
 `Response.OnFinish` — that means mutations made inside a
 `res.Async(...)` goroutine are saved correctly (the persist call
@@ -914,7 +933,7 @@ expired rows alive until `GC()` was called manually). When the cap is
 hit on a fresh `Save`, the store sweeps expired entries first and
 otherwise drops the oldest-`expires` entry to make room. Raise the cap
 via `MaxEntries` if your workload legitimately keeps many concurrent
-sessions; pass a negative value to disable (not recommended outside
+sessions; `mw.NoSessionEntryLimit` disables the cap (not recommended outside
 tests).
 
 For multi-instance fleets, implement `SessionStore` (and `RateLimitStore`)
@@ -1474,8 +1493,12 @@ app, _ := gogo.NewApp(gogo.Config{
 `BodyReadTimeout` protects `Response.Body` users from slow body uploads that
 drip bytes forever without exceeding `BodyLimit`. Keep the 30s default for
 ordinary APIs, lower it for small JSON-only endpoints, raise it for legitimate
-large uploads, or set a negative value only when intentionally disabling the
-deadline for trusted traffic/tests.
+large uploads, or set `BodyReadTimeout: gogo.NoBodyReadTimeout` only when
+intentionally disabling the deadline for trusted traffic/tests.
+
+`BodyLimit: 0` uses the safe 4 MiB default. Set `BodyLimit: gogo.NoBodyLimit`
+only for trusted deployments that already enforce a request-body cap at an
+external layer such as a reverse proxy.
 
 ### TrustProxy and client IPs
 
@@ -1515,8 +1538,8 @@ themselves, accepting that any client can forge the value.
 `gogo.HTTPAdapter(h)` and `gogo.HTTPAdapterWithBody(h, body)` are migration
 helpers for small stdlib handlers. They stage the wrapped handler's response
 before sending it through gogo, so the staged body is capped by
-`gogo.GetMaxHTTPAdapterBodyBytes()` (default 8 MiB; set negative via
-`gogo.SetMaxHTTPAdapterBodyBytes(-1)` to disable).
+`gogo.GetMaxHTTPAdapterBodyBytes()` (default 8 MiB; set to
+`gogo.SetMaxHTTPAdapterBodyBytes(gogo.NoHTTPAdapterBodyLimit)` to disable).
 The adapter accepts `http.Flusher` for compatibility, but `Flush()` only
 commits the staged status code; it does not stream bytes to the client.
 Handlers that stream large downloads should be ported to native gogo streaming

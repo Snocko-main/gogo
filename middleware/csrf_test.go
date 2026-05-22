@@ -15,7 +15,7 @@ import (
 func TestCSRFIssuesTokenOnSafeMethod(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.Use(middleware.CSRF(middleware.CSRFOptions{
-			Secret: []byte("csrf-secret"),
+			Secret: []byte("csrf-secret-32-bytes-AAAAAAAAAAAA"),
 		}))
 		app.Get("/", func(res *gogo.Response, req *gogo.Request) {
 			tok, _ := req.Local(middleware.CSRFLocalKey).(string)
@@ -47,7 +47,7 @@ func TestCSRFIssuesTokenOnSafeMethod(t *testing.T) {
 func TestCSRFRejectsUnsafeWithoutToken(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.Use(middleware.CSRF(middleware.CSRFOptions{
-			Secret: []byte("csrf-secret"),
+			Secret: []byte("csrf-secret-32-bytes-AAAAAAAAAAAA"),
 		}))
 		app.Post("/api", func(res *gogo.Response, req *gogo.Request) {
 			res.Send(200, "text/plain", "ok")
@@ -66,7 +66,7 @@ func TestCSRFRejectsUnsafeWithoutToken(t *testing.T) {
 func TestCSRFAcceptsUnsafeWithMatchingToken(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.Use(middleware.CSRF(middleware.CSRFOptions{
-			Secret: []byte("csrf-secret"),
+			Secret: []byte("csrf-secret-32-bytes-AAAAAAAAAAAA"),
 		}))
 		app.Get("/", func(res *gogo.Response, req *gogo.Request) {
 			res.Send(200, "text/plain", "ok")
@@ -107,7 +107,7 @@ func TestCSRFAcceptsUnsafeWithMatchingToken(t *testing.T) {
 func TestCSRFRejectsForgedCookie(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.Use(middleware.CSRF(middleware.CSRFOptions{
-			Secret: []byte("csrf-secret"),
+			Secret: []byte("csrf-secret-32-bytes-AAAAAAAAAAAA"),
 		}))
 		app.Post("/api", func(res *gogo.Response, req *gogo.Request) {
 			res.Send(200, "text/plain", "ok")
@@ -130,7 +130,7 @@ func TestCSRFRejectsForgedCookie(t *testing.T) {
 
 func TestCSRFRejectsMismatchedHeader(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
-		app.Use(middleware.CSRF(middleware.CSRFOptions{Secret: []byte("csrf-secret")}))
+		app.Use(middleware.CSRF(middleware.CSRFOptions{Secret: []byte("csrf-secret-32-bytes-AAAAAAAAAAAA")}))
 		app.Get("/", func(res *gogo.Response, req *gogo.Request) {
 			res.Send(200, "text/plain", "ok")
 		})

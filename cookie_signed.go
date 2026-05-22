@@ -37,7 +37,10 @@ import (
 // A-Za-z0-9-_) and the typical RFC 6265 cookie-octet set, so the
 // split is unambiguous even when the underlying value contains
 // arbitrary opaque text.
-const signedCookieSep = '.'
+const (
+	signedCookieSep            = '.'
+	minSignedCookieSecretBytes = 32
+)
 
 // SignCookieValue returns value + "." + base64url(HMAC-SHA256(value,
 // secret)) using the FIRST entry of secrets as the signing key.
@@ -45,15 +48,18 @@ const signedCookieSep = '.'
 // VerifyCookieValue instead so a rotation can accept the old key
 // while new cookies are issued with the new one.
 //
-// Panics on an empty secrets slice — signing without a key is never
-// what you want, and silently producing an unauthenticated cookie
-// would be a security footgun.
+// Panics on an empty secrets slice or a first secret shorter than 32 bytes —
+// signing without a strong key is never what you want, and silently producing
+// a weakly authenticated cookie would be a security footgun.
 //
 //	signed := gogo.SignCookieValue("alice:42", secret)
 //	res.SetCookie(gogo.Cookie{Name: "session", Value: signed, HttpOnly: true})
 func SignCookieValue(value string, secrets ...string) string {
 	if len(secrets) == 0 || secrets[0] == "" {
 		panic("gogo: SignCookieValue requires at least one secret")
+	}
+	if len(secrets[0]) < minSignedCookieSecretBytes {
+		panic("gogo: SignCookieValue secret must be at least 32 bytes")
 	}
 	mac := hmac.New(sha256.New, []byte(secrets[0]))
 	mac.Write([]byte(value))
@@ -73,8 +79,8 @@ func SignCookieValue(value string, secrets ...string) string {
 //
 //   - signed is empty or contains no '.',
 //   - the signature segment is not valid base64url,
-//   - no secret produces a matching signature,
-//   - secrets is empty.
+//   - no strong secret produces a matching signature,
+//   - secrets is empty or all supplied secrets are shorter than 32 bytes.
 //
 // Comparison is constant-time so a forged cookie cannot leak the
 // expected signature byte-by-byte through timing.
@@ -89,7 +95,7 @@ func VerifyCookieValue(signed string, secrets ...string) (string, bool) {
 		return "", false
 	}
 	dot := strings.LastIndexByte(signed, signedCookieSep)
-	if dot <= 0 || dot == len(signed)-1 {
+	if dot < 0 || dot == len(signed)-1 {
 		return "", false
 	}
 	value := signed[:dot]
@@ -98,7 +104,7 @@ func VerifyCookieValue(signed string, secrets ...string) (string, bool) {
 		return "", false
 	}
 	for _, secret := range secrets {
-		if secret == "" {
+		if len(secret) < minSignedCookieSecretBytes {
 			continue
 		}
 		mac := hmac.New(sha256.New, []byte(secret))

@@ -43,6 +43,17 @@ func TestRateLimitConfiguredUsesSyncPlacement(t *testing.T) {
 	}
 }
 
+func TestRateLimitBucketLimitDisableSentinel(t *testing.T) {
+	h := RateLimit(RateLimitOptions{
+		Max:        10,
+		Window:     time.Minute,
+		MaxBuckets: NoRateLimitBucketLimit,
+	})
+	if h.Place != mwhint.Sync {
+		t.Fatalf("RateLimit with NoRateLimitBucketLimit placement = %v, want Sync", h.Place)
+	}
+}
+
 func TestRateLimitAsyncStoreUsesAsyncPlacement(t *testing.T) {
 	h := RateLimit(RateLimitOptions{Max: 10, Window: time.Minute, AsyncStore: true})
 	if h.Place != mwhint.Async {

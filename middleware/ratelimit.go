@@ -49,7 +49,8 @@ type RateLimitOptions struct {
 	// the OLDEST remaining bucket (by resetAt) is evicted to make
 	// room. Zero (default) means 100_000 — enough for legitimate
 	// fleets, low enough that worst-case memory stays under ~10 MiB.
-	// Negative disables the cap (not recommended outside tests).
+	// NoRateLimitBucketLimit disables the cap (not recommended outside
+	// tests).
 	// Only consulted when Store is the default MemoryRateLimitStore.
 	MaxBuckets int
 
@@ -74,6 +75,11 @@ type RateLimitStore interface {
 	// window has rolled over, the store should reset to 1.
 	Hit(key string, window time.Duration) (count int, resetAt time.Time)
 }
+
+// NoRateLimitBucketLimit disables the in-memory rate-limit bucket cap. This is
+// intended for tests only; production deployments should keep the cap enabled
+// or use a bounded external store such as Redis.
+const NoRateLimitBucketLimit = -1
 
 // RateLimit returns a middleware that enforces a fixed-window per-key
 // quota. When a key exceeds Max requests within Window, subsequent
@@ -114,7 +120,7 @@ func RateLimit(opt RateLimitOptions) mwhint.Hinted {
 		case opt.MaxBuckets > 0:
 			mem.maxBuckets = opt.MaxBuckets
 		default:
-			mem.maxBuckets = 0 // negative → disabled
+			mem.maxBuckets = 0 // NoRateLimitBucketLimit / legacy negative disables.
 		}
 		opt.Store = mem
 	}
