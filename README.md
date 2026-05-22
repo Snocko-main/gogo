@@ -1299,7 +1299,12 @@ adapter, err := redisadapter.New(redisadapter.Options{
 if err != nil {
     log.Fatal(err)
 }
-hub := gogo.NewWSHub(gogo.WithWSHubAdapter(adapter))
+hub := gogo.NewWSHub(
+    gogo.WithWSHubAdapter(adapter),
+    gogo.WithWSHubAdapterErrorHandler(func(err error) {
+        log.Printf("websocket hub adapter: %v", err)
+    }),
+)
 defer hub.Close()
 if err := hub.Start(); err != nil {
     log.Fatal(err)

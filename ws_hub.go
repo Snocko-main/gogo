@@ -66,6 +66,10 @@ type WSHub struct {
 	adapterWG      sync.WaitGroup
 	adapterQueueMu sync.RWMutex
 	adapterTimeout time.Duration
+	adapterErrMu   sync.Mutex
+	adapterErrFn   func(error)
+	adapterErrNext time.Time
+	adapterErrLast string
 	socketSeq      atomic.Uint64
 	closed         atomic.Bool
 	closeOnce      sync.Once
@@ -121,6 +125,14 @@ func WithWSHubAdapterPublishTimeout(timeout time.Duration) WSHubOption {
 	}
 }
 
+// WithWSHubAdapterErrorHandler receives asynchronous adapter errors from the
+// hub worker. The default reports rate-limited errors through SetPanicHandler.
+func WithWSHubAdapterErrorHandler(fn func(error)) WSHubOption {
+	return func(h *WSHub) {
+		h.adapterErrFn = fn
+	}
+}
+
 // NewWSHub creates a WebSocket hub. With no adapter, it still fans out across
 // every App attached in the current process, which is enough for RunMultiCore.
 func NewWSHub(opts ...WSHubOption) *WSHub {
@@ -132,6 +144,7 @@ func NewWSHub(opts ...WSHubOption) *WSHub {
 		members:        make(map[string]map[uintptr]struct{}),
 		adapterQueueSz: defaultWSHubAdapterQueueSize,
 		adapterTimeout: defaultWSHubAdapterPublishTimeout,
+		adapterErrFn:   defaultWSHubAdapterErrorHandler,
 		startBackoff:   defaultWSHubStartBackoff,
 		ctx:            ctx,
 		cancel:         cancel,
@@ -450,7 +463,9 @@ func (h *WSHub) ensureAdapterWorker() {
 func (h *WSHub) runAdapterWorker(queue <-chan WSHubMessage) {
 	defer h.adapterWG.Done()
 	for msg := range queue {
-		_ = h.publishAdapter(msg, true)
+		if err := h.publishAdapter(msg, true); err != nil {
+			h.reportAdapterError(err)
+		}
 	}
 }
 
@@ -652,6 +667,28 @@ func untrackWSHubSubscribe(ws *WebSocket, topic string) {
 		return
 	}
 	h.removeMembershipIfCurrent(key, ws.hubToken.Load(), topic)
+}
+
+func (h *WSHub) reportAdapterError(err error) {
+	if err == nil || h.adapterErrFn == nil {
+		return
+	}
+	now := time.Now()
+	msg := err.Error()
+	h.adapterErrMu.Lock()
+	if msg == h.adapterErrLast && now.Before(h.adapterErrNext) {
+		h.adapterErrMu.Unlock()
+		return
+	}
+	h.adapterErrLast = msg
+	h.adapterErrNext = now.Add(time.Second)
+	fn := h.adapterErrFn
+	h.adapterErrMu.Unlock()
+	fn(err)
+}
+
+func defaultWSHubAdapterErrorHandler(err error) {
+	reportPanic(fmt.Errorf("gogo: websocket hub adapter: %w", err))
 }
 
 func randomNodeID() string {

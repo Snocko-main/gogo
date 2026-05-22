@@ -129,6 +129,20 @@ func (a *ctxBlockingWSHubAdapter) Publish(ctx context.Context, _ WSHubMessage) e
 
 func (a *ctxBlockingWSHubAdapter) Close() error { return nil }
 
+type failingPublishWSHubAdapter struct {
+	err error
+}
+
+func (a *failingPublishWSHubAdapter) Start(context.Context, func(WSHubMessage)) error {
+	return nil
+}
+
+func (a *failingPublishWSHubAdapter) Publish(context.Context, WSHubMessage) error {
+	return a.err
+}
+
+func (a *failingPublishWSHubAdapter) Close() error { return nil }
+
 func TestWSHubCloseBoundsInFlightAdapterPublish(t *testing.T) {
 	adapter := &ctxBlockingWSHubAdapter{entered: make(chan struct{}, 1)}
 	hub := NewWSHub(
@@ -156,5 +170,29 @@ func TestWSHubCloseBoundsInFlightAdapterPublish(t *testing.T) {
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("Close waited too long for adapter publish")
+	}
+}
+
+func TestWSHubReportsAsyncAdapterError(t *testing.T) {
+	want := errors.New("redis publish failed")
+	errs := make(chan error, 1)
+	hub := NewWSHub(
+		WithWSHubAdapter(&failingPublishWSHubAdapter{err: want}),
+		WithWSHubAdapterErrorHandler(func(err error) {
+			errs <- err
+		}),
+	)
+	defer hub.Close()
+
+	if err := hub.Publish("room", []byte("hello"), Text); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	select {
+	case got := <-errs:
+		if !errors.Is(got, want) {
+			t.Fatalf("async adapter error = %v, want %v", got, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("async adapter error was not reported")
 	}
 }
