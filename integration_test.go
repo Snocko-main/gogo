@@ -5912,7 +5912,7 @@ func TestWSHubCloseSkipsUserCloseWhenOpenDidNotRun(t *testing.T) {
 	}
 }
 
-func TestWSHubCloseRunsWhenUserOpenPanics(t *testing.T) {
+func TestWSHubCloseSkipsUserCloseWhenOpenPanics(t *testing.T) {
 	hub := gogo.NewWSHub(gogo.WithWSHubNodeID("test-node"))
 	defer hub.Close()
 
@@ -5947,8 +5947,8 @@ func TestWSHubCloseRunsWhenUserOpenPanics(t *testing.T) {
 	if got := opened.Load(); got != 1 {
 		t.Fatalf("Open calls = %d, want 1", got)
 	}
-	if got := closed.Load(); got != 1 {
-		t.Fatalf("Close calls = %d, want 1", got)
+	if got := closed.Load(); got != 0 {
+		t.Fatalf("Close calls = %d, want 0", got)
 	}
 }
 

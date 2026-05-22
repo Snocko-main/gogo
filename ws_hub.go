@@ -288,7 +288,7 @@ func (h *WSHub) Wrap(app *App, behavior WebSocketBehavior) WebSocketBehavior {
 		}
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				h.closeAfterOpenPanic(ws, closeFn, recovered)
+				h.closeAfterOpenPanic(ws, recovered)
 			}
 		}()
 		if open != nil {
@@ -309,18 +309,8 @@ func (h *WSHub) Wrap(app *App, behavior WebSocketBehavior) WebSocketBehavior {
 	return behavior
 }
 
-func (h *WSHub) closeAfterOpenPanic(ws *WebSocket, closeFn func(*WebSocket, int, []byte), recovered any) {
+func (h *WSHub) closeAfterOpenPanic(ws *WebSocket, recovered any) {
 	defer h.forget(ws)
-	if closeFn != nil {
-		func() {
-			defer func() {
-				if closeRecovered := recover(); closeRecovered != nil {
-					reportPanic(fmt.Errorf("gogo: websocket hub Close after Open panic also panicked: %v", closeRecovered))
-				}
-			}()
-			closeFn(ws, 1011, []byte("websocket open panic"))
-		}()
-	}
 	func() {
 		defer func() {
 			if endRecovered := recover(); endRecovered != nil {
