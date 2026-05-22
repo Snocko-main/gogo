@@ -244,10 +244,20 @@ func (m *Metrics) observe(method string, status int, dur time.Duration) {
 
 	statusStr := strconv.Itoa(status)
 	bumpTagged(&m.statusCounts, statusStr)
-	bumpTagged(&m.methodCounts, strings.ToUpper(method))
+	bumpTagged(&m.methodCounts, metricsMethodLabel(method))
 
 	if m.opts.OnObservation != nil {
 		m.opts.OnObservation(method, statusStr, dur)
+	}
+}
+
+func metricsMethodLabel(method string) string {
+	upper := strings.ToUpper(method)
+	switch upper {
+	case "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "CONNECT", "TRACE":
+		return upper
+	default:
+		return "OTHER"
 	}
 }
 
