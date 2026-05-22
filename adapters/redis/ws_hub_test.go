@@ -116,3 +116,15 @@ func TestDecodeRejectsInvalidOpcode(t *testing.T) {
 		t.Fatal("decode succeeded for invalid opcode")
 	}
 }
+
+func TestEncodeRejectsInvalidOpcode(t *testing.T) {
+	_, err := encodeMessage(gogo.WSHubMessage{
+		NodeID:  "node-a",
+		Topic:   "room.general",
+		Message: []byte("hello"),
+		OpCode:  gogo.OpCode(99),
+	})
+	if err == nil {
+		t.Fatal("encode succeeded for invalid opcode")
+	}
+}

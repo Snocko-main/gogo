@@ -276,6 +276,9 @@ func encodeMessage(msg gogo.WSHubMessage) ([]byte, error) {
 	if len(msg.NodeID) > 0xffff {
 		return nil, fmt.Errorf("gogo/adapters/redis: WSHub node id too long: %d", len(msg.NodeID))
 	}
+	if msg.OpCode != gogo.Text && msg.OpCode != gogo.Binary {
+		return nil, fmt.Errorf("gogo/adapters/redis: unsupported opcode %d", msg.OpCode)
+	}
 	out := make([]byte, 4+len(msg.NodeID)+len(msg.Message))
 	out[0] = wireVersion
 	out[1] = byte(msg.OpCode)
