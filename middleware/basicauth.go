@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -146,7 +147,7 @@ func parseBasicAuth(auth string, maxCredentialBytes int) (user, pass string, ok 
 	if err != nil {
 		return "", "", false
 	}
-	colon := strings.IndexByte(string(decoded), ':')
+	colon := bytes.IndexByte(decoded, ':')
 	if colon < 0 {
 		return "", "", false
 	}
