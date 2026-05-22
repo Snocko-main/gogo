@@ -264,8 +264,8 @@ func TestWSHubRestoreMembershipAfterUnsubscribeFailure(t *testing.T) {
 	if !removed || !last {
 		t.Fatalf("removeMembershipForUnsubscribe = removed %v last %v, want true/true", removed, last)
 	}
-	if first := hub.restoreMembershipIfCurrent(1, 7, "room"); !first {
-		t.Fatal("restoreMembershipIfCurrent should restore the first local member")
+	if first, restored := hub.restoreMembershipIfCurrent(1, 7, "room"); !first || !restored {
+		t.Fatalf("restoreMembershipIfCurrent = first %v restored %v, want true/true", first, restored)
 	}
 	hub.mu.RLock()
 	_, socketTopic := hub.sockets[1].topics["room"]
@@ -282,8 +282,8 @@ func TestWSHubRestoreMembershipRejectsStaleToken(t *testing.T) {
 	hub.sockets[1] = &hubSocket{token: 7, topics: make(map[string]struct{})}
 	hub.mu.Unlock()
 
-	if first := hub.restoreMembershipIfCurrent(1, 6, "room"); first {
-		t.Fatal("restoreMembershipIfCurrent accepted stale token")
+	if first, restored := hub.restoreMembershipIfCurrent(1, 6, "room"); first || restored {
+		t.Fatalf("restoreMembershipIfCurrent = first %v restored %v, want false/false", first, restored)
 	}
 	hub.mu.RLock()
 	_, member := hub.members["room"][uintptr(1)]

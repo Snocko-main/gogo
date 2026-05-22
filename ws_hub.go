@@ -312,6 +312,7 @@ func (h *WSHub) Wrap(app *App, behavior WebSocketBehavior) WebSocketBehavior {
 
 func (h *WSHub) closeAfterOpenPanic(ws *WebSocket, recovered any) {
 	defer h.forget(ws)
+	reportPanic(recovered)
 	func() {
 		defer func() {
 			if endRecovered := recover(); endRecovered != nil {
@@ -320,7 +321,6 @@ func (h *WSHub) closeAfterOpenPanic(ws *WebSocket, recovered any) {
 		}()
 		ws.End(1011, "websocket open panic")
 	}()
-	reportPanic(recovered)
 }
 
 // Subscribe enrolls ws in topic. It is a small convenience wrapper around
@@ -458,6 +458,12 @@ func (h *WSHub) Close() error {
 		if h.adapterTopicRetry != nil {
 			h.adapterTopicRetry.Stop()
 			h.adapterTopicRetry = nil
+		}
+		if h.adapterTopicDirty != nil {
+			h.adapterTopicDirty = make(map[string]struct{})
+			h.adapterTopicBusy = make(map[string]struct{})
+			h.adapterTopicApplied = make(map[string]bool)
+			h.adapterTopicRetryAt = make(map[string]time.Time)
 		}
 		h.mu.Unlock()
 		h.adapterQueueMu.Lock()
@@ -1023,6 +1029,9 @@ func (h *WSHub) removeMembershipIfCurrent(key uintptr, token uint64, topic strin
 }
 
 func (h *WSHub) removeMembershipForUnsubscribe(key uintptr, token uint64, topic string) (bool, bool) {
+	if h.closed.Load() {
+		return false, false
+	}
 	h.mu.Lock()
 	socket := h.sockets[key]
 	if socket == nil {
@@ -1042,18 +1051,18 @@ func (h *WSHub) removeMembershipForUnsubscribe(key uintptr, token uint64, topic 
 	return true, last
 }
 
-func (h *WSHub) restoreMembershipIfCurrent(key uintptr, token uint64, topic string) bool {
+func (h *WSHub) restoreMembershipIfCurrent(key uintptr, token uint64, topic string) (bool, bool) {
 	if h.closed.Load() {
-		return false
+		return false, false
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	socket := h.sockets[key]
 	if socket == nil || token != socket.token {
-		return false
+		return false, false
 	}
 	if _, ok := socket.topics[topic]; ok {
-		return false
+		return false, true
 	}
 	socket.topics[topic] = struct{}{}
 	first := len(h.members[topic]) == 0
@@ -1061,7 +1070,7 @@ func (h *WSHub) restoreMembershipIfCurrent(key uintptr, token uint64, topic stri
 		h.members[topic] = make(map[uintptr]struct{})
 	}
 	h.members[topic][key] = struct{}{}
-	return first
+	return first, true
 }
 
 func (h *WSHub) removeMembershipLocked(key uintptr, topic string) bool {
@@ -1145,17 +1154,6 @@ func trackWSHubSubscribe(ws *WebSocket, topic string) bool {
 	return false
 }
 
-func untrackWSHubSubscribe(ws *WebSocket, topic string) {
-	if ws == nil {
-		return
-	}
-	key, h := hubForWebSocket(ws)
-	if h == nil {
-		return
-	}
-	h.removeMembershipIfCurrent(key, ws.hubToken.Load(), topic)
-}
-
 func (h *WSHub) reportAdapterError(err error) {
 	if err == nil || h.adapterErrFn == nil {
 		return
@@ -1200,15 +1198,19 @@ func randomDirectTopic(nodeID string) string {
 	if _, err := rand.Read(b[:]); err == nil {
 		return fmt.Sprintf("__gogo_hub:%s:%s", nodeID, hex.EncodeToString(b[:]))
 	}
-	return fmt.Sprintf("__gogo_hub:%s:%s", nodeID, randomNodeID())
+	return fmt.Sprintf("__gogo_hub:%s:%s", nodeID, fallbackNodeID())
 }
 
 func randomNodeID() string {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		return fmt.Sprintf("local-%d-%d-%d", os.Getpid(), time.Now().UnixNano(), fallbackNodeCounter.Add(1))
+		return fallbackNodeID()
 	}
 	return hex.EncodeToString(b[:])
+}
+
+func fallbackNodeID() string {
+	return fmt.Sprintf("local-%d-%d-%d", os.Getpid(), time.Now().UnixNano(), fallbackNodeCounter.Add(1))
 }
 
 func cloneBytes(b []byte) []byte {

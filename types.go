@@ -5492,7 +5492,11 @@ func (ws *WebSocket) Subscribe(topic string) bool {
 		return false
 	}
 	if !trackWSHubSubscribe(ws, topic) {
-		ws.inner.unsubscribe(topic)
+		if !ws.inner.unsubscribe(topic) {
+			if _, h := hubForWebSocket(ws); h != nil {
+				h.reportAdapterError(fmt.Errorf("gogo: websocket hub subscribe rollback failed for topic %q", topic))
+			}
+		}
 		return false
 	}
 	return true
@@ -5510,7 +5514,10 @@ func (ws *WebSocket) Unsubscribe(topic string) bool {
 	}
 	if !ws.inner.unsubscribe(topic) {
 		if removed && h != nil {
-			if first := h.restoreMembershipIfCurrent(key, token, topic); first {
+			first, restored := h.restoreMembershipIfCurrent(key, token, topic)
+			if !restored {
+				h.reportAdapterError(fmt.Errorf("gogo: websocket hub unsubscribe restore failed for topic %q", topic))
+			} else if first {
 				h.queueAdapterTopic(topic)
 			}
 		}
