@@ -383,6 +383,9 @@ func validateSessionOptions(opt SessionOptions) {
 	if opt.CookieSameSite == gogo.SameSiteNone && !opt.CookieSecure {
 		panic("gogo/middleware: Session CookieSameSite=None requires CookieSecure=true")
 	}
+	if opt.TTL <= 0 {
+		panic("gogo/middleware: Session TTL must be positive")
+	}
 }
 
 func persistSession(s *Session, opt SessionOptions) {
@@ -394,7 +397,9 @@ func persistSession(s *Session, opt SessionOptions) {
 		return
 	}
 	if s.dirty {
-		_ = opt.Store.Save(s.ID, s.data, opt.TTL)
+		if err := opt.Store.Save(s.ID, s.data, opt.TTL); err == nil {
+			s.dirty = false
+		}
 	}
 }
 

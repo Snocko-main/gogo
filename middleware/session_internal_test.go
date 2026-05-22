@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"testing"
+	"time"
 
 	"github.com/Snocko-main/gogo"
 	"github.com/Snocko-main/gogo/internal/mwhint"
@@ -58,6 +59,13 @@ func TestSessionValidatesCookieOptionsAtConstruction(t *testing.T) {
 			},
 		},
 		{
+			name: "negative ttl",
+			opt: SessionOptions{
+				Secret: []byte("session-secret"),
+				TTL:    -time.Second,
+			},
+		},
+		{
 			name: "samesite none without secure",
 			opt: SessionOptions{
 				Secret:         []byte("session-secret"),
@@ -76,4 +84,44 @@ func TestSessionValidatesCookieOptionsAtConstruction(t *testing.T) {
 			_ = NewSession(tc.opt)
 		})
 	}
+}
+
+func TestPersistSessionClearsDirtyAfterSuccessfulSave(t *testing.T) {
+	store := &countingSessionStore{}
+	sess := &Session{
+		ID:    "session-id",
+		data:  map[string]any{"phase": "checkpoint"},
+		dirty: true,
+	}
+	opt := SessionOptions{
+		Store: store,
+		TTL:   time.Minute,
+	}
+
+	persistSession(sess, opt)
+	persistSession(sess, opt)
+
+	if store.saves != 1 {
+		t.Fatalf("Save calls = %d, want 1", store.saves)
+	}
+	if sess.dirty {
+		t.Fatal("session remained dirty after successful save")
+	}
+}
+
+type countingSessionStore struct {
+	saves int
+}
+
+func (s *countingSessionStore) Load(string) (map[string]any, bool) {
+	return nil, false
+}
+
+func (s *countingSessionStore) Save(string, map[string]any, time.Duration) error {
+	s.saves++
+	return nil
+}
+
+func (s *countingSessionStore) Delete(string) error {
+	return nil
 }
