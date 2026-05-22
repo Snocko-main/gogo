@@ -2435,7 +2435,7 @@ func (r *Response) StatusCode() int {
 func (r *Response) Header(key, value string) *Response {
 	validateHeaderName(key)
 	validateHeaderValue(key, value)
-	if r.async != nil && key == "Content-Type" {
+	if r.async != nil && strings.EqualFold(key, "Content-Type") {
 		r.async.contentType = value
 		return r
 	}

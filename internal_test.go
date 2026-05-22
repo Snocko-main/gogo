@@ -48,6 +48,19 @@ func TestHeadersBlobForIterationIncompleteSyncUsesFullDump(t *testing.T) {
 	}
 }
 
+func TestAsyncHeaderContentTypeIsCaseInsensitiveFastPath(t *testing.T) {
+	res := &Response{async: &asyncState{}}
+
+	res.Header("content-type", "application/json")
+
+	if res.async.contentType != "application/json" {
+		t.Fatalf("async contentType = %q, want application/json", res.async.contentType)
+	}
+	if len(res.pendingHeaders) != 0 {
+		t.Fatalf("Content-Type was buffered as pending header: %v", res.pendingHeaders)
+	}
+}
+
 func TestDefaultConfigAppliesSafeBodyReadTimeout(t *testing.T) {
 	cfg := defaultConfig(Config{})
 	if cfg.BodyReadTimeout != defaultBodyReadTimeout {
