@@ -79,6 +79,26 @@ const app = new Elysia()
       { headers: { "Content-Type": "application/json" } }
     );
   })
+  // POST /echo: read the body, echo back. Elysia exposes parsed body
+  // via the destructured `body` arg; we ask Bun.serve to skip parsing
+  // and just hand back the bytes.
+  .post("/echo", async ({ request }) => {
+    const buf = await request.arrayBuffer();
+    return new Response(buf, {
+      headers: { "Content-Type": "application/json" },
+    });
+  })
+  // POST /query: body is an integer id; look it up in SQLite, return row.
+  .post("/query", async ({ request }) => {
+    const text = (await request.text()).trim();
+    let id = parseInt(text, 10);
+    if (!Number.isFinite(id) || id < 1 || id > 1000) id = 1;
+    const row = dbStmt.get(id) as { name: string; email: string; role: string };
+    return new Response(
+      `{"id":${id},"name":${JSON.stringify(row.name)},"email":${JSON.stringify(row.email)},"role":${JSON.stringify(row.role)}}\n`,
+      { headers: { "Content-Type": "application/json" } }
+    );
+  })
   .listen({ port, reusePort: workers > 1 });
 
 const tag = workers > 1 ? ` (worker ${process.pid})` : "";

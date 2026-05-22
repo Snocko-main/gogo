@@ -1,0 +1,280 @@
+== actix [single] GET /hello  t=1 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3007/hello
+  1 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.34ms  464.86us   9.07ms   74.22%
+    Req/Sec   209.01k    27.01k  282.28k    66.34%
+  Latency Distribution
+     50%    2.31ms
+     75%    2.55ms
+     90%    2.86ms
+     99%    3.76ms
+  2100094 requests in 10.10s, 258.36MB read
+Requests/sec: 207832.21
+Transfer/sec:     25.57MB
+== actix [single] GET /hello  t=2 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3007/hello
+  2 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.69ms  603.69us  12.60ms   89.51%
+    Req/Sec    93.03k    13.37k  209.28k    92.04%
+  Latency Distribution
+     50%    2.56ms
+     75%    2.79ms
+     90%    3.25ms
+     99%    5.15ms
+  1861011 requests in 10.10s, 228.95MB read
+Requests/sec: 184202.54
+Transfer/sec:     22.66MB
+== actix [single] GET /hello  t=4 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3007/hello
+  4 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     3.02ms    1.11ms  24.62ms   92.43%
+    Req/Sec    42.14k     7.84k   61.49k    80.65%
+  Latency Distribution
+     50%    2.71ms
+     75%    3.10ms
+     90%    3.68ms
+     99%    8.04ms
+  1690119 requests in 10.10s, 207.93MB read
+Requests/sec: 167264.75
+Transfer/sec:     20.58MB
+== actix [single] GET /hello  t=8 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3007/hello
+  8 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.92ms  561.17us  10.71ms   88.34%
+    Req/Sec    21.26k     2.05k   36.80k    90.84%
+  Latency Distribution
+     50%    2.77ms
+     75%    3.05ms
+     90%    3.49ms
+     99%    5.14ms
+  1709194 requests in 10.11s, 210.27MB read
+Requests/sec: 169109.44
+Transfer/sec:     20.80MB
+== actix [single] GET /hello/inon  t=1 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3007/hello/inon
+  1 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.63ms  717.42us  23.39ms   93.81%
+    Req/Sec   191.06k    23.39k  224.21k    88.00%
+  Latency Distribution
+     50%    2.44ms
+     75%    2.67ms
+     90%    3.01ms
+     99%    5.88ms
+  1899598 requests in 10.01s, 231.88MB read
+Requests/sec: 189779.07
+Transfer/sec:     23.17MB
+== actix [single] GET /hello/inon  t=2 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3007/hello/inon
+  2 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.62ms  488.79us  12.24ms   92.14%
+    Req/Sec    95.88k     9.32k  107.18k    90.59%
+  Latency Distribution
+     50%    2.50ms
+     75%    2.66ms
+     90%    3.00ms
+     99%    4.69ms
+  1927124 requests in 10.10s, 235.24MB read
+Requests/sec: 190739.09
+Transfer/sec:     23.28MB
+== actix [single] GET /hello/inon  t=4 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3007/hello/inon
+  4 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.76ms  549.53us  12.73ms   91.71%
+    Req/Sec    45.47k     4.58k   63.34k    92.80%
+  Latency Distribution
+     50%    2.64ms
+     75%    2.85ms
+     90%    3.18ms
+     99%    5.04ms
+  1823404 requests in 10.11s, 222.58MB read
+Requests/sec: 180419.67
+Transfer/sec:     22.02MB
+== actix [single] GET /hello/inon  t=8 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3007/hello/inon
+  8 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     3.15ms    2.06ms  55.97ms   96.18%
+    Req/Sec    20.43k     6.36k  180.48k    93.88%
+  Latency Distribution
+     50%    2.84ms
+     75%    3.19ms
+     90%    3.75ms
+     99%    7.02ms
+  1628633 requests in 10.10s, 198.81MB read
+Requests/sec: 161208.14
+Transfer/sec:     19.68MB
+== actix [single] GET /db  t=1 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3007/db
+  1 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     4.77ms    1.91ms  32.43ms   83.52%
+    Req/Sec   104.77k    21.72k  142.22k    69.00%
+  Latency Distribution
+     50%    4.69ms
+     75%    5.69ms
+     90%    6.62ms
+     99%   12.22ms
+  1042971 requests in 10.01s, 179.71MB read
+Requests/sec: 104209.04
+Transfer/sec:     17.96MB
+== actix [single] GET /db  t=2 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3007/db
+  2 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     5.26ms    3.94ms  75.58ms   91.57%
+    Req/Sec    51.73k    12.97k   72.36k    71.29%
+  Latency Distribution
+     50%    3.99ms
+     75%    5.91ms
+     90%    8.27ms
+     99%   23.17ms
+  1039912 requests in 10.11s, 179.19MB read
+Requests/sec: 102869.46
+Transfer/sec:     17.73MB
+== actix [single] GET /db  t=4 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3007/db
+  4 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     6.36ms    5.66ms  76.06ms   91.22%
+    Req/Sec    22.73k     6.23k   35.41k    70.00%
+  Latency Distribution
+     50%    5.06ms
+     75%    6.50ms
+     90%   10.17ms
+     99%   32.85ms
+  905660 requests in 10.02s, 156.05MB read
+Requests/sec:  90374.06
+Transfer/sec:     15.57MB
+== actix [single] GET /db  t=8 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3007/db
+  8 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     6.30ms    6.64ms  86.21ms   92.13%
+    Req/Sec    11.90k     3.63k   20.57k    65.50%
+  Latency Distribution
+     50%    4.68ms
+     75%    6.24ms
+     90%   10.51ms
+     99%   36.64ms
+  948259 requests in 10.02s, 163.39MB read
+Requests/sec:  94648.01
+Transfer/sec:     16.31MB
+== actix [single] POST /echo  t=1 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3007/echo
+  1 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.61ms  526.15us  15.58ms   93.17%
+    Req/Sec   193.18k    17.00k  223.54k    93.07%
+  Latency Distribution
+     50%    2.49ms
+     75%    2.63ms
+     90%    2.92ms
+     99%    4.38ms
+  1939402 requests in 10.11s, 294.08MB read
+Requests/sec: 191858.50
+Transfer/sec:     29.09MB
+== actix [single] POST /echo  t=2 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3007/echo
+  2 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.78ms  555.06us  13.53ms   91.75%
+    Req/Sec    90.53k     8.13k  111.21k    90.10%
+  Latency Distribution
+     50%    2.63ms
+     75%    2.85ms
+     90%    3.18ms
+     99%    4.89ms
+  1818452 requests in 10.10s, 275.74MB read
+Requests/sec: 179998.02
+Transfer/sec:     27.29MB
+== actix [single] POST /echo  t=4 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3007/echo
+  4 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     3.20ms    1.10ms  28.17ms   93.89%
+    Req/Sec    39.62k     5.82k   49.91k    85.36%
+  Latency Distribution
+     50%    2.91ms
+     75%    3.31ms
+     90%    3.87ms
+     99%    7.33ms
+  1589416 requests in 10.11s, 241.01MB read
+Requests/sec: 157275.64
+Transfer/sec:     23.85MB
+== actix [single] POST /echo  t=8 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3007/echo
+  8 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     3.07ms  568.91us  10.51ms   88.13%
+    Req/Sec    20.24k     3.00k   58.01k    92.40%
+  Latency Distribution
+     50%    2.92ms
+     75%    3.18ms
+     90%    3.63ms
+     99%    5.53ms
+  1617127 requests in 10.10s, 245.21MB read
+Requests/sec: 160096.08
+Transfer/sec:     24.28MB
+== actix [single] POST /query  t=1 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3007/query
+  1 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     6.86ms    6.84ms 147.67ms   91.75%
+    Req/Sec    85.09k    18.97k  122.51k    81.00%
+  Latency Distribution
+     50%    5.18ms
+     75%    6.04ms
+     90%   11.26ms
+     99%   34.21ms
+  847214 requests in 10.02s, 143.82MB read
+Requests/sec:  84582.74
+Transfer/sec:     14.36MB
+== actix [single] POST /query  t=2 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3007/query
+  2 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    11.54ms   14.63ms 176.67ms   88.76%
+    Req/Sec    31.87k    12.75k   64.08k    70.00%
+  Latency Distribution
+     50%    6.73ms
+     75%   15.17ms
+     90%   28.04ms
+     99%   66.61ms
+  635561 requests in 10.04s, 107.89MB read
+Requests/sec:  63288.57
+Transfer/sec:     10.74MB
+== actix [single] POST /query  t=4 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3007/query
+  4 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     8.07ms    7.69ms 116.64ms   90.83%
+    Req/Sec    18.39k     5.41k   31.26k    64.25%
+  Latency Distribution
+     50%    5.32ms
+     75%    7.93ms
+     90%   15.24ms
+     99%   38.65ms
+  733180 requests in 10.02s, 124.46MB read
+Requests/sec:  73142.62
+Transfer/sec:     12.42MB
+== actix [single] POST /query  t=8 c=500 d=10s ==
+Running 10s test @ http://127.0.0.1:3007/query
+  8 threads and 500 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     6.68ms    5.81ms 106.43ms   94.74%
+    Req/Sec    10.30k     2.21k   16.75k    84.38%
+  Latency Distribution
+     50%    5.55ms
+     75%    6.24ms
+     90%    8.34ms
+     99%   32.16ms
+  820243 requests in 10.01s, 139.24MB read
+Requests/sec:  81955.09
+Transfer/sec:     13.91MB
