@@ -2,8 +2,10 @@ package redis
 
 import (
 	"testing"
+	"time"
 
 	gogo "github.com/Snocko-main/gogo"
+	goredis "github.com/redis/go-redis/v9"
 )
 
 func TestWireRoundTrip(t *testing.T) {
@@ -53,6 +55,32 @@ func TestNewSetsDefaultChannelSize(t *testing.T) {
 	}
 	if adapter.maxMsg != defaultMaxMessage {
 		t.Fatalf("max message size = %d, want %d", adapter.maxMsg, defaultMaxMessage)
+	}
+}
+
+func TestNewClientOptions(t *testing.T) {
+	client := goredis.NewClient(&goredis.Options{Addr: "localhost:6379"})
+	defer client.Close()
+	adapter, err := NewClientOptions(client, Options{
+		ChannelPrefix:      "custom:",
+		ChannelSize:        17,
+		ChannelSendTimeout: 2 * time.Second,
+		MaxMessageSize:     32,
+	})
+	if err != nil {
+		t.Fatalf("NewClientOptions: %v", err)
+	}
+	if adapter.prefix != "custom:" {
+		t.Fatalf("prefix = %q, want custom:", adapter.prefix)
+	}
+	if adapter.chSize != 17 {
+		t.Fatalf("channel size = %d, want 17", adapter.chSize)
+	}
+	if adapter.chSend != 2*time.Second {
+		t.Fatalf("channel send timeout = %v, want 2s", adapter.chSend)
+	}
+	if adapter.maxMsg != 32 {
+		t.Fatalf("max message size = %d, want 32", adapter.maxMsg)
 	}
 }
 

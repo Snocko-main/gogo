@@ -79,14 +79,6 @@ func New(opt Options) (*Adapter, error) {
 	if prefix == "" {
 		prefix = defaultChannelPrefix
 	}
-	channelSize := opt.ChannelSize
-	if channelSize <= 0 {
-		channelSize = defaultChannelSize
-	}
-	maxMessage := opt.MaxMessageSize
-	if maxMessage <= 0 {
-		maxMessage = defaultMaxMessage
-	}
 
 	var client goredis.UniversalClient
 	if opt.URL != "" {
@@ -111,27 +103,49 @@ func New(opt Options) (*Adapter, error) {
 		client: client,
 		own:    true,
 		prefix: prefix,
-		chSize: channelSize,
+		chSize: channelSize(opt),
 		chSend: opt.ChannelSendTimeout,
-		maxMsg: maxMessage,
+		maxMsg: maxMessageSize(opt),
 	}, nil
 }
 
 // NewClient wraps an existing Redis client. The adapter does not close client
 // on Close.
 func NewClient(client goredis.UniversalClient, channelPrefix string) (*Adapter, error) {
+	return NewClientOptions(client, Options{ChannelPrefix: channelPrefix})
+}
+
+// NewClientOptions wraps an existing Redis client with full adapter options.
+// URL, Addr, Username, Password, and DB are ignored because client is supplied.
+func NewClientOptions(client goredis.UniversalClient, opt Options) (*Adapter, error) {
 	if client == nil {
 		return nil, errors.New("gogo/adapters/redis: nil Redis client")
 	}
+	channelPrefix := opt.ChannelPrefix
 	if channelPrefix == "" {
 		channelPrefix = defaultChannelPrefix
 	}
 	return &Adapter{
 		client: client,
 		prefix: channelPrefix,
-		chSize: defaultChannelSize,
-		maxMsg: defaultMaxMessage,
+		chSize: channelSize(opt),
+		chSend: opt.ChannelSendTimeout,
+		maxMsg: maxMessageSize(opt),
 	}, nil
+}
+
+func channelSize(opt Options) int {
+	if opt.ChannelSize > 0 {
+		return opt.ChannelSize
+	}
+	return defaultChannelSize
+}
+
+func maxMessageSize(opt Options) int {
+	if opt.MaxMessageSize > 0 {
+		return opt.MaxMessageSize
+	}
+	return defaultMaxMessage
 }
 
 // Start subscribes to every topic under the configured prefix.
