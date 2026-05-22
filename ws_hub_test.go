@@ -485,6 +485,32 @@ func TestWSHubAdapterWorkerRecoversPanic(t *testing.T) {
 	t.Fatal("adapter worker did not publish after panic")
 }
 
+func TestWSHubAdapterErrorHandlerPanicDoesNotStopWorker(t *testing.T) {
+	adapter := &panicOnceWSHubAdapter{}
+	hub := NewWSHub(
+		WithWSHubAdapter(adapter),
+		WithWSHubAdapterErrorHandler(func(error) {
+			panic("error handler failed")
+		}),
+	)
+	defer hub.Close()
+
+	if err := hub.Publish("room", []byte("first"), Text); err != nil {
+		t.Fatalf("first Publish: %v", err)
+	}
+	if err := hub.Publish("room", []byte("second"), Text); err != nil {
+		t.Fatalf("second Publish: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if adapter.publishedCount() == 1 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("adapter worker stopped after error handler panic")
+}
+
 func TestWSHubAdapterTopicRetryUsesBackoff(t *testing.T) {
 	adapter := &failingTopicWSHubAdapter{subErr: errors.New("redis subscribe failed")}
 	hub := NewWSHub(

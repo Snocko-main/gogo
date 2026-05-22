@@ -1103,6 +1103,15 @@ func (h *WSHub) reportAdapterError(err error) {
 	if suppressed > 0 {
 		err = fmt.Errorf("%w (suppressed %d websocket hub adapter errors)", err, suppressed)
 	}
+	callWSHubAdapterErrorHandler(fn, err)
+}
+
+func callWSHubAdapterErrorHandler(fn func(error), err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			reportPanic(fmt.Errorf("gogo: websocket hub adapter error handler panicked: %v", recovered))
+		}
+	}()
 	fn(err)
 }
 
