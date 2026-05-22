@@ -1362,12 +1362,13 @@ func uwsgoHandleWSOpen(handlerID C.uintptr_t, ws *C.uwsgo_ws_t) {
 	handle := cgo.Handle(handlerID)
 	behavior := handle.Value().(WebSocketBehavior)
 	if behavior.Open != nil {
+		wsWrap := &WebSocket{inner: websocketNative{ptr: ws}}
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				reportPanic(recovered)
 			}
 		}()
-		behavior.Open(&WebSocket{inner: websocketNative{ptr: ws}})
+		behavior.Open(wsWrap)
 	}
 }
 
@@ -1376,13 +1377,15 @@ func uwsgoHandleWSMessage(handlerID C.uintptr_t, ws *C.uwsgo_ws_t, message *C.ch
 	handle := cgo.Handle(handlerID)
 	behavior := handle.Value().(WebSocketBehavior)
 	if behavior.Message != nil {
+		wsWrap := &WebSocket{inner: websocketNative{ptr: ws}}
+		initWSHubSocket(wsWrap)
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				reportPanic(recovered)
 			}
 		}()
 		behavior.Message(
-			&WebSocket{inner: websocketNative{ptr: ws}},
+			wsWrap,
 			C.GoBytes(unsafe.Pointer(message), C.int(messageLen)),
 			OpCode(opcode),
 		)
@@ -1394,6 +1397,7 @@ func uwsgoHandleWSClose(handlerID C.uintptr_t, ws *C.uwsgo_ws_t, code C.int, mes
 	handle := cgo.Handle(handlerID)
 	behavior := handle.Value().(WebSocketBehavior)
 	wsWrap := &WebSocket{inner: websocketNative{ptr: ws}}
+	initWSHubSocket(wsWrap)
 	// Release any cgo.Handle that an Upgrade callback or
 	// SetUserData attached to this socket — once the connection is
 	// gone the held Go value can be garbage collected.

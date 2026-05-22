@@ -25,9 +25,19 @@ var (
 	ErrWSHubUntrackedSocket = errors.New("gogo: websocket hub socket is not tracked; register route with hub.WebSocket or hub.Wrap")
 )
 
-const defaultWSHubAdapterQueueSize = 1024
+const (
+	defaultWSHubAdapterQueueSize      = 1024
+	defaultWSHubAdapterPublishTimeout = 5 * time.Second
+	defaultWSHubStartBackoff          = 100 * time.Millisecond
+	maxWSHubStartBackoff              = 2 * time.Second
+)
 
 var fallbackNodeCounter atomic.Uint64
+
+var (
+	wsHubRegistryMu sync.RWMutex
+	wsHubRegistry   = make(map[uintptr]*WSHub)
+)
 
 // WSHub coordinates WebSocket topic publishes across all App instances
 // attached to this process, and optionally across processes through an
@@ -47,10 +57,16 @@ type WSHub struct {
 
 	startMu        sync.Mutex
 	adapterStarted bool
+	startErr       error
+	startNextTry   time.Time
+	startBackoff   time.Duration
 	adapterQueue   chan WSHubMessage
 	adapterQueueSz int
 	adapterOnce    sync.Once
 	adapterWG      sync.WaitGroup
+	adapterQueueMu sync.RWMutex
+	adapterTimeout time.Duration
+	socketSeq      atomic.Uint64
 	closed         atomic.Bool
 	closeOnce      sync.Once
 	ctx            context.Context
@@ -60,6 +76,7 @@ type WSHub struct {
 type hubSocket struct {
 	app    *App
 	direct string
+	token  uint64
 	topics map[string]struct{}
 }
 
@@ -94,6 +111,16 @@ func WithWSHubAdapterQueueSize(size int) WSHubOption {
 	}
 }
 
+// WithWSHubAdapterPublishTimeout bounds each adapter publish. This keeps
+// shutdown from waiting indefinitely on a slow or half-open Redis connection.
+func WithWSHubAdapterPublishTimeout(timeout time.Duration) WSHubOption {
+	return func(h *WSHub) {
+		if timeout > 0 {
+			h.adapterTimeout = timeout
+		}
+	}
+}
+
 // NewWSHub creates a WebSocket hub. With no adapter, it still fans out across
 // every App attached in the current process, which is enough for RunMultiCore.
 func NewWSHub(opts ...WSHubOption) *WSHub {
@@ -104,6 +131,8 @@ func NewWSHub(opts ...WSHubOption) *WSHub {
 		sockets:        make(map[uintptr]*hubSocket),
 		members:        make(map[string]map[uintptr]struct{}),
 		adapterQueueSz: defaultWSHubAdapterQueueSize,
+		adapterTimeout: defaultWSHubAdapterPublishTimeout,
+		startBackoff:   defaultWSHubStartBackoff,
 		ctx:            ctx,
 		cancel:         cancel,
 	}
@@ -172,30 +201,12 @@ func (h *WSHub) Wrap(app *App, behavior WebSocketBehavior) WebSocketBehavior {
 }
 
 // Subscribe enrolls ws in topic. It is a small convenience wrapper around
-// WebSocket.Subscribe so user code can stay hub-centered. PublishFrom uses
-// these tracked subscriptions to exclude the sender safely.
+// WebSocket.Subscribe so user code can stay hub-centered.
 func (h *WSHub) Subscribe(ws *WebSocket, topic string) bool {
 	if ws == nil {
 		return false
 	}
-	ok := ws.Subscribe(topic)
-	if !ok || h == nil {
-		return ok
-	}
-	key := wsNativeKey(ws)
-	if key == 0 {
-		return ok
-	}
-	h.mu.Lock()
-	if socket := h.sockets[key]; socket != nil {
-		socket.topics[topic] = struct{}{}
-		if h.members[topic] == nil {
-			h.members[topic] = make(map[uintptr]struct{})
-		}
-		h.members[topic][key] = struct{}{}
-	}
-	h.mu.Unlock()
-	return ok
+	return ws.Subscribe(topic)
 }
 
 // Unsubscribe removes ws from topic.
@@ -203,16 +214,7 @@ func (h *WSHub) Unsubscribe(ws *WebSocket, topic string) bool {
 	if ws == nil {
 		return false
 	}
-	ok := ws.Unsubscribe(topic)
-	if h == nil {
-		return ok
-	}
-	key := wsNativeKey(ws)
-	if key == 0 {
-		return ok
-	}
-	h.removeMembership(key, topic)
-	return ok
+	return ws.Unsubscribe(topic)
 }
 
 // Publish broadcasts to every local App attached to the hub, then forwards
@@ -231,7 +233,7 @@ func (h *WSHub) Publish(topic string, message []byte, opcode OpCode) error {
 		OpCode:  opcode,
 	}
 	h.publishLocal(msg, nil)
-	return h.publishAdapter(msg)
+	return h.publishAdapterAsync(msg)
 }
 
 // PublishBatch broadcasts many messages with one App.PublishBatch call per
@@ -263,7 +265,7 @@ func (h *WSHub) PublishBatch(msgs []PublishMessage) error {
 		app.PublishBatch(local)
 	}
 	for _, msg := range local {
-		err := h.publishAdapter(WSHubMessage{
+		err := h.publishAdapterAsync(WSHubMessage{
 			NodeID:  h.nodeID,
 			Topic:   msg.Topic,
 			Message: msg.Message,
@@ -278,7 +280,7 @@ func (h *WSHub) PublishBatch(msgs []PublishMessage) error {
 
 // PublishFrom broadcasts from a WebSocket handler and skips the sender. It is
 // safe to call from any goroutine, but ws must have been registered through
-// WebSocket or Wrap and topic subscriptions must use Subscribe.
+// WebSocket or Wrap so the hub can identify the sender.
 func (h *WSHub) PublishFrom(ws *WebSocket, topic string, message []byte, opcode OpCode) error {
 	if h == nil {
 		return nil
@@ -296,7 +298,7 @@ func (h *WSHub) PublishFrom(ws *WebSocket, topic string, message []byte, opcode 
 		Message: cloneBytes(message),
 		OpCode:  opcode,
 	}
-	origin, direct := h.publishFromTargets(key, msg)
+	origin, direct := h.publishFromTargets(ws, key, msg)
 	if origin == nil {
 		return ErrWSHubUntrackedSocket
 	}
@@ -316,8 +318,14 @@ func (h *WSHub) Close() error {
 	var err error
 	h.closeOnce.Do(func() {
 		h.closed.Store(true)
-		h.cancel()
+		h.adapterQueueMu.Lock()
+		if h.adapterQueue != nil {
+			close(h.adapterQueue)
+			h.adapterQueue = nil
+		}
+		h.adapterQueueMu.Unlock()
 		h.adapterWG.Wait()
+		h.cancel()
 		if h.adapter != nil {
 			err = h.adapter.Close()
 		}
@@ -329,16 +337,23 @@ func (h *WSHub) Close() error {
 // be retried after transient adapter failures. Publish and PublishFrom also
 // start the adapter lazily.
 func (h *WSHub) Start() error {
+	return h.startAdapter(true, false)
+}
+
+func (h *WSHub) startAdapter(force bool, allowClosed bool) error {
 	if h == nil || h.adapter == nil {
 		return nil
 	}
-	if h.closed.Load() {
+	if h.closed.Load() && !allowClosed {
 		return ErrWSHubClosed
 	}
 	h.startMu.Lock()
 	defer h.startMu.Unlock()
 	if h.adapterStarted {
 		return nil
+	}
+	if !force && h.startErr != nil && time.Now().Before(h.startNextTry) {
+		return h.startErr
 	}
 	err := h.adapter.Start(h.ctx, func(msg WSHubMessage) {
 		if msg.NodeID == h.nodeID || h.closed.Load() {
@@ -347,9 +362,25 @@ func (h *WSHub) Start() error {
 		h.publishLocal(msg, nil)
 	})
 	if err != nil {
+		h.startErr = err
+		backoff := h.startBackoff
+		if backoff <= 0 {
+			backoff = defaultWSHubStartBackoff
+		}
+		h.startNextTry = time.Now().Add(backoff)
+		if backoff < maxWSHubStartBackoff {
+			backoff *= 2
+			if backoff > maxWSHubStartBackoff {
+				backoff = maxWSHubStartBackoff
+			}
+			h.startBackoff = backoff
+		}
 		return err
 	}
 	h.adapterStarted = true
+	h.startErr = nil
+	h.startNextTry = time.Time{}
+	h.startBackoff = defaultWSHubStartBackoff
 	return nil
 }
 
@@ -370,31 +401,36 @@ func (h *WSHub) publishLocal(msg WSHubMessage, skip *App) {
 	}
 }
 
-func (h *WSHub) publishAdapter(msg WSHubMessage) error {
+func (h *WSHub) publishAdapter(msg WSHubMessage, allowClosed bool) error {
 	if h.adapter == nil {
 		return nil
 	}
-	if h.closed.Load() {
+	if h.closed.Load() && !allowClosed {
 		return ErrWSHubClosed
 	}
-	if err := h.Start(); err != nil {
+	if err := h.startAdapter(false, allowClosed); err != nil {
 		return err
 	}
-	return h.adapter.Publish(context.Background(), msg)
+	ctx, cancel := context.WithTimeout(context.Background(), h.adapterTimeout)
+	defer cancel()
+	return h.adapter.Publish(ctx, msg)
 }
 
 func (h *WSHub) publishAdapterAsync(msg WSHubMessage) error {
 	if h.adapter == nil {
 		return nil
 	}
+	h.adapterQueueMu.RLock()
+	defer h.adapterQueueMu.RUnlock()
 	if h.closed.Load() {
 		return ErrWSHubClosed
 	}
-	if h.adapterQueue == nil {
-		return h.publishAdapter(msg)
+	queue := h.adapterQueue
+	if queue == nil {
+		return h.publishAdapter(msg, false)
 	}
 	select {
-	case h.adapterQueue <- msg:
+	case queue <- msg:
 		return nil
 	case <-h.ctx.Done():
 		return ErrWSHubClosed
@@ -407,19 +443,14 @@ func (h *WSHub) ensureAdapterWorker() {
 	h.adapterOnce.Do(func() {
 		h.adapterQueue = make(chan WSHubMessage, h.adapterQueueSz)
 		h.adapterWG.Add(1)
-		go h.runAdapterWorker()
+		go h.runAdapterWorker(h.adapterQueue)
 	})
 }
 
-func (h *WSHub) runAdapterWorker() {
+func (h *WSHub) runAdapterWorker(queue <-chan WSHubMessage) {
 	defer h.adapterWG.Done()
-	for {
-		select {
-		case <-h.ctx.Done():
-			return
-		case msg := <-h.adapterQueue:
-			_ = h.publishAdapter(msg)
-		}
+	for msg := range queue {
+		_ = h.publishAdapter(msg, true)
 	}
 }
 
@@ -428,15 +459,28 @@ func (h *WSHub) remember(ws *WebSocket, app *App) {
 	if key == 0 {
 		return
 	}
-	direct := h.directTopic(key)
-	ws.Subscribe(direct)
 	h.mu.Lock()
+	if socket := h.sockets[key]; socket != nil {
+		ws.hubToken.Store(socket.token)
+		h.mu.Unlock()
+		registerWSHub(key, h)
+		return
+	}
+	direct := h.directTopic(key)
+	if !ws.inner.subscribe(direct) {
+		h.mu.Unlock()
+		return
+	}
+	token := h.socketSeq.Add(1)
+	ws.hubToken.Store(token)
 	h.sockets[key] = &hubSocket{
 		app:    app,
 		direct: direct,
+		token:  token,
 		topics: make(map[string]struct{}),
 	}
 	h.mu.Unlock()
+	registerWSHub(key, h)
 }
 
 func (h *WSHub) forget(ws *WebSocket) {
@@ -446,18 +490,27 @@ func (h *WSHub) forget(ws *WebSocket) {
 	}
 	h.mu.Lock()
 	if socket := h.sockets[key]; socket != nil {
+		if token := ws.hubToken.Load(); token != 0 && token != socket.token {
+			h.mu.Unlock()
+			return
+		}
 		for topic := range socket.topics {
 			h.removeMembershipLocked(key, topic)
 		}
 	}
 	delete(h.sockets, key)
 	h.mu.Unlock()
+	unregisterWSHub(key, h)
 }
 
-func (h *WSHub) publishFromTargets(sender uintptr, msg WSHubMessage) (*App, []PublishMessage) {
+func (h *WSHub) publishFromTargets(ws *WebSocket, sender uintptr, msg WSHubMessage) (*App, []PublishMessage) {
 	h.mu.RLock()
 	socket := h.sockets[sender]
 	if socket == nil {
+		h.mu.RUnlock()
+		return nil, nil
+	}
+	if token := ws.hubToken.Load(); token != 0 && token != socket.token {
 		h.mu.RUnlock()
 		return nil, nil
 	}
@@ -488,6 +541,37 @@ func (h *WSHub) removeMembership(key uintptr, topic string) {
 	h.mu.Unlock()
 }
 
+func (h *WSHub) addMembership(key uintptr, token uint64, topic string) uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	socket := h.sockets[key]
+	if socket == nil {
+		return 0
+	}
+	if token != 0 && token != socket.token {
+		return 0
+	}
+	socket.topics[topic] = struct{}{}
+	if h.members[topic] == nil {
+		h.members[topic] = make(map[uintptr]struct{})
+	}
+	h.members[topic][key] = struct{}{}
+	return socket.token
+}
+
+func (h *WSHub) removeMembershipIfCurrent(key uintptr, token uint64, topic string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	socket := h.sockets[key]
+	if socket == nil {
+		return
+	}
+	if token != 0 && token != socket.token {
+		return
+	}
+	h.removeMembershipLocked(key, topic)
+}
+
 func (h *WSHub) removeMembershipLocked(key uintptr, topic string) {
 	if socket := h.sockets[key]; socket != nil {
 		delete(socket.topics, topic)
@@ -504,6 +588,70 @@ func (h *WSHub) removeMembershipLocked(key uintptr, topic string) {
 
 func (h *WSHub) directTopic(key uintptr) string {
 	return fmt.Sprintf("__gogo_hub:%s:%x", h.nodeID, key)
+}
+
+func registerWSHub(key uintptr, h *WSHub) {
+	wsHubRegistryMu.Lock()
+	wsHubRegistry[key] = h
+	wsHubRegistryMu.Unlock()
+}
+
+func unregisterWSHub(key uintptr, h *WSHub) {
+	wsHubRegistryMu.Lock()
+	if wsHubRegistry[key] == h {
+		delete(wsHubRegistry, key)
+	}
+	wsHubRegistryMu.Unlock()
+}
+
+func hubForWebSocket(ws *WebSocket) (uintptr, *WSHub) {
+	key := wsNativeKey(ws)
+	if key == 0 {
+		return 0, nil
+	}
+	wsHubRegistryMu.RLock()
+	h := wsHubRegistry[key]
+	wsHubRegistryMu.RUnlock()
+	return key, h
+}
+
+func initWSHubSocket(ws *WebSocket) {
+	if ws == nil {
+		return
+	}
+	key, h := hubForWebSocket(ws)
+	if h == nil {
+		return
+	}
+	h.mu.RLock()
+	if socket := h.sockets[key]; socket != nil {
+		ws.hubToken.Store(socket.token)
+	}
+	h.mu.RUnlock()
+}
+
+func trackWSHubSubscribe(ws *WebSocket, topic string) {
+	if ws == nil {
+		return
+	}
+	key, h := hubForWebSocket(ws)
+	if h == nil {
+		return
+	}
+	if token := h.addMembership(key, ws.hubToken.Load(), topic); token != 0 {
+		ws.hubToken.Store(token)
+	}
+}
+
+func untrackWSHubSubscribe(ws *WebSocket, topic string) {
+	if ws == nil {
+		return
+	}
+	key, h := hubForWebSocket(ws)
+	if h == nil {
+		return
+	}
+	h.removeMembershipIfCurrent(key, ws.hubToken.Load(), topic)
 }
 
 func randomNodeID() string {

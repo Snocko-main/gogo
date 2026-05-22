@@ -1257,12 +1257,11 @@ hub.WebSocket(app, "/chat", gogo.WebSocketBehavior{
 ```
 
 `PublishFrom` skips the sender and is safe to call from any goroutine. Register
-the route with `hub.WebSocket` or `hub.Wrap`, and subscribe with
-`hub.Subscribe`, so the hub can track socket membership without touching uWS
-socket state from the wrong loop thread. Adapter publishes from `PublishFrom`
-are queued onto a hub worker, so Redis/network I/O never blocks the WebSocket
-loop. From worker goroutines, scheduled jobs, or HTTP handlers, use
-`hub.Publish` or `hub.PublishBatch`.
+the route with `hub.WebSocket` or `hub.Wrap` so the hub can identify the socket;
+subscriptions made with either `hub.Subscribe` or raw `ws.Subscribe` are tracked.
+Adapter publishes are queued onto a hub worker, so Redis/network I/O never
+blocks the WebSocket loop. From worker goroutines, scheduled jobs, or HTTP
+handlers, use `hub.Publish` or `hub.PublishBatch`.
 
 ```go
 go func() {

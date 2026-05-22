@@ -5454,7 +5454,8 @@ func parseSingleQueryParam(q, name string) string {
 
 // WebSocket wraps a uWebSockets WebSocket connection.
 type WebSocket struct {
-	inner websocketNative
+	inner    websocketNative
+	hubToken atomic.Uint64
 }
 
 // Send sends a WebSocket message.
@@ -5487,13 +5488,19 @@ func (ws *WebSocket) End(code int, message string) {
 // underlying TopicTree is loop-thread-local; calling Subscribe from
 // a worker goroutine corrupts uWS state.
 func (ws *WebSocket) Subscribe(topic string) bool {
-	return ws.inner.subscribe(topic)
+	trackWSHubSubscribe(ws, topic)
+	ok := ws.inner.subscribe(topic)
+	if !ok {
+		untrackWSHubSubscribe(ws, topic)
+	}
+	return ok
 }
 
 // Unsubscribe removes this WebSocket's subscription to topic. Returns
 // true when a subscription existed and was removed. Like Subscribe,
 // must be called from a WebSocket handler.
 func (ws *WebSocket) Unsubscribe(topic string) bool {
+	untrackWSHubSubscribe(ws, topic)
 	return ws.inner.unsubscribe(topic)
 }
 

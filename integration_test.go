@@ -5830,6 +5830,51 @@ func TestWSHubPublishFromRequiresTrackedSocket(t *testing.T) {
 	}
 }
 
+func TestWSHubPublishFromTracksRawSubscribe(t *testing.T) {
+	hub := gogo.NewWSHub(gogo.WithWSHubNodeID("test-node"))
+	defer hub.Close()
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		hub.WebSocket(app, "/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				ws.Subscribe("room")
+			},
+			Message: func(ws *gogo.WebSocket, msg []byte, op gogo.OpCode) {
+				if err := hub.PublishFrom(ws, "room", msg, op); err != nil {
+					t.Errorf("PublishFrom: %v", err)
+				}
+			},
+		})
+	})
+	defer teardown()
+
+	a, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial a: %v", err)
+	}
+	defer a.Close()
+	b, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial b: %v", err)
+	}
+	defer b.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	if err := a.SendText("raw subscribe hello"); err != nil {
+		t.Fatalf("a.SendText: %v", err)
+	}
+	gotB, err := b.ReadText(2 * time.Second)
+	if err != nil {
+		t.Fatalf("b.ReadText: %v", err)
+	}
+	if gotB != "raw subscribe hello" {
+		t.Errorf("b received %q, want raw subscribe hello", gotB)
+	}
+	if err := a.expectNoMessage(300 * time.Millisecond); err != nil {
+		t.Errorf("publisher should not receive its own hub publish: %v", err)
+	}
+}
+
 type blockingWSHubAdapter struct {
 	entered chan struct{}
 	release chan struct{}
