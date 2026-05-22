@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"strings"
@@ -88,20 +89,22 @@ func BasicAuth(opt BasicAuthOptions) mwhint.Hinted {
 
 	verify := opt.Validator
 	if verify == nil {
-		users := make(map[string]string, len(opt.Users))
+		users := make(map[string][sha256.Size]byte, len(opt.Users))
 		for user, pass := range opt.Users {
-			users[user] = pass
+			users[user] = sha256.Sum256([]byte(pass))
 		}
+		dummy := sha256.Sum256(nil)
 		verify = func(u, p string) bool {
+			supplied := sha256.Sum256([]byte(p))
 			expected, ok := users[u]
 			if !ok {
 				// Run the compare anyway to keep the timing
 				// roughly constant across known vs. unknown
 				// usernames.
-				subtle.ConstantTimeCompare([]byte(p), []byte(p))
+				subtle.ConstantTimeCompare(supplied[:], dummy[:])
 				return false
 			}
-			return subtle.ConstantTimeCompare([]byte(p), []byte(expected)) == 1
+			return subtle.ConstantTimeCompare(supplied[:], expected[:]) == 1
 		}
 	}
 

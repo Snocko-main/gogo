@@ -5009,6 +5009,62 @@ func TestRedirectFromGetAsync(t *testing.T) {
 	}
 }
 
+func TestRedirectFromGetAsyncPreservesPendingHeaders(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.RequestID())
+		app.GetAsync("/r", func(res *gogo.Response, req *gogo.Request) {
+			res.Redirect("/elsewhere", 302)
+		})
+	})
+	defer teardown()
+
+	client := &http.Client{
+		Transport:     &http.Transport{DisableKeepAlives: true},
+		Timeout:       3 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/r", port), nil)
+	req.Header.Set("X-Request-ID", "redirect-async-id")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("GET /r: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 302 {
+		t.Errorf("status: got %d, want 302", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Request-ID"); got != "redirect-async-id" {
+		t.Errorf("X-Request-ID: got %q, want redirect-async-id", got)
+	}
+}
+
+func TestSendBytesFromGetAsyncPreservesPendingHeaders(t *testing.T) {
+	path := writeTempFile(t, ".txt", nil)
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.RequestID())
+		app.GetAsync("/empty", func(res *gogo.Response, req *gogo.Request) {
+			if err := res.SendFile(req, path); err != nil {
+				res.Send(500, "text/plain", err.Error())
+			}
+		})
+	})
+	defer teardown()
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/empty", port), nil)
+	req.Header.Set("X-Request-ID", "sendbytes-async-id")
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /empty: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("status: got %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Request-ID"); got != "sendbytes-async-id" {
+		t.Errorf("X-Request-ID: got %q, want sendbytes-async-id", got)
+	}
+}
+
 // TestHTTPMethodHelpers: Put, Patch, Delete, Options, Head each
 // route only on their own method; mismatched methods fall through to
 // the default 404 (or 405 via MethodNotAllowed when set).

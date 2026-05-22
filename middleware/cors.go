@@ -378,14 +378,18 @@ func validCORSHeaderToken(header string) bool {
 	return true
 }
 
-// matchCompiledOrigin tests whether origin matches any compiled
-// pattern. Lowercases origin once, then runs a single == /
-// HasPrefix / HasSuffix per pattern.
+// matchCompiledOrigin tests whether origin matches any compiled pattern.
+// Runtime origins are normalized with the same parser used for configured
+// origins; malformed request headers simply fail closed instead of matching a
+// wildcard suffix by raw string shape.
 func matchCompiledOrigin(compiled []compiledOrigin, origin string) bool {
 	if len(compiled) == 0 {
 		return false
 	}
-	lower := strings.ToLower(origin)
+	lower, ok := normalizeOriginValue(origin)
+	if !ok {
+		return false
+	}
 	for _, p := range compiled {
 		if p.wildcard {
 			if strings.HasPrefix(lower, p.scheme+"://") &&

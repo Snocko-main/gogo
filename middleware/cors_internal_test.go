@@ -87,6 +87,8 @@ func TestCORSNormalizesConfiguredOrigins(t *testing.T) {
 	}
 	for _, origin := range []string{
 		"https://app.example.com/path",
+		"https://api.trusted.example/path",
+		"https://api.trusted.example?x=1",
 		"https://trusted.example",
 		"https://evil.example",
 	} {

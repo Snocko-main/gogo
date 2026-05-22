@@ -2978,10 +2978,15 @@ func (r *Response) Redirect(location string, code int) {
 		loop := loopFromUintptr(r.async.loopPtr)
 		ctx := r.async.ctxHandle
 		loc := location
+		headers := captureResponseHeaders(r.pendingHeaders, nil)
+		r.pendingHeaders = r.pendingHeaders[:0]
 		loop.Defer(func() {
 			defer asyncCtxRelease(ctx)
 			inner.cork(func() {
 				inner.status(line)
+				for _, h := range headers {
+					inner.header(h.name, h.value)
+				}
 				inner.header("Location", loc)
 				inner.end("")
 			})
@@ -3338,7 +3343,8 @@ func (r *Response) sendBytes(code int, headers []responseHeader, body []byte) {
 		loop := loopFromUintptr(r.async.loopPtr)
 		inner := r.inner
 		ctx := r.async.ctxHandle
-		hs := headers
+		hs := captureResponseHeaders(r.pendingHeaders, headers)
+		r.pendingHeaders = r.pendingHeaders[:0]
 		bs := body
 		loop.Defer(func() {
 			defer asyncCtxRelease(ctx)
@@ -3360,6 +3366,16 @@ func (r *Response) sendBytes(code int, headers []responseHeader, body []byte) {
 	}
 	r.inner.end(bytesAsString(body))
 	runtime.KeepAlive(body)
+}
+
+func captureResponseHeaders(pending, extra []responseHeader) []responseHeader {
+	if len(pending) == 0 {
+		return extra
+	}
+	out := make([]responseHeader, 0, len(pending)+len(extra))
+	out = append(out, pending...)
+	out = append(out, extra...)
+	return out
 }
 
 // bytesAsString aliases body as a Go string without copying. The string
