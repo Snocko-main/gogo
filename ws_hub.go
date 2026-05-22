@@ -67,6 +67,7 @@ type WSHub struct {
 	startBackoff   time.Duration
 	adapterQueue   chan WSHubMessage
 	adapterQueueSz int
+	adapterWorkers int
 	adapterOnce    sync.Once
 	adapterWG      sync.WaitGroup
 	adapterQueueMu sync.RWMutex
@@ -121,6 +122,17 @@ func WithWSHubAdapterQueueSize(size int) WSHubOption {
 	}
 }
 
+// WithWSHubAdapterWorkers sets how many goroutines publish queued adapter
+// messages. The default is 1, which preserves queue order. Larger values can
+// improve Redis throughput when cross-process message ordering is not required.
+func WithWSHubAdapterWorkers(workers int) WSHubOption {
+	return func(h *WSHub) {
+		if workers > 0 {
+			h.adapterWorkers = workers
+		}
+	}
+}
+
 // WithWSHubAdapterPublishTimeout bounds each adapter publish. This keeps
 // shutdown from waiting indefinitely on a slow or half-open Redis connection.
 func WithWSHubAdapterPublishTimeout(timeout time.Duration) WSHubOption {
@@ -159,6 +171,7 @@ func NewWSHub(opts ...WSHubOption) *WSHub {
 		sockets:        make(map[uintptr]*hubSocket),
 		members:        make(map[string]map[uintptr]struct{}),
 		adapterQueueSz: defaultWSHubAdapterQueueSize,
+		adapterWorkers: 1,
 		adapterTimeout: defaultWSHubAdapterPublishTimeout,
 		adapterErrFn:   defaultWSHubAdapterErrorHandler,
 		closeTimeout:   defaultWSHubCloseTimeout,
@@ -499,8 +512,10 @@ func (h *WSHub) publishAdapterAsync(msg WSHubMessage) error {
 func (h *WSHub) ensureAdapterWorker() {
 	h.adapterOnce.Do(func() {
 		h.adapterQueue = make(chan WSHubMessage, h.adapterQueueSz)
-		h.adapterWG.Add(1)
-		go h.runAdapterWorker(h.adapterQueue)
+		h.adapterWG.Add(h.adapterWorkers)
+		for range h.adapterWorkers {
+			go h.runAdapterWorker(h.adapterQueue)
+		}
 	})
 }
 

@@ -1301,6 +1301,8 @@ if err != nil {
 }
 hub := gogo.NewWSHub(
     gogo.WithWSHubAdapter(adapter),
+    // Keep the default 1 worker if cross-process message ordering matters.
+    gogo.WithWSHubAdapterWorkers(4),
     gogo.WithWSHubCloseTimeout(5*time.Second),
     gogo.WithWSHubAdapterErrorHandler(func(err error) {
         log.Printf("websocket hub adapter: %v", err)
