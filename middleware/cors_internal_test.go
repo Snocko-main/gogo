@@ -1,6 +1,9 @@
 package middleware
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestCORSRejectsInvalidConfiguredMethodsAndHeaders(t *testing.T) {
 	cases := []struct {
@@ -66,6 +69,24 @@ func TestCORSRejectsInvalidConfiguredOrigins(t *testing.T) {
 				}
 			}()
 			_ = CORS(CORSOptions{AllowOrigins: []string{origin}})
+		})
+	}
+}
+
+func TestCORSRejectsAmbiguousWildcardOrigins(t *testing.T) {
+	cases := []CORSOptions{
+		{AllowOrigins: []string{"*", "https://app.example.com"}},
+		{AllowOrigins: []string{"https://app.example.com", "*"}},
+		{AllowOrigins: []string{"*"}, AllowCredentials: true},
+	}
+	for _, opt := range cases {
+		t.Run(strings.Join(opt.AllowOrigins, ","), func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("CORS did not panic")
+				}
+			}()
+			_ = CORS(opt)
 		})
 	}
 }

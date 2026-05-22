@@ -642,14 +642,13 @@ A bare `next(res, req); res.OnFinish(...)` is skipped on panic because
 the panic unwinds past the registration. `defer res.OnFinish(...)`
 registers on the unwind, before the framework's outer panic handler
 catches and emits the 500. Use the defer form for observability
-middleware (metrics, audit, tracing); use the inline form for state-
-commit middleware where panic = "don't persist".
+middleware (metrics, audit, tracing) and for cleanup/state that must
+commit even when a handler fails.
 
 **Built-in middleware** using this hook: `mw.NewSession` (commits
-state inline post-handler — panics are intentionally NOT persisted),
-`mw.NewMetrics` (records the final status / duration even on panic
-via the defer form). Custom middleware following either shape should
-do the same.
+session mutations and destroys even when a handler panics) and
+`mw.NewMetrics` (records the final status / duration even on panic).
+Custom middleware with the same requirements should use the defer form.
 
 ### Bundled middleware
 
@@ -703,6 +702,10 @@ metrics := mw.NewMetrics()
 app.Use(metrics.Middleware())
 app.Get("/metrics", metrics.Handler())
 ```
+
+Use `AllowOrigins: []string{"*"}` only by itself for public APIs. gogo
+panics at startup if `"*"` is mixed with explicit origins, or combined with
+`AllowCredentials`, so ambiguous CORS policy fails before serving traffic.
 
 ### RequestID — 128-bit IDs
 
@@ -1359,6 +1362,8 @@ helpers for small stdlib handlers. They stage the wrapped handler's response
 before sending it through gogo, so the staged body is capped by
 `gogo.GetMaxHTTPAdapterBodyBytes()` (default 8 MiB; set negative via
 `gogo.SetMaxHTTPAdapterBodyBytes(-1)` to disable).
+The adapter accepts `http.Flusher` for compatibility, but `Flush()` only
+commits the staged status code; it does not stream bytes to the client.
 Handlers that stream large downloads should be ported to native gogo streaming
 APIs instead of going through the adapter.
 

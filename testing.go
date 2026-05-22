@@ -277,6 +277,11 @@ func waitForPortAccept(host string, timeout time.Duration) error {
 // Useful for migrating routes a-handler-at-a-time from a stdlib
 // net/http codebase, or for serving stdlib-shaped handlers
 // (expvar.Handler, net/http/pprof.Handler, …) under gogo.
+// Responses are buffered before being sent through gogo. The adapter
+// accepts http.Flusher for compatibility with stdlib handlers, but
+// Flush only commits the staged status code; it does not stream bytes
+// to the client. Port streaming or large-download handlers to native
+// gogo APIs instead.
 //
 //	app.Get("/debug/vars", gogo.HTTPAdapter(expvar.Handler()))
 //	app.Get("/debug/pprof/*", gogo.HTTPAdapter(http.HandlerFunc(pprof.Index)))
@@ -407,7 +412,6 @@ type httpAdapterRecorder struct {
 	code     int
 	maxBytes int64
 	tooLarge bool
-	flushed  bool
 }
 
 func newHTTPAdapterRecorder(maxBytes int64) *httpAdapterRecorder {
@@ -460,7 +464,6 @@ func (r *httpAdapterRecorder) Flush() {
 	if r.code == 0 {
 		r.code = 200
 	}
-	r.flushed = true
 }
 
 // flushAdapterRecorder copies the recorded status, headers, and body from the

@@ -298,19 +298,12 @@ func NewSession(opt SessionOptions) mwhint.Hinted {
 			}
 			sess := loadOrCreateSession(req, res, opt, maxAge)
 			req.SetLocal(opt.LocalKey, sess)
-			next(res, req)
-			// Defer persistence to Response.OnFinish so handlers
-			// that upgrade to async via Response.Async still get
-			// their session mutations saved correctly. For sync
-			// responses OnFinish executes the callback inline so
-			// behavior matches the original "save right after
-			// next returns" semantics. The lifecycle is documented
-			// on Session itself — callers can also force a save
-			// mid-handler via Session.Save when they need state
-			// to land before the goroutine completes.
-			res.OnFinish(func() {
+			// Register from a defer so panic recovery still persists
+			// mutations such as Destroy before the response releases.
+			defer res.OnFinish(func() {
 				persistSession(sess, opt)
 			})
+			next(res, req)
 		}
 	})}
 }

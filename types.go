@@ -3837,8 +3837,9 @@ func runFinishCallback(fn func()) {
 // This is the safe hook for middleware that needs to persist or
 // flush state derived from the request:
 //
-//	// Inside middleware, AFTER calling next(res, req):
-//	res.OnFinish(func() { saveSession(s) })
+//	// Inside middleware, before calling next(res, req):
+//	defer res.OnFinish(func() { saveSession(s) })
+//	next(res, req)
 //
 // The hook decides automatically which mode applies:
 //

@@ -69,6 +69,17 @@ func TestHTTPAdapterRecorderIgnoresInvalidSecondWriteHeader(t *testing.T) {
 	}
 }
 
+func TestHTTPAdapterRecorderFlushCommitsStatusOnly(t *testing.T) {
+	rec := newHTTPAdapterRecorder(-1)
+	rec.Flush()
+	if rec.code != 200 {
+		t.Fatalf("Flush code = %d, want 200", rec.code)
+	}
+	if rec.body.Len() != 0 {
+		t.Fatalf("Flush wrote body len %d, want 0", rec.body.Len())
+	}
+}
+
 func TestHostnameFromHostHeader(t *testing.T) {
 	tests := []struct {
 		name string

@@ -374,13 +374,15 @@ func TestHTTPAdapterWithBody(t *testing.T) {
 	}
 }
 
-func TestHTTPAdapterSupportsFlushAndContentTypeSniff(t *testing.T) {
+func TestHTTPAdapterAcceptsBufferedFlushAndContentTypeSniff(t *testing.T) {
 	stdHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			http.Error(w, "no flusher", 500)
 			return
 		}
+		// HTTPAdapter accepts Flush for compatibility, but still
+		// buffers the complete response before sending through gogo.
 		flusher.Flush()
 		_, _ = io.WriteString(w, "<html><body>ok</body></html>")
 	})

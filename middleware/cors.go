@@ -20,8 +20,8 @@ type CORSOptions struct {
 	// are supported — the literal "*" must appear right after "://".
 	//
 	// AllowCredentials cannot be combined with "*" — browsers reject it
-	// per spec. When credentials are required, list the origins
-	// explicitly.
+	// per spec. Do not mix "*" with explicit origins; use only "*"
+	// for public APIs, or list every trusted origin explicitly.
 	AllowOrigins []string
 
 	// AllowMethods is the list of HTTP methods returned in the preflight
@@ -89,10 +89,15 @@ func CORS(opts ...CORSOptions) mwhint.Hinted {
 	if len(opt.AllowHeaders) == 0 {
 		opt.AllowHeaders = defaultAllowHeaders
 	}
-	if opt.AllowCredentials && len(opt.AllowOrigins) == 1 && opt.AllowOrigins[0] == "*" {
-		panic("gogo/middleware: AllowCredentials=true cannot be combined with AllowOrigins={\"*\"}; list explicit origins")
-	}
 	allowOrigins := normalizeCORSOriginPatterns(opt.AllowOrigins)
+	if hasCORSWildcardOrigin(allowOrigins) {
+		if len(allowOrigins) > 1 {
+			panic("gogo/middleware: CORS AllowOrigins cannot mix \"*\" with explicit origins")
+		}
+		if opt.AllowCredentials {
+			panic("gogo/middleware: AllowCredentials=true cannot be combined with AllowOrigins={\"*\"}; list explicit origins")
+		}
+	}
 	validateCORSMethods(opt.AllowMethods)
 	validateCORSHeaders("AllowHeaders", opt.AllowHeaders, true)
 	validateCORSHeaders("ExposeHeaders", opt.ExposeHeaders, false)
@@ -252,6 +257,15 @@ func normalizeCORSOriginPatterns(patterns []string) []string {
 		out = append(out, normalized)
 	}
 	return out
+}
+
+func hasCORSWildcardOrigin(patterns []string) bool {
+	for _, pattern := range patterns {
+		if pattern == "*" {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeCORSOriginPattern(pattern string) (string, bool) {
