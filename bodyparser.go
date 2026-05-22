@@ -28,7 +28,7 @@ var ErrUnsupportedMediaType = errors.New("gogo: unsupported media type")
 // BodyParser deserializes the request body into out based on the
 // request's Content-Type header. Supported media types:
 //
-//   - application/json — encoding/json
+//   - application/json — Config.JSONDecoder, defaulting to encoding/json
 //   - application/x-www-form-urlencoded — form decoding into struct
 //     fields tagged with `form:"name"` (falls back to lower-cased field
 //     name when the tag is missing).
@@ -40,12 +40,13 @@ var ErrUnsupportedMediaType = errors.New("gogo: unsupported media type")
 // ErrNoBody when the body has not been collected, or
 // ErrUnsupportedMediaType for a media type the parser does not handle.
 // JSON / form parse errors surface verbatim from their respective
-// packages so handlers can inspect them.
+// packages so handlers can inspect them. JSON bodies use the App's
+// Config.JSONDecoder when one is configured.
 func (r *Request) BodyParser(out any) error {
 	if r.body == nil {
 		return ErrNoBody
 	}
-	return ParseBody(r.Header("content-type"), r.body, out)
+	return parseBody(r.Header("content-type"), r.body, out, r.jsonDecoder())
 }
 
 // ParseBody is the lower-level helper behind Request.BodyParser, exposed
@@ -56,6 +57,20 @@ func (r *Request) BodyParser(out any) error {
 // — they are stripped before matching. An empty Content-Type is treated
 // as application/octet-stream and returns ErrUnsupportedMediaType.
 func ParseBody(contentType string, body []byte, out any) error {
+	return parseBody(contentType, body, out, json.Unmarshal)
+}
+
+func (r *Request) jsonDecoder() JSONDecoder {
+	if r != nil && r.res != nil && r.res.app != nil && r.res.app.cfg.JSONDecoder != nil {
+		return r.res.app.cfg.JSONDecoder
+	}
+	return json.Unmarshal
+}
+
+func parseBody(contentType string, body []byte, out any, decodeJSON JSONDecoder) error {
+	if decodeJSON == nil {
+		decodeJSON = json.Unmarshal
+	}
 	mediaType, _, err := mime.ParseMediaType(contentType)
 	if err != nil {
 		// Empty or malformed Content-Type. Be lenient: a JSON-shaped
@@ -69,7 +84,7 @@ func ParseBody(contentType string, body []byte, out any) error {
 
 	switch mediaType {
 	case "application/json", "text/json":
-		return json.Unmarshal(body, out)
+		return decodeJSON(body, out)
 	case "application/x-www-form-urlencoded":
 		values, err := url.ParseQuery(string(body))
 		if err != nil {

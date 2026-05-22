@@ -1,6 +1,7 @@
 package gogo
 
 import (
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -80,6 +81,26 @@ func TestDefaultConfigKeepsExplicitBodyReadTimeout(t *testing.T) {
 	cfg = defaultConfig(Config{BodyReadTimeout: NoBodyReadTimeout})
 	if cfg.BodyReadTimeout != NoBodyReadTimeout {
 		t.Fatalf("disabled BodyReadTimeout = %s, want %s", cfg.BodyReadTimeout, NoBodyReadTimeout)
+	}
+}
+
+func TestDefaultConfigJSONCodecs(t *testing.T) {
+	cfg := defaultConfig(Config{})
+	if cfg.JSONEncoder == nil {
+		t.Fatal("JSONEncoder default is nil")
+	}
+	if cfg.JSONDecoder == nil {
+		t.Fatal("JSONDecoder default is nil")
+	}
+
+	customEncoder := func(v any) ([]byte, error) { return []byte("{}"), nil }
+	customDecoder := func(data []byte, v any) error { return nil }
+	cfg = defaultConfig(Config{JSONEncoder: customEncoder, JSONDecoder: customDecoder})
+	if reflect.ValueOf(cfg.JSONEncoder).Pointer() != reflect.ValueOf(customEncoder).Pointer() {
+		t.Fatal("JSONEncoder did not preserve custom function")
+	}
+	if reflect.ValueOf(cfg.JSONDecoder).Pointer() != reflect.ValueOf(customDecoder).Pointer() {
+		t.Fatal("JSONDecoder did not preserve custom function")
 	}
 }
 

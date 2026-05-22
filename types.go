@@ -520,7 +520,26 @@ type Config struct {
 	// any client can spoof their apparent protocol / origin by sending
 	// X-Forwarded-* headers. Default false.
 	TrustProxy bool
+
+	// JSONEncoder is used by Response.JSON and Response.JSONP. Nil uses
+	// encoding/json.Marshal. Override it with a faster compatible encoder
+	// such as sonic.Marshal, go-json.Marshal, or jsoniter.Marshal when JSON
+	// reflection cost dominates your handlers.
+	JSONEncoder JSONEncoder
+
+	// JSONDecoder is used by Request.BodyParser for application/json and
+	// text/json request bodies. Nil uses encoding/json.Unmarshal.
+	JSONDecoder JSONDecoder
 }
+
+// JSONEncoder is the marshaling function used by App-scoped JSON helpers.
+// Its shape matches encoding/json.Marshal and common third-party drop-ins.
+type JSONEncoder func(v any) ([]byte, error)
+
+// JSONDecoder is the unmarshaling function used by App-scoped JSON body
+// parsing helpers. Its shape matches encoding/json.Unmarshal and common
+// third-party drop-ins.
+type JSONDecoder func(data []byte, v any) error
 
 // App is a uWebSockets HTTP application.
 type App struct {
@@ -600,6 +619,12 @@ func defaultConfig(c Config) Config {
 	}
 	if c.BodyReadTimeout == 0 {
 		c.BodyReadTimeout = defaultBodyReadTimeout
+	}
+	if c.JSONEncoder == nil {
+		c.JSONEncoder = json.Marshal
+	}
+	if c.JSONDecoder == nil {
+		c.JSONDecoder = json.Unmarshal
 	}
 	return c
 }
@@ -2633,17 +2658,24 @@ func (r *Response) sendSplitSync(status, contentType, prefix, body string) {
 // marshalling fails the response is replaced with a generic 500 and the
 // underlying marshal error is reported through the panic handler so the
 // programmer sees it server-side without leaking type / package names to
-// the network. json.Marshal only fails for unsupported value shapes
-// (channels, functions, cyclic structures), so failures here always
-// indicate a bug in caller code.
+// the network. With the default encoder, marshal failures happen for
+// unsupported value shapes (channels, functions, cyclic structures), so
+// failures here usually indicate a bug in caller code.
 func (r *Response) JSON(code int, v any) {
-	data, err := json.Marshal(v)
+	data, err := r.jsonEncoder()(v)
 	if err != nil {
 		reportPanic(fmt.Errorf("gogo: JSON marshal: %w", err))
 		r.Send(500, "text/plain; charset=utf-8", "Internal Server Error\n")
 		return
 	}
 	r.Send(code, "application/json", string(data))
+}
+
+func (r *Response) jsonEncoder() JSONEncoder {
+	if r != nil && r.app != nil && r.app.cfg.JSONEncoder != nil {
+		return r.app.cfg.JSONEncoder
+	}
+	return json.Marshal
 }
 
 // JSONBytes writes a pre-marshaled JSON body. Skips json.Marshal so
@@ -2959,14 +2991,14 @@ func (r *Response) JSONP(callback string, v any) {
 		r.Send(400, "text/plain; charset=utf-8", "invalid jsonp callback\n")
 		return
 	}
-	data, err := json.Marshal(v)
+	data, err := r.jsonEncoder()(v)
 	if err != nil {
 		reportPanic(fmt.Errorf("gogo: JSONP marshal: %w", err))
 		r.Send(500, "text/plain; charset=utf-8", "Internal Server Error\n")
 		return
 	}
 	// Escape U+2028 / U+2029 so the JSON-as-JS payload parses across
-	// every browser. json.Marshal emits them as raw UTF-8 bytes; the
+	// every browser. Some encoders emit them as raw UTF-8 bytes; the
 	// JavaScript spec only forbade them as literal line terminators
 	// pre-ES2019 but enough deployed parsers still choke that the
 	// JSONP convention is to escape them defensively.

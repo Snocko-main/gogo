@@ -363,6 +363,12 @@ app.Get("/json", func(res *gogo.Response, req *gogo.Request) {
     res.JSON(200, map[string]any{"ok": true, "n": 42})
 })
 
+// Optional at App construction time:
+// app, _ := gogo.NewApp(gogo.Config{
+//     JSONEncoder: sonic.Marshal,
+//     JSONDecoder: sonic.Unmarshal,
+// })
+
 app.Get("/old", func(res *gogo.Response, req *gogo.Request) {
     res.Redirect("/new", 301)
 })
@@ -489,7 +495,8 @@ the built-in HTML engine does this so the cap is enforced while rendering.
 
 `Request.BodyParser` deserializes the body into a struct based on
 Content-Type. Supported: `application/json`, `application/x-www-form-urlencoded`,
-`multipart/form-data` (value parts only).
+`multipart/form-data` (value parts only). JSON uses `Config.JSONDecoder` when
+configured; `Response.JSON` and `Response.JSONP` use `Config.JSONEncoder`.
 
 ```go
 type CreateUser struct {
