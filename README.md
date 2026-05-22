@@ -1305,8 +1305,6 @@ if err != nil {
 }
 hub := gogo.NewWSHub(
     gogo.WithWSHubAdapter(adapter),
-    // Keep the default 1 worker if cross-process message ordering matters.
-    gogo.WithWSHubAdapterWorkers(4),
     gogo.WithWSHubCloseTimeout(5*time.Second),
     gogo.WithWSHubAdapterErrorHandler(func(err error) {
         log.Printf("websocket hub adapter: %v", err)
@@ -1317,6 +1315,10 @@ if err := hub.Start(); err != nil {
     log.Fatal(err)
 }
 ```
+
+Keep the default one adapter worker when cross-process message order matters.
+If your workload can tolerate reordering, `gogo.WithWSHubAdapterWorkers(4)` can
+raise Redis publish throughput.
 
 With `RunMultiCore`, create one hub outside setup and register every worker's
 route through it:
