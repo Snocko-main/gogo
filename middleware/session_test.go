@@ -20,7 +20,7 @@ import (
 func TestSessionRoundTrip(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.Use(middleware.NewSession(middleware.SessionOptions{
-			Secret: []byte("session-secret"),
+			Secret: []byte("session-secret-32-bytes-AAAAAAAA"),
 			TTL:    time.Minute,
 		}))
 		app.Get("/set", func(res *gogo.Response, req *gogo.Request) {
@@ -67,7 +67,7 @@ func TestSessionRoundTrip(t *testing.T) {
 
 func TestSessionIsolatedPerCookie(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
-		app.Use(middleware.NewSession(middleware.SessionOptions{Secret: []byte("session-secret")}))
+		app.Use(middleware.NewSession(middleware.SessionOptions{Secret: []byte("session-secret-32-bytes-AAAAAAAA")}))
 		app.Get("/whoami", func(res *gogo.Response, req *gogo.Request) {
 			sess := req.Local(middleware.SessionLocalKey).(*middleware.Session)
 			res.Send(200, "text/plain", sess.ID)
@@ -90,7 +90,7 @@ func TestSessionIsolatedPerCookie(t *testing.T) {
 
 func TestSessionRejectsForgedID(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
-		app.Use(middleware.NewSession(middleware.SessionOptions{Secret: []byte("session-secret")}))
+		app.Use(middleware.NewSession(middleware.SessionOptions{Secret: []byte("session-secret-32-bytes-AAAAAAAA")}))
 		app.Get("/whoami", func(res *gogo.Response, req *gogo.Request) {
 			sess := req.Local(middleware.SessionLocalKey).(*middleware.Session)
 			res.Send(200, "text/plain", sess.ID)

@@ -22,9 +22,10 @@ const CSRFLocalKey = "gogo.csrf.token"
 
 // CSRFOptions configures the double-submit-cookie CSRF middleware.
 type CSRFOptions struct {
-	// Secret is the HMAC key used to sign tokens. Required.
-	// Rotating the secret invalidates outstanding tokens, which is
-	// the intended behavior for logout-everywhere flows.
+	// Secret is the HMAC key used to sign tokens. Required; must be at
+	// least 32 bytes of entropy. Rotating the secret invalidates
+	// outstanding tokens, which is the intended behavior for
+	// logout-everywhere flows.
 	Secret []byte
 
 	// CookieName is the Set-Cookie name carrying the token to the
@@ -60,7 +61,7 @@ type CSRFOptions struct {
 
 	// MaxTokenBytes caps the CSRF token read from the Cookie and header
 	// before signature verification or constant-time comparison. Zero uses
-	// a conservative default; negative disables the cap.
+	// a conservative default; NoCSRFTokenLimit disables the cap.
 	MaxTokenBytes int
 
 	// SkipFunc, when non-nil and returning true, bypasses CSRF
@@ -74,6 +75,10 @@ type CSRFOptions struct {
 }
 
 const defaultCSRFMaxTokenBytes = 256
+
+// NoCSRFTokenLimit disables the CSRF token length cap. Use only behind an
+// external header-size limit.
+const NoCSRFTokenLimit = -1
 
 const csrfGeneratedTokenBytes = 22 + 1 + 43 // base64url(16 random bytes) + "." + base64url(sha256)
 
@@ -99,8 +104,8 @@ const csrfGeneratedTokenBytes = 22 + 1 + 43 // base64url(16 random bytes) + "." 
 // Token header via fetch or set it via a custom hidden-field flow
 // the handler manages.
 func CSRF(opt CSRFOptions) mwhint.Hinted {
-	if len(opt.Secret) == 0 {
-		panic("gogo/middleware: CSRF requires a Secret")
+	if err := validateHMACSecret("CSRF", opt.Secret); err != nil {
+		panic("gogo/middleware: " + err.Error())
 	}
 	opt.Secret = append([]byte(nil), opt.Secret...)
 	if opt.CookieName == "" {

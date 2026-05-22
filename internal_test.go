@@ -77,9 +77,38 @@ func TestDefaultConfigKeepsExplicitBodyReadTimeout(t *testing.T) {
 		t.Fatalf("BodyReadTimeout = %s, want 10s", cfg.BodyReadTimeout)
 	}
 
-	cfg = defaultConfig(Config{BodyReadTimeout: -1})
-	if cfg.BodyReadTimeout != -1 {
-		t.Fatalf("disabled BodyReadTimeout = %s, want -1", cfg.BodyReadTimeout)
+	cfg = defaultConfig(Config{BodyReadTimeout: NoBodyReadTimeout})
+	if cfg.BodyReadTimeout != NoBodyReadTimeout {
+		t.Fatalf("disabled BodyReadTimeout = %s, want %s", cfg.BodyReadTimeout, NoBodyReadTimeout)
+	}
+}
+
+func TestDefaultConfigBodyLimitDefaultsAndDisableSentinel(t *testing.T) {
+	cfg := defaultConfig(Config{})
+	if cfg.BodyLimit != 4<<20 {
+		t.Fatalf("BodyLimit default = %d, want 4 MiB", cfg.BodyLimit)
+	}
+
+	cfg = defaultConfig(Config{BodyLimit: 1024})
+	if cfg.BodyLimit != 1024 {
+		t.Fatalf("BodyLimit = %d, want 1024", cfg.BodyLimit)
+	}
+
+	cfg = defaultConfig(Config{BodyLimit: NoBodyLimit})
+	if cfg.BodyLimit != 0 {
+		t.Fatalf("NoBodyLimit normalized to %d, want native disabled value 0", cfg.BodyLimit)
+	}
+}
+
+func TestSendFileLimitDisableSentinel(t *testing.T) {
+	if sendFileTooLarge(1<<30, NoSendFileLimit) {
+		t.Fatal("NoSendFileLimit rejected a large file")
+	}
+	if !sendFileTooLarge(17, 16) {
+		t.Fatal("cap 16 accepted size 17")
+	}
+	if sendFileTooLarge(16, 16) {
+		t.Fatal("cap 16 rejected exact size 16")
 	}
 }
 
@@ -518,6 +547,20 @@ func TestDefaultMultipartPartLimitSetter(t *testing.T) {
 	SetDefaultMultipartPartLimit(123)
 	if got := GetDefaultMultipartPartLimit(); got != 123 {
 		t.Fatalf("GetDefaultMultipartPartLimit() = %d, want 123", got)
+	}
+}
+
+func TestMultipartPartLimitDisableSentinel(t *testing.T) {
+	oldLimit := GetDefaultMultipartPartLimit()
+	defer SetDefaultMultipartPartLimit(oldLimit)
+
+	if got := multipartPartLimit(MultipartOptions{MaxPartBytes: NoMultipartPartLimit}); got != 0 {
+		t.Fatalf("NoMultipartPartLimit option normalized to %d, want 0", got)
+	}
+
+	SetDefaultMultipartPartLimit(NoMultipartPartLimit)
+	if got := multipartPartLimit(MultipartOptions{}); got != 0 {
+		t.Fatalf("NoMultipartPartLimit default normalized to %d, want 0", got)
 	}
 }
 

@@ -337,12 +337,11 @@ func TestCompressSkipsOversizeWriteEndWithoutBufferingTail(t *testing.T) {
 // body that passes the other filters. Useful for benchmarks and for
 // callers who genuinely want to compress arbitrarily large responses.
 func TestCompressMaxSizeDisableSentinel(t *testing.T) {
-	const cap = -1
 	payload := strings.Repeat("compressible-content ", 1<<10) // ~21 KiB
 
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.Use(middleware.Compress(middleware.CompressOptions{
-			MaxSize: cap, // disabled
+			MaxSize: middleware.CompressNoMaxSize,
 		}))
 		app.Get("/", func(res *gogo.Response, req *gogo.Request) {
 			res.Send(200, "text/plain", payload)

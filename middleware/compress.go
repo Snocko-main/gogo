@@ -13,6 +13,10 @@ import (
 	"github.com/Snocko-main/gogo/internal/mwhint"
 )
 
+// CompressNoMaxSize disables CompressOptions.MaxSize. Use sparingly: it lets
+// the middleware buffer and compress arbitrarily large dynamic responses.
+const CompressNoMaxSize = -1
+
 // CompressOptions configures Compress. Zero value uses
 // gzip.DefaultCompression with a 1 KiB MinSize threshold, a 4 MiB
 // MaxSize cap, and the standard "compressible content-type" filter
@@ -38,9 +42,9 @@ type CompressOptions struct {
 	// (no Content-Encoding header). This avoids retaining a whole large
 	// dynamic response just to later decide it is too large to compress.
 	//
-	// Default 4 MiB. Set to 0 to disable the cap (matches the
-	// pre-cap behavior — every body of any size gets compressed if
-	// it passes the other filters). Negative is treated as zero.
+	// Default 4 MiB. Set to CompressNoMaxSize to disable the cap
+	// (matches the pre-cap behavior — every body of any size gets
+	// compressed if it passes the other filters).
 	MaxSize int
 
 	// Filter, when non-nil, is consulted after the body is buffered

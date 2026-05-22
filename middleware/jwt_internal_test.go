@@ -30,7 +30,7 @@ func TestVerifyJWTMaxTokenBytesCanBeDisabled(t *testing.T) {
 	verifier := func(signingInput, signature []byte) error {
 		return errors.New("verifier should not run before header decode")
 	}
-	_, err := verifyJWT(strings.Repeat("a", 32)+".b.c", verifier, "HS256", time.Second, -1)
+	_, err := verifyJWT(strings.Repeat("a", 32)+".b.c", verifier, "HS256", time.Second, NoJWTTokenLimit)
 	if err == nil || err.Error() == "token too large" {
 		t.Fatalf("verifyJWT error = %v, want non-size parse error", err)
 	}
@@ -51,6 +51,21 @@ func TestJWTRejectsECDSACurveMismatch(t *testing.T) {
 		Algorithm: JWTES256,
 		Key:       &priv.PublicKey,
 	})
+}
+
+func TestJWTRejectsWeakHMACSecret(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("JWT accepted a weak HMAC secret")
+		}
+	}()
+	_ = JWT(JWTOptions{Secret: []byte("too-short")})
+}
+
+func TestSignJWTRejectsWeakHMACSecret(t *testing.T) {
+	if _, err := SignJWT(JWTHS256, []byte("too-short"), map[string]any{"sub": "x"}); err == nil {
+		t.Fatal("SignJWT accepted a weak HMAC secret")
+	}
 }
 
 func TestSignJWTRejectsECDSACurveMismatch(t *testing.T) {

@@ -140,7 +140,7 @@ func TestTestServerNilSetup(t *testing.T) {
 // TestTestServerWithMiddleware ensures the full middleware chain
 // (cookies, auth, logger) actually fires under the TestServer.
 func TestTestServerWithMiddleware(t *testing.T) {
-	const secret = "test-secret"
+	const secret = "signed-cookie-secret-32-bytes-AAAA"
 	ts, err := gogo.NewTestServer(func(app *gogo.App) {
 		app.Use(middleware.Helmet())
 		app.Use(middleware.RequestID())
@@ -509,6 +509,39 @@ func TestHTTPAdapterRejectsOversizeResponseBody(t *testing.T) {
 	}
 	if string(body) != "Internal Server Error\n" {
 		t.Errorf("body = %q, want generic 500 body", string(body))
+	}
+}
+
+func TestHTTPAdapterDisableBodyLimitSentinelAllowsOversizeResponseBody(t *testing.T) {
+	old := gogo.GetMaxHTTPAdapterBodyBytes()
+	gogo.SetMaxHTTPAdapterBodyBytes(gogo.NoHTTPAdapterBodyLimit)
+	t.Cleanup(func() { gogo.SetMaxHTTPAdapterBodyBytes(old) })
+
+	want := strings.Repeat("x", 32)
+	stdHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, want)
+	})
+
+	ts, err := gogo.NewTestServer(func(app *gogo.App) {
+		app.Get("/legacy", gogo.HTTPAdapter(stdHandler))
+	})
+	if err != nil {
+		t.Fatalf("NewTestServer: %v", err)
+	}
+	defer ts.Close()
+
+	resp, err := ts.Get("/legacy")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if string(body) != want {
+		t.Errorf("body = %q, want %q", string(body), want)
 	}
 }
 

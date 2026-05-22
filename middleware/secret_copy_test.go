@@ -14,7 +14,7 @@ import (
 )
 
 func TestSessionCopiesSecret(t *testing.T) {
-	secret := []byte("session-secret-32-bytes-AAAA")
+	secret := []byte("session-secret-32-bytes-AAAAAAAA")
 	store := NewMemorySessionStore()
 	if err := store.Save("known-session", map[string]any{"user": "alice"}, time.Hour); err != nil {
 		t.Fatalf("store save: %v", err)
@@ -34,7 +34,7 @@ func TestSessionCopiesSecret(t *testing.T) {
 	}
 	defer ts.Close()
 
-	signed := signSessionID([]byte("session-secret-32-bytes-AAAA"), "known-session")
+	signed := signSessionID([]byte("session-secret-32-bytes-AAAAAAAA"), "known-session")
 	secret[0] ^= 0xff
 
 	req, _ := http.NewRequest("GET", "/", nil)
@@ -51,8 +51,8 @@ func TestSessionCopiesSecret(t *testing.T) {
 }
 
 func TestCSRFCopiesSecret(t *testing.T) {
-	secret := []byte("csrf-secret-32-bytes-AAAA")
-	token, err := newCSRFToken([]byte("csrf-secret-32-bytes-AAAA"))
+	secret := []byte("csrf-secret-32-bytes-AAAAAAAAAAAA")
+	token, err := newCSRFToken([]byte("csrf-secret-32-bytes-AAAAAAAAAAAA"))
 	if err != nil {
 		t.Fatalf("newCSRFToken: %v", err)
 	}
