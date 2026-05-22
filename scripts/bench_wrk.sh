@@ -92,71 +92,80 @@ wait_port() {
 	return 1
 }
 
+port_is_open() {
+	port="$1"
+	(echo >/dev/tcp/127.0.0.1/"$port") >/dev/null 2>&1
+}
+
 start_server() {
 	fw="$1"
 	mode="$2"
+	case "$fw" in
+	gogo) PORT=3002 ;;
+	fiber) PORT=3004 ;;
+	nethttp) PORT=3001 ;;
+	uwsjs) PORT=3003 ;;
+	bun) PORT=3005 ;;
+	actix) PORT=3007 ;;
+	*)
+		echo "unknown framework: $fw" >&2
+		return 1
+		;;
+	esac
+	if port_is_open "$PORT"; then
+		echo "port $PORT is already in use before starting $fw/$mode" >&2
+		return 1
+	fi
 	# Each server is launched in a subshell so we have a clean parent PID
 	# to walk children from (cleanup uses kill_tree to TERM the whole tree).
 	case "$fw:$mode" in
 	gogo:single)
-		PORT=3002
 		( GOGO_CORES=1 go run -tags gogo ./benchmark/gogo >/tmp/bench-gogo.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	gogo:multi)
-		PORT=3002
 		( GOGO_CORES="$NCPU" go run -tags gogo ./benchmark/gogo >/tmp/bench-gogo.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	fiber:single)
-		PORT=3004
 		( GOMAXPROCS=1 FIBER_PREFORK=0 go run ./benchmark/fiber >/tmp/bench-fiber.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	fiber:multi)
-		PORT=3004
 		( FIBER_PREFORK=1 go run ./benchmark/fiber >/tmp/bench-fiber.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	nethttp:single)
-		PORT=3001
 		( GOMAXPROCS=1 go run ./benchmark/nethttp >/tmp/bench-nethttp.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	nethttp:multi)
-		PORT=3001
 		( go run ./benchmark/nethttp >/tmp/bench-nethttp.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	uwsjs:single)
-		PORT=3003
 		( NODE_WORKERS=1 node benchmark/node-uwebsockets/server.cjs >/tmp/bench-uwsjs.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	uwsjs:multi)
-		PORT=3003
 		( NODE_WORKERS="$NCPU" node benchmark/node-uwebsockets/server.cjs >/tmp/bench-uwsjs.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	bun:single)
-		PORT=3005
 		( BUN_WORKERS=1 bun run benchmark/bun-elysia/server.ts >/tmp/bench-bun.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	bun:multi)
-		PORT=3005
 		( BUN_WORKERS="$NCPU" bun run benchmark/bun-elysia/server.ts >/tmp/bench-bun.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	actix:single)
-		PORT=3006
 		# Release binary must be pre-built: cargo build --release --manifest-path benchmark/actix/Cargo.toml
-		( ACTIX_WORKERS=1 PORT=3006 benchmark/actix/target/release/actix-bench >/tmp/bench-actix.log 2>&1 ) &
+		( ACTIX_WORKERS=1 PORT="$PORT" benchmark/actix/target/release/actix-bench >/tmp/bench-actix.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	actix:multi)
-		PORT=3006
-		( ACTIX_WORKERS="$NCPU" PORT=3006 benchmark/actix/target/release/actix-bench >/tmp/bench-actix.log 2>&1 ) &
+		( ACTIX_WORKERS="$NCPU" PORT="$PORT" benchmark/actix/target/release/actix-bench >/tmp/bench-actix.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	*)
@@ -203,10 +212,18 @@ bench_one() {
 
 	# warmup
 	if [ "$WARMUP" -gt 0 ]; then
-		wrk -t1 -c10 -d"${WARMUP}s" "${wrk_extra[@]}" "http://127.0.0.1:$port$endpoint" >/dev/null 2>&1 || true
+		if [ "$post" = 1 ]; then
+			wrk -t1 -c10 -d"${WARMUP}s" "${wrk_extra[@]}" "http://127.0.0.1:$port$endpoint" >/dev/null 2>&1 || true
+		else
+			wrk -t1 -c10 -d"${WARMUP}s" "http://127.0.0.1:$port$endpoint" >/dev/null 2>&1 || true
+		fi
 	fi
 
-	wrk -t"$threads" -c"$CONN" -d"${DURATION}s" --latency "${wrk_extra[@]}" "http://127.0.0.1:$port$endpoint" | tee -a "$log"
+	if [ "$post" = 1 ]; then
+		wrk -t"$threads" -c"$CONN" -d"${DURATION}s" --latency "${wrk_extra[@]}" "http://127.0.0.1:$port$endpoint" | tee -a "$log"
+	else
+		wrk -t"$threads" -c"$CONN" -d"${DURATION}s" --latency "http://127.0.0.1:$port$endpoint" | tee -a "$log"
+	fi
 }
 
 for fw in $FRAMEWORKS; do
