@@ -16,6 +16,10 @@ var (
 	// ErrWSHubClosed is returned when a publish or start is attempted after Close.
 	ErrWSHubClosed = errors.New("gogo: websocket hub is closed")
 
+	// ErrWSHubCloseTimeout is returned when Close cannot drain the adapter
+	// worker within the configured close timeout.
+	ErrWSHubCloseTimeout = errors.New("gogo: websocket hub close timeout")
+
 	// ErrWSHubAdapterQueueFull is returned by PublishFrom when the async
 	// adapter queue is full. Local subscribers have already been fanned out.
 	ErrWSHubAdapterQueueFull = errors.New("gogo: websocket hub adapter queue is full")
@@ -28,6 +32,7 @@ var (
 const (
 	defaultWSHubAdapterQueueSize      = 1024
 	defaultWSHubAdapterPublishTimeout = 5 * time.Second
+	defaultWSHubCloseTimeout          = 5 * time.Second
 	defaultWSHubStartBackoff          = 100 * time.Millisecond
 	maxWSHubStartBackoff              = 2 * time.Second
 )
@@ -70,6 +75,7 @@ type WSHub struct {
 	adapterErrFn   func(error)
 	adapterErrNext time.Time
 	adapterErrLast string
+	closeTimeout   time.Duration
 	socketSeq      atomic.Uint64
 	closed         atomic.Bool
 	closeOnce      sync.Once
@@ -125,6 +131,16 @@ func WithWSHubAdapterPublishTimeout(timeout time.Duration) WSHubOption {
 	}
 }
 
+// WithWSHubCloseTimeout bounds how long Close waits for queued adapter
+// publishes to drain before aborting in-flight adapter work.
+func WithWSHubCloseTimeout(timeout time.Duration) WSHubOption {
+	return func(h *WSHub) {
+		if timeout > 0 {
+			h.closeTimeout = timeout
+		}
+	}
+}
+
 // WithWSHubAdapterErrorHandler receives asynchronous adapter errors from the
 // hub worker. The default reports rate-limited errors through SetPanicHandler.
 func WithWSHubAdapterErrorHandler(fn func(error)) WSHubOption {
@@ -145,6 +161,7 @@ func NewWSHub(opts ...WSHubOption) *WSHub {
 		adapterQueueSz: defaultWSHubAdapterQueueSize,
 		adapterTimeout: defaultWSHubAdapterPublishTimeout,
 		adapterErrFn:   defaultWSHubAdapterErrorHandler,
+		closeTimeout:   defaultWSHubCloseTimeout,
 		startBackoff:   defaultWSHubStartBackoff,
 		ctx:            ctx,
 		cancel:         cancel,
@@ -337,10 +354,14 @@ func (h *WSHub) Close() error {
 			h.adapterQueue = nil
 		}
 		h.adapterQueueMu.Unlock()
-		h.adapterWG.Wait()
+		if waitErr := h.waitAdapterWorker(); waitErr != nil {
+			err = waitErr
+		}
 		h.cancel()
 		if h.adapter != nil {
-			err = h.adapter.Close()
+			if closeErr := h.adapter.Close(); err == nil {
+				err = closeErr
+			}
 		}
 	})
 	return err
@@ -424,9 +445,32 @@ func (h *WSHub) publishAdapter(msg WSHubMessage, allowClosed bool) error {
 	if err := h.startAdapter(false, allowClosed); err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), h.adapterTimeout)
+	ctx, cancel := context.WithTimeout(h.ctx, h.adapterTimeout)
 	defer cancel()
 	return h.adapter.Publish(ctx, msg)
+}
+
+func (h *WSHub) waitAdapterWorker() error {
+	done := make(chan struct{})
+	go func() {
+		h.adapterWG.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(h.closeTimeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return nil
+	case <-timer.C:
+		h.cancel()
+	}
+	timer.Reset(h.closeTimeout)
+	select {
+	case <-done:
+		return nil
+	case <-timer.C:
+		return ErrWSHubCloseTimeout
+	}
 }
 
 func (h *WSHub) publishAdapterAsync(msg WSHubMessage) error {

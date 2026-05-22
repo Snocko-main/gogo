@@ -1301,6 +1301,7 @@ if err != nil {
 }
 hub := gogo.NewWSHub(
     gogo.WithWSHubAdapter(adapter),
+    gogo.WithWSHubCloseTimeout(5*time.Second),
     gogo.WithWSHubAdapterErrorHandler(func(err error) {
         log.Printf("websocket hub adapter: %v", err)
     }),

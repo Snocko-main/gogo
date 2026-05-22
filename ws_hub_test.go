@@ -147,7 +147,8 @@ func TestWSHubCloseBoundsInFlightAdapterPublish(t *testing.T) {
 	adapter := &ctxBlockingWSHubAdapter{entered: make(chan struct{}, 1)}
 	hub := NewWSHub(
 		WithWSHubAdapter(adapter),
-		WithWSHubAdapterPublishTimeout(20*time.Millisecond),
+		WithWSHubAdapterPublishTimeout(time.Hour),
+		WithWSHubCloseTimeout(20*time.Millisecond),
 	)
 
 	if err := hub.Publish("room", []byte("hello"), Text); err != nil {
