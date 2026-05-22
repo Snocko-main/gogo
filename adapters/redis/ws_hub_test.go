@@ -62,10 +62,11 @@ func TestNewClientOptions(t *testing.T) {
 	client := goredis.NewClient(&goredis.Options{Addr: "localhost:6379"})
 	defer client.Close()
 	adapter, err := NewClientOptions(client, Options{
-		ChannelPrefix:      "custom:",
-		ChannelSize:        17,
-		ChannelSendTimeout: 2 * time.Second,
-		MaxMessageSize:     32,
+		ChannelPrefix:        "custom:",
+		ChannelSize:          17,
+		ChannelSendTimeout:   2 * time.Second,
+		MaxMessageSize:       32,
+		DynamicSubscriptions: true,
 	})
 	if err != nil {
 		t.Fatalf("NewClientOptions: %v", err)
@@ -81,6 +82,26 @@ func TestNewClientOptions(t *testing.T) {
 	}
 	if adapter.maxMsg != 32 {
 		t.Fatalf("max message size = %d, want 32", adapter.maxMsg)
+	}
+	if !adapter.dynamic {
+		t.Fatal("dynamic subscriptions = false, want true")
+	}
+}
+
+func TestDynamicSubscribeRequiresStart(t *testing.T) {
+	adapter := &Adapter{dynamic: true}
+	if err := adapter.Subscribe(t.Context(), "room"); err == nil {
+		t.Fatal("Subscribe succeeded before Start")
+	}
+}
+
+func TestStaticSubscribeNoop(t *testing.T) {
+	adapter := &Adapter{}
+	if err := adapter.Subscribe(t.Context(), "room"); err != nil {
+		t.Fatalf("Subscribe static adapter: %v", err)
+	}
+	if err := adapter.Unsubscribe(t.Context(), "room"); err != nil {
+		t.Fatalf("Unsubscribe static adapter: %v", err)
 	}
 }
 

@@ -47,24 +47,33 @@ type Options struct {
 	// MaxMessageSize caps the decoded WebSocket payload accepted from Redis.
 	// Defaults to 16 MiB, matching gogo's WebSocket MaxPayloadLength default.
 	MaxMessageSize int
+
+	// DynamicSubscriptions subscribes Redis only to topics with local WebSocket
+	// subscribers. This avoids receiving every topic under ChannelPrefix in
+	// large fleets; the hub updates subscriptions asynchronously when local
+	// sockets subscribe/unsubscribe.
+	DynamicSubscriptions bool
 }
 
 // Adapter bridges gogo.WSHub messages through Redis Pub/Sub.
 //
-// It uses one Redis client and one pattern subscription. Messages are encoded
-// as a tiny binary frame, while the Redis channel carries the topic:
+// By default it uses one Redis client and one pattern subscription. With
+// Options.DynamicSubscriptions, it subscribes only to channels requested by
+// gogo.WSHub's topic tracking. Messages are encoded as a tiny binary frame,
+// while the Redis channel carries the topic:
 //
 //	prefix + topic
 //
 // Redis Pub/Sub is best-effort. If a process is disconnected, messages
 // published during that window are not replayed.
 type Adapter struct {
-	client goredis.UniversalClient
-	own    bool
-	prefix string
-	chSize int
-	chSend time.Duration
-	maxMsg int
+	client  goredis.UniversalClient
+	own     bool
+	prefix  string
+	chSize  int
+	chSend  time.Duration
+	maxMsg  int
+	dynamic bool
 
 	mu     sync.RWMutex
 	pubsub *goredis.PubSub
@@ -100,12 +109,13 @@ func New(opt Options) (*Adapter, error) {
 		})
 	}
 	return &Adapter{
-		client: client,
-		own:    true,
-		prefix: prefix,
-		chSize: channelSize(opt),
-		chSend: opt.ChannelSendTimeout,
-		maxMsg: maxMessageSize(opt),
+		client:  client,
+		own:     true,
+		prefix:  prefix,
+		chSize:  channelSize(opt),
+		chSend:  opt.ChannelSendTimeout,
+		maxMsg:  maxMessageSize(opt),
+		dynamic: opt.DynamicSubscriptions,
 	}, nil
 }
 
@@ -126,11 +136,12 @@ func NewClientOptions(client goredis.UniversalClient, opt Options) (*Adapter, er
 		channelPrefix = defaultChannelPrefix
 	}
 	return &Adapter{
-		client: client,
-		prefix: channelPrefix,
-		chSize: channelSize(opt),
-		chSend: opt.ChannelSendTimeout,
-		maxMsg: maxMessageSize(opt),
+		client:  client,
+		prefix:  channelPrefix,
+		chSize:  channelSize(opt),
+		chSend:  opt.ChannelSendTimeout,
+		maxMsg:  maxMessageSize(opt),
+		dynamic: opt.DynamicSubscriptions,
 	}, nil
 }
 
@@ -148,7 +159,7 @@ func maxMessageSize(opt Options) int {
 	return defaultMaxMessage
 }
 
-// Start subscribes to every topic under the configured prefix.
+// Start begins receiving Redis Pub/Sub messages.
 func (a *Adapter) Start(ctx context.Context, deliver func(gogo.WSHubMessage)) error {
 	if a == nil || a.client == nil {
 		return errors.New("gogo/adapters/redis: nil adapter")
@@ -167,12 +178,29 @@ func (a *Adapter) Start(ctx context.Context, deliver func(gogo.WSHubMessage)) er
 		return nil
 	}
 	subCtx, cancel := context.WithCancel(ctx)
-	pubsub := a.client.PSubscribe(subCtx, redisGlobEscape(a.prefix)+"*")
-	if _, err := pubsub.Receive(subCtx); err != nil {
-		cancel()
-		_ = pubsub.Close()
-		a.mu.Unlock()
-		return err
+	var pubsub *goredis.PubSub
+	if a.dynamic {
+		pubsub = a.client.Subscribe(subCtx)
+		if err := pubsub.Ping(subCtx); err != nil {
+			cancel()
+			_ = pubsub.Close()
+			a.mu.Unlock()
+			return err
+		}
+		if _, err := pubsub.Receive(subCtx); err != nil {
+			cancel()
+			_ = pubsub.Close()
+			a.mu.Unlock()
+			return err
+		}
+	} else {
+		pubsub = a.client.PSubscribe(subCtx, redisGlobEscape(a.prefix)+"*")
+		if _, err := pubsub.Receive(subCtx); err != nil {
+			cancel()
+			_ = pubsub.Close()
+			a.mu.Unlock()
+			return err
+		}
 	}
 	a.pubsub = pubsub
 	a.cancel = cancel
@@ -207,6 +235,48 @@ func (a *Adapter) Start(ctx context.Context, deliver func(gogo.WSHubMessage)) er
 		}
 	}()
 	return nil
+}
+
+// Subscribe subscribes the Redis receiver to a topic. It is used by WSHub when
+// Options.DynamicSubscriptions is enabled.
+func (a *Adapter) Subscribe(ctx context.Context, topic string) error {
+	if a == nil {
+		return errors.New("gogo/adapters/redis: nil adapter")
+	}
+	if !a.dynamic {
+		return nil
+	}
+	return a.updateSubscription(ctx, topic, true)
+}
+
+// Unsubscribe removes the Redis receiver from a topic. It is used by WSHub
+// when Options.DynamicSubscriptions is enabled.
+func (a *Adapter) Unsubscribe(ctx context.Context, topic string) error {
+	if a == nil {
+		return errors.New("gogo/adapters/redis: nil adapter")
+	}
+	if !a.dynamic {
+		return nil
+	}
+	return a.updateSubscription(ctx, topic, false)
+}
+
+func (a *Adapter) updateSubscription(ctx context.Context, topic string, subscribe bool) error {
+	a.mu.RLock()
+	pubsub := a.pubsub
+	closed := a.closed
+	a.mu.RUnlock()
+	if closed {
+		return errAdapterClosed
+	}
+	if pubsub == nil {
+		return errors.New("gogo/adapters/redis: adapter not started")
+	}
+	channel := a.prefix + topic
+	if subscribe {
+		return pubsub.Subscribe(ctx, channel)
+	}
+	return pubsub.Unsubscribe(ctx, channel)
 }
 
 // Publish sends msg to Redis. The Redis channel name is prefix + topic.

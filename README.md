@@ -1294,6 +1294,10 @@ import redisadapter "github.com/Snocko-main/gogo/adapters/redis"
 
 adapter, err := redisadapter.New(redisadapter.Options{
     URL: "redis://localhost:6379/0",
+    // Optional for large fleets: subscribe Redis only to topics that have
+    // local WebSocket subscribers. The hub updates Redis from its adapter
+    // worker, so subscribe/unsubscribe never blocks the uWS loop.
+    DynamicSubscriptions: true,
     // Optional: tune burst absorption before go-redis can drop Pub/Sub
     // messages because the receive channel is full.
     ChannelSize: 4096,
@@ -1319,6 +1323,12 @@ if err := hub.Start(); err != nil {
 Keep the default one adapter worker when cross-process message order matters.
 If your workload can tolerate reordering, `gogo.WithWSHubAdapterWorkers(4)` can
 raise Redis publish throughput.
+
+`DynamicSubscriptions` uses gogo's Go-side `ws.Subscribe` / `ws.Unsubscribe`
+tracking rather than a uWS subscription callback, so it does not add an extra
+C-to-Go callback on the WebSocket hot path. HTTP `GetAsync` / `PostAsync`
+handlers keep the same shared-memory zero-cgo dispatch path; the Redis work is
+isolated behind the hub's adapter queue.
 
 With `RunMultiCore`, create one hub outside setup and register every worker's
 route through it:

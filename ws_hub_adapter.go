@@ -21,3 +21,13 @@ type WSHubAdapter interface {
 	Publish(ctx context.Context, msg WSHubMessage) error
 	Close() error
 }
+
+// WSHubTopicAdapter is an optional extension for adapters that can subscribe
+// only to topics with local subscribers. WSHub calls these methods
+// asynchronously from its adapter worker when the first local socket subscribes
+// to a topic and when the last local socket leaves.
+type WSHubTopicAdapter interface {
+	WSHubAdapter
+	Subscribe(ctx context.Context, topic string) error
+	Unsubscribe(ctx context.Context, topic string) error
+}

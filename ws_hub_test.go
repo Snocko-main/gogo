@@ -15,6 +15,8 @@ type fakeWSHubAdapter struct {
 	starts    int
 	startErr  error
 	published []WSHubMessage
+	subs      []string
+	unsubs    []string
 }
 
 func (a *fakeWSHubAdapter) Start(context.Context, func(WSHubMessage)) error {
@@ -34,11 +36,31 @@ func (a *fakeWSHubAdapter) Publish(_ context.Context, msg WSHubMessage) error {
 
 func (a *fakeWSHubAdapter) Close() error { return nil }
 
+func (a *fakeWSHubAdapter) Subscribe(_ context.Context, topic string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.subs = append(a.subs, topic)
+	return nil
+}
+
+func (a *fakeWSHubAdapter) Unsubscribe(_ context.Context, topic string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.unsubs = append(a.unsubs, topic)
+	return nil
+}
+
 func (a *fakeWSHubAdapter) snapshot() (bool, int, []WSHubMessage) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	published := append([]WSHubMessage(nil), a.published...)
 	return a.started, a.starts, published
+}
+
+func (a *fakeWSHubAdapter) topicSnapshot() (subs, unsubs []string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.subs...), append([]string(nil), a.unsubs...)
 }
 
 func (a *fakeWSHubAdapter) setStartErr(err error) {
@@ -60,6 +82,21 @@ func waitForAdapterPublish(t *testing.T, adapter *fakeWSHubAdapter, want int) []
 	_, _, published := adapter.snapshot()
 	t.Fatalf("published count = %d, want %d", len(published), want)
 	return nil
+}
+
+func waitForAdapterTopics(t *testing.T, adapter *fakeWSHubAdapter, wantSubs, wantUnsubs int) ([]string, []string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		subs, unsubs := adapter.topicSnapshot()
+		if len(subs) >= wantSubs && len(unsubs) >= wantUnsubs {
+			return subs, unsubs
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	subs, unsubs := adapter.topicSnapshot()
+	t.Fatalf("topic ops = %d subs/%d unsubs, want %d/%d", len(subs), len(unsubs), wantSubs, wantUnsubs)
+	return nil, nil
 }
 
 func TestWSHubPublishCopiesMessageBeforeAdapter(t *testing.T) {
@@ -113,6 +150,40 @@ func TestWSHubStartReturnsAdapterError(t *testing.T) {
 	_, starts, _ := adapter.snapshot()
 	if starts != 2 {
 		t.Fatalf("adapter starts = %d, want 2", starts)
+	}
+}
+
+func TestWSHubQueuesAdapterTopicSubscriptions(t *testing.T) {
+	adapter := &fakeWSHubAdapter{}
+	hub := NewWSHub(WithWSHubAdapter(adapter), WithWSHubAdapterWorkers(4))
+	defer hub.Close()
+
+	hub.mu.Lock()
+	hub.sockets[1] = &hubSocket{token: 1, topics: make(map[string]struct{})}
+	hub.sockets[2] = &hubSocket{token: 2, topics: make(map[string]struct{})}
+	hub.mu.Unlock()
+
+	if token, first := hub.addMembership(1, 0, "room"); token == 0 || !first {
+		t.Fatalf("first membership = token %d first %v, want token and first", token, first)
+	}
+	hub.queueAdapterTopic("room", wsHubAdapterSubscribe)
+	subs, _ := waitForAdapterTopics(t, adapter, 1, 0)
+	if len(subs) != 1 || subs[0] != "room" {
+		t.Fatalf("subs = %#v, want [room]", subs)
+	}
+
+	if _, first := hub.addMembership(2, 0, "room"); first {
+		t.Fatal("second membership should not be first")
+	}
+	hub.removeMembershipIfCurrent(1, 0, "room")
+	_, unsubs := adapter.topicSnapshot()
+	if len(unsubs) != 0 {
+		t.Fatalf("unsubs after first leave = %#v, want none", unsubs)
+	}
+	hub.removeMembershipIfCurrent(2, 0, "room")
+	_, unsubs = waitForAdapterTopics(t, adapter, 1, 1)
+	if len(unsubs) != 1 || unsubs[0] != "room" {
+		t.Fatalf("unsubs = %#v, want [room]", unsubs)
 	}
 }
 
