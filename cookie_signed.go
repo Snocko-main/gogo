@@ -95,7 +95,7 @@ func VerifyCookieValue(signed string, secrets ...string) (string, bool) {
 		return "", false
 	}
 	dot := strings.LastIndexByte(signed, signedCookieSep)
-	if dot <= 0 || dot == len(signed)-1 {
+	if dot < 0 || dot == len(signed)-1 {
 		return "", false
 	}
 	value := signed[:dot]

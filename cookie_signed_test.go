@@ -131,12 +131,12 @@ func TestKeyRotation(t *testing.T) {
 // VerifyCookieValue should recover the empty payload.
 func TestSignEmptyValue(t *testing.T) {
 	signed := gogo.SignCookieValue("", testCookieSecret)
-	// Empty value still produces a "."-prefixed signature; our
-	// verifier rejects a leading separator because we use
-	// LastIndexByte and require dot > 0. Document the behavior
-	// rather than silently round-tripping an empty payload.
-	if _, ok := gogo.VerifyCookieValue(signed, testCookieSecret); ok {
-		t.Errorf("VerifyCookieValue accepted an empty-payload cookie; current contract is to reject")
+	got, ok := gogo.VerifyCookieValue(signed, testCookieSecret)
+	if !ok {
+		t.Fatal("VerifyCookieValue rejected a value produced by SignCookieValue")
+	}
+	if got != "" {
+		t.Errorf("VerifyCookieValue empty payload = %q, want empty", got)
 	}
 }
 
