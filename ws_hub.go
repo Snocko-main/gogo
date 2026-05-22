@@ -31,6 +31,10 @@ var (
 	// ErrWSHubInvalidOpCode is returned when a hub publish is called with an
 	// opcode other than Text or Binary.
 	ErrWSHubInvalidOpCode = errors.New("gogo: websocket hub opcode must be Text or Binary")
+
+	// ErrWSHubTrackFailed is reported when a socket cannot be registered with
+	// the hub during WebSocket open.
+	ErrWSHubTrackFailed = errors.New("gogo: websocket hub could not track socket")
 )
 
 const (
@@ -233,7 +237,11 @@ func (h *WSHub) Wrap(app *App, behavior WebSocketBehavior) WebSocketBehavior {
 	open := behavior.Open
 	closeFn := behavior.Close
 	behavior.Open = func(ws *WebSocket) {
-		h.remember(ws, app)
+		if !h.remember(ws, app) {
+			h.reportAdapterError(ErrWSHubTrackFailed)
+			ws.End(1011, "websocket hub setup failed")
+			return
+		}
 		if open != nil {
 			open(ws)
 		}
@@ -539,28 +547,40 @@ func (h *WSHub) ensureAdapterWorker() {
 func (h *WSHub) runAdapterWorker(queue <-chan WSHubMessage) {
 	defer h.adapterWG.Done()
 	for msg := range queue {
-		if err := h.publishAdapter(msg, true); err != nil {
+		if err := h.publishAdapterSafely(msg); err != nil {
 			h.reportAdapterError(err)
 		}
 	}
 }
 
-func (h *WSHub) remember(ws *WebSocket, app *App) {
+func (h *WSHub) publishAdapterSafely(msg WSHubMessage) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("gogo: websocket hub adapter panic: %v", recovered)
+		}
+	}()
+	return h.publishAdapter(msg, true)
+}
+
+func (h *WSHub) remember(ws *WebSocket, app *App) bool {
 	key := wsNativeKey(ws)
 	if key == 0 {
-		return
+		return false
+	}
+	if !reserveWSHub(key, h) {
+		return false
 	}
 	h.mu.Lock()
 	if socket := h.sockets[key]; socket != nil {
 		ws.hubToken.Store(socket.token)
 		h.mu.Unlock()
-		registerWSHub(key, h)
-		return
+		return true
 	}
 	direct := randomDirectTopic(h.nodeID)
 	if !ws.inner.subscribe(direct) {
 		h.mu.Unlock()
-		return
+		unregisterWSHub(key, h)
+		return false
 	}
 	token := h.socketSeq.Add(1)
 	ws.hubToken.Store(token)
@@ -571,7 +591,7 @@ func (h *WSHub) remember(ws *WebSocket, app *App) {
 		topics: make(map[string]struct{}),
 	}
 	h.mu.Unlock()
-	registerWSHub(key, h)
+	return true
 }
 
 func (h *WSHub) forget(ws *WebSocket) {
@@ -677,10 +697,14 @@ func (h *WSHub) removeMembershipLocked(key uintptr, topic string) {
 	}
 }
 
-func registerWSHub(key uintptr, h *WSHub) {
+func reserveWSHub(key uintptr, h *WSHub) bool {
 	wsHubRegistryMu.Lock()
+	defer wsHubRegistryMu.Unlock()
+	if existing := wsHubRegistry[key]; existing != nil && existing != h {
+		return false
+	}
 	wsHubRegistry[key] = h
-	wsHubRegistryMu.Unlock()
+	return true
 }
 
 func unregisterWSHub(key uintptr, h *WSHub) {

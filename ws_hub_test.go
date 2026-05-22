@@ -3,6 +3,7 @@ package gogo
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -148,6 +149,35 @@ func (a *failingPublishWSHubAdapter) Publish(context.Context, WSHubMessage) erro
 
 func (a *failingPublishWSHubAdapter) Close() error { return nil }
 
+type panicOnceWSHubAdapter struct {
+	mu        sync.Mutex
+	panicked  bool
+	published []WSHubMessage
+}
+
+func (a *panicOnceWSHubAdapter) Start(context.Context, func(WSHubMessage)) error {
+	return nil
+}
+
+func (a *panicOnceWSHubAdapter) Publish(context.Context, WSHubMessage) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.panicked {
+		a.panicked = true
+		panic("redis client panic")
+	}
+	a.published = append(a.published, WSHubMessage{})
+	return nil
+}
+
+func (a *panicOnceWSHubAdapter) Close() error { return nil }
+
+func (a *panicOnceWSHubAdapter) publishedCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.published)
+}
+
 func TestWSHubCloseBoundsInFlightAdapterPublish(t *testing.T) {
 	adapter := &ctxBlockingWSHubAdapter{entered: make(chan struct{}, 1)}
 	hub := NewWSHub(
@@ -200,6 +230,63 @@ func TestWSHubReportsAsyncAdapterError(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("async adapter error was not reported")
+	}
+}
+
+func TestWSHubAdapterWorkerRecoversPanic(t *testing.T) {
+	errs := make(chan error, 1)
+	adapter := &panicOnceWSHubAdapter{}
+	hub := NewWSHub(
+		WithWSHubAdapter(adapter),
+		WithWSHubAdapterErrorHandler(func(err error) {
+			errs <- err
+		}),
+	)
+	defer hub.Close()
+
+	if err := hub.Publish("room", []byte("first"), Text); err != nil {
+		t.Fatalf("first Publish: %v", err)
+	}
+	select {
+	case err := <-errs:
+		if !strings.Contains(err.Error(), "adapter panic") {
+			t.Fatalf("async adapter error = %v, want adapter panic", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("adapter panic was not reported")
+	}
+
+	if err := hub.Publish("room", []byte("second"), Text); err != nil {
+		t.Fatalf("second Publish: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if adapter.publishedCount() == 1 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("adapter worker did not publish after panic")
+}
+
+func TestWSHubRegistryRejectsDifferentHubForSocket(t *testing.T) {
+	key := uintptr(1)
+	h1 := NewWSHub()
+	h2 := NewWSHub()
+	t.Cleanup(func() {
+		unregisterWSHub(key, h1)
+		unregisterWSHub(key, h2)
+	})
+
+	if !reserveWSHub(key, h1) {
+		t.Fatal("first hub could not reserve socket")
+	}
+	if reserveWSHub(key, h2) {
+		t.Fatal("second hub reserved socket already owned by first hub")
+	}
+	unregisterWSHub(key, h1)
+	if !reserveWSHub(key, h2) {
+		t.Fatal("second hub could not reserve socket after first hub released it")
 	}
 }
 
