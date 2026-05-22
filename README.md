@@ -160,6 +160,8 @@ app.Get("/health", gogo.Reply{
 
 ### Basic routes
 
+Sync route handlers run on the uWS loop thread and should stay fast:
+
 ```go
 app.Get("/users", listUsers)
 app.Post("/users", createUser)
@@ -170,6 +172,48 @@ app.Options("/users", optionsUsers)
 app.Head("/users", headUsers)
 app.Any("/echo", anyMethod)
 ```
+
+Async route handlers run on a goroutine and receive a request snapshot:
+
+```go
+app.GetAsync("/users/:id", showUserFromDB)
+app.PostAsync("/uploads", 10<<20, uploadFile) // max body bytes, then handler
+```
+
+The same route registration APIs are available on a `*gogo.Router` returned
+by `Group` or `Mount`, so scoped routes can use sync and async handlers:
+
+```go
+api := app.Group("/api")
+api.Get("/health", health)
+api.GetAsync("/users/:id", showUserFromDB)
+api.Post("/users", createUser)
+api.PostAsync("/uploads", 10<<20, uploadFile)
+```
+
+Route API surface:
+
+| API | `App` | `Router` | handler / target |
+|---|---:|---:|---|
+| `Get(pattern, target)` | yes | yes | `Handler`, `func(*Response, *Request)`, `Reply`, `string`, or `[]byte` |
+| `GetAsync(pattern, handler)` | yes | yes | `AsyncHandler` |
+| `Post(pattern, handler)` | yes | yes | `Handler` |
+| `PostAsync(pattern, maxBodyBytes, handler)` | yes | yes | `PostAsyncHandler` with collected body |
+| `Put(pattern, handler)` | yes | yes | `Handler` |
+| `Patch(pattern, handler)` | yes | yes | `Handler` |
+| `Delete(pattern, handler)` | yes | yes | `Handler` |
+| `Options(pattern, handler)` | yes | yes | `Handler` |
+| `Head(pattern, handler)` | yes | yes | `Handler` |
+| `Any(pattern, handler)` | yes | yes | `Handler` for every HTTP method |
+| `WebSocket(pattern, behavior)` | yes | yes | `WebSocketBehavior` |
+| `Group(prefix, ...middleware)` | yes | yes | returns a scoped `*Router` |
+| `Use(...middleware)` | yes | yes | sync middleware; `App.Use` also supports a path prefix |
+| `UseAsync(...middleware)` | yes | yes | async middleware for `GetAsync` / `PostAsync`; `App.UseAsync` also supports a path prefix |
+| `Mount(prefix, func(*Router))` | yes | no | callback sugar over `Group` |
+| `Name(name, pattern)` | yes | no | names a route pattern for reverse routing |
+| `URL(name, params)` | yes | no | builds a URL for a named route |
+| `NotFound(handler)` | yes | no | fallback for unmatched routes |
+| `MethodNotAllowed(handler)` | yes | no | fallback for known path with unsupported method |
 
 ### Route parameters
 
