@@ -845,8 +845,8 @@ app.Use(mw.RateLimit(mw.RateLimitOptions{
 }))
 ```
 
-Set `MaxBuckets: -1` to disable the cap entirely (tests only — re-introduces
-the OOM risk).
+Set `MaxBuckets: mw.NoRateLimitBucketLimit` to disable the cap entirely
+(tests only — re-introduces the OOM risk).
 
 For multi-instance fleets, plug a Redis-backed `RateLimitStore` instead —
 the cap is irrelevant when state lives in Redis, and counters stay
@@ -933,7 +933,7 @@ expired rows alive until `GC()` was called manually). When the cap is
 hit on a fresh `Save`, the store sweeps expired entries first and
 otherwise drops the oldest-`expires` entry to make room. Raise the cap
 via `MaxEntries` if your workload legitimately keeps many concurrent
-sessions; pass a negative value to disable (not recommended outside
+sessions; `mw.NoSessionEntryLimit` disables the cap (not recommended outside
 tests).
 
 For multi-instance fleets, implement `SessionStore` (and `RateLimitStore`)

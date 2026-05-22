@@ -90,8 +90,9 @@ type SessionOptions struct {
 	// free space, the OLDEST remaining entry (by expires) is
 	// evicted to make room. Zero (default) means 100_000 — enough
 	// for typical fleets, low enough that worst-case memory stays
-	// under ~50 MiB even with rich session payloads. Negative
-	// disables the cap (not recommended outside tests).
+	// under ~50 MiB even with rich session payloads.
+	// NoSessionEntryLimit disables the cap (not recommended outside
+	// tests).
 	//
 	// Only consulted when Store is the default MemorySessionStore.
 	MaxEntries int
@@ -130,6 +131,11 @@ type Session struct {
 	rotate        func(s *Session)
 	rotateOnWrite bool
 }
+
+// NoSessionEntryLimit disables the in-memory session entry cap. This is
+// intended for tests only; production deployments should keep the cap enabled
+// or use a bounded external store such as Redis.
+const NoSessionEntryLimit = -1
 
 // Get returns the value at key, or nil when absent.
 func (s *Session) Get(key string) any {
@@ -258,7 +264,7 @@ func NewSession(opt SessionOptions) mwhint.Hinted {
 		case opt.MaxEntries > 0:
 			mem.maxEntries = opt.MaxEntries
 		default:
-			mem.maxEntries = 0 // negative → disabled
+			mem.maxEntries = 0 // NoSessionEntryLimit / legacy negative disables.
 		}
 		opt.Store = mem
 	}

@@ -25,6 +25,16 @@ func TestSessionAsyncStoreUsesAsyncPlacement(t *testing.T) {
 	}
 }
 
+func TestSessionEntryLimitDisableSentinel(t *testing.T) {
+	h := NewSession(SessionOptions{
+		Secret:     []byte("session-secret-32-bytes-AAAAAAAA"),
+		MaxEntries: NoSessionEntryLimit,
+	})
+	if h.Place != mwhint.Both {
+		t.Fatalf("Session with NoSessionEntryLimit placement = %v, want Both", h.Place)
+	}
+}
+
 func TestSessionRejectsWeakSecret(t *testing.T) {
 	defer func() {
 		if recover() == nil {
