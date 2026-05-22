@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 func TestBodyEncoderOverflowReturnsPrefixOnly(t *testing.T) {
@@ -21,6 +22,29 @@ func TestBodyEncoderOverflowReturnsPrefixOnly(t *testing.T) {
 	}
 	if len(enc.buf) != 0 {
 		t.Fatalf("buffer len after overflow = %d, want 0", len(enc.buf))
+	}
+}
+
+func TestHeadersBlobForIterationIncompleteSyncUsesFullDump(t *testing.T) {
+	partial := []byte("x-first\x00one\x00")
+	full := []byte("x-first\x00one\x00x-late\x00late\x00")
+	req := &Request{
+		syncHeadersPtr:      unsafe.Pointer(&partial[0]),
+		syncHeadersLen:      len(partial),
+		syncHeadersComplete: false,
+	}
+
+	called := false
+	got := req.headersBlobForIteration(func() []byte {
+		called = true
+		return full
+	})
+
+	if !called {
+		t.Fatal("full dump was not called for incomplete sync header blob")
+	}
+	if string(got) != string(full) {
+		t.Fatalf("blob=%q, want full dump %q", string(got), string(full))
 	}
 }
 
