@@ -411,6 +411,37 @@ func TestHTTPAdapterWithBody(t *testing.T) {
 	}
 }
 
+func TestHTTPAdapterRequestBodyIsNonNil(t *testing.T) {
+	stdHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body == nil {
+			http.Error(w, "nil body", 500)
+			return
+		}
+		if err := r.Body.Close(); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.WriteHeader(204)
+	})
+
+	ts, err := gogo.NewTestServer(func(app *gogo.App) {
+		app.Get("/legacy", gogo.HTTPAdapter(stdHandler))
+	})
+	if err != nil {
+		t.Fatalf("NewTestServer: %v", err)
+	}
+	defer ts.Close()
+
+	resp, err := ts.Get("/legacy")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 204 {
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+}
+
 func TestHTTPAdapterAcceptsBufferedFlushAndContentTypeSniff(t *testing.T) {
 	stdHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		flusher, ok := w.(http.Flusher)

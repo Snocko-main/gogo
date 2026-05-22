@@ -361,8 +361,8 @@ func buildAdapterRequest(req *Request, body []byte) (*http.Request, error) {
 		url += "?" + q
 	}
 
-	var bodyReader io.Reader
-	if len(body) > 0 {
+	var bodyReader io.Reader = http.NoBody
+	if body != nil {
 		bodyReader = bytes.NewReader(body)
 	}
 	httpReq, err := http.NewRequest(method, url, bodyReader)
