@@ -20,8 +20,8 @@ type CORSOptions struct {
 	// are supported — the literal "*" must appear right after "://".
 	//
 	// AllowCredentials cannot be combined with "*" — browsers reject it
-	// per spec. When credentials are required, list the origins
-	// explicitly.
+	// per spec. Do not mix "*" with explicit origins; use only "*"
+	// for public APIs, or list every trusted origin explicitly.
 	AllowOrigins []string
 
 	// AllowMethods is the list of HTTP methods returned in the preflight
@@ -89,10 +89,15 @@ func CORS(opts ...CORSOptions) mwhint.Hinted {
 	if len(opt.AllowHeaders) == 0 {
 		opt.AllowHeaders = defaultAllowHeaders
 	}
-	if opt.AllowCredentials && len(opt.AllowOrigins) == 1 && opt.AllowOrigins[0] == "*" {
-		panic("gogo/middleware: AllowCredentials=true cannot be combined with AllowOrigins={\"*\"}; list explicit origins")
-	}
 	allowOrigins := normalizeCORSOriginPatterns(opt.AllowOrigins)
+	if hasCORSWildcardOrigin(allowOrigins) {
+		if len(allowOrigins) > 1 {
+			panic("gogo/middleware: CORS AllowOrigins cannot mix \"*\" with explicit origins")
+		}
+		if opt.AllowCredentials {
+			panic("gogo/middleware: AllowCredentials=true cannot be combined with AllowOrigins={\"*\"}; list explicit origins")
+		}
+	}
 	validateCORSMethods(opt.AllowMethods)
 	validateCORSHeaders("AllowHeaders", opt.AllowHeaders, true)
 	validateCORSHeaders("ExposeHeaders", opt.ExposeHeaders, false)
@@ -254,6 +259,15 @@ func normalizeCORSOriginPatterns(patterns []string) []string {
 	return out
 }
 
+func hasCORSWildcardOrigin(patterns []string) bool {
+	for _, pattern := range patterns {
+		if pattern == "*" {
+			return true
+		}
+	}
+	return false
+}
+
 func normalizeCORSOriginPattern(pattern string) (string, bool) {
 	for i := 0; i < len(pattern); i++ {
 		if pattern[i] < 0x20 || pattern[i] == 0x7f {
@@ -378,14 +392,18 @@ func validCORSHeaderToken(header string) bool {
 	return true
 }
 
-// matchCompiledOrigin tests whether origin matches any compiled
-// pattern. Lowercases origin once, then runs a single == /
-// HasPrefix / HasSuffix per pattern.
+// matchCompiledOrigin tests whether origin matches any compiled pattern.
+// Runtime origins are normalized with the same parser used for configured
+// origins; malformed request headers simply fail closed instead of matching a
+// wildcard suffix by raw string shape.
 func matchCompiledOrigin(compiled []compiledOrigin, origin string) bool {
 	if len(compiled) == 0 {
 		return false
 	}
-	lower := strings.ToLower(origin)
+	lower, ok := normalizeOriginValue(origin)
+	if !ok {
+		return false
+	}
 	for _, p := range compiled {
 		if p.wildcard {
 			if strings.HasPrefix(lower, p.scheme+"://") &&

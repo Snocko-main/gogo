@@ -277,6 +277,11 @@ func waitForPortAccept(host string, timeout time.Duration) error {
 // Useful for migrating routes a-handler-at-a-time from a stdlib
 // net/http codebase, or for serving stdlib-shaped handlers
 // (expvar.Handler, net/http/pprof.Handler, …) under gogo.
+// Responses are buffered before being sent through gogo. The adapter
+// accepts http.Flusher for compatibility with stdlib handlers, but
+// Flush only commits the staged status code; it does not stream bytes
+// to the client. Port streaming or large-download handlers to native
+// gogo APIs instead.
 //
 //	app.Get("/debug/vars", gogo.HTTPAdapter(expvar.Handler()))
 //	app.Get("/debug/pprof/*", gogo.HTTPAdapter(http.HandlerFunc(pprof.Index)))
@@ -356,8 +361,8 @@ func buildAdapterRequest(req *Request, body []byte) (*http.Request, error) {
 		url += "?" + q
 	}
 
-	var bodyReader io.Reader
-	if len(body) > 0 {
+	var bodyReader io.Reader = http.NoBody
+	if body != nil {
 		bodyReader = bytes.NewReader(body)
 	}
 	httpReq, err := http.NewRequest(method, url, bodyReader)
@@ -370,6 +375,9 @@ func buildAdapterRequest(req *Request, body []byte) (*http.Request, error) {
 	// often inspect Auth headers, Cookies, etc.) see what the
 	// real client sent.
 	copyHeadersFromRequest(httpReq.Header, req)
+	if host := req.Header("host"); host != "" {
+		httpReq.Host = host
+	}
 	if httpReq.Header.Get("Content-Length") == "" && len(body) > 0 {
 		httpReq.Header.Set("Content-Length", strconv.Itoa(len(body)))
 	}
@@ -407,7 +415,6 @@ type httpAdapterRecorder struct {
 	code     int
 	maxBytes int64
 	tooLarge bool
-	flushed  bool
 }
 
 func newHTTPAdapterRecorder(maxBytes int64) *httpAdapterRecorder {
@@ -460,7 +467,6 @@ func (r *httpAdapterRecorder) Flush() {
 	if r.code == 0 {
 		r.code = 200
 	}
-	r.flushed = true
 }
 
 // flushAdapterRecorder copies the recorded status, headers, and body from the
@@ -493,7 +499,11 @@ func flushAdapterRecorder(res *Response, rec *httpAdapterRecorder) {
 // Request.Headers abstracts both without one lookup per known name.
 func copyHeadersFromRequest(dst http.Header, req *Request) {
 	req.Headers(func(name, value string) bool {
-		dst.Set(canonicalHeaderName(name), value)
+		key := canonicalHeaderName(name)
+		if key == "Host" {
+			return true
+		}
+		dst.Add(key, value)
 		return true
 	})
 }

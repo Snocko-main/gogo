@@ -91,11 +91,17 @@ type RateLimitStore interface {
 // In-memory backing is single-process. For multi-instance fleets
 // supply a Store implementation that consults a shared backend.
 func RateLimit(opt RateLimitOptions) mwhint.Hinted {
-	if opt.Max <= 0 || opt.Window <= 0 {
+	if opt.Max == 0 && opt.Window == 0 {
 		// No-op pass-through when not configured. Keep it in both chains
 		// so disabled RateLimit does not force async routes off the shared
 		// fast path merely because the middleware was registered.
 		return mwhint.Hinted{Place: mwhint.Both, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler { return next })}
+	}
+	if opt.Max <= 0 {
+		panic("gogo/middleware: RateLimit Max must be positive")
+	}
+	if opt.Window <= 0 {
+		panic("gogo/middleware: RateLimit Window must be positive")
 	}
 	if opt.KeyFunc == nil {
 		opt.KeyFunc = func(req *gogo.Request) string { return req.IP() }

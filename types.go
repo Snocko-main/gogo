@@ -256,8 +256,9 @@ type Handler func(*Response, *Request)
 // AsyncHandler handles a request on a goroutine that is free to block.
 // The Response arrives in async mode with the abort context pre-attached.
 // The Request is a snapshot copied from the live uWS request before it was
-// freed; URL/method/query/params/headers are all readable, with fixed caps
-// (URL 256, query 512, each param 64, headers buffer 4 KB).
+// freed. Shared zero-cgo routes reject snapshots past their fixed caps
+// (URL 256, query 512, each param 64, headers buffer 8 KB); middleware
+// fallback snapshots copy the live request fields via cgo before spawning.
 type AsyncHandler func(*Response, *Request)
 
 // OpCode identifies a WebSocket frame type.
@@ -354,8 +355,11 @@ type WebSocketBehavior struct {
 // from a session token via a DB lookup), use AsyncMiddleware with UseAsync;
 // it runs on a goroutine and is free to block.
 //
-// Static replies (Reply, string, []byte targets of App.Get) and GetShared
-// routes bypass middleware because they have no Go-side handler to wrap.
+// Static replies (Reply, string, []byte targets of App.Get) use their C++
+// fast path only when no matching sync middleware or typed-param constraint
+// needs a Go-side handler. GetAsync / PostAsync keep their shared-memory fast
+// path when only async-capable middleware applies; sync-only middleware makes
+// them fall back to a wrapped sync entry point.
 type Middleware func(next Handler) Handler
 
 // AsyncMiddleware wraps an AsyncHandler the same way Middleware wraps a
@@ -943,6 +947,34 @@ func (a *App) hasMatchingMiddleware(routePattern string) bool {
 	return false
 }
 
+// hasSyncMiddleware reports whether any sync-side middleware could apply to
+// routePattern. Unlike hasMatchingMiddleware, it includes PlaceBoth entries
+// because static GET fallbacks execute on the sync route path and must not
+// bypass app.Use(auth) / app.Use(logger) just because those middlewares also
+// have an async twin.
+func (a *App) hasSyncMiddleware(routePattern string) bool {
+	if len(a.middlewares) == 0 {
+		return false
+	}
+	dynamic := strings.ContainsAny(routePattern, ":*")
+	for _, e := range a.middlewares {
+		if e.prefix == "" {
+			return true
+		}
+		if dynamic {
+			return true
+		}
+		if mwMatches(e.prefix, routePattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasRouteConstraints(meta *routeMeta) bool {
+	return meta != nil && len(meta.constraints) > 0
+}
+
 // UseAsync is retained as a thin alias for App.Use to keep existing
 // code compiling. App.Use now handles all middleware: bundled
 // middleware carries its own placement, raw AsyncMiddleware values
@@ -1015,7 +1047,8 @@ func (a *App) wrapAsyncFiltered(routePattern string, h AsyncHandler, skipAlsoSyn
 //   - []byte                              — same as string
 //   - Reply                               — static body with explicit status and Content-Type
 //
-// Static targets are served entirely in C++ with no Go work per request.
+// Static targets are served entirely in C++ with no Go work per request when
+// no matching sync middleware or typed-param constraints need to run.
 func (a *App) Get(pattern string, target any) {
 	uwsPattern, meta := a.preRoute("get", pattern)
 	switch v := target.(type) {
@@ -1031,11 +1064,35 @@ func (a *App) Get(pattern string, target any) {
 		if v.ContentType != "" {
 			validateHeaderValue("Content-Type", v.ContentType)
 		}
+		if hasRouteConstraints(meta) || a.hasSyncMiddleware(uwsPattern) {
+			cType, body := v.ContentType, v.Body
+			h := a.applyMeta(meta, a.wrap(uwsPattern, func(res *Response, req *Request) {
+				res.Send(code, cType, body)
+			}))
+			a.inner.get(uwsPattern, h)
+			return
+		}
 		a.inner.getStatic(uwsPattern, statusLine(code), v.ContentType, v.Body)
 	case string:
+		if hasRouteConstraints(meta) || a.hasSyncMiddleware(uwsPattern) {
+			body := v
+			h := a.applyMeta(meta, a.wrap(uwsPattern, func(res *Response, req *Request) {
+				res.Send(200, "", body)
+			}))
+			a.inner.get(uwsPattern, h)
+			return
+		}
 		a.inner.getStatic(uwsPattern, statusLine(200), "", v)
 	case []byte:
-		a.inner.getStatic(uwsPattern, statusLine(200), "", string(v))
+		body := string(v)
+		if hasRouteConstraints(meta) || a.hasSyncMiddleware(uwsPattern) {
+			h := a.applyMeta(meta, a.wrap(uwsPattern, func(res *Response, req *Request) {
+				res.Send(200, "", body)
+			}))
+			a.inner.get(uwsPattern, h)
+			return
+		}
+		a.inner.getStatic(uwsPattern, statusLine(200), "", body)
 	default:
 		panic(fmt.Sprintf("gogo: unsupported Get target type %T for %q", target, pattern))
 	}
@@ -1437,14 +1494,20 @@ func (r *Router) wrapGroupAsync(h AsyncHandler) AsyncHandler {
 // zero-cgo static path or must fall back to a dynamic handler so middleware
 // can intercept.
 func (r *Router) hasGroupOrAppMW(fullPattern string) bool {
-	return len(r.syncMW) > 0 || r.app.hasMatchingMiddleware(fullPattern)
+	return len(r.syncMW) > 0 || r.app.hasSyncMiddleware(fullPattern)
+}
+
+// needsDynamicStatic reports whether a static target needs the dynamic path
+// to preserve route semantics: middleware must run and typed-param
+// constraints must reject before the static body is sent.
+func (r *Router) needsDynamicStatic(meta *routeMeta, fullPattern string) bool {
+	return hasRouteConstraints(meta) || r.hasGroupOrAppMW(fullPattern)
 }
 
 // Get registers a GET route under this Router. Target follows the same rules
-// as App.Get: Handler, func, Reply, string, []byte. Static targets bypass
-// middleware only when neither the Router nor the App has any middleware
-// touching this route; otherwise the static body is served by a synthetic
-// dynamic handler so middleware can intercept.
+// as App.Get: Handler, func, Reply, string, []byte. Static targets take the
+// zero-cgo path only when neither middleware nor typed-param constraints need
+// to run; otherwise the static body is served by a synthetic dynamic handler.
 func (r *Router) Get(pattern string, target any) {
 	full, meta := r.preRoute("get", pattern)
 	switch v := target.(type) {
@@ -1462,7 +1525,7 @@ func (r *Router) Get(pattern string, target any) {
 		if v.ContentType != "" {
 			validateHeaderValue("Content-Type", v.ContentType)
 		}
-		if !r.hasGroupOrAppMW(full) {
+		if !r.needsDynamicStatic(meta, full) {
 			r.app.inner.getStatic(full, statusLine(code), v.ContentType, v.Body)
 			return
 		}
@@ -1472,7 +1535,7 @@ func (r *Router) Get(pattern string, target any) {
 		})))
 		r.app.inner.get(full, h)
 	case string:
-		if !r.hasGroupOrAppMW(full) {
+		if !r.needsDynamicStatic(meta, full) {
 			r.app.inner.getStatic(full, statusLine(200), "", v)
 			return
 		}
@@ -1483,7 +1546,7 @@ func (r *Router) Get(pattern string, target any) {
 		r.app.inner.get(full, h)
 	case []byte:
 		body := string(v)
-		if !r.hasGroupOrAppMW(full) {
+		if !r.needsDynamicStatic(meta, full) {
 			r.app.inner.getStatic(full, statusLine(200), "", body)
 			return
 		}
@@ -2372,7 +2435,7 @@ func (r *Response) StatusCode() int {
 func (r *Response) Header(key, value string) *Response {
 	validateHeaderName(key)
 	validateHeaderValue(key, value)
-	if r.async != nil && key == "Content-Type" {
+	if r.async != nil && strings.EqualFold(key, "Content-Type") {
 		r.async.contentType = value
 		return r
 	}
@@ -2978,10 +3041,15 @@ func (r *Response) Redirect(location string, code int) {
 		loop := loopFromUintptr(r.async.loopPtr)
 		ctx := r.async.ctxHandle
 		loc := location
+		headers := captureResponseHeaders(r.pendingHeaders, nil)
+		r.pendingHeaders = r.pendingHeaders[:0]
 		loop.Defer(func() {
 			defer asyncCtxRelease(ctx)
 			inner.cork(func() {
 				inner.status(line)
+				for _, h := range headers {
+					inner.header(h.name, h.value)
+				}
 				inner.header("Location", loc)
 				inner.end("")
 			})
@@ -3338,7 +3406,8 @@ func (r *Response) sendBytes(code int, headers []responseHeader, body []byte) {
 		loop := loopFromUintptr(r.async.loopPtr)
 		inner := r.inner
 		ctx := r.async.ctxHandle
-		hs := headers
+		hs := captureResponseHeaders(r.pendingHeaders, headers)
+		r.pendingHeaders = r.pendingHeaders[:0]
 		bs := body
 		loop.Defer(func() {
 			defer asyncCtxRelease(ctx)
@@ -3360,6 +3429,16 @@ func (r *Response) sendBytes(code int, headers []responseHeader, body []byte) {
 	}
 	r.inner.end(bytesAsString(body))
 	runtime.KeepAlive(body)
+}
+
+func captureResponseHeaders(pending, extra []responseHeader) []responseHeader {
+	if len(pending) == 0 {
+		return extra
+	}
+	out := make([]responseHeader, 0, len(pending)+len(extra))
+	out = append(out, pending...)
+	out = append(out, extra...)
+	return out
 }
 
 // bytesAsString aliases body as a Go string without copying. The string
@@ -3821,8 +3900,9 @@ func runFinishCallback(fn func()) {
 // This is the safe hook for middleware that needs to persist or
 // flush state derived from the request:
 //
-//	// Inside middleware, AFTER calling next(res, req):
-//	res.OnFinish(func() { saveSession(s) })
+//	// Inside middleware, before calling next(res, req):
+//	defer res.OnFinish(func() { saveSession(s) })
+//	next(res, req)
 //
 // The hook decides automatically which mode applies:
 //
@@ -4194,7 +4274,7 @@ func (a *Aborted) Load() bool {
 // request was freed.
 //
 // Both modes expose the same accessors. The shared snapshot has fixed capacity
-// per field (URL 256, query 512, params 64 each up to 8, headers 4 KB total);
+// per field (URL 256, query 512, params 64 each up to 8, headers 8 KB total);
 // requests past those caps are rejected with 431 before reaching user code.
 type Request struct {
 	inner requestNative
@@ -4592,12 +4672,12 @@ func (r *Request) Get(name string) string {
 // fn returns false to stop early — same convention as
 // sync.Map.Range. Returns the number of headers visited.
 //
-// In sync mode this walks the per-call scratch blob the C++
-// dispatcher packs into the request; in async mode it walks the
-// snapshot blob captured into AsyncCtx before the live request was
-// freed. Either way the iteration stays Go-only — zero cgo per
-// pair. Names are returned in the order uWS parsed them, which
-// matches the order on the wire.
+// In sync mode this walks the per-call scratch blob the C++ dispatcher packs
+// into the request when the blob is complete. Requests whose header set
+// overflows that scratch space fall back to one native full-header dump so
+// trailing headers are not silently hidden. Async handlers walk the snapshot
+// blob captured before the live request was freed. Names are returned in the
+// order uWS parsed them, which matches the order on the wire.
 //
 // Useful for middleware that copies headers verbatim (tracing
 // context propagation, raw audit logs, etc.) without paying one
@@ -4611,21 +4691,7 @@ func (r *Request) Headers(fn func(name, value string) bool) int {
 	if fn == nil {
 		return 0
 	}
-	var blob []byte
-	switch {
-	case r.snap != nil:
-		blob = r.snap.headers
-	case r.syncHeadersPtr != nil && (r.syncHeadersLen > 0 || r.syncHeadersComplete):
-		if r.syncHeadersLen > 0 {
-			blob = unsafe.Slice((*byte)(r.syncHeadersPtr), r.syncHeadersLen)
-		}
-	default:
-		// No pre-packed blob available — pull the full header
-		// dump via cgo and walk that. Rare path: only fires when
-		// the dispatcher hasn't populated the scratch pointer
-		// (test stubs, custom request construction).
-		blob = r.inner.headersAll()
-	}
+	blob := r.headersBlobForIteration(r.inner.headersAll)
 	count := 0
 	for len(blob) > 0 {
 		j := indexOfZero(blob)
@@ -4649,6 +4715,28 @@ func (r *Request) Headers(fn func(name, value string) bool) int {
 		}
 	}
 	return count
+}
+
+func (r *Request) headersBlobForIteration(fullDump func() []byte) []byte {
+	switch {
+	case r.snap != nil:
+		return r.snap.headers
+	case r.syncHeadersPtr != nil:
+		if r.syncHeadersComplete {
+			return unsafe.Slice((*byte)(r.syncHeadersPtr), r.syncHeadersLen)
+		}
+		// The dispatcher stopped before packing every header. Pull a
+		// complete dump while the live uWS request is still valid so
+		// middleware that audits or forwards all headers sees the same
+		// data as targeted Header(name) lookups.
+		return fullDump()
+	default:
+		// No pre-packed blob available — pull the full header
+		// dump via cgo and walk that. Rare path: only fires when
+		// the dispatcher hasn't populated the scratch pointer
+		// (test stubs, custom request construction).
+		return fullDump()
+	}
 }
 
 // Hostname returns the host portion of the Host header, with any ":port"

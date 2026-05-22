@@ -488,6 +488,39 @@ func TestWSUpgradeForgotToDecide(t *testing.T) {
 	}
 }
 
+func TestWSUpgradeRejectInvalidStatusFallsBackToPanic500(t *testing.T) {
+	var panicked atomic.Int32
+	gogo.SetPanicHandler(func(recovered any) {
+		panicked.Add(1)
+	})
+	defer gogo.SetPanicHandler(nil)
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.WebSocket("/ws", gogo.WebSocketBehavior{
+			Upgrade: func(ctx *gogo.UpgradeContext) {
+				ctx.Reject(99, "bad status")
+			},
+		})
+	})
+	defer teardown()
+
+	resp, _, conn, err := dialWSWithHeaders(port, "/ws", nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	conn.Close()
+	if resp.StatusCode != 500 {
+		t.Fatalf("status = %d, body=%q, want 500", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "upgrade callback panicked") {
+		t.Fatalf("body = %q, want panic fallback", body)
+	}
+	if panicked.Load() != 1 {
+		t.Fatalf("panic handler called %d times, want 1", panicked.Load())
+	}
+}
+
 // TestWSUpgradeAcceptKey verifies the negotiated Sec-WebSocket-Accept
 // value matches the standard RFC 6455 transform after a custom
 // upgrade callback runs — i.e. the upgrade path doesn't mangle the

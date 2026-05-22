@@ -8,15 +8,31 @@ import (
 )
 
 func TestRateLimitDisabledUsesBothPlacement(t *testing.T) {
-	for _, opt := range []RateLimitOptions{
-		{},
-		{Max: 10},
-		{Window: time.Minute},
-	} {
-		h := RateLimit(opt)
-		if h.Place != mwhint.Both {
-			t.Fatalf("disabled RateLimit placement = %v, want Both", h.Place)
-		}
+	h := RateLimit(RateLimitOptions{})
+	if h.Place != mwhint.Both {
+		t.Fatalf("disabled RateLimit placement = %v, want Both", h.Place)
+	}
+}
+
+func TestRateLimitRejectsPartialOrInvalidConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		opt  RateLimitOptions
+	}{
+		{name: "max without window", opt: RateLimitOptions{Max: 10}},
+		{name: "window without max", opt: RateLimitOptions{Window: time.Minute}},
+		{name: "negative max", opt: RateLimitOptions{Max: -1, Window: time.Minute}},
+		{name: "negative window", opt: RateLimitOptions{Max: 10, Window: -time.Second}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("RateLimit did not panic")
+				}
+			}()
+			_ = RateLimit(tc.opt)
+		})
 	}
 }
 

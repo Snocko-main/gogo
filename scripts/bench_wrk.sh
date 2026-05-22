@@ -127,27 +127,27 @@ start_server() {
 	# to walk children from (cleanup uses kill_tree to TERM the whole tree).
 	case "$fw:$mode" in
 	gogo:single)
-		( GOGO_CORES=1 go run -tags gogo ./benchmark/gogo >/tmp/bench-gogo.log 2>&1 ) &
+		( cd benchmark && GOGO_CORES=1 go run -tags gogo ./gogo >/tmp/bench-gogo.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	gogo:multi)
-		( GOMAXPROCS="$MULTI_WORKERS" GOGO_CORES="$MULTI_WORKERS" go run -tags gogo ./benchmark/gogo >/tmp/bench-gogo.log 2>&1 ) &
+		( cd benchmark && GOMAXPROCS="$MULTI_WORKERS" GOGO_CORES="$MULTI_WORKERS" go run -tags gogo ./gogo >/tmp/bench-gogo.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	fiber:single)
-		( GOMAXPROCS=1 FIBER_PREFORK=0 go run ./benchmark/fiber >/tmp/bench-fiber.log 2>&1 ) &
+		( cd benchmark && GOMAXPROCS=1 FIBER_PREFORK=0 go run ./fiber >/tmp/bench-fiber.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	fiber:multi)
-		( GOMAXPROCS="$MULTI_WORKERS" FIBER_PREFORK=1 go run ./benchmark/fiber >/tmp/bench-fiber.log 2>&1 ) &
+		( cd benchmark && GOMAXPROCS="$MULTI_WORKERS" FIBER_PREFORK=1 go run ./fiber >/tmp/bench-fiber.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	nethttp:single)
-		( GOMAXPROCS=1 go run ./benchmark/nethttp >/tmp/bench-nethttp.log 2>&1 ) &
+		( cd benchmark && GOMAXPROCS=1 go run ./nethttp >/tmp/bench-nethttp.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	nethttp:multi)
-		( GOMAXPROCS="$MULTI_WORKERS" go run ./benchmark/nethttp >/tmp/bench-nethttp.log 2>&1 ) &
+		( cd benchmark && GOMAXPROCS="$MULTI_WORKERS" go run ./nethttp >/tmp/bench-nethttp.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	uwsjs:single)

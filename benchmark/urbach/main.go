@@ -71,7 +71,7 @@ func main() {
 
 	filePath := os.Getenv("BENCH_FILE")
 	if filePath == "" {
-		filePath = "benchmark/data/sample.json"
+		filePath = "data/sample.json"
 	}
 	s.Get("/file", func(ctx web.Context) error {
 		data, err := os.ReadFile(filePath)

@@ -35,9 +35,9 @@ type paramConstraint struct {
 }
 
 // routeMeta carries per-route information that the request-time wrapper
-// uses to populate req.paramNames and run typed-param validation. One
-// instance per registered dynamic route; static routes (Reply / string
-// / []byte targets) have no meta because they cannot call Param().
+// uses to populate req.paramNames and run typed-param validation. Static
+// targets can still carry constraints; the router falls back from the
+// zero-cgo static path when validation is required.
 type routeMeta struct {
 	pattern     string
 	paramNames  []string                // index → name

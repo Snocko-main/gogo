@@ -1,6 +1,9 @@
 package middleware
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestCORSRejectsInvalidConfiguredMethodsAndHeaders(t *testing.T) {
 	cases := []struct {
@@ -70,6 +73,24 @@ func TestCORSRejectsInvalidConfiguredOrigins(t *testing.T) {
 	}
 }
 
+func TestCORSRejectsAmbiguousWildcardOrigins(t *testing.T) {
+	cases := []CORSOptions{
+		{AllowOrigins: []string{"*", "https://app.example.com"}},
+		{AllowOrigins: []string{"https://app.example.com", "*"}},
+		{AllowOrigins: []string{"*"}, AllowCredentials: true},
+	}
+	for _, opt := range cases {
+		t.Run(strings.Join(opt.AllowOrigins, ","), func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("CORS did not panic")
+				}
+			}()
+			_ = CORS(opt)
+		})
+	}
+}
+
 func TestCORSNormalizesConfiguredOrigins(t *testing.T) {
 	compiled := compileOrigins(normalizeCORSOriginPatterns([]string{
 		"https://APP.example.com/",
@@ -87,11 +108,28 @@ func TestCORSNormalizesConfiguredOrigins(t *testing.T) {
 	}
 	for _, origin := range []string{
 		"https://app.example.com/path",
+		"https://api.trusted.example/path",
+		"https://api.trusted.example?x=1",
 		"https://trusted.example",
 		"https://evil.example",
 	} {
 		if matchCompiledOrigin(compiled, origin) {
 			t.Fatalf("compiled origins matched invalid origin %q", origin)
+		}
+	}
+}
+
+func TestCORSRejectsRuntimeOriginsWithWhitespace(t *testing.T) {
+	compiled := compileOrigins(normalizeCORSOriginPatterns([]string{
+		"https://app.example.com",
+	}))
+	for _, origin := range []string{
+		" https://app.example.com",
+		"https://app.example.com ",
+		"\thttps://app.example.com",
+	} {
+		if matchCompiledOrigin(compiled, origin) {
+			t.Fatalf("compiled origins matched malformed runtime origin %q", origin)
 		}
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 func TestBodyEncoderOverflowReturnsPrefixOnly(t *testing.T) {
@@ -21,6 +22,42 @@ func TestBodyEncoderOverflowReturnsPrefixOnly(t *testing.T) {
 	}
 	if len(enc.buf) != 0 {
 		t.Fatalf("buffer len after overflow = %d, want 0", len(enc.buf))
+	}
+}
+
+func TestHeadersBlobForIterationIncompleteSyncUsesFullDump(t *testing.T) {
+	partial := []byte("x-first\x00one\x00")
+	full := []byte("x-first\x00one\x00x-late\x00late\x00")
+	req := &Request{
+		syncHeadersPtr:      unsafe.Pointer(&partial[0]),
+		syncHeadersLen:      len(partial),
+		syncHeadersComplete: false,
+	}
+
+	called := false
+	got := req.headersBlobForIteration(func() []byte {
+		called = true
+		return full
+	})
+
+	if !called {
+		t.Fatal("full dump was not called for incomplete sync header blob")
+	}
+	if string(got) != string(full) {
+		t.Fatalf("blob=%q, want full dump %q", string(got), string(full))
+	}
+}
+
+func TestAsyncHeaderContentTypeIsCaseInsensitiveFastPath(t *testing.T) {
+	res := &Response{async: &asyncState{}}
+
+	res.Header("content-type", "application/json")
+
+	if res.async.contentType != "application/json" {
+		t.Fatalf("async contentType = %q, want application/json", res.async.contentType)
+	}
+	if len(res.pendingHeaders) != 0 {
+		t.Fatalf("Content-Type was buffered as pending header: %v", res.pendingHeaders)
 	}
 }
 
@@ -66,6 +103,17 @@ func TestHTTPAdapterRecorderIgnoresInvalidSecondWriteHeader(t *testing.T) {
 	rec.WriteHeader(99)
 	if rec.code != 200 {
 		t.Fatalf("second WriteHeader changed code to %d, want 200", rec.code)
+	}
+}
+
+func TestHTTPAdapterRecorderFlushCommitsStatusOnly(t *testing.T) {
+	rec := newHTTPAdapterRecorder(-1)
+	rec.Flush()
+	if rec.code != 200 {
+		t.Fatalf("Flush code = %d, want 200", rec.code)
+	}
+	if rec.body.Len() != 0 {
+		t.Fatalf("Flush wrote body len %d, want 0", rec.body.Len())
 	}
 }
 

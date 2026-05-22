@@ -9,6 +9,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -312,6 +313,63 @@ func TestSessionPersistsAfterResponseAsync(t *testing.T) {
 	}
 	if string(body) != "user=42 logged_in=true" {
 		t.Errorf("session payload: got %q, want %q", string(body), "user=42 logged_in=true")
+	}
+}
+
+func TestSessionPersistsAfterHandlerPanic(t *testing.T) {
+	var panicked atomic.Int32
+	gogo.SetPanicHandler(func(recovered any) {
+		panicked.Add(1)
+	})
+	defer gogo.SetPanicHandler(nil)
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.NewSession(middleware.SessionOptions{
+			Secret: []byte("session-secret-32-bytes-AAAAAAAA"),
+			TTL:    time.Minute,
+		}))
+		app.Get("/set-panic", func(res *gogo.Response, req *gogo.Request) {
+			sess := req.Local(middleware.SessionLocalKey).(*middleware.Session)
+			sess.Set("user_id", float64(7))
+			panic("session panic regression")
+		})
+		app.Get("/me", func(res *gogo.Response, req *gogo.Request) {
+			sess := req.Local(middleware.SessionLocalKey).(*middleware.Session)
+			uid := sess.Get("user_id")
+			if uid == nil {
+				res.Send(401, "text/plain", "no session")
+				return
+			}
+			res.Send(200, "text/plain", fmt.Sprintf("user=%v", uid))
+		})
+	})
+	defer teardown()
+
+	jar, _ := newCookieJar()
+	client := &http.Client{Jar: jar, Timeout: 5 * time.Second}
+
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/set-panic", port))
+	if err != nil {
+		t.Fatalf("set-panic: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 500 || !strings.Contains(string(body), "Internal Server Error") {
+		t.Fatalf("set-panic: status=%d body=%q", resp.StatusCode, string(body))
+	}
+	if panicked.Load() != 1 {
+		t.Fatalf("panic handler called %d times, want 1", panicked.Load())
+	}
+
+	resp, err = client.Get(fmt.Sprintf("http://127.0.0.1:%d/me", port))
+	if err != nil {
+		t.Fatalf("me: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || string(body) != "user=7" {
+		t.Fatalf("session mutation before panic was not persisted: status=%d body=%q",
+			resp.StatusCode, string(body))
 	}
 }
 

@@ -1,6 +1,9 @@
 package middleware
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestWebSocketAuthPanicsOnInvalidConfiguredOrigins(t *testing.T) {
 	cases := []string{
@@ -48,6 +51,26 @@ func TestWebSocketAuthAcceptsValidConfiguredOrigins(t *testing.T) {
 	}
 }
 
+func TestWebSocketAuthPanicsOnAmbiguousWildcardOrigins(t *testing.T) {
+	cases := [][]string{
+		{"*", "https://app.example.com"},
+		{"https://app.example.com", "*"},
+		{"*", "*"},
+	}
+	for _, origins := range cases {
+		t.Run(strings.Join(origins, ","), func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("WebSocketAuth did not panic")
+				}
+			}()
+			_ = WebSocketAuth(WebSocketAuthOptions{
+				AllowedOrigins: origins,
+			})
+		})
+	}
+}
+
 func TestOriginAllowedRejectsMalformedRuntimeOrigin(t *testing.T) {
 	allowed := []string{normalizeAllowedOriginValue("https://app.example.com")}
 	if !originAllowed("https://app.example.com", allowed) {
@@ -57,10 +80,23 @@ func TestOriginAllowedRejectsMalformedRuntimeOrigin(t *testing.T) {
 		"https://app.example.com/path",
 		"https://app.example.com?x=1",
 		"https://app.example.com\n",
+		" https://app.example.com",
+		"https://app.example.com ",
+		"\thttps://app.example.com",
 	} {
 		if originAllowed(origin, allowed) {
 			t.Fatalf("originAllowed accepted malformed runtime origin %q", origin)
 		}
+	}
+}
+
+func TestWebSocketAuthTrimsConfiguredOriginsOnly(t *testing.T) {
+	allowed := []string{normalizeAllowedOriginValue(" https://APP.example.com/ ")}
+	if !originAllowed("https://app.example.com", allowed) {
+		t.Fatal("originAllowed rejected normalized configured origin")
+	}
+	if originAllowed(" https://app.example.com ", allowed) {
+		t.Fatal("originAllowed accepted whitespace-padded runtime origin")
 	}
 }
 

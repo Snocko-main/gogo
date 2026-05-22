@@ -72,6 +72,13 @@ func TestCSRFValidatesOptionsAtConstruction(t *testing.T) {
 			},
 		},
 		{
+			name: "negative cookie max age",
+			opt: CSRFOptions{
+				Secret:       []byte("csrf-secret"),
+				CookieMaxAge: -1,
+			},
+		},
+		{
 			name: "generated token cannot fit max",
 			opt: CSRFOptions{
 				Secret:        []byte("csrf-secret"),

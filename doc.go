@@ -54,7 +54,7 @@
 //
 // All async handlers receive a *Request snapshot (URL/method/query/params/
 // headers all captured before uWS freed the live request). Snapshot caps in
-// the zero-cgo shared path: URL 256, query 512, params 8x64, headers 4 KB
+// the zero-cgo shared path: URL 256, query 512, params 8x64, headers 8 KB
 // total; requests that exceed those caps are rejected with 431 rather than
 // being silently truncated. The middleware/PostAsync paths copy headers exactly
 // via cgo so they have no cap.
@@ -95,10 +95,11 @@
 // "/api" mean the same thing — trailing "/*" or "/**" is stripped. Without a
 // pattern, middleware applies to every later-registered route.
 //
-// Path matching happens at route registration, so per-request overhead is
-// just a function call through the matched chain — no string comparison per
-// request. Static replies (Reply, string, []byte targets of app.Get) bypass
-// middleware.
+// Global middleware composes at route registration with no per-request string
+// comparison. Scoped middleware matches the live request URL so dynamic routes
+// cannot bypass a scoped guard. Static replies (Reply, string, []byte targets
+// of app.Get) use the zero-cgo fast path only when no matching sync middleware
+// or typed-param constraint needs to run.
 //
 // # Async middleware
 //

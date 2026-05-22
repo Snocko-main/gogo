@@ -145,8 +145,12 @@ curl http://localhost:3000/
 
 ### Static replies (zero cgo per request)
 
-If the response never changes, register a `gogo.Reply` — it is served
-entirely from C++ with no cgo callback per request:
+If the response never changes, register a `gogo.Reply`. When no matching
+sync middleware is installed and no typed-parameter constraint needs checking,
+it is served entirely from C++ with no cgo callback per request. If middleware
+such as auth, CORS, logging, or rate limiting matches the route, or the pattern
+uses a typed parameter like `:id<int>`, gogo automatically falls back to the
+dynamic path so the middleware/constraint still runs:
 
 ```go
 app.Get("/health", gogo.Reply{
@@ -697,14 +701,13 @@ A bare `next(res, req); res.OnFinish(...)` is skipped on panic because
 the panic unwinds past the registration. `defer res.OnFinish(...)`
 registers on the unwind, before the framework's outer panic handler
 catches and emits the 500. Use the defer form for observability
-middleware (metrics, audit, tracing); use the inline form for state-
-commit middleware where panic = "don't persist".
+middleware (metrics, audit, tracing) and for cleanup/state that must
+commit even when a handler fails.
 
 **Built-in middleware** using this hook: `mw.NewSession` (commits
-state inline post-handler — panics are intentionally NOT persisted),
-`mw.NewMetrics` (records the final status / duration even on panic
-via the defer form). Custom middleware following either shape should
-do the same.
+session mutations and destroys even when a handler panics) and
+`mw.NewMetrics` (records the final status / duration even on panic).
+Custom middleware with the same requirements should use the defer form.
 
 ### Bundled middleware
 
@@ -758,6 +761,10 @@ metrics := mw.NewMetrics()
 app.Use(metrics.Middleware())
 app.Get("/metrics", metrics.Handler())
 ```
+
+Use `AllowOrigins: []string{"*"}` only by itself for public APIs. gogo
+panics at startup if `"*"` is mixed with explicit origins, or combined with
+`AllowCredentials`, so ambiguous CORS policy fails before serving traffic.
 
 ### RequestID — 128-bit IDs
 
@@ -1295,7 +1302,8 @@ Defaults:
   (CLI tools like `websocat`). Safe IF you have no browser clients
   on this endpoint.
 - `AllowedOrigins: []string{"*"}` → accept any origin. Opt-in for
-  public APIs that don't rely on ambient cookie auth.
+  public APIs that don't rely on ambient cookie auth. Use `"*"` only by
+  itself; gogo panics at startup if it is mixed with explicit origins.
 
 **Legacy auto-accept** — if you intentionally want the old uWS behavior
 of accepting every handshake when `Upgrade` is nil, set
@@ -1348,7 +1356,8 @@ app.PostAsync("/upload", 10<<20, func(res *gogo.Response, req *gogo.Request, bod
 app.PostAsync("/upload-form", 50<<20, func(res *gogo.Response, req *gogo.Request, body []byte) {
     err := req.Multipart(func(p *gogo.MultipartPart) error {
         if p.IsFile() {
-            return p.SaveAt("./uploads/" + filepath.Base(p.FileName))
+            _, err := p.SaveInto("./uploads")
+            return err
         }
         log.Printf("field %s = %s", p.Name, p.Data)
         return nil
@@ -1508,6 +1517,8 @@ helpers for small stdlib handlers. They stage the wrapped handler's response
 before sending it through gogo, so the staged body is capped by
 `gogo.GetMaxHTTPAdapterBodyBytes()` (default 8 MiB; set negative via
 `gogo.SetMaxHTTPAdapterBodyBytes(-1)` to disable).
+The adapter accepts `http.Flusher` for compatibility, but `Flush()` only
+commits the staged status code; it does not stream bytes to the client.
 Handlers that stream large downloads should be ported to native gogo streaming
 APIs instead of going through the adapter.
 
@@ -1643,6 +1654,10 @@ Bun, and Rust:
 (`/hello`, `/hello/:name`, `/db`), then POSTs against `/echo` (sync
 body-echo) and `/query` (body carries an id, server runs a SQLite
 lookup), and tears it down. See the script header for the env knobs.
+
+Go benchmark dependencies live in the nested `benchmark` module so importing
+gogo does not pull benchmark-only frameworks or database drivers into your
+application module graph.
 
 ### Results
 

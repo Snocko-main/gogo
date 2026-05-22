@@ -9,7 +9,7 @@
 //
 // Run with:
 //
-//	go run ./benchmark/fiber-perfquickwins :8081
+//	cd benchmark && go run ./fiber-perfquickwins :8081
 //
 // And drive via wrk in lockstep with the gogo binary:
 //

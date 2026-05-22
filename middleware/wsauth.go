@@ -34,7 +34,8 @@ type WebSocketAuthOptions struct {
 	// Matching is case-insensitive. Trailing slashes are ignored.
 	// The literal "*" is treated as "allow any origin" and is
 	// intentionally not the zero-value default — opt in explicitly
-	// when you understand the risk.
+	// when you understand the risk. Do not mix "*" with explicit
+	// origins; the helper panics at construction time.
 	//
 	// Entries must be valid origins ("scheme://host[:port]"), "null",
 	// or "*". Paths other than a single trailing slash, queries,
@@ -104,13 +105,18 @@ func WebSocketAuth(opt WebSocketAuthOptions) func(*gogo.UpgradeContext) {
 	// Pre-normalize the allow-list once at construction so the
 	// per-handshake hot path is just a slice scan.
 	allowAny := false
+	wildcards := 0
 	allowed := make([]string, 0, len(opt.AllowedOrigins))
 	for _, o := range opt.AllowedOrigins {
 		if o == "*" {
 			allowAny = true
+			wildcards++
 			continue
 		}
 		allowed = append(allowed, normalizeAllowedOriginValue(o))
+	}
+	if wildcards > 0 && len(opt.AllowedOrigins) > 1 {
+		panic("gogo/middleware: WebSocketAuth AllowedOrigins cannot mix \"*\" with explicit origins")
 	}
 	subprotocols := make([]string, len(opt.AllowedSubprotocols))
 	copy(subprotocols, opt.AllowedSubprotocols)
@@ -184,6 +190,12 @@ func WebSocketAuth(opt WebSocketAuthOptions) func(*gogo.UpgradeContext) {
 // a single trailing slash. The allow-list is application-owned config, so
 // fail fast on malformed entries instead of producing a silent runtime reject.
 func normalizeAllowedOriginValue(o string) string {
+	for i := 0; i < len(o); i++ {
+		if o[i] < 0x20 || o[i] == 0x7f {
+			panic("gogo/middleware: WebSocketAuth AllowedOrigins contains an invalid origin")
+		}
+	}
+	o = strings.TrimSpace(o)
 	normalized, ok := normalizeOriginValue(o)
 	if !ok {
 		panic("gogo/middleware: WebSocketAuth AllowedOrigins contains an invalid origin")
@@ -193,9 +205,9 @@ func normalizeAllowedOriginValue(o string) string {
 
 // normalizeOriginValue lower-cases the scheme + host portion and strips any
 // trailing slash so the allow-list comparison is robust against trivial
-// differences ("HTTPS://APP" vs "https://app/"). Runtime request origins return
-// ok=false when malformed so a hostile peer cannot turn a bad Origin into a
-// panic.
+// differences ("HTTPS://APP" vs "https://app/"). Runtime request origins are
+// intentionally strict: surrounding whitespace is malformed and must fail
+// closed rather than being repaired into an allow-list match.
 func normalizeOriginValue(o string) (string, bool) {
 	if o == "" {
 		return "", false
@@ -205,8 +217,7 @@ func normalizeOriginValue(o string) (string, bool) {
 			return "", false
 		}
 	}
-	o = strings.TrimSpace(o)
-	if o == "" {
+	if strings.TrimSpace(o) != o {
 		return "", false
 	}
 	if o == "null" {

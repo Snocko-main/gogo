@@ -135,6 +135,26 @@ func TestTypedParamInt(t *testing.T) {
 	}
 }
 
+func TestTypedParamStaticReply(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Get("/users/:id<int>/status", gogo.Reply{Body: "ok"})
+	})
+	defer teardown()
+
+	r1, _ := http.Get(fmt.Sprintf("http://127.0.0.1:%d/users/42/status", port))
+	body, _ := io.ReadAll(r1.Body)
+	r1.Body.Close()
+	if r1.StatusCode != 200 || string(body) != "ok" {
+		t.Fatalf("valid static typed route = %d %q, want 200 ok", r1.StatusCode, body)
+	}
+
+	r2, _ := http.Get(fmt.Sprintf("http://127.0.0.1:%d/users/alice/status", port))
+	r2.Body.Close()
+	if r2.StatusCode != 404 {
+		t.Fatalf("invalid static typed route = %d, want 404", r2.StatusCode)
+	}
+}
+
 // TestTypedParamUUID validates the <uuid> constraint. Tests that an
 // async route plus an Async-placed middleware both fire only on
 // valid UUIDs.
@@ -363,6 +383,27 @@ func TestGroupTypedParam(t *testing.T) {
 	r2.Body.Close()
 	if r2.StatusCode != 404 {
 		t.Errorf("non-int post id status = %d, want 404", r2.StatusCode)
+	}
+}
+
+func TestGroupTypedParamStaticReply(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		users := app.Group("/users/:userID")
+		users.Get("/posts/:postID<int>/status", "ok")
+	})
+	defer teardown()
+
+	r1, _ := http.Get(fmt.Sprintf("http://127.0.0.1:%d/users/alice/posts/42/status", port))
+	body, _ := io.ReadAll(r1.Body)
+	r1.Body.Close()
+	if r1.StatusCode != 200 || string(body) != "ok" {
+		t.Fatalf("valid group static typed route = %d %q, want 200 ok", r1.StatusCode, body)
+	}
+
+	r2, _ := http.Get(fmt.Sprintf("http://127.0.0.1:%d/users/alice/posts/foo/status", port))
+	r2.Body.Close()
+	if r2.StatusCode != 404 {
+		t.Fatalf("invalid group static typed route = %d, want 404", r2.StatusCode)
 	}
 }
 
