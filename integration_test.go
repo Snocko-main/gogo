@@ -5,6 +5,7 @@ package gogo_test
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -5733,6 +5734,341 @@ func TestWebSocketSubscribePublish(t *testing.T) {
 	// A (publisher) does NOT receive its own broadcast — uWS skips it.
 	if err := a.expectNoMessage(300 * time.Millisecond); err != nil {
 		t.Errorf("publisher should not receive its own publish: %v", err)
+	}
+}
+
+func TestWSHubPublishFrom(t *testing.T) {
+	hub := gogo.NewWSHub(gogo.WithWSHubNodeID("test-node"))
+	defer hub.Close()
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		hub.WebSocket(app, "/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				hub.Subscribe(ws, "room")
+			},
+			Message: func(ws *gogo.WebSocket, msg []byte, op gogo.OpCode) {
+				if err := hub.PublishFrom(ws, "room", msg, op); err != nil {
+					t.Errorf("PublishFrom: %v", err)
+				}
+			},
+		})
+	})
+	defer teardown()
+
+	a, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial a: %v", err)
+	}
+	defer a.Close()
+	b, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial b: %v", err)
+	}
+	defer b.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	if err := a.SendText("hub hello"); err != nil {
+		t.Fatalf("a.SendText: %v", err)
+	}
+	gotB, err := b.ReadText(2 * time.Second)
+	if err != nil {
+		t.Fatalf("b.ReadText: %v", err)
+	}
+	if gotB != "hub hello" {
+		t.Errorf("b received %q, want hub hello", gotB)
+	}
+	if err := a.expectNoMessage(300 * time.Millisecond); err != nil {
+		t.Errorf("publisher should not receive its own hub publish: %v", err)
+	}
+}
+
+func TestWSHubPublishFromRequiresTrackedSocket(t *testing.T) {
+	hub := gogo.NewWSHub(gogo.WithWSHubNodeID("test-node"))
+	defer hub.Close()
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		hub.Attach(app)
+		app.WebSocket("/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				ws.Subscribe("room")
+			},
+			Message: func(ws *gogo.WebSocket, msg []byte, op gogo.OpCode) {
+				err := hub.PublishFrom(ws, "room", msg, op)
+				if !errors.Is(err, gogo.ErrWSHubUntrackedSocket) {
+					t.Errorf("PublishFrom error = %v, want ErrWSHubUntrackedSocket", err)
+				}
+				ws.SendText("untracked")
+			},
+		})
+	})
+	defer teardown()
+
+	a, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial a: %v", err)
+	}
+	defer a.Close()
+	b, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial b: %v", err)
+	}
+	defer b.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	if err := a.SendText("hub hello"); err != nil {
+		t.Fatalf("a.SendText: %v", err)
+	}
+	gotA, err := a.ReadText(2 * time.Second)
+	if err != nil {
+		t.Fatalf("a.ReadText: %v", err)
+	}
+	if gotA != "untracked" {
+		t.Errorf("a received %q, want untracked", gotA)
+	}
+	if err := b.expectNoMessage(300 * time.Millisecond); err != nil {
+		t.Errorf("untracked PublishFrom should not broadcast: %v", err)
+	}
+}
+
+func TestWSHubPublishFromTracksRawSubscribe(t *testing.T) {
+	hub := gogo.NewWSHub(gogo.WithWSHubNodeID("test-node"))
+	defer hub.Close()
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		hub.WebSocket(app, "/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				ws.Subscribe("room")
+			},
+			Message: func(ws *gogo.WebSocket, msg []byte, op gogo.OpCode) {
+				if err := hub.PublishFrom(ws, "room", msg, op); err != nil {
+					t.Errorf("PublishFrom: %v", err)
+				}
+			},
+		})
+	})
+	defer teardown()
+
+	a, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial a: %v", err)
+	}
+	defer a.Close()
+	b, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial b: %v", err)
+	}
+	defer b.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	if err := a.SendText("raw subscribe hello"); err != nil {
+		t.Fatalf("a.SendText: %v", err)
+	}
+	gotB, err := b.ReadText(2 * time.Second)
+	if err != nil {
+		t.Fatalf("b.ReadText: %v", err)
+	}
+	if gotB != "raw subscribe hello" {
+		t.Errorf("b received %q, want raw subscribe hello", gotB)
+	}
+	if err := a.expectNoMessage(300 * time.Millisecond); err != nil {
+		t.Errorf("publisher should not receive its own hub publish: %v", err)
+	}
+}
+
+func TestWSHubSubscribeRollsBackWhenHubTrackingFails(t *testing.T) {
+	hub := gogo.NewWSHub(gogo.WithWSHubNodeID("test-node"))
+	var appRef *gogo.App
+	var subscribeReturned atomic.Bool
+	var opened atomic.Bool
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		appRef = app
+		hub.WebSocket(app, "/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				hub.Close()
+				subscribeReturned.Store(ws.Subscribe("room"))
+				opened.Store(true)
+			},
+		})
+	})
+	defer teardown()
+
+	client, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if opened.Load() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !opened.Load() {
+		t.Fatal("Open did not run")
+	}
+	if subscribeReturned.Load() {
+		t.Fatal("Subscribe succeeded even though hub tracking failed")
+	}
+
+	appRef.Publish("room", []byte("ghost"), gogo.Text)
+	if err := client.expectNoMessage(300 * time.Millisecond); err != nil {
+		t.Fatalf("rollback left native subscription active: %v", err)
+	}
+}
+
+func TestWSHubCloseSkipsUserCloseWhenOpenDidNotRun(t *testing.T) {
+	hubA := gogo.NewWSHub(gogo.WithWSHubNodeID("hub-a"))
+	defer hubA.Close()
+	hubB := gogo.NewWSHub(gogo.WithWSHubNodeID("hub-b"))
+	defer hubB.Close()
+
+	var opened atomic.Int32
+	var closed atomic.Int32
+	port, teardown := startApp(t, func(app *gogo.App) {
+		behavior := gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				opened.Add(1)
+			},
+			Close: func(ws *gogo.WebSocket, code int, msg []byte) {
+				closed.Add(1)
+			},
+		}
+		app.WebSocket("/ws", hubB.Wrap(app, hubA.Wrap(app, behavior)))
+	})
+	defer teardown()
+
+	client, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+	_, _ = client.ReadText(500 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
+
+	if got := opened.Load(); got != 0 {
+		t.Fatalf("Open calls = %d, want 0", got)
+	}
+	if got := closed.Load(); got != 0 {
+		t.Fatalf("Close calls = %d, want 0", got)
+	}
+}
+
+func TestWSHubCloseSkipsUserCloseWhenOpenPanics(t *testing.T) {
+	hub := gogo.NewWSHub(gogo.WithWSHubNodeID("test-node"))
+	defer hub.Close()
+
+	var opened atomic.Int32
+	var closed atomic.Int32
+	port, teardown := startApp(t, func(app *gogo.App) {
+		hub.WebSocket(app, "/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				opened.Add(1)
+				panic("open failed after partial setup")
+			},
+			Close: func(ws *gogo.WebSocket, code int, msg []byte) {
+				closed.Add(1)
+			},
+		})
+	})
+	defer teardown()
+
+	client, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	client.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if closed.Load() == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := opened.Load(); got != 1 {
+		t.Fatalf("Open calls = %d, want 1", got)
+	}
+	if got := closed.Load(); got != 0 {
+		t.Fatalf("Close calls = %d, want 0", got)
+	}
+}
+
+type blockingWSHubAdapter struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (a *blockingWSHubAdapter) Start(context.Context, func(gogo.WSHubMessage)) error {
+	return nil
+}
+
+func (a *blockingWSHubAdapter) Publish(context.Context, gogo.WSHubMessage) error {
+	select {
+	case a.entered <- struct{}{}:
+	default:
+	}
+	<-a.release
+	return nil
+}
+
+func (a *blockingWSHubAdapter) Close() error { return nil }
+
+func TestWSHubPublishFromDoesNotBlockOnAdapter(t *testing.T) {
+	adapter := &blockingWSHubAdapter{
+		entered: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	hub := gogo.NewWSHub(
+		gogo.WithWSHubNodeID("test-node"),
+		gogo.WithWSHubAdapter(adapter),
+		gogo.WithWSHubAdapterQueueSize(1),
+	)
+	defer func() {
+		close(adapter.release)
+		if err := hub.Close(); err != nil {
+			t.Errorf("hub.Close: %v", err)
+		}
+	}()
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		hub.WebSocket(app, "/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				hub.Subscribe(ws, "room")
+			},
+			Message: func(ws *gogo.WebSocket, msg []byte, op gogo.OpCode) {
+				if err := hub.PublishFrom(ws, "room", msg, op); err != nil {
+					t.Errorf("PublishFrom: %v", err)
+				}
+				ws.SendText("after")
+			},
+		})
+	})
+	defer teardown()
+
+	a, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial a: %v", err)
+	}
+	defer a.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	if err := a.SendText("hub hello"); err != nil {
+		t.Fatalf("a.SendText: %v", err)
+	}
+	gotA, err := a.ReadText(500 * time.Millisecond)
+	if err != nil {
+		t.Fatalf("PublishFrom blocked on adapter publish: %v", err)
+	}
+	if gotA != "after" {
+		t.Errorf("a received %q, want after", gotA)
+	}
+	select {
+	case <-adapter.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("adapter publish was not queued")
 	}
 }
 

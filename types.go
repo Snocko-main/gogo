@@ -5454,7 +5454,8 @@ func parseSingleQueryParam(q, name string) string {
 
 // WebSocket wraps a uWebSockets WebSocket connection.
 type WebSocket struct {
-	inner websocketNative
+	inner    websocketNative
+	hubToken atomic.Uint64
 }
 
 // Send sends a WebSocket message.
@@ -5487,14 +5488,45 @@ func (ws *WebSocket) End(code int, message string) {
 // underlying TopicTree is loop-thread-local; calling Subscribe from
 // a worker goroutine corrupts uWS state.
 func (ws *WebSocket) Subscribe(topic string) bool {
-	return ws.inner.subscribe(topic)
+	if !ws.inner.subscribe(topic) {
+		return false
+	}
+	if h, ok := trackWSHubSubscribe(ws, topic); !ok {
+		if !ws.inner.unsubscribe(topic) {
+			if h != nil {
+				h.reportAdapterError(fmt.Errorf("gogo: websocket hub subscribe rollback failed for topic %q", topic))
+			}
+		}
+		return false
+	}
+	return true
 }
 
 // Unsubscribe removes this WebSocket's subscription to topic. Returns
 // true when a subscription existed and was removed. Like Subscribe,
 // must be called from a WebSocket handler.
 func (ws *WebSocket) Unsubscribe(topic string) bool {
-	return ws.inner.unsubscribe(topic)
+	key, h := hubForWebSocket(ws)
+	token := ws.hubToken.Load()
+	removed, last := false, false
+	if h != nil {
+		removed, last = h.removeMembershipForUnsubscribe(key, token, topic)
+	}
+	if !ws.inner.unsubscribe(topic) {
+		if removed && h != nil {
+			first, restored := h.restoreMembershipIfCurrent(key, token, topic)
+			if !restored {
+				h.reportAdapterError(fmt.Errorf("gogo: websocket hub unsubscribe restore failed for topic %q", topic))
+			} else if first {
+				h.queueAdapterTopic(topic)
+			}
+		}
+		return false
+	}
+	if removed && last {
+		h.queueAdapterTopic(topic)
+	}
+	return true
 }
 
 // Publish broadcasts message to every OTHER subscriber of topic.

@@ -105,6 +105,7 @@ func upgradeAccept(uintptr, string, uintptr) {}
 func upgradeReject(uintptr, string, string)  {}
 func wsGetUserData(*WebSocket) uintptr       { return 0 }
 func wsSetUserData(*WebSocket, uintptr)      {}
+func wsNativeKey(*WebSocket) uintptr         { return 0 }
 func asyncCtxRelease(uintptr)                {}
 
 func (requestNative) method() string           { return "" }
