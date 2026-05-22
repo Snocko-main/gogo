@@ -237,6 +237,9 @@ func validateCSRFOptions(opt CSRFOptions) {
 	if opt.CookieSameSite == gogo.SameSiteNone && !opt.CookieSecure {
 		panic("gogo/middleware: CSRF CookieSameSite=None requires CookieSecure=true")
 	}
+	if opt.CookieMaxAge < 0 {
+		panic("gogo/middleware: CSRF CookieMaxAge must be non-negative")
+	}
 	if opt.MaxTokenBytes >= 0 && opt.MaxTokenBytes < csrfGeneratedTokenBytes {
 		panic("gogo/middleware: CSRF MaxTokenBytes is smaller than generated token length")
 	}
