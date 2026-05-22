@@ -44,8 +44,8 @@ type SessionStore interface {
 // SessionOptions configures the Session middleware.
 type SessionOptions struct {
 	// Secret signs the session-id cookie with HMAC so it cannot be
-	// forged by clients (and is bound to this server fleet).
-	// Required.
+	// forged by clients (and is bound to this server fleet). Required;
+	// must be at least 32 bytes of entropy.
 	Secret []byte
 
 	// Store is the persistence backend. Default
@@ -246,8 +246,8 @@ func (s *Session) Save() {
 // (Helmet, CORS, …) but for sessions the struct name carries the
 // weight since handlers reference it constantly.
 func NewSession(opt SessionOptions) mwhint.Hinted {
-	if len(opt.Secret) == 0 {
-		panic("gogo/middleware: Session requires a Secret")
+	if err := validateHMACSecret("Session", opt.Secret); err != nil {
+		panic("gogo/middleware: " + err.Error())
 	}
 	opt.Secret = append([]byte(nil), opt.Secret...)
 	if opt.Store == nil {

@@ -9,7 +9,7 @@ import (
 )
 
 func TestSessionDefaultUsesBothPlacement(t *testing.T) {
-	h := NewSession(SessionOptions{Secret: []byte("session-secret")})
+	h := NewSession(SessionOptions{Secret: []byte("session-secret-32-bytes-AAAAAAAA")})
 	if h.Place != mwhint.Both {
 		t.Fatalf("default Session placement = %v, want Both", h.Place)
 	}
@@ -17,12 +17,21 @@ func TestSessionDefaultUsesBothPlacement(t *testing.T) {
 
 func TestSessionAsyncStoreUsesAsyncPlacement(t *testing.T) {
 	h := NewSession(SessionOptions{
-		Secret:     []byte("session-secret"),
+		Secret:     []byte("session-secret-32-bytes-AAAAAAAA"),
 		AsyncStore: true,
 	})
 	if h.Place != mwhint.Async {
 		t.Fatalf("AsyncStore Session placement = %v, want Async", h.Place)
 	}
+}
+
+func TestSessionRejectsWeakSecret(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("NewSession accepted a weak HMAC secret")
+		}
+	}()
+	_ = NewSession(SessionOptions{Secret: []byte("too-short")})
 }
 
 func TestSessionValidatesCookieOptionsAtConstruction(t *testing.T) {
@@ -33,42 +42,42 @@ func TestSessionValidatesCookieOptionsAtConstruction(t *testing.T) {
 		{
 			name: "bad cookie name",
 			opt: SessionOptions{
-				Secret:     []byte("session-secret"),
+				Secret:     []byte("session-secret-32-bytes-AAAAAAAA"),
 				CookieName: "bad name",
 			},
 		},
 		{
 			name: "bad cookie path",
 			opt: SessionOptions{
-				Secret:     []byte("session-secret"),
+				Secret:     []byte("session-secret-32-bytes-AAAAAAAA"),
 				CookiePath: "/; Domain=evil.example",
 			},
 		},
 		{
 			name: "bad cookie domain",
 			opt: SessionOptions{
-				Secret:       []byte("session-secret"),
+				Secret:       []byte("session-secret-32-bytes-AAAAAAAA"),
 				CookieDomain: "example.com; Secure",
 			},
 		},
 		{
 			name: "bad samesite",
 			opt: SessionOptions{
-				Secret:         []byte("session-secret"),
+				Secret:         []byte("session-secret-32-bytes-AAAAAAAA"),
 				CookieSameSite: gogo.SameSite("Lax; Domain=evil.example"),
 			},
 		},
 		{
 			name: "negative ttl",
 			opt: SessionOptions{
-				Secret: []byte("session-secret"),
+				Secret: []byte("session-secret-32-bytes-AAAAAAAA"),
 				TTL:    -time.Second,
 			},
 		},
 		{
 			name: "samesite none without secure",
 			opt: SessionOptions{
-				Secret:         []byte("session-secret"),
+				Secret:         []byte("session-secret-32-bytes-AAAAAAAA"),
 				CookieSameSite: gogo.SameSiteNone,
 			},
 		},

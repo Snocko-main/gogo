@@ -60,9 +60,8 @@ const (
 // JWTOptions configures the JWT middleware.
 type JWTOptions struct {
 	// Secret is the HMAC verification key for HS256/384/512.
-	// Required when Algorithm is an HMAC variant. Use at least
-	// 32 bytes of entropy for HS256, proportionally more for the
-	// larger variants. Ignored for asymmetric algorithms.
+	// Required when Algorithm is an HMAC variant; must be at least
+	// 32 bytes of entropy. Ignored for asymmetric algorithms.
 	Secret []byte
 
 	// Key is the public key for asymmetric algorithms (RS*, PS*,
@@ -275,8 +274,8 @@ type jwtVerifier func(signingInput, signature []byte) error
 func jwtBuildVerifier(info jwtAlgInfo, secret []byte, key crypto.PublicKey) (jwtVerifier, error) {
 	switch info.family {
 	case "HS":
-		if len(secret) == 0 {
-			return nil, errors.New("HMAC algorithm requires Secret")
+		if err := validateHMACSecret("HMAC algorithm", secret); err != nil {
+			return nil, err
 		}
 		s := append([]byte(nil), secret...) // defensive copy
 		hashNew := info.hashNew
@@ -455,6 +454,9 @@ func SignJWT(alg JWTAlgorithm, key any, claims map[string]any) (string, error) {
 		secret, ok := key.([]byte)
 		if !ok {
 			return "", errors.New("HMAC SignJWT requires []byte key")
+		}
+		if err := validateHMACSecret("HMAC SignJWT", secret); err != nil {
+			return "", err
 		}
 		mac := hmac.New(info.hashNew, secret)
 		mac.Write([]byte(signingInput))

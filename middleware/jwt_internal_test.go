@@ -53,6 +53,21 @@ func TestJWTRejectsECDSACurveMismatch(t *testing.T) {
 	})
 }
 
+func TestJWTRejectsWeakHMACSecret(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("JWT accepted a weak HMAC secret")
+		}
+	}()
+	_ = JWT(JWTOptions{Secret: []byte("too-short")})
+}
+
+func TestSignJWTRejectsWeakHMACSecret(t *testing.T) {
+	if _, err := SignJWT(JWTHS256, []byte("too-short"), map[string]any{"sub": "x"}); err == nil {
+		t.Fatal("SignJWT accepted a weak HMAC secret")
+	}
+}
+
 func TestSignJWTRejectsECDSACurveMismatch(t *testing.T) {
 	priv, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
 	if err != nil {

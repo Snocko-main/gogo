@@ -752,7 +752,7 @@ app.GetAsync("/api/me", func(res *gogo.Response, req *gogo.Request) {
 
 // CSRF — double-submit cookie pattern.
 app.Use(mw.CSRF(mw.CSRFOptions{
-    Secret:        []byte("32-byte-secret-..."),
+    Secret:        []byte(os.Getenv("CSRF_SECRET")),
     MaxTokenBytes: 256, // default; negative disables the token length cap
 }))
 
@@ -765,6 +765,11 @@ app.Get("/metrics", metrics.Handler())
 Use `AllowOrigins: []string{"*"}` only by itself for public APIs. gogo
 panics at startup if `"*"` is mixed with explicit origins, or combined with
 `AllowCredentials`, so ambiguous CORS policy fails before serving traffic.
+
+HMAC-backed middleware secrets (`JWT` with HS*, `CSRF`, and `NewSession`)
+must be at least 32 bytes. Generate them from a secret manager or a CSPRNG;
+short demo strings panic at startup instead of silently weakening token
+integrity.
 
 ### RequestID — 128-bit IDs
 
@@ -877,6 +882,9 @@ app.GetAsync("/me", func(res *gogo.Response, req *gogo.Request) {
     res.JSON(200, map[string]any{"user_id": uid})
 })
 ```
+
+`SESSION_SECRET` must be at least 32 bytes; rotate it intentionally because
+rotation invalidates existing session cookies.
 
 Sessions persist automatically at request completion via
 `Response.OnFinish` — that means mutations made inside a
