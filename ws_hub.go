@@ -540,7 +540,7 @@ func (h *WSHub) remember(ws *WebSocket, app *App) {
 		registerWSHub(key, h)
 		return
 	}
-	direct := h.directTopic(key)
+	direct := randomDirectTopic(h.nodeID)
 	if !ws.inner.subscribe(direct) {
 		h.mu.Unlock()
 		return
@@ -660,10 +660,6 @@ func (h *WSHub) removeMembershipLocked(key uintptr, topic string) {
 	}
 }
 
-func (h *WSHub) directTopic(key uintptr) string {
-	return fmt.Sprintf("__gogo_hub:%s:%x", h.nodeID, key)
-}
-
 func registerWSHub(key uintptr, h *WSHub) {
 	wsHubRegistryMu.Lock()
 	wsHubRegistry[key] = h
@@ -748,6 +744,14 @@ func (h *WSHub) reportAdapterError(err error) {
 
 func defaultWSHubAdapterErrorHandler(err error) {
 	reportPanic(fmt.Errorf("gogo: websocket hub adapter: %w", err))
+}
+
+func randomDirectTopic(nodeID string) string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		return fmt.Sprintf("__gogo_hub:%s:%s", nodeID, hex.EncodeToString(b[:]))
+	}
+	return fmt.Sprintf("__gogo_hub:%s:%s", nodeID, randomNodeID())
 }
 
 func randomNodeID() string {
