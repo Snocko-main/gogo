@@ -1096,10 +1096,24 @@ curl -N http://localhost:3000/events
 
 ## WebSocket
 
+Register a WebSocket route with `app.WebSocket` or `router.WebSocket`.
+Browser clients connect with the normal `WebSocket` API. Because browsers
+send an `Origin` header, browser-facing routes should include an `Upgrade`
+callback that explicitly accepts or rejects the handshake.
+
 ### Echo server
 
 ```go
 app.WebSocket("/ws", gogo.WebSocketBehavior{
+    Upgrade: func(ctx *gogo.UpgradeContext) {
+        // Local dev page served from the same app.
+        origin := ctx.Header("origin")
+        if origin != "" && origin != "http://localhost:3000" {
+            ctx.Reject(403, "bad origin")
+            return
+        }
+        ctx.Accept("")
+    },
     Open: func(ws *gogo.WebSocket) {
         log.Println("client connected")
         ws.SendText("welcome\n")
@@ -1116,6 +1130,70 @@ app.WebSocket("/ws", gogo.WebSocketBehavior{
     IdleTimeout:      120 * time.Second,
     MaxBackpressure:  64 * 1024,
 })
+```
+
+Browser-side:
+
+```html
+<script>
+const ws = new WebSocket('ws://localhost:3000/ws');
+
+ws.addEventListener('open', () => {
+    ws.send('hello from the browser');
+});
+
+ws.addEventListener('message', e => {
+    console.log('server:', e.data);
+});
+</script>
+```
+
+Or from the CLI:
+
+```sh
+websocat ws://localhost:3000/ws
+```
+
+### Upgrade gate
+
+For browser clients, add an `Upgrade` callback and explicitly accept or
+reject the handshake. This is where origin checks, token checks,
+subprotocol negotiation, and per-connection user data belong.
+
+```go
+app.WebSocket("/ws", gogo.WebSocketBehavior{
+    Upgrade: func(ctx *gogo.UpgradeContext) {
+        if ctx.Header("origin") != "https://app.example.com" {
+            ctx.Reject(403, "bad origin")
+            return
+        }
+
+        user, ok := loadUserFromToken(ctx.QueryParam("token"))
+        if !ok {
+            ctx.Reject(401, "bad token")
+            return
+        }
+
+        ctx.SetUserData(user) // available later via ws.UserData()
+        ctx.Accept("")        // accept with no subprotocol
+    },
+    Open: func(ws *gogo.WebSocket) {
+        user := ws.UserData().(*User)
+        ws.SendText("welcome, " + user.Name + "\n")
+    },
+    Message: func(ws *gogo.WebSocket, msg []byte, op gogo.OpCode) {
+        ws.Send(msg, op)
+    },
+})
+```
+
+Browser-side with a token:
+
+```html
+<script>
+const token = encodeURIComponent(window.localStorage.getItem('token') || '');
+const ws = new WebSocket(`wss://api.example.com/ws?token=${token}`);
+</script>
 ```
 
 ### Pub/Sub
