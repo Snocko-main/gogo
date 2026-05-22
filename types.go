@@ -5488,12 +5488,11 @@ func (ws *WebSocket) End(code int, message string) {
 // underlying TopicTree is loop-thread-local; calling Subscribe from
 // a worker goroutine corrupts uWS state.
 func (ws *WebSocket) Subscribe(topic string) bool {
-	trackWSHubSubscribe(ws, topic)
-	ok := ws.inner.subscribe(topic)
-	if !ok {
-		untrackWSHubSubscribe(ws, topic)
+	if !ws.inner.subscribe(topic) {
+		return false
 	}
-	return ok
+	trackWSHubSubscribe(ws, topic)
+	return true
 }
 
 // Unsubscribe removes this WebSocket's subscription to topic. Returns
