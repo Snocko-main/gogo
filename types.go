@@ -5491,7 +5491,10 @@ func (ws *WebSocket) Subscribe(topic string) bool {
 	if !ws.inner.subscribe(topic) {
 		return false
 	}
-	trackWSHubSubscribe(ws, topic)
+	if !trackWSHubSubscribe(ws, topic) {
+		ws.inner.unsubscribe(topic)
+		return false
+	}
 	return true
 }
 

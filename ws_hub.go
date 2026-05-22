@@ -1127,20 +1127,22 @@ func initWSHubSocket(ws *WebSocket) {
 	h.mu.RUnlock()
 }
 
-func trackWSHubSubscribe(ws *WebSocket, topic string) {
+func trackWSHubSubscribe(ws *WebSocket, topic string) bool {
 	if ws == nil {
-		return
+		return true
 	}
 	key, h := hubForWebSocket(ws)
 	if h == nil {
-		return
+		return true
 	}
 	if token, first := h.addMembership(key, ws.hubToken.Load(), topic); token != 0 {
 		ws.hubToken.Store(token)
 		if first {
 			h.queueAdapterTopic(topic)
 		}
+		return true
 	}
+	return false
 }
 
 func untrackWSHubSubscribe(ws *WebSocket, topic string) {

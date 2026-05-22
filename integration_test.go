@@ -5875,6 +5875,50 @@ func TestWSHubPublishFromTracksRawSubscribe(t *testing.T) {
 	}
 }
 
+func TestWSHubSubscribeRollsBackWhenHubTrackingFails(t *testing.T) {
+	hub := gogo.NewWSHub(gogo.WithWSHubNodeID("test-node"))
+	var appRef *gogo.App
+	var subscribeReturned atomic.Bool
+	var opened atomic.Bool
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		appRef = app
+		hub.WebSocket(app, "/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				hub.Close()
+				subscribeReturned.Store(ws.Subscribe("room"))
+				opened.Store(true)
+			},
+		})
+	})
+	defer teardown()
+
+	client, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if opened.Load() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !opened.Load() {
+		t.Fatal("Open did not run")
+	}
+	if subscribeReturned.Load() {
+		t.Fatal("Subscribe succeeded even though hub tracking failed")
+	}
+
+	appRef.Publish("room", []byte("ghost"), gogo.Text)
+	if err := client.expectNoMessage(300 * time.Millisecond); err != nil {
+		t.Fatalf("rollback left native subscription active: %v", err)
+	}
+}
+
 func TestWSHubCloseSkipsUserCloseWhenOpenDidNotRun(t *testing.T) {
 	hubA := gogo.NewWSHub(gogo.WithWSHubNodeID("hub-a"))
 	defer hubA.Close()
