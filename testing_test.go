@@ -140,7 +140,7 @@ func TestTestServerNilSetup(t *testing.T) {
 // TestTestServerWithMiddleware ensures the full middleware chain
 // (cookies, auth, logger) actually fires under the TestServer.
 func TestTestServerWithMiddleware(t *testing.T) {
-	const secret = "test-secret"
+	const secret = "signed-cookie-secret-32-bytes-AAAA"
 	ts, err := gogo.NewTestServer(func(app *gogo.App) {
 		app.Use(middleware.Helmet())
 		app.Use(middleware.RequestID())

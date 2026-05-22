@@ -29,14 +29,19 @@ func readAllString(t *testing.T, r *http.Response) string {
 	return string(b)
 }
 
+const (
+	testCookieSecret    = "signed-cookie-secret-32-bytes-AAAA"
+	testCookieSecretAlt = "signed-cookie-secret-32-bytes-BBBB"
+)
+
 // TestSignVerifyRoundTrip is the basic shape: sign, then verify with
 // the same key, get back the original value.
 func TestSignVerifyRoundTrip(t *testing.T) {
-	signed := gogo.SignCookieValue("alice:42", "shh")
+	signed := gogo.SignCookieValue("alice:42", testCookieSecret)
 	if !strings.Contains(signed, ".") {
 		t.Fatalf("signed value missing separator: %q", signed)
 	}
-	got, ok := gogo.VerifyCookieValue(signed, "shh")
+	got, ok := gogo.VerifyCookieValue(signed, testCookieSecret)
 	if !ok {
 		t.Fatalf("VerifyCookieValue returned !ok for fresh signed value")
 	}
@@ -48,8 +53,8 @@ func TestSignVerifyRoundTrip(t *testing.T) {
 // TestVerifyRejectsWrongSecret confirms a different key fails to
 // authenticate even when the value is otherwise legal.
 func TestVerifyRejectsWrongSecret(t *testing.T) {
-	signed := gogo.SignCookieValue("alice", "key-A")
-	if _, ok := gogo.VerifyCookieValue(signed, "key-B"); ok {
+	signed := gogo.SignCookieValue("alice", testCookieSecret)
+	if _, ok := gogo.VerifyCookieValue(signed, testCookieSecretAlt); ok {
 		t.Errorf("VerifyCookieValue accepted a signature from a different key")
 	}
 }
@@ -57,11 +62,11 @@ func TestVerifyRejectsWrongSecret(t *testing.T) {
 // TestVerifyRejectsTamperedValue confirms changing the payload after
 // signing invalidates the cookie.
 func TestVerifyRejectsTamperedValue(t *testing.T) {
-	signed := gogo.SignCookieValue("alice", "shh")
+	signed := gogo.SignCookieValue("alice", testCookieSecret)
 	// Replace the value part with "bob" but keep the signature.
 	sigIdx := strings.LastIndexByte(signed, '.')
 	tampered := "bob" + signed[sigIdx:]
-	if _, ok := gogo.VerifyCookieValue(tampered, "shh"); ok {
+	if _, ok := gogo.VerifyCookieValue(tampered, testCookieSecret); ok {
 		t.Errorf("VerifyCookieValue accepted tampered value")
 	}
 }
@@ -69,9 +74,9 @@ func TestVerifyRejectsTamperedValue(t *testing.T) {
 // TestVerifyRejectsTamperedSignature confirms a forged signature
 // fails even when the value is unchanged.
 func TestVerifyRejectsTamperedSignature(t *testing.T) {
-	signed := gogo.SignCookieValue("alice", "shh")
+	signed := gogo.SignCookieValue("alice", testCookieSecret)
 	tampered := signed[:len(signed)-2] + "AA"
-	if _, ok := gogo.VerifyCookieValue(tampered, "shh"); ok {
+	if _, ok := gogo.VerifyCookieValue(tampered, testCookieSecret); ok {
 		t.Errorf("VerifyCookieValue accepted a forged signature")
 	}
 }
@@ -91,7 +96,7 @@ func TestVerifyMalformedInputs(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, ok := gogo.VerifyCookieValue(tc.input, "shh"); ok {
+			if _, ok := gogo.VerifyCookieValue(tc.input, testCookieSecret); ok {
 				t.Errorf("expected !ok for %q", tc.input)
 			}
 		})
@@ -102,7 +107,7 @@ func TestVerifyMalformedInputs(t *testing.T) {
 // key and read back with the NEW key listed first (the deployment
 // pattern during rotation).
 func TestKeyRotation(t *testing.T) {
-	oldKey, newKey := "old-key", "new-key"
+	oldKey, newKey := testCookieSecret, testCookieSecretAlt
 	signed := gogo.SignCookieValue("session-123", oldKey)
 
 	// New key listed first (the canonical "sign with new, accept old"
@@ -125,12 +130,12 @@ func TestKeyRotation(t *testing.T) {
 // carries only the signature segment after the separator, and
 // VerifyCookieValue should recover the empty payload.
 func TestSignEmptyValue(t *testing.T) {
-	signed := gogo.SignCookieValue("", "shh")
+	signed := gogo.SignCookieValue("", testCookieSecret)
 	// Empty value still produces a "."-prefixed signature; our
 	// verifier rejects a leading separator because we use
 	// LastIndexByte and require dot > 0. Document the behavior
 	// rather than silently round-tripping an empty payload.
-	if _, ok := gogo.VerifyCookieValue(signed, "shh"); ok {
+	if _, ok := gogo.VerifyCookieValue(signed, testCookieSecret); ok {
 		t.Errorf("VerifyCookieValue accepted an empty-payload cookie; current contract is to reject")
 	}
 }
@@ -156,10 +161,19 @@ func TestSignEmptySecretPanic(t *testing.T) {
 	_ = gogo.SignCookieValue("alice", "")
 }
 
+func TestSignWeakSecretPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic on weak secret")
+		}
+	}()
+	_ = gogo.SignCookieValue("alice", "too-short")
+}
+
 // TestVerifyNoSecretsReturnsFalse confirms verification with zero
 // secrets returns a clean ("", false) — no panic.
 func TestVerifyNoSecretsReturnsFalse(t *testing.T) {
-	signed := gogo.SignCookieValue("alice", "shh")
+	signed := gogo.SignCookieValue("alice", testCookieSecret)
 	if _, ok := gogo.VerifyCookieValue(signed); ok {
 		t.Errorf("VerifyCookieValue accepted with no secrets")
 	}
@@ -174,12 +188,21 @@ func TestVerifyEmptySecretReturnsFalse(t *testing.T) {
 	}
 }
 
+func TestVerifyWeakSecretReturnsFalse(t *testing.T) {
+	mac := hmac.New(sha256.New, []byte("too-short"))
+	mac.Write([]byte("admin"))
+	forged := "admin." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	if _, ok := gogo.VerifyCookieValue(forged, "too-short"); ok {
+		t.Errorf("VerifyCookieValue accepted a weak secret")
+	}
+}
+
 // TestSetCookieSignedRoundTripsViaHTTP exercises the convenience
 // methods through a real request: SetCookieSigned writes a Set-Cookie
 // header, the client echoes it back, and CookieSigned verifies the
 // signature on the next request.
 func TestSetCookieSignedRoundTripsViaHTTP(t *testing.T) {
-	const secret = "test-secret"
+	const secret = testCookieSecret
 
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.Get("/issue", func(res *gogo.Response, req *gogo.Request) {
@@ -236,7 +259,7 @@ func TestSetCookieSignedRoundTripsViaHTTP(t *testing.T) {
 // TestCookieSignedRejectsForgery: a hand-crafted cookie that pairs
 // the real value with a bogus signature should fail verification.
 func TestCookieSignedRejectsForgery(t *testing.T) {
-	const secret = "test-secret"
+	const secret = testCookieSecret
 
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.Get("/whoami", func(res *gogo.Response, req *gogo.Request) {
@@ -265,7 +288,7 @@ func TestCookieSignedRejectsForgery(t *testing.T) {
 // TestCookieSignedMissing returns false when the cookie isn't set
 // at all.
 func TestCookieSignedMissing(t *testing.T) {
-	const secret = "test-secret"
+	const secret = testCookieSecret
 
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.Get("/x", func(res *gogo.Response, req *gogo.Request) {

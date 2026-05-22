@@ -534,14 +534,18 @@ res.SetCookie(gogo.Cookie{
 })
 
 // Signed cookies — tamper-evident with HMAC-SHA256.
-res.SetCookieSigned(gogo.Cookie{Name: "uid", Value: "42"}, "my-secret")
-uid, ok := req.CookieSigned("uid", "my-secret")
+cookieSecret := os.Getenv("COOKIE_SECRET") // at least 32 bytes
+res.SetCookieSigned(gogo.Cookie{Name: "uid", Value: "42"}, cookieSecret)
+uid, ok := req.CookieSigned("uid", cookieSecret)
 if !ok {
     res.Send(401, "text/plain", "bad cookie\n")
     return
 }
 _ = uid
 ```
+
+Signed-cookie secrets shorter than 32 bytes panic when signing and never
+verify when reading; use a secret manager or CSPRNG-generated value.
 
 ## Middleware
 
