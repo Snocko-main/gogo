@@ -34,7 +34,8 @@ type WebSocketAuthOptions struct {
 	// Matching is case-insensitive. Trailing slashes are ignored.
 	// The literal "*" is treated as "allow any origin" and is
 	// intentionally not the zero-value default — opt in explicitly
-	// when you understand the risk.
+	// when you understand the risk. Do not mix "*" with explicit
+	// origins; the helper panics at construction time.
 	//
 	// Entries must be valid origins ("scheme://host[:port]"), "null",
 	// or "*". Paths other than a single trailing slash, queries,
@@ -104,13 +105,18 @@ func WebSocketAuth(opt WebSocketAuthOptions) func(*gogo.UpgradeContext) {
 	// Pre-normalize the allow-list once at construction so the
 	// per-handshake hot path is just a slice scan.
 	allowAny := false
+	wildcards := 0
 	allowed := make([]string, 0, len(opt.AllowedOrigins))
 	for _, o := range opt.AllowedOrigins {
 		if o == "*" {
 			allowAny = true
+			wildcards++
 			continue
 		}
 		allowed = append(allowed, normalizeAllowedOriginValue(o))
+	}
+	if wildcards > 0 && len(opt.AllowedOrigins) > 1 {
+		panic("gogo/middleware: WebSocketAuth AllowedOrigins cannot mix \"*\" with explicit origins")
 	}
 	subprotocols := make([]string, len(opt.AllowedSubprotocols))
 	copy(subprotocols, opt.AllowedSubprotocols)

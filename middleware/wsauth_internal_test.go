@@ -1,6 +1,9 @@
 package middleware
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestWebSocketAuthPanicsOnInvalidConfiguredOrigins(t *testing.T) {
 	cases := []string{
@@ -43,6 +46,26 @@ func TestWebSocketAuthAcceptsValidConfiguredOrigins(t *testing.T) {
 			}()
 			_ = WebSocketAuth(WebSocketAuthOptions{
 				AllowedOrigins: []string{origin},
+			})
+		})
+	}
+}
+
+func TestWebSocketAuthPanicsOnAmbiguousWildcardOrigins(t *testing.T) {
+	cases := [][]string{
+		{"*", "https://app.example.com"},
+		{"https://app.example.com", "*"},
+		{"*", "*"},
+	}
+	for _, origins := range cases {
+		t.Run(strings.Join(origins, ","), func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("WebSocketAuth did not panic")
+				}
+			}()
+			_ = WebSocketAuth(WebSocketAuthOptions{
+				AllowedOrigins: origins,
 			})
 		})
 	}

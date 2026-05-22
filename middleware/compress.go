@@ -19,9 +19,11 @@ import (
 // (text/*, application/json, application/javascript, application/xml,
 // image/svg+xml).
 type CompressOptions struct {
-	// Level is the gzip / deflate compression level. Valid range
-	// 0 (no compression) to 9 (best). Default
-	// gzip.DefaultCompression (-1).
+	// Level is the gzip / deflate compression level. Zero means
+	// gzip.DefaultCompression so the zero-value options stay useful.
+	// Explicit valid values are gzip.DefaultCompression,
+	// gzip.HuffmanOnly, and 1..9. Values outside the stdlib range
+	// panic at construction time.
 	Level int
 
 	// MinSize skips compression when the buffered body is smaller
@@ -92,6 +94,9 @@ func Compress(opts ...CompressOptions) mwhint.Hinted {
 	} else if opt.MaxSize < 0 {
 		opt.MaxSize = 0 // explicit "disable cap" sentinel
 	}
+	if !validCompressLevel(opt.Level) {
+		panic("gogo/middleware: Compress Level must be gzip.DefaultCompression, gzip.HuffmanOnly, or 0..9")
+	}
 	if opt.Filter == nil {
 		opt.Filter = defaultCompressFilter
 	}
@@ -128,6 +133,12 @@ func Compress(opts ...CompressOptions) mwhint.Hinted {
 			next(res, req)
 		}
 	})}
+}
+
+func validCompressLevel(level int) bool {
+	return level == gzip.DefaultCompression ||
+		level == gzip.HuffmanOnly ||
+		(level >= gzip.NoCompression && level <= gzip.BestCompression)
 }
 
 // negotiateEncoding returns "gzip", "deflate", or "" — picking a supported

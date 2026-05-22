@@ -1149,7 +1149,8 @@ Defaults:
   (CLI tools like `websocat`). Safe IF you have no browser clients
   on this endpoint.
 - `AllowedOrigins: []string{"*"}` → accept any origin. Opt-in for
-  public APIs that don't rely on ambient cookie auth.
+  public APIs that don't rely on ambient cookie auth. Use `"*"` only by
+  itself; gogo panics at startup if it is mixed with explicit origins.
 
 **Legacy auto-accept** — if you intentionally want the old uWS behavior
 of accepting every handshake when `Upgrade` is nil, set
