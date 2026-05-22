@@ -312,7 +312,6 @@ func (h *WSHub) Wrap(app *App, behavior WebSocketBehavior) WebSocketBehavior {
 
 func (h *WSHub) closeAfterOpenPanic(ws *WebSocket, recovered any) {
 	defer h.forget(ws)
-	reportPanic(recovered)
 	func() {
 		defer func() {
 			if endRecovered := recover(); endRecovered != nil {
@@ -321,6 +320,7 @@ func (h *WSHub) closeAfterOpenPanic(ws *WebSocket, recovered any) {
 		}()
 		ws.End(1011, "websocket open panic")
 	}()
+	reportPanic(recovered)
 }
 
 // Subscribe enrolls ws in topic. It is a small convenience wrapper around
@@ -787,6 +787,11 @@ func (h *WSHub) adapterTopicState(topic string) (desired, applied bool) {
 
 func (h *WSHub) finishAdapterTopic(topic string, desired bool, err error) {
 	h.mu.Lock()
+	if h.closed.Load() {
+		delete(h.adapterTopicBusy, topic)
+		h.mu.Unlock()
+		return
+	}
 	if err == nil {
 		if desired {
 			h.adapterTopicApplied[topic] = true
@@ -1029,10 +1034,11 @@ func (h *WSHub) removeMembershipIfCurrent(key uintptr, token uint64, topic strin
 }
 
 func (h *WSHub) removeMembershipForUnsubscribe(key uintptr, token uint64, topic string) (bool, bool) {
+	h.mu.Lock()
 	if h.closed.Load() {
+		h.mu.Unlock()
 		return false, false
 	}
-	h.mu.Lock()
 	socket := h.sockets[key]
 	if socket == nil {
 		h.mu.Unlock()
@@ -1052,17 +1058,17 @@ func (h *WSHub) removeMembershipForUnsubscribe(key uintptr, token uint64, topic 
 }
 
 func (h *WSHub) restoreMembershipIfCurrent(key uintptr, token uint64, topic string) (bool, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if h.closed.Load() {
 		return false, false
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	socket := h.sockets[key]
 	if socket == nil || token != socket.token {
 		return false, false
 	}
 	if _, ok := socket.topics[topic]; ok {
-		return false, true
+		return false, false
 	}
 	socket.topics[topic] = struct{}{}
 	first := len(h.members[topic]) == 0
@@ -1136,22 +1142,22 @@ func initWSHubSocket(ws *WebSocket) {
 	h.mu.RUnlock()
 }
 
-func trackWSHubSubscribe(ws *WebSocket, topic string) bool {
+func trackWSHubSubscribe(ws *WebSocket, topic string) (*WSHub, bool) {
 	if ws == nil {
-		return true
+		return nil, true
 	}
 	key, h := hubForWebSocket(ws)
 	if h == nil {
-		return true
+		return nil, true
 	}
 	if token, first := h.addMembership(key, ws.hubToken.Load(), topic); token != 0 {
 		ws.hubToken.Store(token)
 		if first {
 			h.queueAdapterTopic(topic)
 		}
-		return true
+		return h, true
 	}
-	return false
+	return h, false
 }
 
 func (h *WSHub) reportAdapterError(err error) {

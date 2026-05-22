@@ -5491,9 +5491,9 @@ func (ws *WebSocket) Subscribe(topic string) bool {
 	if !ws.inner.subscribe(topic) {
 		return false
 	}
-	if !trackWSHubSubscribe(ws, topic) {
+	if h, ok := trackWSHubSubscribe(ws, topic); !ok {
 		if !ws.inner.unsubscribe(topic) {
-			if _, h := hubForWebSocket(ws); h != nil {
+			if h != nil {
 				h.reportAdapterError(fmt.Errorf("gogo: websocket hub subscribe rollback failed for topic %q", topic))
 			}
 		}

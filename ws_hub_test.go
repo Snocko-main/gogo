@@ -293,6 +293,38 @@ func TestWSHubRestoreMembershipRejectsStaleToken(t *testing.T) {
 	}
 }
 
+func TestWSHubRestoreMembershipRejectsExistingTopic(t *testing.T) {
+	hub := NewWSHub()
+	hub.mu.Lock()
+	hub.sockets[1] = &hubSocket{token: 7, topics: map[string]struct{}{"room": {}}}
+	hub.members["room"] = map[uintptr]struct{}{1: {}}
+	hub.mu.Unlock()
+
+	if first, restored := hub.restoreMembershipIfCurrent(1, 7, "room"); first || restored {
+		t.Fatalf("restoreMembershipIfCurrent = first %v restored %v, want false/false", first, restored)
+	}
+}
+
+func TestWSHubRemoveMembershipForUnsubscribeRejectsClosedHub(t *testing.T) {
+	hub := NewWSHub()
+	hub.mu.Lock()
+	hub.sockets[1] = &hubSocket{token: 7, topics: map[string]struct{}{"room": {}}}
+	hub.members["room"] = map[uintptr]struct{}{1: {}}
+	hub.mu.Unlock()
+	hub.closed.Store(true)
+
+	removed, last := hub.removeMembershipForUnsubscribe(1, 7, "room")
+	if removed || last {
+		t.Fatalf("removeMembershipForUnsubscribe = removed %v last %v, want false/false", removed, last)
+	}
+	hub.mu.RLock()
+	_, member := hub.members["room"][uintptr(1)]
+	hub.mu.RUnlock()
+	if !member {
+		t.Fatal("closed remove mutated membership")
+	}
+}
+
 type ctxBlockingWSHubAdapter struct {
 	entered chan struct{}
 }
@@ -606,6 +638,25 @@ func TestWSHubAdapterTopicRetryUsesSingleTimer(t *testing.T) {
 	hub.mu.Unlock()
 	if second != first {
 		t.Fatal("adapter topic retry scheduled more than one timer")
+	}
+}
+
+func TestWSHubFinishAdapterTopicAfterCloseDoesNotDirtyMaps(t *testing.T) {
+	hub := NewWSHub(
+		WithWSHubAdapter(&fakeWSHubAdapter{}),
+		WithWSHubAdapterErrorHandler(nil),
+	)
+	if err := hub.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	hub.finishAdapterTopic("room", true, errors.New("late redis error"))
+	hub.mu.RLock()
+	dirty := len(hub.adapterTopicDirty)
+	retries := len(hub.adapterTopicRetryAt)
+	hub.mu.RUnlock()
+	if dirty != 0 || retries != 0 {
+		t.Fatalf("topic maps after close = dirty %d retries %d, want empty", dirty, retries)
 	}
 }
 
