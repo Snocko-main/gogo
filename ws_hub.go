@@ -80,6 +80,7 @@ type WSHub struct {
 	adapterTopicBusy     map[string]struct{}
 	adapterTopicApplied  map[string]bool
 	adapterTopicRetryAt  map[string]time.Time
+	adapterTopicRetry    *time.Timer
 	adapterQueueSz       int
 	adapterWorkers       int
 	adapterTopicWorkers  int
@@ -453,6 +454,12 @@ func (h *WSHub) Close() error {
 	var err error
 	h.closeOnce.Do(func() {
 		h.closed.Store(true)
+		h.mu.Lock()
+		if h.adapterTopicRetry != nil {
+			h.adapterTopicRetry.Stop()
+			h.adapterTopicRetry = nil
+		}
+		h.mu.Unlock()
 		h.adapterQueueMu.Lock()
 		if h.adapterQueue != nil {
 			close(h.adapterQueue)
@@ -690,6 +697,7 @@ func (h *WSHub) runAdapterTopicWorker(queue <-chan struct{}) {
 		for {
 			topic, ok := h.nextAdapterTopic()
 			if !ok {
+				h.scheduleAdapterTopicRetry()
 				break
 			}
 			h.reconcileAdapterTopicSafely(topic)
@@ -789,10 +797,51 @@ func (h *WSHub) finishAdapterTopic(topic string, desired bool, err error) {
 	h.mu.Unlock()
 	if err != nil {
 		h.reportAdapterError(err)
-		time.AfterFunc(defaultWSHubStartBackoff, h.signalAdapterTopic)
+		h.scheduleAdapterTopicRetry()
 		return
 	}
 	if needsSignal {
+		h.signalAdapterTopic()
+	}
+}
+
+func (h *WSHub) scheduleAdapterTopicRetry() {
+	h.mu.Lock()
+	if h.closed.Load() || h.adapterTopicRetry != nil {
+		h.mu.Unlock()
+		return
+	}
+	var next time.Time
+	now := time.Now()
+	for topic := range h.adapterTopicDirty {
+		if _, busy := h.adapterTopicBusy[topic]; busy {
+			continue
+		}
+		retryAt := h.adapterTopicRetryAt[topic]
+		if retryAt.IsZero() || !retryAt.After(now) {
+			h.mu.Unlock()
+			h.signalAdapterTopic()
+			return
+		}
+		if next.IsZero() || retryAt.Before(next) {
+			next = retryAt
+		}
+	}
+	if next.IsZero() {
+		h.mu.Unlock()
+		return
+	}
+	delay := time.Until(next)
+	h.adapterTopicRetry = time.AfterFunc(delay, h.fireAdapterTopicRetry)
+	h.mu.Unlock()
+}
+
+func (h *WSHub) fireAdapterTopicRetry() {
+	h.mu.Lock()
+	h.adapterTopicRetry = nil
+	closed := h.closed.Load()
+	h.mu.Unlock()
+	if !closed {
 		h.signalAdapterTopic()
 	}
 }

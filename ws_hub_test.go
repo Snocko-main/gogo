@@ -585,6 +585,30 @@ func TestWSHubAdapterTopicRetryUsesBackoff(t *testing.T) {
 	}
 }
 
+func TestWSHubAdapterTopicRetryUsesSingleTimer(t *testing.T) {
+	hub := NewWSHub(
+		WithWSHubAdapter(&fakeWSHubAdapter{}),
+		WithWSHubAdapterErrorHandler(nil),
+	)
+	defer hub.Close()
+
+	hub.finishAdapterTopic("room.a", true, errors.New("redis down"))
+	hub.mu.Lock()
+	first := hub.adapterTopicRetry
+	hub.mu.Unlock()
+	if first == nil {
+		t.Fatal("adapterTopicRetry timer was not scheduled")
+	}
+
+	hub.finishAdapterTopic("room.b", true, errors.New("redis down"))
+	hub.mu.Lock()
+	second := hub.adapterTopicRetry
+	hub.mu.Unlock()
+	if second != first {
+		t.Fatal("adapter topic retry scheduled more than one timer")
+	}
+}
+
 func TestWSHubSignalAdapterTopicDoesNotRaceClosedQueue(t *testing.T) {
 	hub := NewWSHub(WithWSHubAdapter(&fakeWSHubAdapter{}))
 	start := make(chan struct{})
