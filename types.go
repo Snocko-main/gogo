@@ -967,6 +967,10 @@ func (a *App) hasSyncMiddleware(routePattern string) bool {
 	return false
 }
 
+func hasRouteConstraints(meta *routeMeta) bool {
+	return meta != nil && len(meta.constraints) > 0
+}
+
 // UseAsync is retained as a thin alias for App.Use to keep existing
 // code compiling. App.Use now handles all middleware: bundled
 // middleware carries its own placement, raw AsyncMiddleware values
@@ -1039,7 +1043,8 @@ func (a *App) wrapAsyncFiltered(routePattern string, h AsyncHandler, skipAlsoSyn
 //   - []byte                              — same as string
 //   - Reply                               — static body with explicit status and Content-Type
 //
-// Static targets are served entirely in C++ with no Go work per request.
+// Static targets are served entirely in C++ with no Go work per request when
+// no matching sync middleware or typed-param constraints need to run.
 func (a *App) Get(pattern string, target any) {
 	uwsPattern, meta := a.preRoute("get", pattern)
 	switch v := target.(type) {
@@ -1055,7 +1060,7 @@ func (a *App) Get(pattern string, target any) {
 		if v.ContentType != "" {
 			validateHeaderValue("Content-Type", v.ContentType)
 		}
-		if a.hasSyncMiddleware(uwsPattern) {
+		if hasRouteConstraints(meta) || a.hasSyncMiddleware(uwsPattern) {
 			cType, body := v.ContentType, v.Body
 			h := a.applyMeta(meta, a.wrap(uwsPattern, func(res *Response, req *Request) {
 				res.Send(code, cType, body)
@@ -1065,7 +1070,7 @@ func (a *App) Get(pattern string, target any) {
 		}
 		a.inner.getStatic(uwsPattern, statusLine(code), v.ContentType, v.Body)
 	case string:
-		if a.hasSyncMiddleware(uwsPattern) {
+		if hasRouteConstraints(meta) || a.hasSyncMiddleware(uwsPattern) {
 			body := v
 			h := a.applyMeta(meta, a.wrap(uwsPattern, func(res *Response, req *Request) {
 				res.Send(200, "", body)
@@ -1076,7 +1081,7 @@ func (a *App) Get(pattern string, target any) {
 		a.inner.getStatic(uwsPattern, statusLine(200), "", v)
 	case []byte:
 		body := string(v)
-		if a.hasSyncMiddleware(uwsPattern) {
+		if hasRouteConstraints(meta) || a.hasSyncMiddleware(uwsPattern) {
 			h := a.applyMeta(meta, a.wrap(uwsPattern, func(res *Response, req *Request) {
 				res.Send(200, "", body)
 			}))
@@ -1488,11 +1493,17 @@ func (r *Router) hasGroupOrAppMW(fullPattern string) bool {
 	return len(r.syncMW) > 0 || r.app.hasSyncMiddleware(fullPattern)
 }
 
+// needsDynamicStatic reports whether a static target needs the dynamic path
+// to preserve route semantics: middleware must run and typed-param
+// constraints must reject before the static body is sent.
+func (r *Router) needsDynamicStatic(meta *routeMeta, fullPattern string) bool {
+	return hasRouteConstraints(meta) || r.hasGroupOrAppMW(fullPattern)
+}
+
 // Get registers a GET route under this Router. Target follows the same rules
-// as App.Get: Handler, func, Reply, string, []byte. Static targets bypass
-// middleware only when neither the Router nor the App has any middleware
-// touching this route; otherwise the static body is served by a synthetic
-// dynamic handler so middleware can intercept.
+// as App.Get: Handler, func, Reply, string, []byte. Static targets take the
+// zero-cgo path only when neither middleware nor typed-param constraints need
+// to run; otherwise the static body is served by a synthetic dynamic handler.
 func (r *Router) Get(pattern string, target any) {
 	full, meta := r.preRoute("get", pattern)
 	switch v := target.(type) {
@@ -1510,7 +1521,7 @@ func (r *Router) Get(pattern string, target any) {
 		if v.ContentType != "" {
 			validateHeaderValue("Content-Type", v.ContentType)
 		}
-		if !r.hasGroupOrAppMW(full) {
+		if !r.needsDynamicStatic(meta, full) {
 			r.app.inner.getStatic(full, statusLine(code), v.ContentType, v.Body)
 			return
 		}
@@ -1520,7 +1531,7 @@ func (r *Router) Get(pattern string, target any) {
 		})))
 		r.app.inner.get(full, h)
 	case string:
-		if !r.hasGroupOrAppMW(full) {
+		if !r.needsDynamicStatic(meta, full) {
 			r.app.inner.getStatic(full, statusLine(200), "", v)
 			return
 		}
@@ -1531,7 +1542,7 @@ func (r *Router) Get(pattern string, target any) {
 		r.app.inner.get(full, h)
 	case []byte:
 		body := string(v)
-		if !r.hasGroupOrAppMW(full) {
+		if !r.needsDynamicStatic(meta, full) {
 			r.app.inner.getStatic(full, statusLine(200), "", body)
 			return
 		}
