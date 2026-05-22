@@ -104,6 +104,15 @@ func TestDefaultConfigJSONCodecs(t *testing.T) {
 	}
 }
 
+func TestEscapeJSONPDefusesScriptAndLineSeparators(t *testing.T) {
+	in := []byte("{\"x\":\"</script>&\u2028\u2029\"}")
+	got := string(escapeJSONP(in))
+	want := "{\"x\":\"\\u003c/script\\u003e\\u0026\\u2028\\u2029\"}"
+	if got != want {
+		t.Fatalf("escapeJSONP = %q, want %q", got, want)
+	}
+}
+
 func TestDefaultConfigBodyLimitDefaultsAndDisableSentinel(t *testing.T) {
 	cfg := defaultConfig(Config{})
 	if cfg.BodyLimit != 4<<20 {

@@ -2668,7 +2668,8 @@ func (r *Response) JSON(code int, v any) {
 		r.Send(500, "text/plain; charset=utf-8", "Internal Server Error\n")
 		return
 	}
-	r.Send(code, "application/json", string(data))
+	r.Send(code, "application/json", bytesAsString(data))
+	runtime.KeepAlive(data)
 }
 
 func (r *Response) jsonEncoder() JSONEncoder {
@@ -2688,6 +2689,7 @@ func (r *Response) jsonEncoder() JSONEncoder {
 // application/json automatically.
 func (r *Response) JSONBytes(code int, b []byte) {
 	r.Send(code, "application/json", bytesAsString(b))
+	runtime.KeepAlive(b)
 }
 
 // JSONStream emits a JSON body through a streaming encoder, avoiding
@@ -2997,13 +2999,7 @@ func (r *Response) JSONP(callback string, v any) {
 		r.Send(500, "text/plain; charset=utf-8", "Internal Server Error\n")
 		return
 	}
-	// Escape U+2028 / U+2029 so the JSON-as-JS payload parses across
-	// every browser. Some encoders emit them as raw UTF-8 bytes; the
-	// JavaScript spec only forbade them as literal line terminators
-	// pre-ES2019 but enough deployed parsers still choke that the
-	// JSONP convention is to escape them defensively.
-	body := bytes.ReplaceAll(data, []byte{0xE2, 0x80, 0xA8}, []byte("\\u2028"))
-	body = bytes.ReplaceAll(body, []byte{0xE2, 0x80, 0xA9}, []byte("\\u2029"))
+	body := escapeJSONP(data)
 
 	var b strings.Builder
 	b.Grow(len(callback) + len(body) + 4)
@@ -3016,6 +3012,18 @@ func (r *Response) JSONP(callback string, v any) {
 	b.Write(body)
 	b.WriteString(");")
 	r.Send(200, "application/javascript; charset=utf-8", b.String())
+}
+
+// escapeJSONP keeps JSONP safe even when Config.JSONEncoder does not mirror
+// encoding/json's HTMLEscape behavior. It prevents `</script>` breakouts and
+// line-separator parser hazards when JSONP is consumed via a script tag.
+func escapeJSONP(data []byte) []byte {
+	data = bytes.ReplaceAll(data, []byte("<"), []byte("\\u003c"))
+	data = bytes.ReplaceAll(data, []byte(">"), []byte("\\u003e"))
+	data = bytes.ReplaceAll(data, []byte("&"), []byte("\\u0026"))
+	data = bytes.ReplaceAll(data, []byte{0xE2, 0x80, 0xA8}, []byte("\\u2028"))
+	data = bytes.ReplaceAll(data, []byte{0xE2, 0x80, 0xA9}, []byte("\\u2029"))
+	return data
 }
 
 // validJSONPCallback accepts only characters that can legally appear
