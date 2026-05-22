@@ -163,8 +163,8 @@ func (c *UpgradeContext) Reject(status int, body string) {
 	if c.done {
 		return
 	}
-	c.done = true
 	line := statusLine(status)
+	c.done = true
 	upgradeReject(c.ctxPtr, line, body)
 }
 
