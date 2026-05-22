@@ -6,7 +6,7 @@
 # Endpoints:   /hello, /hello/:name, /db (GET) + /echo (POST)
 # Threads:     1, 2, 4, 8     (wrk -t)
 # Connections: 500            (wrk -c)
-# Modes:       single (1 worker) and multi (NumCPU workers)
+# Modes:       single (1 worker) and multi (MULTI_WORKERS workers)
 #
 # /echo POSTs a fixed 50-byte JSON body via scripts/wrk_post.lua so each
 # server's body-collection path is exercised. Each server is started,
@@ -22,6 +22,7 @@
 #   POST_ENDPOINTS POST endpoints to hit                (default "/echo")
 #   FRAMEWORKS     subset to run                        (default "gogo fiber nethttp uwsjs bun actix")
 #   MODES          subset to run                        (default "single multi")
+#   MULTI_WORKERS  server workers/processes for multi   (default min(NumCPU, 4))
 #   WARMUP         seconds of warmup hits before timing (default 2)
 #   RESULTS_DIR    where to write logs                  (default benchmark/results)
 #
@@ -54,6 +55,12 @@ if ! command -v wrk >/dev/null 2>&1; then
 fi
 
 NCPU="$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)"
+if [ "$NCPU" -lt 4 ]; then
+	DEFAULT_MULTI_WORKERS="$NCPU"
+else
+	DEFAULT_MULTI_WORKERS=4
+fi
+MULTI_WORKERS="${MULTI_WORKERS:-$DEFAULT_MULTI_WORKERS}"
 
 SERVER_PID=""
 
@@ -124,7 +131,7 @@ start_server() {
 		SERVER_PID=$!
 		;;
 	gogo:multi)
-		( GOGO_CORES="$NCPU" go run -tags gogo ./benchmark/gogo >/tmp/bench-gogo.log 2>&1 ) &
+		( GOMAXPROCS="$MULTI_WORKERS" GOGO_CORES="$MULTI_WORKERS" go run -tags gogo ./benchmark/gogo >/tmp/bench-gogo.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	fiber:single)
@@ -132,7 +139,7 @@ start_server() {
 		SERVER_PID=$!
 		;;
 	fiber:multi)
-		( FIBER_PREFORK=1 go run ./benchmark/fiber >/tmp/bench-fiber.log 2>&1 ) &
+		( GOMAXPROCS="$MULTI_WORKERS" FIBER_PREFORK=1 go run ./benchmark/fiber >/tmp/bench-fiber.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	nethttp:single)
@@ -140,7 +147,7 @@ start_server() {
 		SERVER_PID=$!
 		;;
 	nethttp:multi)
-		( go run ./benchmark/nethttp >/tmp/bench-nethttp.log 2>&1 ) &
+		( GOMAXPROCS="$MULTI_WORKERS" go run ./benchmark/nethttp >/tmp/bench-nethttp.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	uwsjs:single)
@@ -148,7 +155,7 @@ start_server() {
 		SERVER_PID=$!
 		;;
 	uwsjs:multi)
-		( NODE_WORKERS="$NCPU" node benchmark/node-uwebsockets/server.cjs >/tmp/bench-uwsjs.log 2>&1 ) &
+		( NODE_WORKERS="$MULTI_WORKERS" node benchmark/node-uwebsockets/server.cjs >/tmp/bench-uwsjs.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	bun:single)
@@ -156,7 +163,7 @@ start_server() {
 		SERVER_PID=$!
 		;;
 	bun:multi)
-		( BUN_WORKERS="$NCPU" bun run benchmark/bun-elysia/server.ts >/tmp/bench-bun.log 2>&1 ) &
+		( BUN_WORKERS="$MULTI_WORKERS" bun run benchmark/bun-elysia/server.ts >/tmp/bench-bun.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	actix:single)
@@ -165,7 +172,7 @@ start_server() {
 		SERVER_PID=$!
 		;;
 	actix:multi)
-		( ACTIX_WORKERS="$NCPU" PORT="$PORT" benchmark/actix/target/release/actix-bench >/tmp/bench-actix.log 2>&1 ) &
+		( ACTIX_WORKERS="$MULTI_WORKERS" PORT="$PORT" benchmark/actix/target/release/actix-bench >/tmp/bench-actix.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	*)
