@@ -1,7 +1,6 @@
 package gogo
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -3018,12 +3017,51 @@ func (r *Response) JSONP(callback string, v any) {
 // encoding/json's HTMLEscape behavior. It prevents `</script>` breakouts and
 // line-separator parser hazards when JSONP is consumed via a script tag.
 func escapeJSONP(data []byte) []byte {
-	data = bytes.ReplaceAll(data, []byte("<"), []byte("\\u003c"))
-	data = bytes.ReplaceAll(data, []byte(">"), []byte("\\u003e"))
-	data = bytes.ReplaceAll(data, []byte("&"), []byte("\\u0026"))
-	data = bytes.ReplaceAll(data, []byte{0xE2, 0x80, 0xA8}, []byte("\\u2028"))
-	data = bytes.ReplaceAll(data, []byte{0xE2, 0x80, 0xA9}, []byte("\\u2029"))
-	return data
+	var out []byte
+	for i := 0; i < len(data); i++ {
+		repl := ""
+		switch data[i] {
+		case '<':
+			repl = "\\u003c"
+		case '>':
+			repl = "\\u003e"
+		case '&':
+			repl = "\\u0026"
+		case 0xE2:
+			if i+2 < len(data) && data[i+1] == 0x80 {
+				switch data[i+2] {
+				case 0xA8:
+					repl = "\\u2028"
+				case 0xA9:
+					repl = "\\u2029"
+				}
+				if repl != "" {
+					if out == nil {
+						out = make([]byte, 0, len(data)+8)
+						out = append(out, data[:i]...)
+					}
+					out = append(out, repl...)
+					i += 2
+					continue
+				}
+			}
+		}
+		if repl == "" {
+			if out != nil {
+				out = append(out, data[i])
+			}
+			continue
+		}
+		if out == nil {
+			out = make([]byte, 0, len(data)+8)
+			out = append(out, data[:i]...)
+		}
+		out = append(out, repl...)
+	}
+	if out == nil {
+		return data
+	}
+	return out
 }
 
 // validJSONPCallback accepts only characters that can legally appear

@@ -2007,6 +2007,31 @@ func TestResponseJSONUsesConfiguredEncoder(t *testing.T) {
 	}
 }
 
+func TestResponseJSONPWithCustomEncoderEscapesScriptBreakout(t *testing.T) {
+	cfg := gogo.Config{
+		JSONEncoder: func(v any) ([]byte, error) {
+			return []byte("{\"x\":\"</script>&\xe2\x80\xa8\xe2\x80\xa9\"}"), nil
+		},
+	}
+	port, teardown := startAppCfg(t, cfg, func(app *gogo.App) {
+		app.Get("/jsonp", func(res *gogo.Response, req *gogo.Request) {
+			res.JSONP("cb", map[string]any{"ignored": true})
+		})
+	})
+	defer teardown()
+
+	resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/jsonp", port))
+	if err != nil {
+		t.Fatalf("GET /jsonp: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	want := `/**/cb({"x":"\u003c/script\u003e\u0026\u2028\u2029"});`
+	if string(body) != want {
+		t.Fatalf("JSONP body=%q, want %q", body, want)
+	}
+}
+
 // TestResponseJSONBytes confirms the pre-marshaled JSON shortcut emits
 // the exact bytes with Content-Type: application/json. Useful for
 // cached responses and faster encoders.
