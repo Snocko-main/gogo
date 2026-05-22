@@ -1474,6 +1474,13 @@ func wsSetUserData(w *WebSocket, data uintptr) {
 	C.uwsgo_ws_set_user_data(w.inner.ptr, C.uintptr_t(data))
 }
 
+func wsNativeKey(w *WebSocket) uintptr {
+	if w == nil {
+		return 0
+	}
+	return uintptr(unsafe.Pointer(w.inner.ptr))
+}
+
 //export uwsgoHandleDefer
 func uwsgoHandleDefer(callbackID C.uintptr_t) {
 	h := cgo.Handle(callbackID)

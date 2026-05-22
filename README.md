@@ -1214,43 +1214,81 @@ const ws = new WebSocket(`wss://api.example.com/ws?token=${token}`);
 
 ### Pub/Sub
 
-uWebSockets has built-in pub/sub. Subscribe inside `Open`, publish anywhere
-on the loop with `ws.Publish` or anywhere off the loop with `app.Publish`.
-`ws.Publish` delivers to the other subscribers of the topic; send a local
-ack first if the publishing client should also see its own message.
+For app code, prefer `WSHub`. It keeps the fast uWS local path, fans out
+across every `App` attached in the current process, and can bridge multiple
+processes or hosts through an adapter such as Redis.
 
 ```go
-app.WebSocket("/chat", gogo.WebSocketBehavior{
+hub := gogo.NewWSHub()
+defer hub.Close()
+
+hub.WebSocket(app, "/chat", gogo.WebSocketBehavior{
     Upgrade: func(ctx *gogo.UpgradeContext) {
         ctx.Accept("")
     },
     Open: func(ws *gogo.WebSocket) {
-        ws.Subscribe("room.general")
+        hub.Subscribe(ws, "room.general")
         ws.SendText("joined room.general\n")
     },
     Message: func(ws *gogo.WebSocket, msg []byte, op gogo.OpCode) {
         ws.SendText("you: " + string(msg))
-        ws.Publish("room.general", msg, op)      // broadcast to subscribers
+        _ = hub.PublishFrom(ws, "room.general", msg, op)
     },
 })
+```
 
-// From a worker goroutine — must use App.Publish (loop-safe, copies bytes).
+`PublishFrom` uses `ws.Publish` on the sender's event loop, so the sender
+does not receive its own broadcast. Other `App` instances in the same
+process receive the message through `App.Publish`. From worker goroutines,
+scheduled jobs, or HTTP handlers, use `hub.Publish` or `hub.PublishBatch`.
+
+```go
 go func() {
     for {
         time.Sleep(10 * time.Second)
-        app.Publish("room.general", []byte("server tick"), gogo.Text)
+        _ = hub.Publish("room.general", []byte("server tick"), gogo.Text)
     }
 }()
 ```
 
-For bursty fan-out, batch publishes save one cgo crossing + one mutex per
-message:
+For bursty fan-out, batch publishes keep the same one-cgo-crossing local
+fast path as `App.PublishBatch`:
 
 ```go
-app.PublishBatch([]gogo.PublishMessage{
+_ = hub.PublishBatch([]gogo.PublishMessage{
     {Topic: "room.general", Message: []byte("hi 1"), OpCode: gogo.Text},
     {Topic: "room.general", Message: []byte("hi 2"), OpCode: gogo.Text},
     {Topic: "alerts",       Message: []byte("ping"), OpCode: gogo.Text},
+})
+```
+
+For multi-process or multi-host deployments, add a Redis adapter. Redis
+Pub/Sub is best-effort realtime fan-out: fast and simple, but disconnected
+processes do not replay missed messages.
+
+```go
+import redisadapter "github.com/Snocko-main/gogo/adapters/redis"
+
+adapter, err := redisadapter.New(redisadapter.Options{
+    URL: "redis://localhost:6379/0",
+})
+if err != nil {
+    log.Fatal(err)
+}
+hub := gogo.NewWSHub(gogo.WithWSHubAdapter(adapter))
+defer hub.Close()
+if err := hub.Start(); err != nil {
+    log.Fatal(err)
+}
+```
+
+With `RunMultiCore`, create one hub outside setup and register every worker's
+route through it:
+
+```go
+hub := gogo.NewWSHub(gogo.WithWSHubAdapter(adapter))
+handle, err := gogo.RunMultiCore(4, 3000, func(app *gogo.App) {
+    hub.WebSocket(app, "/chat", behavior)
 })
 ```
 
@@ -1627,7 +1665,7 @@ app.MethodNotAllowed(func(res *gogo.Response, req *gogo.Request) {
 - [`examples/authmw`](examples/authmw) — logger + bearer auth (sync & async middleware)
 - [`examples/upload`](examples/upload) — POST body collection with 413 + streaming OnData
 - [`examples/sse`](examples/sse) — Server-Sent Events with reconnect resume
-- [`examples/websocket`](examples/websocket) — browser WebSocket + upgrade gate + echo
+- [`examples/websocket`](examples/websocket) — browser WebSocket + upgrade gate + pub/sub
 - [`examples/multicore`](examples/multicore) — `RunMultiCore` + `/metrics` + graceful shutdown
 
 ## Why There Is a C++ Bridge

@@ -79,7 +79,10 @@ func main() {
 		Body:        indexHTML,
 	})
 
-	app.WebSocket("/ws", gogo.WebSocketBehavior{
+	hub := gogo.NewWSHub()
+	defer hub.Close()
+
+	hub.WebSocket(app, "/ws", gogo.WebSocketBehavior{
 		Upgrade: func(ctx *gogo.UpgradeContext) {
 			origin := ctx.Header("origin")
 			if origin != "" && origin != "http://localhost:3004" {
@@ -101,7 +104,7 @@ func main() {
 		Open: func(ws *gogo.WebSocket) {
 			info := ws.UserData().(*clientInfo)
 			topic := "room." + info.Room
-			ws.Subscribe(topic)
+			hub.Subscribe(ws, topic)
 			log.Printf("%s connected to %s", info.Name, topic)
 			ws.SendText("welcome, " + info.Name + " (" + topic + ")\n")
 		},
@@ -117,7 +120,9 @@ func main() {
 			}
 			topic := "room." + info.Room
 			ws.SendText("you: " + text + "\n")
-			ws.Publish(topic, []byte(info.Name+": "+text+"\n"), gogo.Text)
+			if err := hub.PublishFrom(ws, topic, []byte(info.Name+": "+text+"\n"), gogo.Text); err != nil {
+				log.Printf("publish: %v", err)
+			}
 		},
 		Close: func(ws *gogo.WebSocket, code int, msg []byte) {
 			if info, ok := ws.UserData().(*clientInfo); ok {
