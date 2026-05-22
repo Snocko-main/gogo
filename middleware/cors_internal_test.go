@@ -119,6 +119,21 @@ func TestCORSNormalizesConfiguredOrigins(t *testing.T) {
 	}
 }
 
+func TestCORSRejectsRuntimeOriginsWithWhitespace(t *testing.T) {
+	compiled := compileOrigins(normalizeCORSOriginPatterns([]string{
+		"https://app.example.com",
+	}))
+	for _, origin := range []string{
+		" https://app.example.com",
+		"https://app.example.com ",
+		"\thttps://app.example.com",
+	} {
+		if matchCompiledOrigin(compiled, origin) {
+			t.Fatalf("compiled origins matched malformed runtime origin %q", origin)
+		}
+	}
+}
+
 func TestFilterRequestedHeadersDropsInvalidTokens(t *testing.T) {
 	got := filterRequestedHeaders("X-Good, bad header, X-Also-Good, evil\nname")
 	want := "X-Good, X-Also-Good"

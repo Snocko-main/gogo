@@ -80,10 +80,23 @@ func TestOriginAllowedRejectsMalformedRuntimeOrigin(t *testing.T) {
 		"https://app.example.com/path",
 		"https://app.example.com?x=1",
 		"https://app.example.com\n",
+		" https://app.example.com",
+		"https://app.example.com ",
+		"\thttps://app.example.com",
 	} {
 		if originAllowed(origin, allowed) {
 			t.Fatalf("originAllowed accepted malformed runtime origin %q", origin)
 		}
+	}
+}
+
+func TestWebSocketAuthTrimsConfiguredOriginsOnly(t *testing.T) {
+	allowed := []string{normalizeAllowedOriginValue(" https://APP.example.com/ ")}
+	if !originAllowed("https://app.example.com", allowed) {
+		t.Fatal("originAllowed rejected normalized configured origin")
+	}
+	if originAllowed(" https://app.example.com ", allowed) {
+		t.Fatal("originAllowed accepted whitespace-padded runtime origin")
 	}
 }
 

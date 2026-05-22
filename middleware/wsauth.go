@@ -190,6 +190,12 @@ func WebSocketAuth(opt WebSocketAuthOptions) func(*gogo.UpgradeContext) {
 // a single trailing slash. The allow-list is application-owned config, so
 // fail fast on malformed entries instead of producing a silent runtime reject.
 func normalizeAllowedOriginValue(o string) string {
+	for i := 0; i < len(o); i++ {
+		if o[i] < 0x20 || o[i] == 0x7f {
+			panic("gogo/middleware: WebSocketAuth AllowedOrigins contains an invalid origin")
+		}
+	}
+	o = strings.TrimSpace(o)
 	normalized, ok := normalizeOriginValue(o)
 	if !ok {
 		panic("gogo/middleware: WebSocketAuth AllowedOrigins contains an invalid origin")
@@ -199,9 +205,9 @@ func normalizeAllowedOriginValue(o string) string {
 
 // normalizeOriginValue lower-cases the scheme + host portion and strips any
 // trailing slash so the allow-list comparison is robust against trivial
-// differences ("HTTPS://APP" vs "https://app/"). Runtime request origins return
-// ok=false when malformed so a hostile peer cannot turn a bad Origin into a
-// panic.
+// differences ("HTTPS://APP" vs "https://app/"). Runtime request origins are
+// intentionally strict: surrounding whitespace is malformed and must fail
+// closed rather than being repaired into an allow-list match.
 func normalizeOriginValue(o string) (string, bool) {
 	if o == "" {
 		return "", false
@@ -211,8 +217,7 @@ func normalizeOriginValue(o string) (string, bool) {
 			return "", false
 		}
 	}
-	o = strings.TrimSpace(o)
-	if o == "" {
+	if strings.TrimSpace(o) != o {
 		return "", false
 	}
 	if o == "null" {
