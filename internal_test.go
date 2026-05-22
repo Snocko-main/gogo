@@ -538,6 +538,20 @@ func TestDefaultMultipartPartLimitSetter(t *testing.T) {
 	}
 }
 
+func TestMultipartPartLimitDisableSentinel(t *testing.T) {
+	oldLimit := GetDefaultMultipartPartLimit()
+	defer SetDefaultMultipartPartLimit(oldLimit)
+
+	if got := multipartPartLimit(MultipartOptions{MaxPartBytes: NoMultipartPartLimit}); got != 0 {
+		t.Fatalf("NoMultipartPartLimit option normalized to %d, want 0", got)
+	}
+
+	SetDefaultMultipartPartLimit(NoMultipartPartLimit)
+	if got := multipartPartLimit(MultipartOptions{}); got != 0 {
+		t.Fatalf("NoMultipartPartLimit default normalized to %d, want 0", got)
+	}
+}
+
 func TestDefaultMultipartPartLimitLegacyAssignment(t *testing.T) {
 	oldLimit := GetDefaultMultipartPartLimit()
 	defer SetDefaultMultipartPartLimit(oldLimit)

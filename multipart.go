@@ -20,9 +20,14 @@ import (
 // runtime changes so readers observe the update atomically.
 var DefaultMultipartPartLimit int64 = 8 << 20
 
+// NoMultipartPartLimit disables the multipart per-part cap. Use only when
+// Config.BodyLimit or an external proxy still bounds total request size.
+const NoMultipartPartLimit int64 = -1
+
 // SetDefaultMultipartPartLimit sets the process-wide multipart per-part cap
-// used when MultipartOptions.MaxPartBytes is zero. Values at or below zero
-// disable the default cap. Prefer explicit MultipartOptions for per-route
+// used when MultipartOptions.MaxPartBytes is zero. Set to
+// NoMultipartPartLimit to disable the default cap. Values at or below zero
+// are kept as legacy opt-outs. Prefer explicit MultipartOptions for per-route
 // policies.
 func SetDefaultMultipartPartLimit(maxBytes int64) {
 	atomic.StoreInt64(&DefaultMultipartPartLimit, maxBytes)
@@ -41,7 +46,8 @@ var ErrMultipartPartTooLarge = errors.New("gogo: multipart part exceeds max size
 // ParseMultipartStream.
 type MultipartOptions struct {
 	// MaxPartBytes caps bytes read for each individual part. Zero uses
-	// GetDefaultMultipartPartLimit; negative disables the per-part cap.
+	// GetDefaultMultipartPartLimit; NoMultipartPartLimit disables the
+	// per-part cap.
 	MaxPartBytes int64
 }
 
@@ -353,7 +359,7 @@ func multipartPartLimit(opt MultipartOptions) int64 {
 		return opt.MaxPartBytes
 	}
 	limit := GetDefaultMultipartPartLimit()
-	if limit < 0 {
+	if limit <= 0 {
 		return 0
 	}
 	return limit

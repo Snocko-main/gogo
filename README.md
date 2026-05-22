@@ -513,7 +513,9 @@ Multipart value parts parsed by `BodyParser` and `ParseMultipart` are capped by
 `GetDefaultMultipartPartLimit()` (8 MiB by default). Override the process default
 with `SetDefaultMultipartPartLimit(n)` before registering handlers, or pass
 `MultipartOptions{MaxPartBytes: n}` to multipart APIs for route-specific limits.
-The older `DefaultMultipartPartLimit = n` assignment style still works during
+Use `gogo.NoMultipartPartLimit` only for trusted upload flows where
+`Config.BodyLimit` or an external proxy still bounds total request size. The
+older `DefaultMultipartPartLimit = n` assignment style still works during
 startup, but the setter is preferred for runtime-safe updates.
 
 ## Cookies
