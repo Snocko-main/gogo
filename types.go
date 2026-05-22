@@ -3006,7 +3006,7 @@ func (r *Response) JSONP(callback string, v any) {
 	body := escapeJSONP(data)
 
 	var b strings.Builder
-	b.Grow(len(callback) + len(body) + 4)
+	b.Grow(len(callback) + len(body) + len("/**/") + len("(") + len(");"))
 	// Leading "/**/" defuses content-sniffing attacks where a browser
 	// would interpret a buffered JSONP response as something other
 	// than JS. The comment is harmless to actual JS parsers.
