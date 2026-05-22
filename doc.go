@@ -69,7 +69,8 @@
 //     drains it.
 //   - Async handler with body > 8 KB: cgo Loop::defer falls back.
 //
-// res.JSON wraps Send with json.Marshal and Content-Type: application/json.
+// res.JSON wraps Send with Config.JSONEncoder (encoding/json.Marshal by
+// default) and Content-Type: application/json.
 //
 // # Middleware
 //

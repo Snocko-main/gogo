@@ -363,6 +363,12 @@ app.Get("/json", func(res *gogo.Response, req *gogo.Request) {
     res.JSON(200, map[string]any{"ok": true, "n": 42})
 })
 
+// Optional at App construction time:
+// app, _ := gogo.NewApp(gogo.Config{
+//     JSONEncoder: sonic.Marshal,
+//     JSONDecoder: sonic.Unmarshal,
+// })
+
 app.Get("/old", func(res *gogo.Response, req *gogo.Request) {
     res.Redirect("/new", 301)
 })
@@ -489,7 +495,8 @@ the built-in HTML engine does this so the cap is enforced while rendering.
 
 `Request.BodyParser` deserializes the body into a struct based on
 Content-Type. Supported: `application/json`, `application/x-www-form-urlencoded`,
-`multipart/form-data` (value parts only).
+`multipart/form-data` (value parts only). JSON uses `Config.JSONDecoder` when
+configured; `Response.JSON` and `Response.JSONP` use `Config.JSONEncoder`.
 
 ```go
 type CreateUser struct {
@@ -1549,16 +1556,20 @@ app, _ := gogo.NewApp(gogo.Config{
     BindAddr:        "127.0.0.1",      // localhost only
     CapturePeerIP:   true,             // populate req.IP() on async paths
     TrustProxy:      true,             // honor X-Forwarded-*
+    // JSONEncoder:  sonic.Marshal,    // optional: faster JSON responses
+    // JSONDecoder:  sonic.Unmarshal,  // optional: faster BodyParser JSON
 })
 ```
 
-| Field             | Default | Notes                                                   |
-| ----------------- | ------- | ------------------------------------------------------- |
-| `BodyLimit`       | 4 MiB   | Reject Content-Length > limit with 413 on the C++ side  |
-| `BodyReadTimeout` | 30s     | Deadline for `Response.Body` to finish reading the body |
-| `BindAddr`        | `""`    | Empty = all interfaces (`0.0.0.0`)                      |
-| `CapturePeerIP`   | `false` | Snapshot peer IP for async / shared-dispatch paths      |
-| `TrustProxy`      | `false` | Honor `X-Forwarded-*` in `Protocol()`/`Secure()`/`IPs()` |
+| Field             | Default                   | Notes                                                   |
+| ----------------- | ------------------------- | ------------------------------------------------------- |
+| `BodyLimit`       | 4 MiB                     | Reject Content-Length > limit with 413 on the C++ side  |
+| `BodyReadTimeout` | 30s                       | Deadline for `Response.Body` to finish reading the body |
+| `BindAddr`        | `""`                      | Empty = all interfaces (`0.0.0.0`)                      |
+| `CapturePeerIP`   | `false`                   | Snapshot peer IP for async / shared-dispatch paths      |
+| `TrustProxy`      | `false`                   | Honor `X-Forwarded-*` in `Protocol()`/`Secure()`/`IPs()` |
+| `JSONEncoder`     | `encoding/json.Marshal`   | Encoder for `Response.JSON` and `Response.JSONP`        |
+| `JSONDecoder`     | `encoding/json.Unmarshal` | Decoder for `Request.BodyParser` JSON bodies            |
 
 `BodyReadTimeout` protects `Response.Body` users from slow body uploads that
 drip bytes forever without exceeding `BodyLimit`. Keep the 30s default for
@@ -1569,6 +1580,14 @@ intentionally disabling the deadline for trusted traffic/tests.
 `BodyLimit: 0` uses the safe 4 MiB default. Set `BodyLimit: gogo.NoBodyLimit`
 only for trusted deployments that already enforce a request-body cap at an
 external layer such as a reverse proxy.
+
+`JSONEncoder` and `JSONDecoder` let you plug in drop-in JSON libraries such as
+`sonic`, `go-json`, or `jsoniter` without adding a framework dependency. Leave
+them nil for the standard library defaults. `JSONP` still escapes script-breakout
+characters defensively even when a custom encoder does not mirror
+`encoding/json`'s HTML escaping. `JSONStream` exposes `*json.Encoder` directly,
+so it intentionally keeps using `encoding/json`; use `Response.Stream` when you
+need to stream custom-encoded chunks.
 
 ### TrustProxy and client IPs
 

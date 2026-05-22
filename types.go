@@ -1,7 +1,6 @@
 package gogo
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -520,7 +519,26 @@ type Config struct {
 	// any client can spoof their apparent protocol / origin by sending
 	// X-Forwarded-* headers. Default false.
 	TrustProxy bool
+
+	// JSONEncoder is used by Response.JSON and Response.JSONP. Nil uses
+	// encoding/json.Marshal. Override it with a faster compatible encoder
+	// such as sonic.Marshal, go-json.Marshal, or jsoniter.Marshal when JSON
+	// reflection cost dominates your handlers.
+	JSONEncoder JSONEncoder
+
+	// JSONDecoder is used by Request.BodyParser for application/json and
+	// text/json request bodies. Nil uses encoding/json.Unmarshal.
+	JSONDecoder JSONDecoder
 }
+
+// JSONEncoder is the marshaling function used by App-scoped JSON helpers.
+// Its shape matches encoding/json.Marshal and common third-party drop-ins.
+type JSONEncoder func(v any) ([]byte, error)
+
+// JSONDecoder is the unmarshaling function used by App-scoped JSON body
+// parsing helpers. Its shape matches encoding/json.Unmarshal and common
+// third-party drop-ins.
+type JSONDecoder func(data []byte, v any) error
 
 // App is a uWebSockets HTTP application.
 type App struct {
@@ -600,6 +618,12 @@ func defaultConfig(c Config) Config {
 	}
 	if c.BodyReadTimeout == 0 {
 		c.BodyReadTimeout = defaultBodyReadTimeout
+	}
+	if c.JSONEncoder == nil {
+		c.JSONEncoder = json.Marshal
+	}
+	if c.JSONDecoder == nil {
+		c.JSONDecoder = json.Unmarshal
 	}
 	return c
 }
@@ -2633,17 +2657,25 @@ func (r *Response) sendSplitSync(status, contentType, prefix, body string) {
 // marshalling fails the response is replaced with a generic 500 and the
 // underlying marshal error is reported through the panic handler so the
 // programmer sees it server-side without leaking type / package names to
-// the network. json.Marshal only fails for unsupported value shapes
-// (channels, functions, cyclic structures), so failures here always
-// indicate a bug in caller code.
+// the network. With the default encoder, marshal failures happen for
+// unsupported value shapes (channels, functions, cyclic structures), so
+// failures here usually indicate a bug in caller code.
 func (r *Response) JSON(code int, v any) {
-	data, err := json.Marshal(v)
+	data, err := r.jsonEncoder()(v)
 	if err != nil {
-		reportPanic(fmt.Errorf("gogo: JSON marshal: %w", err))
+		reportPanic(fmt.Errorf("gogo: Response.JSON Config.JSONEncoder: %w", err))
 		r.Send(500, "text/plain; charset=utf-8", "Internal Server Error\n")
 		return
 	}
-	r.Send(code, "application/json", string(data))
+	r.Send(code, "application/json", bytesAsString(data))
+	runtime.KeepAlive(data)
+}
+
+func (r *Response) jsonEncoder() JSONEncoder {
+	if r != nil && r.app != nil && r.app.cfg.JSONEncoder != nil {
+		return r.app.cfg.JSONEncoder
+	}
+	return json.Marshal
 }
 
 // JSONBytes writes a pre-marshaled JSON body. Skips json.Marshal so
@@ -2656,6 +2688,7 @@ func (r *Response) JSON(code int, v any) {
 // application/json automatically.
 func (r *Response) JSONBytes(code int, b []byte) {
 	r.Send(code, "application/json", bytesAsString(b))
+	runtime.KeepAlive(b)
 }
 
 // JSONStream emits a JSON body through a streaming encoder, avoiding
@@ -2669,6 +2702,11 @@ func (r *Response) JSONBytes(code int, b []byte) {
 // newline (json.Encoder's default). For a single top-level array
 // the caller is responsible for writing the framing characters
 // themselves; for newline-delimited feeds Encode is enough.
+// JSONStream intentionally uses encoding/json's streaming encoder
+// rather than Config.JSONEncoder, whose contract is whole-value
+// marshal. For custom codec output, marshal each value yourself and
+// write through Response.Stream or send pre-marshaled bytes with
+// Response.JSONBytes.
 //
 // Async only — call from GetAsync/PostAsync or wrap a sync handler
 // in Response.Async. The underlying Response.Stream applies the
@@ -2959,22 +2997,16 @@ func (r *Response) JSONP(callback string, v any) {
 		r.Send(400, "text/plain; charset=utf-8", "invalid jsonp callback\n")
 		return
 	}
-	data, err := json.Marshal(v)
+	data, err := r.jsonEncoder()(v)
 	if err != nil {
-		reportPanic(fmt.Errorf("gogo: JSONP marshal: %w", err))
+		reportPanic(fmt.Errorf("gogo: Response.JSONP Config.JSONEncoder: %w", err))
 		r.Send(500, "text/plain; charset=utf-8", "Internal Server Error\n")
 		return
 	}
-	// Escape U+2028 / U+2029 so the JSON-as-JS payload parses across
-	// every browser. json.Marshal emits them as raw UTF-8 bytes; the
-	// JavaScript spec only forbade them as literal line terminators
-	// pre-ES2019 but enough deployed parsers still choke that the
-	// JSONP convention is to escape them defensively.
-	body := bytes.ReplaceAll(data, []byte{0xE2, 0x80, 0xA8}, []byte("\\u2028"))
-	body = bytes.ReplaceAll(body, []byte{0xE2, 0x80, 0xA9}, []byte("\\u2029"))
+	body := escapeJSONP(data)
 
 	var b strings.Builder
-	b.Grow(len(callback) + len(body) + 4)
+	b.Grow(len(callback) + len(body) + len("/**/") + len("(") + len(");"))
 	// Leading "/**/" defuses content-sniffing attacks where a browser
 	// would interpret a buffered JSONP response as something other
 	// than JS. The comment is harmless to actual JS parsers.
@@ -2984,6 +3016,88 @@ func (r *Response) JSONP(callback string, v any) {
 	b.Write(body)
 	b.WriteString(");")
 	r.Send(200, "application/javascript; charset=utf-8", b.String())
+}
+
+// escapeJSONP keeps JSONP safe even when Config.JSONEncoder does not mirror
+// encoding/json's HTMLEscape behavior. It prevents `</script>` breakouts and
+// legacy line-separator parser hazards when JSONP is consumed via a script tag.
+func escapeJSONP(data []byte) []byte {
+	var out []byte
+	for i := 0; i < len(data); i++ {
+		repl := ""
+		switch data[i] {
+		case '<':
+			repl = "\\u003c"
+		case '>':
+			repl = "\\u003e"
+		case '&':
+			repl = "\\u0026"
+		case 0xC2:
+			if i+1 < len(data) && data[i+1] == 0x85 {
+				if out == nil {
+					out = make([]byte, 0, len(data)+jsonpEscapeExtra(data, i))
+					out = append(out, data[:i]...)
+				}
+				out = append(out, "\\u0085"...)
+				i++
+				continue
+			}
+		case 0xE2:
+			if i+2 < len(data) && data[i+1] == 0x80 {
+				switch data[i+2] {
+				case 0xA8:
+					repl = "\\u2028"
+				case 0xA9:
+					repl = "\\u2029"
+				}
+				if repl != "" {
+					if out == nil {
+						out = make([]byte, 0, len(data)+jsonpEscapeExtra(data, i))
+						out = append(out, data[:i]...)
+					}
+					out = append(out, repl...)
+					i += 2
+					continue
+				}
+			}
+		}
+		if repl == "" {
+			if out != nil {
+				out = append(out, data[i])
+			}
+			continue
+		}
+		if out == nil {
+			out = make([]byte, 0, len(data)+jsonpEscapeExtra(data, i))
+			out = append(out, data[:i]...)
+		}
+		out = append(out, repl...)
+	}
+	if out == nil {
+		return data
+	}
+	return out
+}
+
+func jsonpEscapeExtra(data []byte, start int) int {
+	extra := 0
+	for i := start; i < len(data); i++ {
+		switch data[i] {
+		case '<', '>', '&':
+			extra += len("\\u003c") - 1
+		case 0xC2:
+			if i+1 < len(data) && data[i+1] == 0x85 {
+				extra += len("\\u0085") - 2
+				i++
+			}
+		case 0xE2:
+			if i+2 < len(data) && data[i+1] == 0x80 && (data[i+2] == 0xA8 || data[i+2] == 0xA9) {
+				extra += len("\\u2028") - 3
+				i += 2
+			}
+		}
+	}
+	return extra
 }
 
 // validJSONPCallback accepts only characters that can legally appear

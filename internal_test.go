@@ -1,6 +1,7 @@
 package gogo
 
 import (
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -80,6 +81,43 @@ func TestDefaultConfigKeepsExplicitBodyReadTimeout(t *testing.T) {
 	cfg = defaultConfig(Config{BodyReadTimeout: NoBodyReadTimeout})
 	if cfg.BodyReadTimeout != NoBodyReadTimeout {
 		t.Fatalf("disabled BodyReadTimeout = %s, want %s", cfg.BodyReadTimeout, NoBodyReadTimeout)
+	}
+}
+
+func TestDefaultConfigJSONCodecs(t *testing.T) {
+	cfg := defaultConfig(Config{})
+	if cfg.JSONEncoder == nil {
+		t.Fatal("JSONEncoder default is nil")
+	}
+	if cfg.JSONDecoder == nil {
+		t.Fatal("JSONDecoder default is nil")
+	}
+
+	customEncoder := func(v any) ([]byte, error) { return []byte("{}"), nil }
+	customDecoder := func(data []byte, v any) error { return nil }
+	cfg = defaultConfig(Config{JSONEncoder: customEncoder, JSONDecoder: customDecoder})
+	if reflect.ValueOf(cfg.JSONEncoder).Pointer() != reflect.ValueOf(customEncoder).Pointer() {
+		t.Fatal("JSONEncoder did not preserve custom function")
+	}
+	if reflect.ValueOf(cfg.JSONDecoder).Pointer() != reflect.ValueOf(customDecoder).Pointer() {
+		t.Fatal("JSONDecoder did not preserve custom function")
+	}
+}
+
+func TestEscapeJSONPDefusesScriptAndLineSeparators(t *testing.T) {
+	in := []byte("{\"x\":\"</script>&\u0085\u2028\u2029\"}")
+	got := string(escapeJSONP(in))
+	want := "{\"x\":\"\\u003c/script\\u003e\\u0026\\u0085\\u2028\\u2029\"}"
+	if got != want {
+		t.Fatalf("escapeJSONP = %q, want %q", got, want)
+	}
+}
+
+func TestEscapeJSONPNoopReturnsOriginalSlice(t *testing.T) {
+	in := []byte(`{"x":"safe"}`)
+	out := escapeJSONP(in)
+	if len(out) == 0 || &out[0] != &in[0] {
+		t.Fatal("escapeJSONP allocated for safe input")
 	}
 }
 

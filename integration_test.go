@@ -1952,6 +1952,86 @@ func TestResponseJSON(t *testing.T) {
 	}
 }
 
+func TestResponseJSONUsesConfiguredEncoder(t *testing.T) {
+	var calls atomic.Int32
+	cfg := gogo.Config{
+		JSONEncoder: func(v any) ([]byte, error) {
+			calls.Add(1)
+			return []byte(`{"custom":true}`), nil
+		},
+	}
+	port, teardown := startAppCfg(t, cfg, func(app *gogo.App) {
+		app.Get("/json", func(res *gogo.Response, req *gogo.Request) {
+			res.JSON(200, map[string]any{"ignored": true})
+		})
+		app.GetAsync("/async-json", func(res *gogo.Response, req *gogo.Request) {
+			res.JSON(201, map[string]any{"ignored": true})
+		})
+		app.Get("/jsonp", func(res *gogo.Response, req *gogo.Request) {
+			res.JSONP("cb", map[string]any{"ignored": true})
+		})
+	})
+	defer teardown()
+
+	resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/json", port))
+	if err != nil {
+		t.Fatalf("GET /json: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != `{"custom":true}` {
+		t.Fatalf("sync JSON body=%q", body)
+	}
+
+	resp, err = noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/async-json", port))
+	if err != nil {
+		t.Fatalf("GET /async-json: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 201 || string(body) != `{"custom":true}` {
+		t.Fatalf("async JSON got status=%d body=%q", resp.StatusCode, body)
+	}
+
+	resp, err = noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/jsonp", port))
+	if err != nil {
+		t.Fatalf("GET /jsonp: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != `/**/cb({"custom":true});` {
+		t.Fatalf("JSONP body=%q", body)
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("encoder calls=%d, want 3", calls.Load())
+	}
+}
+
+func TestResponseJSONPWithCustomEncoderEscapesScriptBreakout(t *testing.T) {
+	cfg := gogo.Config{
+		JSONEncoder: func(v any) ([]byte, error) {
+			return []byte("{\"x\":\"</script>&\xc2\x85\xe2\x80\xa8\xe2\x80\xa9\"}"), nil
+		},
+	}
+	port, teardown := startAppCfg(t, cfg, func(app *gogo.App) {
+		app.Get("/jsonp", func(res *gogo.Response, req *gogo.Request) {
+			res.JSONP("cb", map[string]any{"ignored": true})
+		})
+	})
+	defer teardown()
+
+	resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/jsonp", port))
+	if err != nil {
+		t.Fatalf("GET /jsonp: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	want := `/**/cb({"x":"\u003c/script\u003e\u0026\u0085\u2028\u2029"});`
+	if string(body) != want {
+		t.Fatalf("JSONP body=%q, want %q", body, want)
+	}
+}
+
 // TestResponseJSONBytes confirms the pre-marshaled JSON shortcut emits
 // the exact bytes with Content-Type: application/json. Useful for
 // cached responses and faster encoders.
@@ -3241,7 +3321,7 @@ func TestJSONMarshalErrorDoesNotLeak(t *testing.T) {
 	if got == nil {
 		t.Fatal("panic handler did not see the marshal error")
 	}
-	if !strings.Contains(*got, "JSON marshal") && !strings.Contains(*got, "unsupported") {
+	if !strings.Contains(*got, "Response.JSON Config.JSONEncoder") && !strings.Contains(*got, "unsupported") {
 		t.Fatalf("panic handler payload: %q", *got)
 	}
 }
@@ -5488,6 +5568,88 @@ func TestBodyParserJSON(t *testing.T) {
 	status, _ = httpPost(t, port, "/u", "application/json", []byte(`{not json}`))
 	if status != 400 {
 		t.Errorf("bad JSON: status %d, want 400", status)
+	}
+}
+
+func TestBodyParserJSONUsesConfiguredDecoder(t *testing.T) {
+	type user struct {
+		Name string `json:"name"`
+	}
+	var calls atomic.Int32
+	cfg := gogo.Config{
+		JSONDecoder: func(data []byte, v any) error {
+			calls.Add(1)
+			u := v.(*user)
+			u.Name = "custom"
+			return nil
+		},
+	}
+	port, teardown := startAppCfg(t, cfg, func(app *gogo.App) {
+		app.PostAsync("/u", 1024, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			var u user
+			if err := req.BodyParser(&u); err != nil {
+				res.Send(400, "text/plain", err.Error())
+				return
+			}
+			res.Send(200, "text/plain", u.Name)
+		})
+	})
+	defer teardown()
+
+	status, body := httpPost(t, port, "/u", "application/json", []byte(`{"name":"ignored"}`))
+	if status != 200 || body != "custom" {
+		t.Fatalf("custom decoder: got %d %q, want 200 custom", status, body)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("decoder calls=%d, want 1", calls.Load())
+	}
+}
+
+func TestBodyParserJSONUsesConfiguredDecoderOnSlowAndRouterPaths(t *testing.T) {
+	type user struct {
+		Name string `json:"name"`
+	}
+	var calls atomic.Int32
+	cfg := gogo.Config{
+		JSONDecoder: func(data []byte, v any) error {
+			calls.Add(1)
+			u := v.(*user)
+			u.Name = "custom"
+			return nil
+		},
+	}
+	port, teardown := startAppCfg(t, cfg, func(app *gogo.App) {
+		app.PostAsync("/slow", 16*1024, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			var u user
+			if err := req.BodyParser(&u); err != nil {
+				res.Send(400, "text/plain", err.Error())
+				return
+			}
+			res.Send(200, "text/plain", u.Name)
+		})
+
+		api := app.Group("/api")
+		api.PostAsync("/u", 1024, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			var u user
+			if err := req.BodyParser(&u); err != nil {
+				res.Send(400, "text/plain", err.Error())
+				return
+			}
+			res.Send(200, "text/plain", u.Name)
+		})
+	})
+	defer teardown()
+
+	status, body := httpPost(t, port, "/slow", "application/json", []byte(`{"name":"ignored"}`))
+	if status != 200 || body != "custom" {
+		t.Fatalf("slow custom decoder: got %d %q, want 200 custom", status, body)
+	}
+	status, body = httpPost(t, port, "/api/u", "application/json", []byte(`{"name":"ignored"}`))
+	if status != 200 || body != "custom" {
+		t.Fatalf("router custom decoder: got %d %q, want 200 custom", status, body)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("decoder calls=%d, want 2", calls.Load())
 	}
 }
 
