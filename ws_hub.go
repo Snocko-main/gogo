@@ -27,6 +27,10 @@ var (
 	// ErrWSHubUntrackedSocket is returned when PublishFrom cannot identify the
 	// sender. Register routes with WSHub.WebSocket or WSHub.Wrap.
 	ErrWSHubUntrackedSocket = errors.New("gogo: websocket hub socket is not tracked; register route with hub.WebSocket or hub.Wrap")
+
+	// ErrWSHubInvalidOpCode is returned when a hub publish is called with an
+	// opcode other than Text or Binary.
+	ErrWSHubInvalidOpCode = errors.New("gogo: websocket hub opcode must be Text or Binary")
 )
 
 const (
@@ -271,6 +275,9 @@ func (h *WSHub) Publish(topic string, message []byte, opcode OpCode) error {
 	if h.closed.Load() {
 		return ErrWSHubClosed
 	}
+	if !validWSHubOpCode(opcode) {
+		return ErrWSHubInvalidOpCode
+	}
 	msg := WSHubMessage{
 		NodeID:  h.nodeID,
 		Topic:   topic,
@@ -295,6 +302,9 @@ func (h *WSHub) PublishBatch(msgs []PublishMessage) error {
 	local := make([]PublishMessage, len(msgs))
 	var firstErr error
 	for i, msg := range msgs {
+		if !validWSHubOpCode(msg.OpCode) {
+			return ErrWSHubInvalidOpCode
+		}
 		local[i] = PublishMessage{
 			Topic:   msg.Topic,
 			Message: cloneBytes(msg.Message),
@@ -338,6 +348,9 @@ func (h *WSHub) PublishFrom(ws *WebSocket, topic string, message []byte, opcode 
 	key := wsNativeKey(ws)
 	if key == 0 {
 		return ErrWSHubUntrackedSocket
+	}
+	if !validWSHubOpCode(opcode) {
+		return ErrWSHubInvalidOpCode
 	}
 	msg := WSHubMessage{
 		NodeID:  h.nodeID,
@@ -748,6 +761,10 @@ func (h *WSHub) reportAdapterError(err error) {
 
 func defaultWSHubAdapterErrorHandler(err error) {
 	reportPanic(fmt.Errorf("gogo: websocket hub adapter: %w", err))
+}
+
+func validWSHubOpCode(opcode OpCode) bool {
+	return opcode == Text || opcode == Binary
 }
 
 func randomDirectTopic(nodeID string) string {

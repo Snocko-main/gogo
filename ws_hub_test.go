@@ -197,3 +197,17 @@ func TestWSHubReportsAsyncAdapterError(t *testing.T) {
 		t.Fatal("async adapter error was not reported")
 	}
 }
+
+func TestWSHubRejectsInvalidOpCode(t *testing.T) {
+	hub := NewWSHub()
+	if err := hub.Publish("room", []byte("hello"), OpCode(99)); !errors.Is(err, ErrWSHubInvalidOpCode) {
+		t.Fatalf("Publish error = %v, want ErrWSHubInvalidOpCode", err)
+	}
+	if err := hub.PublishBatch([]PublishMessage{{
+		Topic:   "room",
+		Message: []byte("hello"),
+		OpCode:  OpCode(99),
+	}}); !errors.Is(err, ErrWSHubInvalidOpCode) {
+		t.Fatalf("PublishBatch error = %v, want ErrWSHubInvalidOpCode", err)
+	}
+}
