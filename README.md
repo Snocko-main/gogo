@@ -1160,6 +1160,15 @@ For browser clients, add an `Upgrade` callback and explicitly accept or
 reject the handshake. This is where origin checks, token checks,
 subprotocol negotiation, and per-connection user data belong.
 
+The order is:
+
+1. Client sends an HTTP `GET` request with `Upgrade: websocket`.
+2. gogo calls `Upgrade` while the request is still an HTTP handshake.
+3. `ctx.Reject(...)` returns an HTTP error response and no socket opens.
+4. `ctx.Accept(...)` completes the `101 Switching Protocols` handshake.
+5. `Open` runs after the connection is established, then `Message` runs for
+   frames from that client.
+
 ```go
 app.WebSocket("/ws", gogo.WebSocketBehavior{
     Upgrade: func(ctx *gogo.UpgradeContext) {
@@ -1200,13 +1209,20 @@ const ws = new WebSocket(`wss://api.example.com/ws?token=${token}`);
 
 uWebSockets has built-in pub/sub. Subscribe inside `Open`, publish anywhere
 on the loop with `ws.Publish` or anywhere off the loop with `app.Publish`.
+`ws.Publish` delivers to the other subscribers of the topic; send a local
+ack first if the publishing client should also see its own message.
 
 ```go
 app.WebSocket("/chat", gogo.WebSocketBehavior{
+    Upgrade: func(ctx *gogo.UpgradeContext) {
+        ctx.Accept("")
+    },
     Open: func(ws *gogo.WebSocket) {
         ws.Subscribe("room.general")
+        ws.SendText("joined room.general\n")
     },
     Message: func(ws *gogo.WebSocket, msg []byte, op gogo.OpCode) {
+        ws.SendText("you: " + string(msg))
         ws.Publish("room.general", msg, op)      // broadcast to subscribers
     },
 })
@@ -1600,6 +1616,7 @@ app.MethodNotAllowed(func(res *gogo.Response, req *gogo.Request) {
 - [`examples/authmw`](examples/authmw) — logger + bearer auth (sync & async middleware)
 - [`examples/upload`](examples/upload) — POST body collection with 413 + streaming OnData
 - [`examples/sse`](examples/sse) — Server-Sent Events with reconnect resume
+- [`examples/websocket`](examples/websocket) — browser WebSocket + upgrade gate + echo
 - [`examples/multicore`](examples/multicore) — `RunMultiCore` + `/metrics` + graceful shutdown
 
 ## Why There Is a C++ Bridge
