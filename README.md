@@ -800,7 +800,9 @@ import (
 app.Use(mw.RequestID(mw.RequestIDOptions{
     Generator: func() string {
         var buf [8]byte
-        rand.Read(buf[:])
+        if _, err := rand.Read(buf[:]); err != nil {
+            panic("request id entropy unavailable: " + err.Error())
+        }
         return hex.EncodeToString(buf[:])   // 16 chars, 64-bit entropy
     },
 }))
