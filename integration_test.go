@@ -2010,7 +2010,7 @@ func TestResponseJSONUsesConfiguredEncoder(t *testing.T) {
 func TestResponseJSONPWithCustomEncoderEscapesScriptBreakout(t *testing.T) {
 	cfg := gogo.Config{
 		JSONEncoder: func(v any) ([]byte, error) {
-			return []byte("{\"x\":\"</script>&\xe2\x80\xa8\xe2\x80\xa9\"}"), nil
+			return []byte("{\"x\":\"</script>&\xc2\x85\xe2\x80\xa8\xe2\x80\xa9\"}"), nil
 		},
 	}
 	port, teardown := startAppCfg(t, cfg, func(app *gogo.App) {
@@ -2026,7 +2026,7 @@ func TestResponseJSONPWithCustomEncoderEscapesScriptBreakout(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
-	want := `/**/cb({"x":"\u003c/script\u003e\u0026\u2028\u2029"});`
+	want := `/**/cb({"x":"\u003c/script\u003e\u0026\u0085\u2028\u2029"});`
 	if string(body) != want {
 		t.Fatalf("JSONP body=%q, want %q", body, want)
 	}
@@ -3321,7 +3321,7 @@ func TestJSONMarshalErrorDoesNotLeak(t *testing.T) {
 	if got == nil {
 		t.Fatal("panic handler did not see the marshal error")
 	}
-	if !strings.Contains(*got, "JSON marshal") && !strings.Contains(*got, "unsupported") {
+	if !strings.Contains(*got, "Response.JSON Config.JSONEncoder") && !strings.Contains(*got, "unsupported") {
 		t.Fatalf("panic handler payload: %q", *got)
 	}
 }

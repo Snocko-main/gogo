@@ -56,6 +56,8 @@ func (r *Request) BodyParser(out any) error {
 // contentType may include parameters (`application/json; charset=utf-8`)
 // — they are stripped before matching. An empty Content-Type is treated
 // as application/octet-stream and returns ErrUnsupportedMediaType.
+// ParseBody has no App context, so JSON uses encoding/json.Unmarshal;
+// use Request.BodyParser when you want Config.JSONDecoder.
 func ParseBody(contentType string, body []byte, out any) error {
 	return parseBody(contentType, body, out, json.Unmarshal)
 }

@@ -1585,7 +1585,9 @@ external layer such as a reverse proxy.
 `sonic`, `go-json`, or `jsoniter` without adding a framework dependency. Leave
 them nil for the standard library defaults. `JSONP` still escapes script-breakout
 characters defensively even when a custom encoder does not mirror
-`encoding/json`'s HTML escaping.
+`encoding/json`'s HTML escaping. `JSONStream` exposes `*json.Encoder` directly,
+so it intentionally keeps using `encoding/json`; use `Response.Stream` when you
+need to stream custom-encoded chunks.
 
 ### TrustProxy and client IPs
 

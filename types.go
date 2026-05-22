@@ -2663,7 +2663,7 @@ func (r *Response) sendSplitSync(status, contentType, prefix, body string) {
 func (r *Response) JSON(code int, v any) {
 	data, err := r.jsonEncoder()(v)
 	if err != nil {
-		reportPanic(fmt.Errorf("gogo: JSON marshal: %w", err))
+		reportPanic(fmt.Errorf("gogo: Response.JSON Config.JSONEncoder: %w", err))
 		r.Send(500, "text/plain; charset=utf-8", "Internal Server Error\n")
 		return
 	}
@@ -2702,6 +2702,11 @@ func (r *Response) JSONBytes(code int, b []byte) {
 // newline (json.Encoder's default). For a single top-level array
 // the caller is responsible for writing the framing characters
 // themselves; for newline-delimited feeds Encode is enough.
+// JSONStream intentionally uses encoding/json's streaming encoder
+// rather than Config.JSONEncoder, whose contract is whole-value
+// marshal. For custom codec output, marshal each value yourself and
+// write through Response.Stream or send pre-marshaled bytes with
+// Response.JSONBytes.
 //
 // Async only — call from GetAsync/PostAsync or wrap a sync handler
 // in Response.Async. The underlying Response.Stream applies the
@@ -2994,7 +2999,7 @@ func (r *Response) JSONP(callback string, v any) {
 	}
 	data, err := r.jsonEncoder()(v)
 	if err != nil {
-		reportPanic(fmt.Errorf("gogo: JSONP marshal: %w", err))
+		reportPanic(fmt.Errorf("gogo: Response.JSONP Config.JSONEncoder: %w", err))
 		r.Send(500, "text/plain; charset=utf-8", "Internal Server Error\n")
 		return
 	}
@@ -3015,7 +3020,7 @@ func (r *Response) JSONP(callback string, v any) {
 
 // escapeJSONP keeps JSONP safe even when Config.JSONEncoder does not mirror
 // encoding/json's HTMLEscape behavior. It prevents `</script>` breakouts and
-// line-separator parser hazards when JSONP is consumed via a script tag.
+// legacy line-separator parser hazards when JSONP is consumed via a script tag.
 func escapeJSONP(data []byte) []byte {
 	var out []byte
 	for i := 0; i < len(data); i++ {
@@ -3027,6 +3032,16 @@ func escapeJSONP(data []byte) []byte {
 			repl = "\\u003e"
 		case '&':
 			repl = "\\u0026"
+		case 0xC2:
+			if i+1 < len(data) && data[i+1] == 0x85 {
+				if out == nil {
+					out = make([]byte, 0, len(data)+jsonpEscapeExtra(data, i))
+					out = append(out, data[:i]...)
+				}
+				out = append(out, "\\u0085"...)
+				i++
+				continue
+			}
 		case 0xE2:
 			if i+2 < len(data) && data[i+1] == 0x80 {
 				switch data[i+2] {
@@ -3037,7 +3052,7 @@ func escapeJSONP(data []byte) []byte {
 				}
 				if repl != "" {
 					if out == nil {
-						out = make([]byte, 0, len(data)+8)
+						out = make([]byte, 0, len(data)+jsonpEscapeExtra(data, i))
 						out = append(out, data[:i]...)
 					}
 					out = append(out, repl...)
@@ -3053,7 +3068,7 @@ func escapeJSONP(data []byte) []byte {
 			continue
 		}
 		if out == nil {
-			out = make([]byte, 0, len(data)+8)
+			out = make([]byte, 0, len(data)+jsonpEscapeExtra(data, i))
 			out = append(out, data[:i]...)
 		}
 		out = append(out, repl...)
@@ -3062,6 +3077,27 @@ func escapeJSONP(data []byte) []byte {
 		return data
 	}
 	return out
+}
+
+func jsonpEscapeExtra(data []byte, start int) int {
+	extra := 0
+	for i := start; i < len(data); i++ {
+		switch data[i] {
+		case '<', '>', '&':
+			extra += len("\\u003c") - 1
+		case 0xC2:
+			if i+1 < len(data) && data[i+1] == 0x85 {
+				extra += len("\\u0085") - 2
+				i++
+			}
+		case 0xE2:
+			if i+2 < len(data) && data[i+1] == 0x80 && (data[i+2] == 0xA8 || data[i+2] == 0xA9) {
+				extra += len("\\u2028") - 3
+				i += 2
+			}
+		}
+	}
+	return extra
 }
 
 // validJSONPCallback accepts only characters that can legally appear
