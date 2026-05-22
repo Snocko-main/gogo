@@ -3,7 +3,8 @@
 //   - GET / serves a tiny HTML client.
 //   - WebSocket /ws upgrades only allowed origins.
 //   - Upgrade stashes per-connection state with SetUserData.
-//   - Message echoes text frames back to the client.
+//   - Open subscribes each connection to a room.
+//   - Message publishes text frames to the other subscribers.
 //
 // Run:
 //
@@ -13,7 +14,7 @@
 //
 // Or connect from the CLI:
 //
-//	websocat 'ws://localhost:3004/ws?name=cli'
+//	websocat 'ws://localhost:3004/ws?name=cli&room=general'
 package main
 
 import (
@@ -28,6 +29,7 @@ const indexHTML = `<!doctype html>
 <html>
 <body>
 <h1>gogo~ WebSocket demo</h1>
+<p>Open this page in two tabs. Messages publish to every other client in the room.</p>
 <form id="form">
   <input id="msg" autocomplete="off" value="hello from the browser">
   <button>Send</button>
@@ -38,7 +40,8 @@ const log = document.getElementById('log');
 const msg = document.getElementById('msg');
 const form = document.getElementById('form');
 const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
-const ws = new WebSocket(scheme + '://' + location.host + '/ws?name=browser');
+const name = 'browser-' + Math.random().toString(16).slice(2, 6);
+const ws = new WebSocket(scheme + '://' + location.host + '/ws?name=' + name + '&room=general');
 
 function line(text) {
     const li = document.createElement('li');
@@ -61,6 +64,7 @@ form.addEventListener('submit', e => {
 
 type clientInfo struct {
 	Name string
+	Room string
 }
 
 func main() {
@@ -87,13 +91,19 @@ func main() {
 			if name == "" {
 				name = "guest"
 			}
-			ctx.SetUserData(&clientInfo{Name: name})
+			room := strings.TrimSpace(ctx.QueryParam("room"))
+			if room == "" {
+				room = "general"
+			}
+			ctx.SetUserData(&clientInfo{Name: name, Room: room})
 			ctx.Accept("")
 		},
 		Open: func(ws *gogo.WebSocket) {
 			info := ws.UserData().(*clientInfo)
-			log.Printf("%s connected", info.Name)
-			ws.SendText("welcome, " + info.Name + "\n")
+			topic := "room." + info.Room
+			ws.Subscribe(topic)
+			log.Printf("%s connected to %s", info.Name, topic)
+			ws.SendText("welcome, " + info.Name + " (" + topic + ")\n")
 		},
 		Message: func(ws *gogo.WebSocket, msg []byte, op gogo.OpCode) {
 			info := ws.UserData().(*clientInfo)
@@ -101,7 +111,13 @@ func main() {
 				ws.SendText("binary frames are not handled by this demo\n")
 				return
 			}
-			ws.SendText(info.Name + " said: " + string(msg) + "\n")
+			text := strings.TrimSpace(string(msg))
+			if text == "" {
+				return
+			}
+			topic := "room." + info.Room
+			ws.SendText("you: " + text + "\n")
+			ws.Publish(topic, []byte(info.Name+": "+text+"\n"), gogo.Text)
 		},
 		Close: func(ws *gogo.WebSocket, code int, msg []byte) {
 			if info, ok := ws.UserData().(*clientInfo); ok {
