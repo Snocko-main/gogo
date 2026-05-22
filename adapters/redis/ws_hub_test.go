@@ -71,3 +71,20 @@ func TestDecodeRejectsOversizedMessage(t *testing.T) {
 		t.Fatal("decode succeeded for oversized message")
 	}
 }
+
+func TestDecodeRejectsInvalidOpcode(t *testing.T) {
+	in := gogo.WSHubMessage{
+		NodeID:  "node-a",
+		Topic:   "room.general",
+		Message: []byte("hello"),
+		OpCode:  gogo.Text,
+	}
+	payload, err := encodeMessage(in)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	payload[1] = 99
+	if _, err := decodeMessage(in.Topic, payload, defaultMaxMessage); err == nil {
+		t.Fatal("decode succeeded for invalid opcode")
+	}
+}

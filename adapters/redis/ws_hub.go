@@ -286,11 +286,15 @@ func decodeMessage(topic string, payload []byte, maxMessageSize int) (gogo.WSHub
 	if maxMessageSize > 0 && msgLen > maxMessageSize {
 		return gogo.WSHubMessage{}, fmt.Errorf("gogo/adapters/redis: message too large: %d > %d", msgLen, maxMessageSize)
 	}
+	opcode := gogo.OpCode(payload[1])
+	if opcode != gogo.Text && opcode != gogo.Binary {
+		return gogo.WSHubMessage{}, fmt.Errorf("gogo/adapters/redis: unsupported opcode %d", payload[1])
+	}
 	msg := gogo.WSHubMessage{
 		NodeID:  string(payload[4 : 4+nodeLen]),
 		Topic:   topic,
 		Message: cloneBytes(payload[4+nodeLen:]),
-		OpCode:  gogo.OpCode(payload[1]),
+		OpCode:  opcode,
 	}
 	return msg, nil
 }
