@@ -17,6 +17,8 @@ const (
 	wireVersion          = 1
 )
 
+var errAdapterClosed = errors.New("gogo/adapters/redis: adapter closed")
+
 // Options configures a Redis-backed gogo.WSHub adapter.
 type Options struct {
 	// URL is parsed with redis.ParseURL. Example:
@@ -50,6 +52,8 @@ type Adapter struct {
 	mu     sync.Mutex
 	pubsub *goredis.PubSub
 	cancel context.CancelFunc
+	closed bool
+	wg     sync.WaitGroup
 }
 
 // New creates a Redis-backed WSHub adapter.
@@ -110,22 +114,29 @@ func (a *Adapter) Start(ctx context.Context, deliver func(gogo.WSHubMessage)) er
 	}
 
 	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+		return errAdapterClosed
+	}
 	if a.pubsub != nil {
 		a.mu.Unlock()
 		return nil
 	}
 	subCtx, cancel := context.WithCancel(ctx)
-	pubsub := a.client.PSubscribe(subCtx, a.prefix+"*")
+	pubsub := a.client.PSubscribe(subCtx, redisGlobEscape(a.prefix)+"*")
 	if _, err := pubsub.Receive(subCtx); err != nil {
 		cancel()
+		_ = pubsub.Close()
 		a.mu.Unlock()
 		return err
 	}
 	a.pubsub = pubsub
 	a.cancel = cancel
+	a.wg.Add(1)
 	a.mu.Unlock()
 
 	go func() {
+		defer a.wg.Done()
 		ch := pubsub.Channel()
 		for {
 			select {
@@ -159,6 +170,11 @@ func (a *Adapter) Publish(ctx context.Context, msg gogo.WSHubMessage) error {
 	if err != nil {
 		return err
 	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed {
+		return errAdapterClosed
+	}
 	return a.client.Publish(ctx, a.prefix+msg.Topic, payload).Err()
 }
 
@@ -168,8 +184,14 @@ func (a *Adapter) Close() error {
 		return nil
 	}
 	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+		return nil
+	}
+	a.closed = true
 	cancel := a.cancel
 	pubsub := a.pubsub
+	client := a.client
 	a.cancel = nil
 	a.pubsub = nil
 	a.mu.Unlock()
@@ -181,12 +203,25 @@ func (a *Adapter) Close() error {
 	if pubsub != nil {
 		err = pubsub.Close()
 	}
-	if a.own && a.client != nil {
-		if closeErr := a.client.Close(); err == nil {
+	a.wg.Wait()
+	if a.own && client != nil {
+		if closeErr := client.Close(); err == nil {
 			err = closeErr
 		}
 	}
 	return err
+}
+
+func redisGlobEscape(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case '\\', '*', '?', '[', ']':
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 func encodeMessage(msg gogo.WSHubMessage) ([]byte, error) {

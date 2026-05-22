@@ -5781,6 +5781,54 @@ func TestWSHubPublishFrom(t *testing.T) {
 	}
 }
 
+func TestWSHubPublishFromRequiresTrackedSocket(t *testing.T) {
+	hub := gogo.NewWSHub(gogo.WithWSHubNodeID("test-node"))
+	defer hub.Close()
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		hub.Attach(app)
+		app.WebSocket("/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				ws.Subscribe("room")
+			},
+			Message: func(ws *gogo.WebSocket, msg []byte, op gogo.OpCode) {
+				err := hub.PublishFrom(ws, "room", msg, op)
+				if !errors.Is(err, gogo.ErrWSHubUntrackedSocket) {
+					t.Errorf("PublishFrom error = %v, want ErrWSHubUntrackedSocket", err)
+				}
+				ws.SendText("untracked")
+			},
+		})
+	})
+	defer teardown()
+
+	a, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial a: %v", err)
+	}
+	defer a.Close()
+	b, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial b: %v", err)
+	}
+	defer b.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	if err := a.SendText("hub hello"); err != nil {
+		t.Fatalf("a.SendText: %v", err)
+	}
+	gotA, err := a.ReadText(2 * time.Second)
+	if err != nil {
+		t.Fatalf("a.ReadText: %v", err)
+	}
+	if gotA != "untracked" {
+		t.Errorf("a received %q, want untracked", gotA)
+	}
+	if err := b.expectNoMessage(300 * time.Millisecond); err != nil {
+		t.Errorf("untracked PublishFrom should not broadcast: %v", err)
+	}
+}
+
 // TestWebSocketAppPublish: App.Publish from a Go worker goroutine
 // reaches every subscriber on the loop without the publisher ever
 // being on the loop thread.

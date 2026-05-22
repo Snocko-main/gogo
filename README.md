@@ -1237,10 +1237,11 @@ hub.WebSocket(app, "/chat", gogo.WebSocketBehavior{
 })
 ```
 
-`PublishFrom` uses `ws.Publish` on the sender's event loop, so the sender
-does not receive its own broadcast. Other `App` instances in the same
-process receive the message through `App.Publish`. From worker goroutines,
-scheduled jobs, or HTTP handlers, use `hub.Publish` or `hub.PublishBatch`.
+`PublishFrom` skips the sender and is safe to call from any goroutine. Register
+the route with `hub.WebSocket` or `hub.Wrap`, and subscribe with
+`hub.Subscribe`, so the hub can track socket membership without touching uWS
+socket state from the wrong loop thread. From worker goroutines, scheduled
+jobs, or HTTP handlers, use `hub.Publish` or `hub.PublishBatch`.
 
 ```go
 go func() {

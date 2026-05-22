@@ -33,3 +33,11 @@ func TestWireRoundTrip(t *testing.T) {
 		t.Fatal("decoded message aliases the wire payload")
 	}
 }
+
+func TestRedisGlobEscape(t *testing.T) {
+	got := redisGlobEscape(`app[prod]:ws:*?\`)
+	want := `app\[prod\]:ws:\*\?\\`
+	if got != want {
+		t.Fatalf("redisGlobEscape = %q, want %q", got, want)
+	}
+}
