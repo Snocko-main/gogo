@@ -260,8 +260,10 @@ func (h *WSHub) Unsubscribe(ws *WebSocket, topic string) bool {
 	return ws.Unsubscribe(topic)
 }
 
-// Publish broadcasts to every local App attached to the hub, then forwards
-// to the adapter if present. It is safe to call from any goroutine.
+// Publish broadcasts to every local App attached to the hub, then queues the
+// message for the adapter if present. It is safe to call from any goroutine.
+// Adapter publish failures are reported asynchronously through
+// WithWSHubAdapterErrorHandler.
 func (h *WSHub) Publish(topic string, message []byte, opcode OpCode) error {
 	if h == nil {
 		return nil
@@ -280,8 +282,9 @@ func (h *WSHub) Publish(topic string, message []byte, opcode OpCode) error {
 }
 
 // PublishBatch broadcasts many messages with one App.PublishBatch call per
-// local App, then forwards each message to the adapter. For local fan-out
-// this keeps the same batching advantage as App.PublishBatch.
+// local App, then queues each message for the adapter. For local fan-out this
+// keeps the same batching advantage as App.PublishBatch. Adapter publish
+// failures are reported asynchronously through WithWSHubAdapterErrorHandler.
 func (h *WSHub) PublishBatch(msgs []PublishMessage) error {
 	if h == nil || len(msgs) == 0 {
 		return nil
@@ -323,7 +326,8 @@ func (h *WSHub) PublishBatch(msgs []PublishMessage) error {
 
 // PublishFrom broadcasts from a WebSocket handler and skips the sender. It is
 // safe to call from any goroutine, but ws must have been registered through
-// WebSocket or Wrap so the hub can identify the sender.
+// WebSocket or Wrap so the hub can identify the sender. Adapter publish
+// failures are reported asynchronously through WithWSHubAdapterErrorHandler.
 func (h *WSHub) PublishFrom(ws *WebSocket, topic string, message []byte, opcode OpCode) error {
 	if h == nil {
 		return nil
