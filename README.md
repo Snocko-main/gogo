@@ -471,10 +471,10 @@ app.Get("/", func(res *gogo.Response, req *gogo.Request) {
 
 Templates are named by their path relative to `Root` with the suffix stripped
 — `views/user/profile.tmpl` is rendered as `user/profile`. Render output is
-capped by `gogo.GetMaxRenderBytes()` (default 8 MiB; set negative via
-`gogo.SetMaxRenderBytes(-1)` to disable) before it is sent, so oversized
-templates fail with a generic 500 instead of staging unbounded memory. Bring
-your own engine by implementing `TemplateEngine`:
+capped by `gogo.GetMaxRenderBytes()` (default 8 MiB; set to
+`gogo.SetMaxRenderBytes(gogo.NoRenderLimit)` to disable) before it is sent, so
+oversized templates fail with a generic 500 instead of staging unbounded memory.
+Bring your own engine by implementing `TemplateEngine`:
 
 ```go
 type TemplateEngine interface {
@@ -1521,8 +1521,8 @@ themselves, accepting that any client can forge the value.
 `gogo.HTTPAdapter(h)` and `gogo.HTTPAdapterWithBody(h, body)` are migration
 helpers for small stdlib handlers. They stage the wrapped handler's response
 before sending it through gogo, so the staged body is capped by
-`gogo.GetMaxHTTPAdapterBodyBytes()` (default 8 MiB; set negative via
-`gogo.SetMaxHTTPAdapterBodyBytes(-1)` to disable).
+`gogo.GetMaxHTTPAdapterBodyBytes()` (default 8 MiB; set to
+`gogo.SetMaxHTTPAdapterBodyBytes(gogo.NoHTTPAdapterBodyLimit)` to disable).
 The adapter accepts `http.Flusher` for compatibility, but `Flush()` only
 commits the staged status code; it does not stream bytes to the client.
 Handlers that stream large downloads should be ported to native gogo streaming

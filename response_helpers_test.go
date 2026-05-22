@@ -228,6 +228,34 @@ func TestRenderRejectsOversizeTemplateOutput(t *testing.T) {
 	}
 }
 
+func TestRenderDisableLimitSentinelAllowsOversizeTemplateOutput(t *testing.T) {
+	old := gogo.GetMaxRenderBytes()
+	gogo.SetMaxRenderBytes(gogo.NoRenderLimit)
+	t.Cleanup(func() { gogo.SetMaxRenderBytes(old) })
+
+	dir := t.TempDir()
+	want := strings.Repeat("x", 32)
+	mustWrite(t, filepath.Join(dir, "big.tmpl"), want)
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.SetTemplateEngine(gogo.NewHTMLTemplateEngine(gogo.HTMLTemplateOptions{Root: dir}))
+		app.Get("/big", func(res *gogo.Response, req *gogo.Request) {
+			res.Render("big", nil)
+		})
+	})
+	defer teardown()
+
+	r, _ := http.Get(fmt.Sprintf("http://127.0.0.1:%d/big", port))
+	body := readAllString(t, r)
+	r.Body.Close()
+	if r.StatusCode != 200 {
+		t.Errorf("status = %d, want 200", r.StatusCode)
+	}
+	if body != want {
+		t.Errorf("body = %q, want %q", body, want)
+	}
+}
+
 func TestSetTemplateEngineCanClearEngine(t *testing.T) {
 	dir := t.TempDir()
 	mustWrite(t, filepath.Join(dir, "x.tmpl"), `ok`)
