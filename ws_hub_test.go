@@ -166,7 +166,7 @@ func TestWSHubQueuesAdapterTopicSubscriptions(t *testing.T) {
 	if token, first := hub.addMembership(1, 1, "room"); token == 0 || !first {
 		t.Fatalf("first membership = token %d first %v, want token and first", token, first)
 	}
-	hub.queueAdapterTopic("room", wsHubAdapterSubscribe)
+	hub.queueAdapterTopic("room")
 	subs, _ := waitForAdapterTopics(t, adapter, 1, 0)
 	if len(subs) != 1 || subs[0] != "room" {
 		t.Fatalf("subs = %#v, want [room]", subs)
@@ -184,6 +184,38 @@ func TestWSHubQueuesAdapterTopicSubscriptions(t *testing.T) {
 	_, unsubs = waitForAdapterTopics(t, adapter, 1, 1)
 	if len(unsubs) != 1 || unsubs[0] != "room" {
 		t.Fatalf("unsubs = %#v, want [room]", unsubs)
+	}
+}
+
+func TestWSHubReconcilesTopicToLatestDesiredState(t *testing.T) {
+	adapter := &fakeWSHubAdapter{}
+	hub := NewWSHub(WithWSHubAdapter(adapter))
+	defer hub.Close()
+
+	hub.mu.Lock()
+	hub.sockets[1] = &hubSocket{token: 1, topics: map[string]struct{}{"room": {}}}
+	hub.members["room"] = map[uintptr]struct{}{1: {}}
+	hub.adapterTopicApplied["room"] = true
+	last := hub.removeMembershipLocked(1, "room")
+	if !last {
+		t.Fatal("removeMembershipLocked should see last local member")
+	}
+	hub.sockets[2] = &hubSocket{token: 2, topics: map[string]struct{}{"room": {}}}
+	hub.members["room"] = map[uintptr]struct{}{2: {}}
+	hub.adapterTopicDirty["room"] = struct{}{}
+	hub.mu.Unlock()
+
+	hub.reconcileAdapterTopic("room")
+	subs, unsubs := adapter.topicSnapshot()
+	if len(subs) != 0 || len(unsubs) != 0 {
+		t.Fatalf("topic ops = subs %#v unsubs %#v, want no-op because desired stayed subscribed", subs, unsubs)
+	}
+}
+
+func TestWSHubAdapterTopicWorkersOption(t *testing.T) {
+	hub := NewWSHub(WithWSHubAdapterTopicWorkers(3))
+	if hub.adapterTopicWorkers != 3 {
+		t.Fatalf("adapterTopicWorkers = %d, want 3", hub.adapterTopicWorkers)
 	}
 }
 
@@ -281,6 +313,23 @@ func (a *panicOnceWSHubAdapter) publishedCount() int {
 	return len(a.published)
 }
 
+type panicOnceTopicWSHubAdapter struct {
+	fakeWSHubAdapter
+	panicMu  sync.Mutex
+	panicked bool
+}
+
+func (a *panicOnceTopicWSHubAdapter) Subscribe(ctx context.Context, topic string) error {
+	a.panicMu.Lock()
+	if !a.panicked {
+		a.panicked = true
+		a.panicMu.Unlock()
+		panic("redis subscribe panic")
+	}
+	a.panicMu.Unlock()
+	return a.fakeWSHubAdapter.Subscribe(ctx, topic)
+}
+
 func TestWSHubCloseBoundsInFlightAdapterPublish(t *testing.T) {
 	adapter := &ctxBlockingWSHubAdapter{entered: make(chan struct{}, 1)}
 	hub := NewWSHub(
@@ -366,7 +415,7 @@ func TestWSHubAdapterErrorRateLimitIsGlobal(t *testing.T) {
 	}
 }
 
-func TestWSHubAdapterPanicBypassesRateLimit(t *testing.T) {
+func TestWSHubAdapterPanicIsRateLimited(t *testing.T) {
 	errs := make(chan error, 2)
 	hub := NewWSHub(WithWSHubAdapterErrorHandler(func(err error) {
 		errs <- err
@@ -374,8 +423,8 @@ func TestWSHubAdapterPanicBypassesRateLimit(t *testing.T) {
 
 	hub.reportAdapterError(wsHubAdapterPanicError{recovered: "boom"})
 	hub.reportAdapterError(wsHubAdapterPanicError{recovered: "boom"})
-	if got := len(errs); got != 2 {
-		t.Fatalf("reported panics = %d, want 2", got)
+	if got := len(errs); got != 1 {
+		t.Fatalf("reported panics = %d, want 1", got)
 	}
 }
 
@@ -413,6 +462,40 @@ func TestWSHubAdapterWorkerRecoversPanic(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("adapter worker did not publish after panic")
+}
+
+func TestWSHubAdapterTopicWorkerRecoversPanic(t *testing.T) {
+	errs := make(chan error, 1)
+	adapter := &panicOnceTopicWSHubAdapter{}
+	hub := NewWSHub(
+		WithWSHubAdapter(adapter),
+		WithWSHubAdapterErrorHandler(func(err error) {
+			errs <- err
+		}),
+	)
+	defer hub.Close()
+
+	hub.mu.Lock()
+	hub.sockets[1] = &hubSocket{token: 1, topics: make(map[string]struct{})}
+	hub.mu.Unlock()
+
+	if token, first := hub.addMembership(1, 1, "room"); token == 0 || !first {
+		t.Fatalf("membership = token %d first %v, want token and first", token, first)
+	}
+	hub.queueAdapterTopic("room")
+	select {
+	case err := <-errs:
+		if !strings.Contains(err.Error(), "adapter panic") {
+			t.Fatalf("async adapter error = %v, want adapter panic", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("adapter topic panic was not reported")
+	}
+
+	subs, _ := waitForAdapterTopics(t, &adapter.fakeWSHubAdapter, 1, 0)
+	if len(subs) != 1 || subs[0] != "room" {
+		t.Fatalf("subs = %#v, want [room]", subs)
+	}
 }
 
 func TestWSHubRegistryRejectsDifferentHubForSocket(t *testing.T) {

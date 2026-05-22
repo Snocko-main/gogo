@@ -75,12 +75,14 @@ type WSHub struct {
 	startNextTry         time.Time
 	startBackoff         time.Duration
 	adapterQueue         chan wsHubAdapterWork
-	adapterTopicQ        chan wsHubAdapterWork
+	adapterTopicQ        chan struct{}
+	adapterTopicDirty    map[string]struct{}
+	adapterTopicBusy     map[string]struct{}
+	adapterTopicApplied  map[string]bool
 	adapterQueueSz       int
 	adapterWorkers       int
+	adapterTopicWorkers  int
 	adapterOnce          sync.Once
-	adapterWG            sync.WaitGroup
-	adapterTopicWG       sync.WaitGroup
 	adapterLive          atomic.Int32
 	adapterDone          chan struct{}
 	adapterQueueMu       sync.RWMutex
@@ -109,8 +111,6 @@ type wsHubAdapterOp uint8
 
 const (
 	wsHubAdapterPublish wsHubAdapterOp = iota
-	wsHubAdapterSubscribe
-	wsHubAdapterUnsubscribe
 )
 
 type wsHubAdapterWork struct {
@@ -170,6 +170,16 @@ func WithWSHubAdapterWorkers(workers int) WSHubOption {
 	}
 }
 
+// WithWSHubAdapterTopicWorkers sets how many goroutines reconcile adapter
+// topic subscriptions. The default is 1; raise it for high subscription churn.
+func WithWSHubAdapterTopicWorkers(workers int) WSHubOption {
+	return func(h *WSHub) {
+		if workers > 0 {
+			h.adapterTopicWorkers = workers
+		}
+	}
+}
+
 // WithWSHubAdapterPublishTimeout bounds each adapter publish. This keeps
 // shutdown from waiting indefinitely on a slow or half-open Redis connection.
 func WithWSHubAdapterPublishTimeout(timeout time.Duration) WSHubOption {
@@ -203,18 +213,19 @@ func WithWSHubAdapterErrorHandler(fn func(error)) WSHubOption {
 func NewWSHub(opts ...WSHubOption) *WSHub {
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &WSHub{
-		nodeID:         randomNodeID(),
-		apps:           make(map[*App]struct{}),
-		sockets:        make(map[uintptr]*hubSocket),
-		members:        make(map[string]map[uintptr]struct{}),
-		adapterQueueSz: defaultWSHubAdapterQueueSize,
-		adapterWorkers: 1,
-		adapterTimeout: defaultWSHubAdapterPublishTimeout,
-		adapterErrFn:   defaultWSHubAdapterErrorHandler,
-		closeTimeout:   defaultWSHubCloseTimeout,
-		startBackoff:   defaultWSHubStartBackoff,
-		ctx:            ctx,
-		cancel:         cancel,
+		nodeID:              randomNodeID(),
+		apps:                make(map[*App]struct{}),
+		sockets:             make(map[uintptr]*hubSocket),
+		members:             make(map[string]map[uintptr]struct{}),
+		adapterQueueSz:      defaultWSHubAdapterQueueSize,
+		adapterWorkers:      1,
+		adapterTopicWorkers: 1,
+		adapterTimeout:      defaultWSHubAdapterPublishTimeout,
+		adapterErrFn:        defaultWSHubAdapterErrorHandler,
+		closeTimeout:        defaultWSHubCloseTimeout,
+		startBackoff:        defaultWSHubStartBackoff,
+		ctx:                 ctx,
+		cancel:              cancel,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -274,10 +285,10 @@ func (h *WSHub) Wrap(app *App, behavior WebSocketBehavior) WebSocketBehavior {
 			ws.End(1011, "websocket hub setup failed")
 			return
 		}
+		h.markOpen(ws)
 		if open != nil {
 			open(ws)
 		}
-		h.markOpen(ws)
 	}
 	behavior.Close = func(ws *WebSocket, code int, msg []byte) {
 		opened := h.wasOpen(ws)
@@ -561,34 +572,42 @@ func (h *WSHub) waitAdapterWorkerDone(timeout time.Duration) bool {
 }
 
 func (h *WSHub) queueAdapterPublish(msg WSHubMessage) error {
-	return h.queueAdapterWork(wsHubAdapterWork{op: wsHubAdapterPublish, msg: msg}, false)
+	return h.queueAdapterWork(wsHubAdapterWork{op: wsHubAdapterPublish, msg: msg})
 }
 
-func (h *WSHub) queueAdapterTopic(topic string, op wsHubAdapterOp) {
+func (h *WSHub) queueAdapterTopic(topic string) {
 	if _, ok := h.adapter.(WSHubTopicAdapter); !ok {
 		return
 	}
-	work := wsHubAdapterWork{op: op, topic: topic}
-	h.adapterQueueMu.RLock()
-	defer h.adapterQueueMu.RUnlock()
+	h.mu.Lock()
 	if h.closed.Load() {
+		h.mu.Unlock()
 		return
 	}
-	if h.adapterTopicQ == nil {
-		if err := h.runAdapterWork(work, false); err != nil {
-			h.reportAdapterError(err)
-		}
+	if h.adapterTopicDirty == nil {
+		h.adapterTopicDirty = make(map[string]struct{})
+	}
+	h.adapterTopicDirty[topic] = struct{}{}
+	h.mu.Unlock()
+	h.signalAdapterTopic()
+}
+
+func (h *WSHub) signalAdapterTopic() {
+	h.adapterQueueMu.RLock()
+	queue := h.adapterTopicQ
+	closed := h.closed.Load()
+	h.adapterQueueMu.RUnlock()
+	if queue == nil || closed {
 		return
 	}
 	select {
-	case h.adapterTopicQ <- work:
+	case queue <- struct{}{}:
 	case <-h.ctx.Done():
 	default:
-		h.reportAdapterError(fmt.Errorf("%w while queueing websocket hub subscription for topic %q", ErrWSHubAdapterQueueFull, topic))
 	}
 }
 
-func (h *WSHub) queueAdapterWork(work wsHubAdapterWork, reportOnly bool) error {
+func (h *WSHub) queueAdapterWork(work wsHubAdapterWork) error {
 	if h.adapter == nil {
 		return nil
 	}
@@ -607,9 +626,6 @@ func (h *WSHub) queueAdapterWork(work wsHubAdapterWork, reportOnly bool) error {
 	case <-h.ctx.Done():
 		return ErrWSHubClosed
 	default:
-		if reportOnly {
-			return fmt.Errorf("%w while queueing websocket hub subscription for topic %q", ErrWSHubAdapterQueueFull, work.topic)
-		}
 		return ErrWSHubAdapterQueueFull
 	}
 }
@@ -619,37 +635,46 @@ func (h *WSHub) ensureAdapterWorker() {
 		workers := h.adapterWorkers
 		topicWorkers := 0
 		if _, ok := h.adapter.(WSHubTopicAdapter); ok {
-			topicWorkers = 1
+			topicWorkers = h.adapterTopicWorkers
 		}
 		h.adapterLive.Store(int32(workers + topicWorkers))
 		h.adapterDone = make(chan struct{})
 		h.adapterQueue = make(chan wsHubAdapterWork, h.adapterQueueSz)
-		h.adapterWG.Add(workers)
 		for range workers {
 			go h.runAdapterWorker(h.adapterQueue)
 		}
 		if topicWorkers > 0 {
-			h.adapterTopicQ = make(chan wsHubAdapterWork, h.adapterQueueSz)
-			h.adapterTopicWG.Add(1)
-			go h.runAdapterTopicWorker(h.adapterTopicQ)
+			h.adapterTopicQ = make(chan struct{}, 1)
+			h.adapterTopicDirty = make(map[string]struct{})
+			h.adapterTopicBusy = make(map[string]struct{})
+			h.adapterTopicApplied = make(map[string]bool)
+			for range topicWorkers {
+				go h.runAdapterTopicWorker(h.adapterTopicQ)
+			}
 		}
 	})
 }
 
 func (h *WSHub) runAdapterWorker(queue <-chan wsHubAdapterWork) {
 	defer func() {
-		h.adapterWG.Done()
 		h.adapterWorkerDone()
 	}()
 	h.runAdapterWorkLoop(queue)
 }
 
-func (h *WSHub) runAdapterTopicWorker(queue <-chan wsHubAdapterWork) {
+func (h *WSHub) runAdapterTopicWorker(queue <-chan struct{}) {
 	defer func() {
-		h.adapterTopicWG.Done()
 		h.adapterWorkerDone()
 	}()
-	h.runAdapterWorkLoop(queue)
+	for range queue {
+		for {
+			topic, ok := h.nextAdapterTopic()
+			if !ok {
+				break
+			}
+			h.reconcileAdapterTopicSafely(topic)
+		}
+	}
 }
 
 func (h *WSHub) adapterWorkerDone() {
@@ -679,27 +704,88 @@ func (h *WSHub) runAdapterWork(work wsHubAdapterWork, allowClosed bool) error {
 	switch work.op {
 	case wsHubAdapterPublish:
 		return h.publishAdapter(work.msg, allowClosed)
-	case wsHubAdapterSubscribe, wsHubAdapterUnsubscribe:
-		return h.updateAdapterTopic(work.topic, work.op, allowClosed)
 	default:
 		return fmt.Errorf("gogo: websocket hub unknown adapter op %d", work.op)
 	}
 }
 
-func (h *WSHub) updateAdapterTopic(topic string, op wsHubAdapterOp, allowClosed bool) error {
+func (h *WSHub) nextAdapterTopic() (string, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for topic := range h.adapterTopicDirty {
+		if _, busy := h.adapterTopicBusy[topic]; busy {
+			continue
+		}
+		delete(h.adapterTopicDirty, topic)
+		h.adapterTopicBusy[topic] = struct{}{}
+		return topic, true
+	}
+	return "", false
+}
+
+func (h *WSHub) reconcileAdapterTopic(topic string) {
+	desired, applied := h.adapterTopicState(topic)
+	if desired == applied {
+		h.finishAdapterTopic(topic, applied, nil)
+		return
+	}
+	err := h.updateAdapterTopic(topic, desired)
+	h.finishAdapterTopic(topic, desired, err)
+}
+
+func (h *WSHub) reconcileAdapterTopicSafely(topic string) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			h.finishAdapterTopic(topic, false, wsHubAdapterPanicError{recovered: recovered, stack: debug.Stack()})
+		}
+	}()
+	h.reconcileAdapterTopic(topic)
+}
+
+func (h *WSHub) adapterTopicState(topic string) (desired, applied bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.members[topic]) > 0, h.adapterTopicApplied[topic]
+}
+
+func (h *WSHub) finishAdapterTopic(topic string, desired bool, err error) {
+	h.mu.Lock()
+	if err == nil {
+		if desired {
+			h.adapterTopicApplied[topic] = true
+		} else {
+			delete(h.adapterTopicApplied, topic)
+		}
+	} else {
+		h.adapterTopicDirty[topic] = struct{}{}
+	}
+	delete(h.adapterTopicBusy, topic)
+	needsSignal := len(h.adapterTopicDirty) > 0 && !h.closed.Load()
+	h.mu.Unlock()
+	if err != nil {
+		h.reportAdapterError(err)
+		time.AfterFunc(defaultWSHubStartBackoff, h.signalAdapterTopic)
+		return
+	}
+	if needsSignal {
+		h.signalAdapterTopic()
+	}
+}
+
+func (h *WSHub) updateAdapterTopic(topic string, subscribe bool) error {
 	adapter, ok := h.adapter.(WSHubTopicAdapter)
 	if !ok {
 		return nil
 	}
-	if h.closed.Load() && !allowClosed {
+	if h.closed.Load() {
 		return ErrWSHubClosed
 	}
-	if err := h.startAdapter(false, allowClosed); err != nil {
+	if err := h.startAdapter(false, false); err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(h.ctx, h.adapterTimeout)
 	defer cancel()
-	if op == wsHubAdapterSubscribe {
+	if subscribe {
 		return adapter.Subscribe(ctx, topic)
 	}
 	return adapter.Unsubscribe(ctx, topic)
@@ -790,7 +876,7 @@ func (h *WSHub) forget(ws *WebSocket) {
 		delete(h.sockets, key)
 		h.mu.Unlock()
 		for _, topic := range unsub {
-			h.queueAdapterTopic(topic, wsHubAdapterUnsubscribe)
+			h.queueAdapterTopic(topic)
 		}
 	} else {
 		h.mu.Unlock()
@@ -869,7 +955,7 @@ func (h *WSHub) removeMembershipIfCurrent(key uintptr, token uint64, topic strin
 	last := h.removeMembershipLocked(key, topic)
 	h.mu.Unlock()
 	if last {
-		h.queueAdapterTopic(topic, wsHubAdapterUnsubscribe)
+		h.queueAdapterTopic(topic)
 	}
 }
 
@@ -947,7 +1033,7 @@ func trackWSHubSubscribe(ws *WebSocket, topic string) {
 	if token, first := h.addMembership(key, ws.hubToken.Load(), topic); token != 0 {
 		ws.hubToken.Store(token)
 		if first {
-			h.queueAdapterTopic(topic, wsHubAdapterSubscribe)
+			h.queueAdapterTopic(topic)
 		}
 	}
 }
@@ -965,11 +1051,6 @@ func untrackWSHubSubscribe(ws *WebSocket, topic string) {
 
 func (h *WSHub) reportAdapterError(err error) {
 	if err == nil || h.adapterErrFn == nil {
-		return
-	}
-	var panicErr wsHubAdapterPanicError
-	if errors.As(err, &panicErr) {
-		h.adapterErrFn(err)
 		return
 	}
 	now := time.Now()

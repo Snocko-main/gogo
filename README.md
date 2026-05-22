@@ -1328,7 +1328,10 @@ raise Redis publish throughput.
 tracking rather than a uWS subscription callback, so it does not add an extra
 C-to-Go callback on the WebSocket hot path. HTTP `GetAsync` / `PostAsync`
 handlers keep the same shared-memory zero-cgo dispatch path; the Redis work is
-isolated behind the hub's adapter queue.
+isolated behind the hub's adapter queue. Subscription changes are reconciled to
+the latest local topic state, so rapid leave/join churn cannot leave Redis
+subscribed to the wrong final state. For very high subscription churn,
+`gogo.WithWSHubAdapterTopicWorkers(2)` can parallelize reconciliation.
 
 With `RunMultiCore`, create one hub outside setup and register every worker's
 route through it:
