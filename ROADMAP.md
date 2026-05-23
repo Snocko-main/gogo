@@ -414,9 +414,9 @@ needed. fiber's WS doesn't have a built-in pub/sub.
 
 ### D-3. Multi-core polish
 
-`RunMultiCore` works via `SO_REUSEPORT`. Document tuning knobs (pinning,
-GOMAXPROCS, per-worker DB pools). Add a `RunMultiCore` example with
-metrics + graceful shutdown.
+`RunMultiCore` works via accepted-socket round-robin across local App loops.
+Document tuning knobs (pinning, GOMAXPROCS, per-worker DB pools). Add a
+`RunMultiCore` example with metrics + graceful shutdown.
 
 ### D-4. C++-side compression
 
@@ -587,5 +587,5 @@ D-7 observability bundle.
 - HTTP/2, HTTP/3 — uWS has SSL support but HTTP/2 is uneven and HTTP/3
   needs lsquic. Reasonable for 3.0 once 1.x and 2.0 are stable.
 - gRPC. Different protocol surface; better as a sibling package.
-- Cluster mode beyond `SO_REUSEPORT`. Single-node multi-core is enough
-  for the common case.
+- Multi-process cluster mode. Single-process multi-core is enough for the
+  common case.

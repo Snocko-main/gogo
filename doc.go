@@ -160,9 +160,10 @@
 //	handle.Wait()
 //
 // RunMultiCore spawns N independent App instances, each bound to the
-// same port via SO_REUSEPORT — the kernel load-balances incoming
-// connections across the listening sockets. setup runs once per
-// instance on the OS thread that instance will own.
+// same port. Accepted sockets are round-robined across the App loops,
+// so scaling does not depend on the kernel's SO_REUSEPORT hash
+// distributing connections evenly. setup runs once per instance on
+// the OS thread that instance will own.
 //
 // Tuning knobs that actually matter:
 //

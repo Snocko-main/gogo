@@ -1,7 +1,7 @@
 // multicore demonstrates the full RunMultiCore production setup:
 //
-//   - N independent uWS event loops behind SO_REUSEPORT, one per
-//     vCPU (NumCPU by default)
+//   - N independent uWS event loops, one per vCPU (NumCPU by default),
+//     with accepted sockets round-robined across loops
 //   - Shared state (here: a counter; in real apps a *sql.DB pool)
 //     created ONCE before RunMultiCore and captured into the handlers
 //     so per-worker initialization stays cheap

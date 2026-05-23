@@ -1481,8 +1481,9 @@ app.Post("/upload-stream", func(res *gogo.Response, req *gogo.Request) {
 
 Single-loop mode (`NewApp` + `Run`) caps throughput at one OS thread. To
 saturate every vCPU, use `RunMultiCore` — N independent App instances bound
-to the same port via `SO_REUSEPORT`. The kernel load-balances connections
-across the listening sockets.
+to the same port. Accepted sockets are round-robined across the App loops, so
+scaling does not depend on the kernel's `SO_REUSEPORT` hash distributing
+connections evenly.
 
 ```go
 func main() {
