@@ -603,6 +603,10 @@ func (a appNative) listen(host string, port int) bool {
 	return C.uwsgo_app_listen(a.ptr, chost, C.int(port)) != 0
 }
 
+func (a appNative) addChild(child appNative) {
+	C.uwsgo_app_add_child(a.ptr, child.ptr)
+}
+
 func (a appNative) setBodyLimit(limit int) {
 	C.uwsgo_app_set_body_limit(a.ptr, C.size_t(limit))
 }
@@ -1373,7 +1377,7 @@ func uwsgoHandleWSOpen(handlerID C.uintptr_t, ws *C.uwsgo_ws_t) {
 				reportPanic(recovered)
 			}
 		}()
-		behavior.Open(&WebSocket{inner: websocketNative{ptr: ws}})
+		behavior.Open(&WebSocket{inner: websocketNative{ptr: ws}, app: behavior.app})
 	}
 }
 
@@ -1388,7 +1392,7 @@ func uwsgoHandleWSMessage(handlerID C.uintptr_t, ws *C.uwsgo_ws_t, message *C.ch
 			}
 		}()
 		behavior.Message(
-			&WebSocket{inner: websocketNative{ptr: ws}},
+			&WebSocket{inner: websocketNative{ptr: ws}, app: behavior.app},
 			C.GoBytes(unsafe.Pointer(message), C.int(messageLen)),
 			OpCode(opcode),
 		)
@@ -1399,7 +1403,7 @@ func uwsgoHandleWSMessage(handlerID C.uintptr_t, ws *C.uwsgo_ws_t, message *C.ch
 func uwsgoHandleWSClose(handlerID C.uintptr_t, ws *C.uwsgo_ws_t, code C.int, message *C.char, messageLen C.size_t) {
 	handle := cgo.Handle(handlerID)
 	behavior := handle.Value().(WebSocketBehavior)
-	wsWrap := &WebSocket{inner: websocketNative{ptr: ws}}
+	wsWrap := &WebSocket{inner: websocketNative{ptr: ws}, app: behavior.app}
 	// Release any cgo.Handle that an Upgrade callback or
 	// SetUserData attached to this socket — once the connection is
 	// gone the held Go value can be garbage collected.

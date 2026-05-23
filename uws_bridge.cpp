@@ -646,6 +646,13 @@ extern "C" int uwsgo_app_listen(uwsgo_app_t *app, const char *host, int port) {
     return ok ? 1 : 0;
 }
 
+extern "C" void uwsgo_app_add_child(uwsgo_app_t *parent, uwsgo_app_t *child) {
+    if (parent == nullptr || child == nullptr || parent->app == nullptr || child->app == nullptr) {
+        return;
+    }
+    parent->app->addChildApp(child->app.get());
+}
+
 extern "C" void uwsgo_app_run(uwsgo_app_t *app) {
     if (app == nullptr || app->app == nullptr) {
         return;

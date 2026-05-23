@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
 	gogo "github.com/Snocko-main/gogo"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 var dbConn *sql.DB
@@ -62,7 +62,8 @@ func main() {
 	}
 
 	// GOGO_CORES=N enables multi-core mode (N independent App instances
-	// behind SO_REUSEPORT). Defaults to single-core for parity with old runs.
+	// with accepted sockets round-robined across loops). Defaults to
+	// single-core for parity with old runs.
 	n := 1
 	if env := os.Getenv("GOGO_CORES"); env != "" {
 		if v, err := strconv.Atoi(env); err == nil && v > 0 {
@@ -153,6 +154,9 @@ func main() {
 
 	if n == 1 {
 		// Keep the simple path for the historical single-loop benchmark.
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+
 		app, err := gogo.NewApp()
 		if err != nil {
 			log.Fatal(err)
@@ -171,6 +175,6 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("gogo~ listening on http://localhost:3002 (%d cores via SO_REUSEPORT)", n)
+	log.Printf("gogo~ listening on http://localhost:3002 (%d cores)", n)
 	handle.Wait()
 }
