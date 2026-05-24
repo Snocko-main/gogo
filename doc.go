@@ -177,11 +177,10 @@
 //     RunMultiCore and capture the pointers into the handler
 //     closures. setup runs once per loop; allocating fresh DB pools
 //     per loop wastes RAM and connection slots.
-//   - Per-loop CPU pinning — gogo does not pin to specific cores.
-//     Linux's scheduler typically keeps each loop on its initial CPU
-//     for cache locality. If you need stricter pinning run the
-//     server under `taskset -c 0-(N-1)` or wrap LockOSThread with a
-//     sched_setaffinity call.
+//   - Per-loop CPU pinning — on Linux, set GOGO_PIN_THREADS=1 to pin
+//     each RunMultiCore event-loop thread to one CPU from the process's
+//     current affinity mask. Combine it with `taskset -c 0-(N-1)` so
+//     the server and load generator do not compete for the same CPUs.
 //
 // On a 4 vCPU host the gogo bench /plain route scales from ~112 k RPS
 // at 1 core to ~230 k RPS at 2 cores (~2.05× linear). Past 2 cores

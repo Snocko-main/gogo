@@ -1420,7 +1420,10 @@ Tuning knobs that actually matter:
   already owns one core.
 - Pin shared resources (DB pools, caches) to one allocation outside
   `setup`.
-- For strict CPU pinning, run under `taskset -c 0-(N-1)`.
+- For strict CPU pinning on Linux, set `GOGO_PIN_THREADS=1`. gogo pins each
+  `RunMultiCore` event-loop thread to one CPU from the process's current
+  affinity mask, so combine it with `taskset -c 0-(N-1)` or the bench
+  script's `SERVER_CPUSET`.
 
 When benchmarking very small sync routes with `wrk`, keep the load generator
 off the server cores; otherwise the same-host client can hide multi-core

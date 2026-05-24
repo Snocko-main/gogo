@@ -35,11 +35,10 @@
 // counts; a production app would create a *sql.DB once at startup
 // and pass it into every handler closure.
 //
-// Pinning to CPUs — gogo doesn't pin loops to specific cores
-// today. With a `RunMultiCore(N=NumCPU)` config the kernel typically
-// keeps each loop on its initial CPU; if you need stricter pinning
-// run the server under `taskset -c 0-(N-1)` or wrap the
-// LockOSThread inside a sched_setaffinity call (Linux only).
+// Pinning to CPUs — on Linux, set GOGO_PIN_THREADS=1 to pin each
+// RunMultiCore loop to one CPU from the process's current affinity
+// mask. Combine it with taskset (for example taskset -c 0-3) when
+// you want to reserve separate CPUs for the load generator.
 
 package main
 

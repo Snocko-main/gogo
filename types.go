@@ -2117,6 +2117,15 @@ func (h *MultiCoreHandle) Wait() {
 	<-h.done
 }
 
+func pinMultiCoreThreadsEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GOGO_PIN_THREADS"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 // RunMultiCore spawns n independent App instances on dedicated OS threads.
 // Each instance binds to the given port, then every listener round-robins
 // accepted sockets across every App. This keeps scaling predictable even on
@@ -2161,6 +2170,7 @@ func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, erro
 			close(abort)
 		})
 	}
+	pinThreads := pinMultiCoreThreadsEnabled()
 
 	var runWg sync.WaitGroup
 	for i := 0; i < n; i++ {
@@ -2173,6 +2183,12 @@ func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, erro
 			// LockOSThread keeps us pinned for the lifetime of Run.
 			runtime.LockOSThread()
 			defer runtime.UnlockOSThread()
+			if pinThreads {
+				if _, err := pinCurrentOSThreadToCPUIndex(idx); err != nil {
+					starts <- startResult{idx: idx, err: fmt.Errorf("gogo: pin worker %d: %w", idx, err)}
+					return
+				}
+			}
 
 			app, err := NewApp()
 			if err != nil {

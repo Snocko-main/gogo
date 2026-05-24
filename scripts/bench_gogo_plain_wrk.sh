@@ -18,6 +18,9 @@
 #
 # Set SAMPLE_CPU=1 to write per-thread CPU samples next to the wrk log. On
 # Linux this includes the CPU core (PSR) each gogo thread was running on.
+# PIN_THREADS=1 asks gogo RunMultiCore to pin each event-loop thread to one
+# CPU from the server's current affinity mask. Combine with SERVER_CPUSET so
+# worker 0..N map cleanly onto the CPUs you reserved for the server.
 
 set -eu
 
@@ -37,6 +40,7 @@ BINARY="${BINARY:-/tmp/gogo-plain-bench-bin}"
 WRK_PROCESSES="${WRK_PROCESSES:-1}"
 SERVER_CPUSET="${SERVER_CPUSET:-}"
 WRK_CPUSET="${WRK_CPUSET:-}"
+PIN_THREADS="${PIN_THREADS:-1}"
 SAMPLE_CPU="${SAMPLE_CPU:-0}"
 CPU_SAMPLE_INTERVAL="${CPU_SAMPLE_INTERVAL:-1}"
 
@@ -154,10 +158,10 @@ fi
 
 case "$MODE" in
 single)
-	server_env=(GOGO_BENCH_PLAIN_ONLY=1 GOGO_CORES=1 GOMAXPROCS=1)
+	server_env=(GOGO_BENCH_PLAIN_ONLY=1 GOGO_CORES=1 GOMAXPROCS=1 GOGO_PIN_THREADS=0)
 	;;
 multi)
-	server_env=(GOGO_BENCH_PLAIN_ONLY=1 GOGO_CORES="$WORKERS" GOMAXPROCS="$WORKERS")
+	server_env=(GOGO_BENCH_PLAIN_ONLY=1 GOGO_CORES="$WORKERS" GOMAXPROCS="$WORKERS" GOGO_PIN_THREADS="$PIN_THREADS")
 	;;
 *)
 	echo "MODE must be single or multi, got $MODE" >&2
@@ -165,7 +169,7 @@ multi)
 	;;
 esac
 
-echo "starting gogo $MODE on :$PORT workers=$WORKERS server_cpuset=${SERVER_CPUSET:-none}"
+echo "starting gogo $MODE on :$PORT workers=$WORKERS server_cpuset=${SERVER_CPUSET:-none} pin_threads=$PIN_THREADS"
 (
 	for kv in "${server_env[@]}"; do
 		export "$kv"
