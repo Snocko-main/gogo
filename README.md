@@ -1422,6 +1422,26 @@ Tuning knobs that actually matter:
   `setup`.
 - For strict CPU pinning, run under `taskset -c 0-(N-1)`.
 
+When benchmarking very small sync routes with `wrk`, keep the load generator
+off the server cores; otherwise the same-host client can hide multi-core
+server scaling. The focused helper below starts the gogo benchmark in
+plain-only mode and can run several `wrk` processes in parallel:
+
+```bash
+SERVER_CPUSET=0-3 WRK_CPUSET=4-7 MODE=multi WORKERS=4 \
+  ROUTES=/plain THREADS="1 2 4" CONN=1000 DURATION=30 SAMPLE_CPU=1 \
+  ./scripts/bench_gogo_plain_wrk.sh
+```
+
+If one `wrk` process is the bottleneck, keep each process at one thread and
+increase `WRK_PROCESSES`:
+
+```bash
+SERVER_CPUSET=0-3 WRK_CPUSET=4-7 MODE=multi WORKERS=4 \
+  ROUTES=/plain THREADS=1 CONN=2000 WRK_PROCESSES=4 DURATION=30 \
+  ./scripts/bench_gogo_plain_wrk.sh
+```
+
 See `examples/multicore` for a full setup with `/metrics`.
 
 ## Graceful Shutdown

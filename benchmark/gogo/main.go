@@ -48,12 +48,15 @@ func initDB(path string) error {
 }
 
 func main() {
-	dbPath := os.Getenv("BENCH_DB")
-	if dbPath == "" {
-		dbPath = "/tmp/uwsbench/sample.db"
-	}
-	if err := initDB(dbPath); err != nil {
-		log.Fatal(err)
+	plainOnly := os.Getenv("GOGO_BENCH_PLAIN_ONLY") == "1"
+	if !plainOnly {
+		dbPath := os.Getenv("BENCH_DB")
+		if dbPath == "" {
+			dbPath = "/tmp/uwsbench/sample.db"
+		}
+		if err := initDB(dbPath); err != nil {
+			log.Fatal(err)
+		}
 	}
 
 	filePath := os.Getenv("BENCH_FILE")
@@ -87,6 +90,9 @@ func main() {
 			Body:        `{"ok":true}` + "\n",
 		})
 		app.Get("/plain-static", "hello world\n")
+		if plainOnly {
+			return
+		}
 		app.Get("/hello/:name", func(res *gogo.Response, req *gogo.Request) {
 			res.Send(200, "text/plain; charset=utf-8", "hello "+req.Parameter(0)+"\n")
 		})
