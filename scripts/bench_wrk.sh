@@ -63,6 +63,8 @@ fi
 MULTI_WORKERS="${MULTI_WORKERS:-$DEFAULT_MULTI_WORKERS}"
 
 SERVER_PID=""
+SERVER_PORT=""
+BENCH_BIN_DIR="${BENCH_BIN_DIR:-${TMPDIR:-/tmp}/gogo-bench-bin}"
 
 # kill_tree walks down the descendant tree from a PID and signals each one.
 # Used because macOS lacks `setsid`, so we can't rely on process groups.
@@ -83,7 +85,21 @@ cleanup() {
 		sleep 1
 		kill_tree "$SERVER_PID" KILL
 	fi
+	if [ -n "$SERVER_PORT" ]; then
+		local pids
+		pids="$(lsof -tiTCP:"$SERVER_PORT" -sTCP:LISTEN 2>/dev/null || true)"
+		for p in $pids; do
+			kill_tree "$p" TERM
+		done
+		if [ -n "$pids" ]; then
+			sleep 1
+			for p in $pids; do
+				kill_tree "$p" KILL
+			done
+		fi
+	fi
 	SERVER_PID=""
+	SERVER_PORT=""
 }
 trap cleanup EXIT INT TERM
 
@@ -102,6 +118,18 @@ wait_port() {
 port_is_open() {
 	port="$1"
 	(echo >/dev/tcp/127.0.0.1/"$port") >/dev/null 2>&1
+}
+
+build_go_binary() {
+	name="$1"
+	tags="$2"
+	pkg="$3"
+	mkdir -p "$BENCH_BIN_DIR"
+	if [ -n "$tags" ]; then
+		( cd benchmark && go build -tags "$tags" -o "$BENCH_BIN_DIR/$name" "$pkg" )
+	else
+		( cd benchmark && go build -o "$BENCH_BIN_DIR/$name" "$pkg" )
+	fi
 }
 
 start_server() {
@@ -123,31 +151,36 @@ start_server() {
 		echo "port $PORT is already in use before starting $fw/$mode" >&2
 		return 1
 	fi
-	# Each server is launched in a subshell so we have a clean parent PID
-	# to walk children from (cleanup uses kill_tree to TERM the whole tree).
+	SERVER_PORT="$PORT"
 	case "$fw:$mode" in
 	gogo:single)
-		( cd benchmark && GOGO_CORES=1 go run -tags gogo ./gogo >/tmp/bench-gogo.log 2>&1 ) &
+		build_go_binary gogo-bench gogo ./gogo
+		( GOGO_CORES=1 "$BENCH_BIN_DIR/gogo-bench" >/tmp/bench-gogo.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	gogo:multi)
-		( cd benchmark && GOMAXPROCS="$MULTI_WORKERS" GOGO_CORES="$MULTI_WORKERS" go run -tags gogo ./gogo >/tmp/bench-gogo.log 2>&1 ) &
+		build_go_binary gogo-bench gogo ./gogo
+		( GOMAXPROCS="$MULTI_WORKERS" GOGO_CORES="$MULTI_WORKERS" "$BENCH_BIN_DIR/gogo-bench" >/tmp/bench-gogo.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	fiber:single)
-		( cd benchmark && GOMAXPROCS=1 FIBER_PREFORK=0 go run ./fiber >/tmp/bench-fiber.log 2>&1 ) &
+		build_go_binary fiber-bench "" ./fiber
+		( GOMAXPROCS=1 FIBER_PREFORK=0 "$BENCH_BIN_DIR/fiber-bench" >/tmp/bench-fiber.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	fiber:multi)
-		( cd benchmark && GOMAXPROCS="$MULTI_WORKERS" FIBER_PREFORK=1 go run ./fiber >/tmp/bench-fiber.log 2>&1 ) &
+		build_go_binary fiber-bench "" ./fiber
+		( GOMAXPROCS="$MULTI_WORKERS" FIBER_PREFORK=1 "$BENCH_BIN_DIR/fiber-bench" >/tmp/bench-fiber.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	nethttp:single)
-		( cd benchmark && GOMAXPROCS=1 go run ./nethttp >/tmp/bench-nethttp.log 2>&1 ) &
+		build_go_binary nethttp-bench "" ./nethttp
+		( GOMAXPROCS=1 "$BENCH_BIN_DIR/nethttp-bench" >/tmp/bench-nethttp.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	nethttp:multi)
-		( cd benchmark && GOMAXPROCS="$MULTI_WORKERS" go run ./nethttp >/tmp/bench-nethttp.log 2>&1 ) &
+		build_go_binary nethttp-bench "" ./nethttp
+		( GOMAXPROCS="$MULTI_WORKERS" "$BENCH_BIN_DIR/nethttp-bench" >/tmp/bench-nethttp.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	uwsjs:single)
