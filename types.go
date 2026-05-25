@@ -576,6 +576,9 @@ type App struct {
 	// nativeMu serializes App.Close with cross-thread native calls that keep
 	// using the app pointer after leaving Go, such as WebSocket publishes.
 	nativeMu sync.RWMutex
+	// closeMu serializes Close calls without blocking read-side nativeMu users
+	// while Close waits for per-loop async workers to drain.
+	closeMu sync.Mutex
 	// workerRefAcquired / workerRefDropped pair a shared-dispatch
 	// worker-pool reference with Apps that actually register at
 	// least one shared fast-path route. Sync-only Apps must not hold
@@ -2192,8 +2195,8 @@ func (a *App) Close() {
 	for a.pendingTimers.Load() > 0 {
 		runtime.Gosched()
 	}
-	a.nativeMu.Lock()
-	defer a.nativeMu.Unlock()
+	a.closeMu.Lock()
+	defer a.closeMu.Unlock()
 
 	var requestRing uintptr
 	var requestRingGen *sharedWorkerGeneration
@@ -2210,6 +2213,8 @@ func (a *App) Close() {
 		// the App until this ring's workers have fully drained.
 		<-requestRingGen.drained
 	}
+	a.nativeMu.Lock()
+	defer a.nativeMu.Unlock()
 	a.inner.close()
 	if requestRing != 0 {
 		freeRequestRingAfterDrain(requestRing, requestRingGen)
