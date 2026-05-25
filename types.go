@@ -2192,6 +2192,9 @@ func (a *App) Close() {
 	for a.pendingTimers.Load() > 0 {
 		runtime.Gosched()
 	}
+	a.nativeMu.Lock()
+	defer a.nativeMu.Unlock()
+
 	var requestRing uintptr
 	var requestRingGen *sharedWorkerGeneration
 	if a.workerRefAcquired.Load() && !a.workerRefDropped.Swap(true) {
@@ -2207,9 +2210,7 @@ func (a *App) Close() {
 		// the App until this ring's workers have fully drained.
 		<-requestRingGen.drained
 	}
-	a.nativeMu.Lock()
 	a.inner.close()
-	a.nativeMu.Unlock()
 	if requestRing != 0 {
 		freeRequestRingAfterDrain(requestRing, requestRingGen)
 	}
