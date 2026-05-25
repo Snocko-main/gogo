@@ -1535,6 +1535,9 @@ Tuning knobs that actually matter:
   `PostAsync` dispatch by loop and starts `n` async workers per loop. This can
   help short async handlers; benchmark IO-heavy handlers against their real
   backend before raising it.
+- `gogo.WithMultiCoreCloseTimeout(d)` — bounds shutdown waits when a per-loop
+  async handler is stuck. On timeout, gogo reports via `PanicHandler` and
+  releases native resources later after the worker drains.
 - `gogo.SetWorkerCount(n)` — controls the `GetAsync` worker pool. Default
   is `NumCPU`; with `RunMultiCore` consider halving this since each loop
   already owns one core. When `WithMultiCorePerLoopAsyncWorkers` is enabled,

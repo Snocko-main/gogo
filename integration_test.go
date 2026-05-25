@@ -307,6 +307,89 @@ func TestRunMultiCorePerLoopAsyncWorkersCloseWaitsForHandler(t *testing.T) {
 	}
 }
 
+func TestRunMultiCorePerLoopAsyncWorkersCloseTimeout(t *testing.T) {
+	port := freePort(t)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	panicCh := make(chan string, 1)
+	var releaseOnce sync.Once
+
+	gogo.SetPanicHandler(func(recovered any) {
+		select {
+		case panicCh <- fmt.Sprint(recovered):
+		default:
+		}
+	})
+	defer gogo.SetPanicHandler(nil)
+
+	handle, err := gogo.RunMultiCore(1, port, func(app *gogo.App) {
+		app.GetAsync("/block", func(res *gogo.Response, req *gogo.Request) {
+			close(entered)
+			<-release
+		})
+	}, gogo.WithMultiCorePerLoopAsyncWorkers(1), gogo.WithMultiCoreCloseTimeout(50*time.Millisecond))
+	if err != nil {
+		t.Fatalf("RunMultiCore per-loop async workers: %v", err)
+	}
+	defer func() {
+		releaseOnce.Do(func() { close(release) })
+		handle.Shutdown()
+		handle.Wait()
+	}()
+
+	clientDone := make(chan struct{})
+	go func() {
+		defer close(clientDone)
+		client := &http.Client{Timeout: 2 * time.Second}
+		resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/block", port))
+		if err == nil {
+			resp.Body.Close()
+		}
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("async handler did not start")
+	}
+
+	handle.Shutdown()
+	waitDone := make(chan struct{})
+	started := time.Now()
+	go func() {
+		handle.Wait()
+		close(waitDone)
+	}()
+
+	select {
+	case <-waitDone:
+		if elapsed := time.Since(started); elapsed > time.Second {
+			t.Fatalf("handle.Wait returned too slowly after close timeout: %s", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("handle.Wait did not return after close timeout")
+	}
+
+	select {
+	case msg := <-panicCh:
+		if !strings.Contains(msg, "timed out") || !strings.Contains(msg, "per-loop async workers") {
+			t.Fatalf("panic report = %q, want close timeout context", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("close timeout was not reported")
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	if !gogo.WaitForSharedWorkers(2 * time.Second) {
+		t.Fatal("shared workers did not stop after releasing blocked handler")
+	}
+	select {
+	case <-clientDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("client request did not finish after releasing blocked handler")
+	}
+}
+
 func TestRunMultiCoreSetupPanicReturnsError(t *testing.T) {
 	port := freePort(t)
 	handle, err := gogo.RunMultiCore(2, port, func(app *gogo.App) {

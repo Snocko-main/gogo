@@ -579,6 +579,9 @@ type App struct {
 	// closeMu serializes Close calls without blocking read-side nativeMu users
 	// while Close waits for per-loop async workers to drain.
 	closeMu sync.Mutex
+	// nativeCloseStarted makes native resource release exactly-once even when
+	// a per-loop async close timeout defers the actual free to a goroutine.
+	nativeCloseStarted atomic.Bool
 	// workerRefAcquired / workerRefDropped pair a shared-dispatch
 	// worker-pool reference with Apps that actually register at
 	// least one shared fast-path route. Sync-only Apps must not hold
@@ -619,6 +622,7 @@ type App struct {
 	// RunMultiCore options before setup registers routes.
 	sharedRequestRing    bool
 	sharedWorkersPerRing int
+	sharedCloseTimeout   time.Duration
 }
 
 const defaultBodyReadTimeout = 30 * time.Second
@@ -2211,8 +2215,49 @@ func (a *App) Close() {
 		// Per-loop async workers may still be running user handlers that
 		// retain AsyncCtx pointers into this App's native pools. Do not free
 		// the App until this ring's workers have fully drained.
-		<-requestRingGen.drained
+		if !a.waitForSharedWorkerDrain(requestRingGen, requestRing) {
+			return
+		}
 	}
+	a.closeNative(requestRing)
+}
+
+func (a *App) waitForSharedWorkerDrain(gen *sharedWorkerGeneration, requestRing uintptr) bool {
+	timeout := a.sharedCloseTimeout
+	if timeout <= 0 {
+		<-gen.drained
+		return true
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-gen.drained:
+		return true
+	case <-timer.C:
+		reportPanic(fmt.Errorf("gogo: App.Close timed out after %s waiting for per-loop async workers to drain; native resources will be released after workers drain", timeout))
+		a.closeNativeAfterDrain(gen, requestRing)
+		return false
+	}
+}
+
+func (a *App) closeNativeAfterDrain(gen *sharedWorkerGeneration, requestRing uintptr) {
+	if a.nativeCloseStarted.Swap(true) {
+		return
+	}
+	go func() {
+		<-gen.drained
+		a.closeNativeLocked(requestRing)
+	}()
+}
+
+func (a *App) closeNative(requestRing uintptr) {
+	if a.nativeCloseStarted.Swap(true) {
+		return
+	}
+	a.closeNativeLocked(requestRing)
+}
+
+func (a *App) closeNativeLocked(requestRing uintptr) {
 	a.nativeMu.Lock()
 	defer a.nativeMu.Unlock()
 	a.inner.close()
@@ -2232,6 +2277,7 @@ type multiCoreConfig struct {
 	fanoutAcceptedSockets bool
 	shardAsyncRequestRing bool
 	asyncWorkersPerRing   int
+	closeTimeout          time.Duration
 }
 
 // MultiCoreOption configures RunMultiCore.
@@ -2275,6 +2321,21 @@ func WithMultiCorePerLoopAsyncWorkers(workersPerLoop int) MultiCoreOption {
 	}
 }
 
+// WithMultiCoreCloseTimeout bounds how long each App.Close waits for
+// per-loop async workers to drain before returning. It only affects Apps
+// using WithMultiCorePerLoopAsyncWorkers; the default zero value waits
+// indefinitely so native resources are released synchronously. On timeout,
+// gogo reports the stuck drain via the PanicHandler, returns from Close, and
+// releases the native App later after the worker generation eventually drains.
+func WithMultiCoreCloseTimeout(timeout time.Duration) MultiCoreOption {
+	if timeout < 0 {
+		timeout = 0
+	}
+	return func(c *multiCoreConfig) {
+		c.closeTimeout = timeout
+	}
+}
+
 // Shutdown initiates graceful stop on every App in the group. Idempotent;
 // safe to call from any goroutine.
 func (h *MultiCoreHandle) Shutdown() {
@@ -2297,9 +2358,10 @@ func (h *MultiCoreHandle) Wait() {
 // and let each App keep sockets accepted by its own listener, which can be
 // faster when the OS distributes connections evenly. Pass
 // WithMultiCorePerLoopAsyncWorkers to shard GetAsync/PostAsync dispatch by App
-// loop instead of using the process-wide async worker pool. setup is called
-// once per App, on the thread that instance will run on, to register routes /
-// middleware / etc.
+// loop instead of using the process-wide async worker pool. Pass
+// WithMultiCoreCloseTimeout to bound shutdown waits for stuck per-loop async
+// handlers. setup is called once per App, on the thread that instance will run
+// on, to register routes / middleware / etc.
 //
 // setup MUST register the same routes on every App for consistent behavior;
 // the framework just calls setup(app) and trusts user code to be
@@ -2370,6 +2432,7 @@ func RunMultiCore(n int, port int, setup func(app *App), opts ...MultiCoreOption
 			}
 			app.sharedRequestRing = mc.shardAsyncRequestRing
 			app.sharedWorkersPerRing = mc.asyncWorkersPerRing
+			app.sharedCloseTimeout = mc.closeTimeout
 
 			starts <- startResult{idx: idx, app: app}
 			select {

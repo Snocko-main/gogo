@@ -181,6 +181,9 @@
 //     dispatch by loop and start N workers per loop. This can reduce
 //     contention for short async handlers; benchmark IO-heavy handlers
 //     with their real backend before raising N.
+//   - WithMultiCoreCloseTimeout — bound App.Close / handle.Wait when
+//     per-loop async workers are stuck in long-running handlers. On
+//     timeout, native resources are released later after workers drain.
 //   - SetWorkerCount — controls the GetAsync worker-goroutine pool.
 //     Default = NumCPU. With RunMultiCore each loop already owns one
 //     core; the workers compete for the same CPUs, so consider
