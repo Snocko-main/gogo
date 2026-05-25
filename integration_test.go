@@ -241,6 +241,72 @@ func TestRunMultiCorePerLoopAsyncWorkersStarts(t *testing.T) {
 	}
 }
 
+func TestRunMultiCorePerLoopAsyncWorkersCloseWaitsForHandler(t *testing.T) {
+	port := freePort(t)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+
+	handle, err := gogo.RunMultiCore(1, port, func(app *gogo.App) {
+		app.GetAsync("/block", func(res *gogo.Response, req *gogo.Request) {
+			close(entered)
+			<-release
+		})
+	}, gogo.WithMultiCorePerLoopAsyncWorkers(1))
+	if err != nil {
+		t.Fatalf("RunMultiCore per-loop async workers: %v", err)
+	}
+	defer func() {
+		releaseOnce.Do(func() { close(release) })
+		handle.Shutdown()
+		handle.Wait()
+	}()
+
+	clientDone := make(chan struct{})
+	go func() {
+		defer close(clientDone)
+		client := &http.Client{Timeout: 2 * time.Second}
+		resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/block", port))
+		if err == nil {
+			resp.Body.Close()
+		}
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("async handler did not start")
+	}
+
+	handle.Shutdown()
+	waitDone := make(chan struct{})
+	go func() {
+		handle.Wait()
+		close(waitDone)
+	}()
+
+	select {
+	case <-waitDone:
+		t.Fatal("handle.Wait returned before the in-flight async handler drained")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case <-waitDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handle.Wait did not return after async handler drained")
+	}
+	select {
+	case <-clientDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("client request did not finish after shutdown")
+	}
+	if !gogo.WaitForSharedWorkers(2 * time.Second) {
+		t.Fatal("shared workers did not stop")
+	}
+}
+
 func TestRunMultiCoreSetupPanicReturnsError(t *testing.T) {
 	port := freePort(t)
 	handle, err := gogo.RunMultiCore(2, port, func(app *gogo.App) {

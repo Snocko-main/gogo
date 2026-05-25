@@ -2201,6 +2201,12 @@ func (a *App) Close() {
 		}
 		stopSharedWorkersIfIdle()
 	}
+	if requestRingGen != nil {
+		// Per-loop async workers may still be running user handlers that
+		// retain AsyncCtx pointers into this App's native pools. Do not free
+		// the App until this ring's workers have fully drained.
+		<-requestRingGen.drained
+	}
 	a.nativeMu.Lock()
 	a.inner.close()
 	a.nativeMu.Unlock()
