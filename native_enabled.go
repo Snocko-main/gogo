@@ -81,6 +81,7 @@ var (
 	sharedWorkersStarted    bool
 	sharedWorkerGen         *sharedWorkerGeneration
 	sharedWorkerGens        []*sharedWorkerGeneration
+	shardedWorkerGens       map[uintptr]*sharedWorkerGeneration
 	// sharedActiveApps counts Apps that registered at least one route
 	// on the shared-dispatch fast path. Plain sync apps do not hold a
 	// worker-pool reference; otherwise a long-lived sync-only App would
@@ -112,14 +113,21 @@ func registerSharedHandler(h AsyncHandler) uint32 {
 	return uint32(len(sharedHandlers) - 1)
 }
 
-func (a *appNative) getShared(pattern string, handler AsyncHandler) {
+func (a *appNative) getShared(pattern string, handler AsyncHandler, shardRequestRing bool, workersPerRing int) {
 	id := registerSharedHandler(handler)
 	cpattern := C.CString(pattern)
 	defer C.free(unsafe.Pointer(cpattern))
+	if shardRequestRing {
+		a.setShardedRequestRing(true)
+	}
 	C.uwsgo_app_get_shared(a.ptr, cpattern, C.uint32_t(id))
 	sharedActive.Store(true)
 	// Lazily start worker goroutines on first shared route registration.
-	ensureSharedWorkers()
+	if shardRequestRing {
+		ensureSharedWorkersForRing(a.requestRing(), workersPerRing)
+	} else {
+		ensureSharedWorkers()
+	}
 }
 
 // postShared registers a POST route on the zero-cgo shared
@@ -132,16 +140,23 @@ func (a *appNative) getShared(pattern string, handler AsyncHandler) {
 // maxBody == 0 means "use the C-side default" (SNAP_BODY_CAP).
 // Bodies larger than the active cap short-circuit with 413 on
 // the loop thread — the goroutine is never spawned.
-func (a *appNative) postShared(pattern string, handler AsyncHandler, maxBody int) {
+func (a *appNative) postShared(pattern string, handler AsyncHandler, maxBody int, shardRequestRing bool, workersPerRing int) {
 	id := registerSharedHandler(handler)
 	cpattern := C.CString(pattern)
 	defer C.free(unsafe.Pointer(cpattern))
 	if maxBody < 0 {
 		maxBody = 0
 	}
+	if shardRequestRing {
+		a.setShardedRequestRing(true)
+	}
 	C.uwsgo_app_post_shared(a.ptr, cpattern, C.uint32_t(id), C.size_t(maxBody))
 	sharedActive.Store(true)
-	ensureSharedWorkers()
+	if shardRequestRing {
+		ensureSharedWorkersForRing(a.requestRing(), workersPerRing)
+	} else {
+		ensureSharedWorkers()
+	}
 }
 
 // workerCount controls how many goroutines drain the request ring. Read once
@@ -183,7 +198,38 @@ func ensureSharedWorkers() {
 	for i := 0; i < n; i++ {
 		go func() {
 			defer sharedWorkerDone(gen)
-			sharedWorker(gen.stop)
+			sharedWorker(gen.stop, shared.requestRing)
+		}()
+	}
+}
+
+func ensureSharedWorkersForRing(ring uintptr, n int) {
+	if ring == 0 {
+		ensureSharedWorkers()
+		return
+	}
+	if n <= 0 {
+		n = 1
+	}
+	sharedWorkerLifecycleMu.Lock()
+	defer sharedWorkerLifecycleMu.Unlock()
+	if shardedWorkerGens == nil {
+		shardedWorkerGens = make(map[uintptr]*sharedWorkerGeneration)
+	}
+	if _, ok := shardedWorkerGens[ring]; ok {
+		return
+	}
+	gen := &sharedWorkerGeneration{
+		stop:    make(chan struct{}),
+		drained: make(chan struct{}),
+	}
+	gen.live.Store(int32(n))
+	shardedWorkerGens[ring] = gen
+	sharedWorkerGens = append(sharedWorkerGens, gen)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer sharedWorkerDone(gen)
+			sharedWorker(gen.stop, ring)
 		}()
 	}
 }
@@ -205,6 +251,12 @@ func sharedWorkerDone(gen *sharedWorkerGeneration) {
 	for i, candidate := range sharedWorkerGens {
 		if candidate == gen {
 			sharedWorkerGens = append(sharedWorkerGens[:i], sharedWorkerGens[i+1:]...)
+			break
+		}
+	}
+	for ring, candidate := range shardedWorkerGens {
+		if candidate == gen {
+			delete(shardedWorkerGens, ring)
 			break
 		}
 	}
@@ -235,10 +287,18 @@ func stopSharedWorkersIfIdle() {
 		return
 	}
 	if !sharedWorkersStarted {
+		for ring, gen := range shardedWorkerGens {
+			close(gen.stop)
+			delete(shardedWorkerGens, ring)
+		}
 		return
 	}
 	close(sharedWorkerGen.stop)
 	sharedWorkersStarted = false
+	for ring, gen := range shardedWorkerGens {
+		close(gen.stop)
+		delete(shardedWorkerGens, ring)
+	}
 }
 
 // WaitForSharedWorkers blocks until every shared-dispatch worker
@@ -300,16 +360,16 @@ func WaitForSharedWorkers(timeout time.Duration) bool {
 // The stop channel is checked only on the idle / back-off branch (a
 // closed channel makes the non-blocking select fall through to the
 // exit path). Hot-path requests are never delayed by the check.
-func sharedWorker(stop <-chan struct{}) {
+func sharedWorker(stop <-chan struct{}, requestRing uintptr) {
 	const spinLimit = 256
 
-	headAddr := (*atomic.Uint64)(unsafe.Pointer(shared.requestRing + shared.headOffset))
+	headAddr := (*atomic.Uint64)(unsafe.Pointer(requestRing + shared.headOffset))
 	idleSleep := time.Duration(0)
 	spins := 0
 
 	for {
 		idx := headAddr.Load()
-		slotBase := shared.requestRing + shared.slotsOffset + uintptr(idx&shared.ringMask)*shared.slotStride
+		slotBase := requestRing + shared.slotsOffset + uintptr(idx&shared.ringMask)*shared.slotStride
 		seqAddr := (*atomic.Uint64)(unsafe.Pointer(slotBase + shared.slotSeqOffset))
 
 		if seqAddr.Load() != idx+1 {
@@ -617,6 +677,18 @@ func (a appNative) setCapturePeerIP(enable bool) {
 		v = 1
 	}
 	C.uwsgo_app_set_capture_peer_ip(a.ptr, v)
+}
+
+func (a appNative) setShardedRequestRing(enable bool) {
+	v := C.int(0)
+	if enable {
+		v = 1
+	}
+	C.uwsgo_app_set_sharded_request_ring(a.ptr, v)
+}
+
+func (a appNative) requestRing() uintptr {
+	return uintptr(C.uwsgo_app_request_ring(a.ptr))
 }
 
 func (a appNative) run() {

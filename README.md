@@ -1487,9 +1487,11 @@ app.Post("/upload-stream", func(res *gogo.Response, req *gogo.Request) {
 
 Single-loop mode (`NewApp` + `Run`) caps throughput at one OS thread. To
 saturate every vCPU, use `RunMultiCore` — N independent App instances bound
-to the same port. Accepted sockets are round-robined across the App loops, so
-scaling does not depend on the kernel's `SO_REUSEPORT` hash distributing
-connections evenly.
+to the same port. By default, accepted sockets are round-robined across the
+App loops, so scaling does not depend on the kernel's `SO_REUSEPORT` hash
+distributing connections evenly. When your OS distributes connections well,
+`gogo.WithMultiCoreReusePort()` skips that cross-loop fanout and can improve
+throughput and tail latency for sync/static routes.
 
 ```go
 func main() {
@@ -1509,7 +1511,7 @@ func main() {
             _ = db.QueryRow("SELECT 1").Scan(&n)
             res.JSON(200, map[string]int{"n": n})
         })
-    })
+    }, gogo.WithMultiCoreReusePort())
     if err != nil {
         log.Fatal(err)
     }
@@ -1526,6 +1528,13 @@ func main() {
 Tuning knobs that actually matter:
 
 - `GOMAXPROCS` — pin to the same N you passed to `RunMultiCore`.
+- `gogo.WithMultiCoreReusePort()` — avoids accepted-socket fanout when your
+  kernel balances `SO_REUSEPORT` listeners well; omit it for deterministic
+  round-robin fanout.
+- `gogo.WithMultiCorePerLoopAsyncWorkers(n)` — shards `GetAsync` /
+  `PostAsync` dispatch by loop and starts `n` async workers per loop. This can
+  help short async handlers; benchmark IO-heavy handlers against their real
+  backend before raising it.
 - `gogo.SetWorkerCount(n)` — controls the `GetAsync` worker pool. Default
   is `NumCPU`; with `RunMultiCore` consider halving this since each loop
   already owns one core.

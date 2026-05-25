@@ -610,6 +610,12 @@ type App struct {
 	// pubsubPeers is populated by RunMultiCore before listeners start. uWS's
 	// TopicTree is loop-local, so App.Publish fans out to every peer loop.
 	pubsubPeers []*App
+
+	// sharedRequestRing switches GetAsync/PostAsync shared dispatch from the
+	// process-wide request ring to this App's per-loop request ring. Set by
+	// RunMultiCore options before setup registers routes.
+	sharedRequestRing    bool
+	sharedWorkersPerRing int
 }
 
 const defaultBodyReadTimeout = 30 * time.Second
@@ -1183,7 +1189,7 @@ func (a *App) GetAsync(pattern string, handler AsyncHandler) {
 		// worker (the snapshot built in C++ has no Go-side meta).
 		wrappedAsync := a.applyAppRefAsync(a.applyMetaAsync(meta, a.wrapAsync(uwsPattern, handler)))
 		a.acquireSharedWorkerRef()
-		a.inner.getShared(uwsPattern, wrappedAsync)
+		a.inner.getShared(uwsPattern, wrappedAsync, a.sharedRequestRing, a.sharedWorkersPerRing)
 		return
 	}
 
@@ -1251,7 +1257,7 @@ func (a *App) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandl
 		meta == nil && !a.hasMatchingMiddleware(uwsPattern) {
 		wrappedAsync := a.applyAppRefAsync(a.applyMetaAsync(meta, a.wrapAsync(uwsPattern, finalAsync)))
 		a.acquireSharedWorkerRef()
-		a.inner.postShared(uwsPattern, wrappedAsync, maxBodyBytes)
+		a.inner.postShared(uwsPattern, wrappedAsync, maxBodyBytes, a.sharedRequestRing, a.sharedWorkersPerRing)
 		return
 	}
 
@@ -1719,7 +1725,7 @@ func (r *Router) GetAsync(pattern string, handler AsyncHandler) {
 		// res.app so Response.Render works on async fast-path routes.
 		wrappedAsync := r.app.applyAppRefAsync(r.app.applyMetaAsync(meta, r.app.wrapAsync(full, r.wrapGroupAsync(handler))))
 		r.app.acquireSharedWorkerRef()
-		r.app.inner.getShared(full, wrappedAsync)
+		r.app.inner.getShared(full, wrappedAsync, r.app.sharedRequestRing, r.app.sharedWorkersPerRing)
 		return
 	}
 
@@ -2204,6 +2210,53 @@ type MultiCoreHandle struct {
 	done chan struct{}
 }
 
+type multiCoreConfig struct {
+	fanoutAcceptedSockets bool
+	shardAsyncRequestRing bool
+	asyncWorkersPerRing   int
+}
+
+// MultiCoreOption configures RunMultiCore.
+type MultiCoreOption func(*multiCoreConfig)
+
+// WithMultiCoreFanout keeps RunMultiCore's default LocalCluster-style
+// accepted-socket fanout: every listener round-robins accepted sockets across
+// every App loop. This gives predictable distribution even when the kernel's
+// SO_REUSEPORT hash sends most loopback or low-cardinality traffic to one
+// listener.
+func WithMultiCoreFanout() MultiCoreOption {
+	return func(c *multiCoreConfig) {
+		c.fanoutAcceptedSockets = true
+	}
+}
+
+// WithMultiCoreReusePort disables accepted-socket fanout and lets each App
+// keep the sockets accepted by its own listener. This avoids cross-loop socket
+// handoff overhead and is usually faster when the OS distributes SO_REUSEPORT
+// connections evenly. If traffic lands unevenly on your platform, use the
+// default fanout mode instead.
+func WithMultiCoreReusePort() MultiCoreOption {
+	return func(c *multiCoreConfig) {
+		c.fanoutAcceptedSockets = false
+	}
+}
+
+// WithMultiCorePerLoopAsyncWorkers shards GetAsync/PostAsync shared dispatch
+// by App loop and starts workersPerLoop goroutines for each loop's request
+// ring. This reduces cross-core contention for short async handlers in
+// RunMultiCore mode. IO-heavy handlers should be benchmarked with their real
+// datastore before raising the value; more workers can improve throughput or
+// just add scheduler and backend contention.
+func WithMultiCorePerLoopAsyncWorkers(workersPerLoop int) MultiCoreOption {
+	if workersPerLoop <= 0 {
+		workersPerLoop = 1
+	}
+	return func(c *multiCoreConfig) {
+		c.shardAsyncRequestRing = true
+		c.asyncWorkersPerRing = workersPerLoop
+	}
+}
+
 // Shutdown initiates graceful stop on every App in the group. Idempotent;
 // safe to call from any goroutine.
 func (h *MultiCoreHandle) Shutdown() {
@@ -2219,11 +2272,16 @@ func (h *MultiCoreHandle) Wait() {
 }
 
 // RunMultiCore spawns n independent App instances on dedicated OS threads.
-// Each instance binds to the given port, then every listener round-robins
-// accepted sockets across every App. This keeps scaling predictable even on
-// kernels or loopback paths where SO_REUSEPORT hashes connections to only one
-// listening socket. setup is called once per App, on the thread that instance
-// will run on, to register routes / middleware / etc.
+// Each instance binds to the given port. By default every listener
+// round-robins accepted sockets across every App, keeping scaling predictable
+// even on kernels or loopback paths where SO_REUSEPORT hashes connections to
+// only one listening socket. Pass WithMultiCoreReusePort to skip that fanout
+// and let each App keep sockets accepted by its own listener, which can be
+// faster when the OS distributes connections evenly. Pass
+// WithMultiCorePerLoopAsyncWorkers to shard GetAsync/PostAsync dispatch by App
+// loop instead of using the process-wide async worker pool. setup is called
+// once per App, on the thread that instance will run on, to register routes /
+// middleware / etc.
 //
 // setup MUST register the same routes on every App for consistent behavior;
 // the framework just calls setup(app) and trusts user code to be
@@ -2235,12 +2293,21 @@ func (h *MultiCoreHandle) Wait() {
 // Returns a MultiCoreHandle that can Shutdown or Wait. Returns an error if
 // any App fails to start; in that case already-started Apps are shut down
 // before returning.
-func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, error) {
+func RunMultiCore(n int, port int, setup func(app *App), opts ...MultiCoreOption) (*MultiCoreHandle, error) {
 	if n <= 0 {
 		return nil, fmt.Errorf("gogo: RunMultiCore needs n>0, got %d", n)
 	}
 	if setup == nil {
 		return nil, fmt.Errorf("gogo: RunMultiCore requires a setup function")
+	}
+	mc := multiCoreConfig{
+		fanoutAcceptedSockets: true,
+		asyncWorkersPerRing:   1,
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&mc)
+		}
 	}
 
 	type startResult struct {
@@ -2283,6 +2350,8 @@ func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, erro
 				starts <- startResult{idx: idx, err: err}
 				return
 			}
+			app.sharedRequestRing = mc.shardAsyncRequestRing
+			app.sharedWorkersPerRing = mc.asyncWorkersPerRing
 
 			starts <- startResult{idx: idx, app: app}
 			select {
@@ -2305,7 +2374,7 @@ func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, erro
 				return
 			}
 
-			if n > 1 {
+			if n > 1 && mc.fanoutAcceptedSockets {
 				for childIdx, child := range apps {
 					// Keep the accepting App in the child set. This mirrors uWS's
 					// LocalCluster pattern and gives every listener the same complete

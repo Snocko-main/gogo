@@ -170,6 +170,77 @@ func TestRunMultiCoreDistributesAcceptedSockets(t *testing.T) {
 	}
 }
 
+func TestRunMultiCoreReusePortStarts(t *testing.T) {
+	const workers = 2
+
+	oldProcs := runtime.GOMAXPROCS(workers)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	port := freePort(t)
+	handle, err := gogo.RunMultiCore(workers, port, func(app *gogo.App) {
+		app.Get("/ok", "ok")
+	}, gogo.WithMultiCoreReusePort())
+	if err != nil {
+		t.Fatalf("RunMultiCore reuseport: %v", err)
+	}
+	defer func() {
+		handle.Shutdown()
+		handle.Wait()
+	}()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/ok", port))
+	if err != nil {
+		t.Fatalf("GET /ok: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if resp.StatusCode != 200 || string(body) != "ok" {
+		t.Fatalf("status=%d body=%q, want 200 ok", resp.StatusCode, body)
+	}
+}
+
+func TestRunMultiCorePerLoopAsyncWorkersStarts(t *testing.T) {
+	const workers = 2
+
+	oldProcs := runtime.GOMAXPROCS(workers)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	port := freePort(t)
+	handle, err := gogo.RunMultiCore(workers, port, func(app *gogo.App) {
+		app.GetAsync("/async", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "ok")
+		})
+	}, gogo.WithMultiCorePerLoopAsyncWorkers(1))
+	if err != nil {
+		t.Fatalf("RunMultiCore per-loop async workers: %v", err)
+	}
+	defer func() {
+		handle.Shutdown()
+		handle.Wait()
+		if !gogo.WaitForSharedWorkers(2 * time.Second) {
+			t.Fatal("shared workers did not stop")
+		}
+	}()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/async", port))
+	if err != nil {
+		t.Fatalf("GET /async: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if resp.StatusCode != 200 || string(body) != "ok" {
+		t.Fatalf("status=%d body=%q, want 200 ok", resp.StatusCode, body)
+	}
+}
+
 func TestRunMultiCoreSetupPanicReturnsError(t *testing.T) {
 	port := freePort(t)
 	handle, err := gogo.RunMultiCore(2, port, func(app *gogo.App) {

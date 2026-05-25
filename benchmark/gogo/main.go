@@ -61,9 +61,12 @@ func main() {
 		filePath = "data/sample.json"
 	}
 
-	// GOGO_CORES=N enables multi-core mode (N independent App instances
-	// with accepted sockets round-robined across loops). Defaults to
-	// single-core for parity with old runs.
+	// GOGO_CORES=N enables multi-core mode (N independent App instances).
+	// GOGO_MULTICORE_MODE=reuseport lets each loop keep the sockets accepted
+	// by its own listener; otherwise RunMultiCore uses its default fanout mode.
+	// GOGO_ASYNC_RING=perloop enables per-loop async request rings; optionally
+	// set GOGO_WORKERS_PER_RING=N.
+	// Defaults to single-core for parity with old runs.
 	n := 1
 	if env := os.Getenv("GOGO_CORES"); env != "" {
 		if v, err := strconv.Atoi(env); err == nil && v > 0 {
@@ -171,7 +174,20 @@ func main() {
 		return
 	}
 
-	handle, err := gogo.RunMultiCore(n, 3002, setup)
+	var opts []gogo.MultiCoreOption
+	if os.Getenv("GOGO_MULTICORE_MODE") == "reuseport" {
+		opts = append(opts, gogo.WithMultiCoreReusePort())
+	}
+	if os.Getenv("GOGO_ASYNC_RING") == "perloop" {
+		workersPerRing := 1
+		if env := os.Getenv("GOGO_WORKERS_PER_RING"); env != "" {
+			if v, err := strconv.Atoi(env); err == nil && v > 0 {
+				workersPerRing = v
+			}
+		}
+		opts = append(opts, gogo.WithMultiCorePerLoopAsyncWorkers(workersPerRing))
+	}
+	handle, err := gogo.RunMultiCore(n, 3002, setup, opts...)
 	if err != nil {
 		log.Fatal(err)
 	}

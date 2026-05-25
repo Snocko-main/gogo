@@ -47,26 +47,27 @@ func newAppNative() (appNative, error) {
 	return appNative{}, errNativeDisabled
 }
 
-func (appNative) get(string, Handler)                      {}
-func (appNative) getStatic(string, string, string, string) {}
-func (appNative) getShared(string, AsyncHandler)           {}
-func (appNative) postShared(string, AsyncHandler, int)     {}
-func (appNative) post(string, Handler)                     {}
-func (appNative) any(string, Handler)                      {}
-func (appNative) put(string, Handler)                      {}
-func (appNative) patch(string, Handler)                    {}
-func (appNative) deleteM(string, Handler)                  {}
-func (appNative) options(string, Handler)                  {}
-func (appNative) head(string, Handler)                     {}
-func (appNative) websocket(string, WebSocketBehavior)      {}
-func (appNative) listen(string, int) bool                  { return false }
-func (appNative) addChild(appNative) bool                  { return false }
-func (appNative) setBodyLimit(int)                         {}
-func (appNative) setCapturePeerIP(bool)                    {}
-func (appNative) run()                                     {}
-func (appNative) stop()                                    {}
-func (appNative) closeListen()                             {}
-func (appNative) close()                                   {}
+func (appNative) get(string, Handler)                       {}
+func (appNative) getStatic(string, string, string, string)  {}
+func (appNative) getShared(string, AsyncHandler, bool, int) {}
+func (appNative) postShared(string, AsyncHandler, int, bool, int) {
+}
+func (appNative) post(string, Handler)                {}
+func (appNative) any(string, Handler)                 {}
+func (appNative) put(string, Handler)                 {}
+func (appNative) patch(string, Handler)               {}
+func (appNative) deleteM(string, Handler)             {}
+func (appNative) options(string, Handler)             {}
+func (appNative) head(string, Handler)                {}
+func (appNative) websocket(string, WebSocketBehavior) {}
+func (appNative) listen(string, int) bool             { return false }
+func (appNative) addChild(appNative) bool             { return false }
+func (appNative) setBodyLimit(int)                    {}
+func (appNative) setCapturePeerIP(bool)               {}
+func (appNative) run()                                {}
+func (appNative) stop()                               {}
+func (appNative) closeListen()                        {}
+func (appNative) close()                              {}
 
 func (responseNative) status(string)               {}
 func (responseNative) header(string, string)       {}

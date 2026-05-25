@@ -160,18 +160,27 @@
 //	handle.Wait()
 //
 // RunMultiCore spawns N independent App instances, each bound to the
-// same port. Accepted sockets are round-robined across the App loops,
-// so scaling does not depend on the kernel's SO_REUSEPORT hash
-// distributing connections evenly. setup runs once per instance on
-// the OS thread that instance will own. setup has no error return; do
-// fallible shared initialization before RunMultiCore. A setup panic is
-// recovered, converted to an error, and any created Apps are closed.
+// same port. By default accepted sockets are round-robined across the
+// App loops, so scaling does not depend on the kernel's SO_REUSEPORT
+// hash distributing connections evenly. Pass WithMultiCoreReusePort
+// when your OS balances listeners well and you want to avoid cross-loop
+// accepted-socket fanout. setup runs once per instance on the OS thread
+// that instance will own. setup has no error return; do fallible shared
+// initialization before RunMultiCore. A setup panic is recovered,
+// converted to an error, and any created Apps are closed.
 //
 // Tuning knobs that actually matter:
 //
 //   - GOMAXPROCS — pin to the same N you passed to RunMultiCore. The
 //     scheduler then has exactly one P per loop; oversubscribing
 //     wastes context-switch budget, undersubscribing starves loops.
+//   - WithMultiCoreReusePort — skip accepted-socket fanout when the
+//     OS distributes SO_REUSEPORT listeners evenly; omit it for
+//     deterministic round-robin fanout.
+//   - WithMultiCorePerLoopAsyncWorkers — shard GetAsync/PostAsync
+//     dispatch by loop and start N workers per loop. This can reduce
+//     contention for short async handlers; benchmark IO-heavy handlers
+//     with their real backend before raising N.
 //   - SetWorkerCount — controls the GetAsync worker-goroutine pool.
 //     Default = NumCPU. With RunMultiCore each loop already owns one
 //     core; the workers compete for the same CPUs, so consider

@@ -245,6 +245,7 @@ struct uwsgo_app_t {
     // threads. Allocated on the heap so multiple App instances within the
     // same process don't share state and don't contend on a global ring.
     PendingRing *pending_ring = nullptr;
+    PendingRing *request_ring = nullptr;
     struct us_timer_t *drain_timer = nullptr;
 
     // ctx_pool recycles AsyncCtx blocks so the shared-dispatch hot path
@@ -263,6 +264,7 @@ struct uwsgo_app_t {
     // a string_view format + ~50-byte memcpy per shared-dispatch
     // request, which measures at ~2-3% on small-response routes.
     bool capture_peer_ip = false;
+    bool sharded_request_ring = false;
 };
 
 static size_t copy_string_view(std::string_view value, char *buffer, size_t buffer_len) {
@@ -283,6 +285,8 @@ extern "C" uwsgo_app_t *uwsgo_app_new(void) {
     // in the same process don't share state and don't contend on a global.
     a->pending_ring = new PendingRing;
     a->pending_ring->init();
+    a->request_ring = new PendingRing;
+    a->request_ring->init();
     // Allocate the per-App AsyncCtx recycle pool. Empty at start; fills
     // as requests complete and ctx::release pushes back into it.
     a->ctx_pool = new CtxPool;
@@ -483,6 +487,17 @@ extern "C" void uwsgo_app_set_body_limit(uwsgo_app_t *app, size_t limit) {
 
 extern "C" void uwsgo_app_set_capture_peer_ip(uwsgo_app_t *app, int enable) {
     app->capture_peer_ip = enable != 0;
+}
+
+extern "C" void uwsgo_app_set_sharded_request_ring(uwsgo_app_t *app, int enable) {
+    app->sharded_request_ring = enable != 0;
+}
+
+extern "C" void *uwsgo_app_request_ring(uwsgo_app_t *app) {
+    if (app == nullptr) {
+        return nullptr;
+    }
+    return app->request_ring;
 }
 
 extern "C" void uwsgo_app_ws(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id,
@@ -955,6 +970,7 @@ struct AsyncCtx {
     uWS::HttpResponse<false> *response;
     uWS::Loop *loop = nullptr;  // The loop that owns this response (set at creation time)
     PendingRing *pending_ring = nullptr;  // The response ring this ctx must be pushed onto
+    PendingRing *request_ring = nullptr;  // The request ring that owns this ctx handoff
     CtxPool *pool = nullptr;  // Per-App pool to push back into on release; null = always delete
     uint32_t handler_id = 0;  // Used by shared-dispatch path to pick which Go handler runs
 
@@ -1008,6 +1024,7 @@ struct AsyncCtx {
         response = nullptr;
         loop = nullptr;
         pending_ring = nullptr;
+        request_ring = nullptr;
         handler_id = 0;
         inline_status_len = 0;
         inline_ct_len = 0;
@@ -1056,6 +1073,9 @@ extern "C" void uwsgo_app_free(uwsgo_app_t *app) {
     }
     if (app->pending_ring) {
         delete app->pending_ring;
+    }
+    if (app->request_ring) {
+        delete app->request_ring;
     }
     delete app;
 }
@@ -1288,13 +1308,14 @@ static void snapshot_request(uwsgo_app_t *app, AsyncCtx *ctx, uWS::HttpResponse<
 // return. Used by both the GET and POST shared-dispatch paths so
 // the enqueue-and-recover logic stays in one place.
 static bool enqueue_ctx(AsyncCtx *ctx, uWS::HttpResponse<false> *res) {
-    uint64_t tail = g_request.tail.load(std::memory_order_relaxed);
+    PendingRing *request_ring = ctx->request_ring ? ctx->request_ring : &g_request;
+    uint64_t tail = request_ring->tail.load(std::memory_order_relaxed);
     for (int spin = 0;; ++spin) {
-        PendingSlot *slot = &g_request.slots[tail & RING_MASK];
+        PendingSlot *slot = &request_ring->slots[tail & RING_MASK];
         uint64_t seq = slot->sequence.load(std::memory_order_acquire);
         int64_t diff = (int64_t)(seq - tail);
         if (diff == 0) {
-            if (g_request.tail.compare_exchange_weak(
+            if (request_ring->tail.compare_exchange_weak(
                     tail, tail + 1,
                     std::memory_order_relaxed,
                     std::memory_order_relaxed)) {
@@ -1312,7 +1333,7 @@ static bool enqueue_ctx(AsyncCtx *ctx, uWS::HttpResponse<false> *res) {
             res->end("Server overloaded\n");
             return false;
         } else {
-            tail = g_request.tail.load(std::memory_order_relaxed);
+            tail = request_ring->tail.load(std::memory_order_relaxed);
         }
         if (spin > 100000) {
             ctx->release();
@@ -1338,6 +1359,7 @@ static AsyncCtx *acquire_shared_ctx(uwsgo_app_t *app, uWS::HttpResponse<false> *
     ctx->response = res;
     ctx->loop = uWS::Loop::get();
     ctx->pending_ring = app->pending_ring;
+    ctx->request_ring = app->sharded_request_ring ? app->request_ring : &g_request;
     ctx->handler_id = handler_id;
     return ctx;
 }
