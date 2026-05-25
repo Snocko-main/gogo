@@ -60,6 +60,7 @@ func (appNative) options(string, Handler)                  {}
 func (appNative) head(string, Handler)                     {}
 func (appNative) websocket(string, WebSocketBehavior)      {}
 func (appNative) listen(string, int) bool                  { return false }
+func (appNative) addChild(appNative) bool                  { return false }
 func (appNative) setBodyLimit(int)                         {}
 func (appNative) setCapturePeerIP(bool)                    {}
 func (appNative) run()                                     {}

@@ -1272,6 +1272,12 @@ handlers, use `hub.Publish` or `hub.PublishBatch`. A successful publish call
 means local fan-out completed and the adapter message was queued; Redis/network
 errors are reported through `WithWSHubAdapterErrorHandler`.
 
+If you call raw `ws.Publish` from a WebSocket handler in `RunMultiCore`, gogo
+publishes locally on the current loop and schedules one copied publish on each
+peer loop. That keeps delivery correct across cores, but the peer part is
+O(worker count); use `WSHub` when you want the skip-sender semantics plus a
+clear place to add Redis/cluster fan-out.
+
 ```go
 go func() {
     for {
@@ -1481,8 +1487,9 @@ app.Post("/upload-stream", func(res *gogo.Response, req *gogo.Request) {
 
 Single-loop mode (`NewApp` + `Run`) caps throughput at one OS thread. To
 saturate every vCPU, use `RunMultiCore` — N independent App instances bound
-to the same port via `SO_REUSEPORT`. The kernel load-balances connections
-across the listening sockets.
+to the same port. Accepted sockets are round-robined across the App loops, so
+scaling does not depend on the kernel's `SO_REUSEPORT` hash distributing
+connections evenly.
 
 ```go
 func main() {

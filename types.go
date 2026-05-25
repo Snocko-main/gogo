@@ -280,6 +280,8 @@ type WebSocketBehavior struct {
 	Message func(*WebSocket, []byte, OpCode)
 	Close   func(*WebSocket, int, []byte)
 
+	app *App
+
 	// MaxPayloadLength is the largest single incoming message the
 	// server will accept. Frames over this cap cause uWS to close the
 	// connection. Default 16 MiB.
@@ -604,6 +606,10 @@ type App struct {
 	// nil means "no engine installed" — Render then responds 500 with an
 	// operator-visible error logged via reportPanic.
 	templateEngine atomic.Pointer[templateEngineSlot]
+
+	// pubsubPeers is populated by RunMultiCore before listeners start. uWS's
+	// TopicTree is loop-local, so App.Publish fans out to every peer loop.
+	pubsubPeers []*App
 }
 
 const defaultBodyReadTimeout = 30 * time.Second
@@ -1328,6 +1334,7 @@ func (a *App) Head(pattern string, handler Handler) {
 // WebSocket registers a WebSocket route.
 func (a *App) WebSocket(pattern string, behavior WebSocketBehavior) {
 	validatePattern(pattern)
+	behavior.app = a
 	a.inner.websocket(pattern, behavior)
 }
 
@@ -1337,10 +1344,10 @@ func (a *App) WebSocket(pattern string, behavior WebSocketBehavior) {
 // clients — where calling WebSocket.Publish directly would touch
 // uWS's loop-thread-local TopicTree from the wrong thread.
 //
-// The publish is dispatched onto the App's loop, so it is safe to
-// call from any goroutine. The topic + message bytes are copied
-// before scheduling, so the caller's buffers can be reused or
-// reclaimed as soon as Publish returns.
+// In RunMultiCore mode the publish is dispatched onto every peer
+// App's loop so subscribers on all cores receive it. The topic +
+// message bytes are copied before scheduling, so the caller's
+// buffers can be reused or reclaimed as soon as Publish returns.
 //
 // Topics are exact-match strings — uWS's TopicTree v20 does not
 // support MQTT-style "+" / "#" wildcards. Publish to the same string
@@ -1350,7 +1357,7 @@ func (a *App) WebSocket(pattern string, behavior WebSocketBehavior) {
 // payloads use Text so browser clients receive them as strings via
 // onmessage.data.
 //
-// Returns immediately — delivery happens asynchronously on the loop.
+// Returns immediately — delivery happens asynchronously on the loop(s).
 // There is no error / delivery-count return because the loop may not
 // have processed the publish yet when this returns; uWS itself does
 // not surface that count back to the publisher.
@@ -1358,9 +1365,9 @@ func (a *App) WebSocket(pattern string, behavior WebSocketBehavior) {
 //
 // Performance — pick the right entry point:
 //   - Inside an Open/Message/Close handler (loop thread): prefer
-//     WebSocket.Publish. It bypasses the cross-thread defer mutex
-//     and message copy — the cost is just a cgo crossing plus uWS's
-//     own internal publish work.
+//     WebSocket.Publish. On a single App it bypasses the cross-thread defer
+//     mutex and message copy. In RunMultiCore it still has to schedule one
+//     copied peer-loop publish per other App, so the cost is O(peer loops).
 //   - From a worker goroutine, single message: App.Publish. Measures
 //     ~750 ns/op on this VM end-to-end including cgo + heap copy +
 //     Loop::defer mutex + wakeup.
@@ -1374,12 +1381,34 @@ func (a *App) Publish(topic string, message []byte, opcode OpCode) {
 	if a.closed.Load() || a.stopping.Load() {
 		return
 	}
+	peers := a.pubsubPeers
+	if len(peers) > 1 {
+		for _, peer := range peers {
+			peer.publishLocal(topic, message, opcode)
+		}
+		return
+	}
+	a.publishLocal(topic, message, opcode)
+}
+
+func (a *App) publishLocal(topic string, message []byte, opcode OpCode) {
+	if a.closed.Load() || a.stopping.Load() {
+		return
+	}
 	a.nativeMu.RLock()
 	defer a.nativeMu.RUnlock()
 	if a.closed.Load() || a.stopping.Load() {
 		return
 	}
 	a.inner.publish(topic, message, opcode)
+}
+
+func (a *App) publishPeersExcept(skip *App, topic string, message []byte, opcode OpCode) {
+	for _, peer := range a.pubsubPeers {
+		if peer != skip {
+			peer.publishLocal(topic, message, opcode)
+		}
+	}
 }
 
 // PublishMessage is one entry in an App.PublishBatch call.
@@ -1424,9 +1453,25 @@ type PublishMessage struct {
 // Mixed Text/Binary opcodes in one batch are fine.
 //
 // Returns immediately. Like Publish, delivery happens later on the
-// loop and there is no per-message delivery-count. Calls after
+// loop(s) and there is no per-message delivery-count. In RunMultiCore
+// mode the batch is dispatched once per peer App so subscribers on all
+// cores receive it. Calls after
 // Shutdown, ShutdownGracefully, or Close are ignored.
 func (a *App) PublishBatch(msgs []PublishMessage) {
+	if a.closed.Load() || a.stopping.Load() {
+		return
+	}
+	peers := a.pubsubPeers
+	if len(peers) > 1 {
+		for _, peer := range peers {
+			peer.publishBatchLocal(msgs)
+		}
+		return
+	}
+	a.publishBatchLocal(msgs)
+}
+
+func (a *App) publishBatchLocal(msgs []PublishMessage) {
 	if a.closed.Load() || a.stopping.Load() {
 		return
 	}
@@ -1740,6 +1785,7 @@ func (r *Router) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHa
 func (r *Router) WebSocket(pattern string, behavior WebSocketBehavior) {
 	validatePattern(pattern)
 	full := r.prefix + pattern
+	behavior.app = r.app
 	r.app.inner.websocket(full, behavior)
 }
 
@@ -2173,16 +2219,18 @@ func (h *MultiCoreHandle) Wait() {
 }
 
 // RunMultiCore spawns n independent App instances on dedicated OS threads.
-// Each instance binds to the given port — uWS listen sockets enable
-// SO_REUSEPORT, so the kernel load-balances incoming connections across
-// the App instances. setup is called once per App, on the thread that
-// instance will run on, to register routes / middleware / etc.
+// Each instance binds to the given port, then every listener round-robins
+// accepted sockets across every App. This keeps scaling predictable even on
+// kernels or loopback paths where SO_REUSEPORT hashes connections to only one
+// listening socket. setup is called once per App, on the thread that instance
+// will run on, to register routes / middleware / etc.
 //
 // setup MUST register the same routes on every App for consistent behavior;
 // the framework just calls setup(app) and trusts user code to be
-// deterministic. Heavy shared state (DB pools, caches) should be created
-// ONCE outside RunMultiCore and captured into the handler closures so
-// per-App initialization stays cheap.
+// deterministic. Heavy shared state (DB pools, caches) and any fallible
+// initialization should be created ONCE outside RunMultiCore and captured into
+// the handler closures so per-App initialization stays cheap. If setup panics,
+// RunMultiCore converts it to an error and closes any Apps created so far.
 //
 // Returns a MultiCoreHandle that can Shutdown or Wait. Returns an error if
 // any App fails to start; in that case already-started Apps are shut down
@@ -2196,15 +2244,31 @@ func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, erro
 	}
 
 	type startResult struct {
+		idx int
 		app *App
 		err error
 	}
 	starts := make(chan startResult, n)
+	setups := make(chan startResult, n)
+	listens := make(chan startResult, n)
+	configureSetup := make(chan struct{})
+	configureChildren := make(chan struct{})
+	runLoops := make(chan struct{})
+	runReturned := make(chan struct{}, n)
+	closeApps := make(chan struct{})
+	abort := make(chan struct{})
 	done := make(chan struct{})
-	apps := make([]*App, 0, n)
+	apps := make([]*App, n)
+	var abortOnce sync.Once
+	abortAll := func() {
+		abortOnce.Do(func() {
+			close(abort)
+		})
+	}
 
 	var runWg sync.WaitGroup
 	for i := 0; i < n; i++ {
+		idx := i
 		runWg.Add(1)
 		go func() {
 			defer runWg.Done()
@@ -2216,42 +2280,126 @@ func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, erro
 
 			app, err := NewApp()
 			if err != nil {
-				starts <- startResult{nil, err}
+				starts <- startResult{idx: idx, err: err}
 				return
 			}
-			setup(app)
+
+			starts <- startResult{idx: idx, app: app}
+			select {
+			case <-configureSetup:
+			case <-abort:
+				app.Close()
+				return
+			}
+
+			if err := runMultiCoreSetup(idx, app, setup); err != nil {
+				setups <- startResult{idx: idx, app: app, err: err}
+				app.Close()
+				return
+			}
+			setups <- startResult{idx: idx, app: app}
+			select {
+			case <-configureChildren:
+			case <-abort:
+				app.Close()
+				return
+			}
+
+			if n > 1 {
+				for childIdx, child := range apps {
+					// Keep the accepting App in the child set. This mirrors uWS's
+					// LocalCluster pattern and gives every listener the same complete
+					// round-robin destination list.
+					if !app.inner.addChild(child.inner) {
+						app.Close()
+						listens <- startResult{
+							idx: idx,
+							err: fmt.Errorf("gogo: failed to configure multicore child app %d for worker %d", childIdx, idx),
+						}
+						return
+					}
+				}
+			}
+
 			if !app.Listen(port) {
 				app.Close()
-				starts <- startResult{nil, fmt.Errorf("gogo: failed to Listen on :%d", port)}
+				listens <- startResult{idx: idx, err: fmt.Errorf("gogo: failed to Listen on :%d", port)}
 				return
 			}
-			starts <- startResult{app, nil}
-			app.Run()
-			app.Close()
+
+			listens <- startResult{idx: idx, app: app}
+			select {
+			case <-runLoops:
+				app.Run()
+				runReturned <- struct{}{}
+				<-closeApps
+				app.Close()
+			case <-abort:
+				app.Close()
+			}
 		}()
 	}
 
-	// Collect start results.
+	// First create every App so peer pub/sub is fully wired before user
+	// setup can start background publishers. Child routing is installed only
+	// after routes are registered and all App pointers exist, because each
+	// listener needs the full set of destination loops for accepted-socket
+	// round-robin.
 	for i := 0; i < n; i++ {
 		r := <-starts
 		if r.err != nil {
-			// Shut down any apps that already started, then surface the error.
-			for _, a := range apps {
-				a.Shutdown()
-			}
+			abortAll()
 			runWg.Wait()
 			return nil, r.err
 		}
-		apps = append(apps, r.app)
+		apps[r.idx] = r.app
+	}
+	for _, app := range apps {
+		app.pubsubPeers = apps
+	}
+	close(configureSetup)
+
+	for i := 0; i < n; i++ {
+		r := <-setups
+		if r.err != nil {
+			abortAll()
+			runWg.Wait()
+			return nil, r.err
+		}
 	}
 
-	// Signal Wait() once every Run loop has exited.
+	close(configureChildren)
+
+	for i := 0; i < n; i++ {
+		r := <-listens
+		if r.err != nil {
+			abortAll()
+			runWg.Wait()
+			return nil, r.err
+		}
+	}
+	close(runLoops)
+
 	go func() {
+		for i := 0; i < n; i++ {
+			<-runReturned
+		}
+		close(closeApps)
 		runWg.Wait()
 		close(done)
 	}()
 
 	return &MultiCoreHandle{apps: apps, done: done}, nil
+}
+
+func runMultiCoreSetup(idx int, app *App, setup func(app *App)) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("gogo: RunMultiCore setup panic on worker %d: %v", idx, recovered)
+		}
+	}()
+	setup(app)
+	return nil
 }
 
 // Response wraps a uWebSockets response.
@@ -5569,6 +5717,7 @@ func parseSingleQueryParam(q, name string) string {
 // WebSocket wraps a uWebSockets WebSocket connection.
 type WebSocket struct {
 	inner    websocketNative
+	app      *App
 	hubToken atomic.Uint64
 }
 
@@ -5643,7 +5792,8 @@ func (ws *WebSocket) Unsubscribe(topic string) bool {
 	return true
 }
 
-// Publish broadcasts message to every OTHER subscriber of topic.
+// Publish broadcasts message to every OTHER subscriber of topic, including
+// subscribers on peer RunMultiCore loops.
 // uWS deliberately excludes the publishing socket from its own
 // broadcast — per WebSocket.h: "Publish as sender, does not receive
 // its own messages even if subscribed to relevant topics" — so if
@@ -5652,17 +5802,24 @@ func (ws *WebSocket) Unsubscribe(topic string) bool {
 //
 // opcode picks the WebSocket frame type (Text or Binary). Returns
 // true when the message was queued for delivery to at least one
-// subscriber.
+// subscriber on the publishing socket's local loop. In RunMultiCore
+// mode, peer-loop fanout is fire-and-forget and is not reflected in
+// this return value.
 //
-// This is the fast path: no cross-thread defer, no message copy,
-// just a cgo crossing into uWS's TopicTree publish. Use it from
-// Open/Message/Close handlers wherever possible. App.Publish exists
-// specifically for the worker-goroutine case where you don't have
-// a live WebSocket pointer on the loop thread.
+// This is the fast path for the publishing socket's local loop: no cross-thread
+// defer, no message copy, just a cgo crossing into uWS's TopicTree publish. In
+// RunMultiCore, peer loops are reached by scheduling one copied publish per
+// other App, so the peer fan-out cost is O(peer loops). App.Publish exists for
+// the worker-goroutine case where you don't have a live WebSocket pointer on
+// the loop thread.
 //
 // Calling this from off the loop thread (e.g. a goroutine you
 // spawned from a handler) corrupts uWS state — the WebSocket
 // pointer is only valid on the loop.
 func (ws *WebSocket) Publish(topic string, message []byte, opcode OpCode) bool {
-	return ws.inner.publish(topic, message, opcode)
+	ok := ws.inner.publish(topic, message, opcode)
+	if ws.app != nil && len(ws.app.pubsubPeers) > 1 {
+		ws.app.publishPeersExcept(ws.app, topic, message, opcode)
+	}
+	return ok
 }

@@ -110,6 +110,419 @@ func startApp(t testing.TB, configure func(app *gogo.App)) (port int, teardown f
 	return port, teardown
 }
 
+func TestRunMultiCoreDistributesAcceptedSockets(t *testing.T) {
+	const workers = 4
+
+	oldProcs := runtime.GOMAXPROCS(workers)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	port := freePort(t)
+	var next atomic.Int32
+	var counts [workers]atomic.Int64
+
+	handle, err := gogo.RunMultiCore(workers, port, func(app *gogo.App) {
+		id := int(next.Add(1)) - 1
+		app.Get("/id", func(res *gogo.Response, req *gogo.Request) {
+			counts[id].Add(1)
+			res.Send(200, "text/plain", strconv.Itoa(id))
+		})
+	})
+	if err != nil {
+		t.Fatalf("RunMultiCore: %v", err)
+	}
+	defer func() {
+		handle.Shutdown()
+		handle.Wait()
+	}()
+
+	client := &http.Client{
+		Transport: &http.Transport{DisableKeepAlives: true},
+		Timeout:   2 * time.Second,
+	}
+
+	seen := make(map[int]bool)
+	for i := 0; i < workers*8; i++ {
+		resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/id", port))
+		if err != nil {
+			t.Fatalf("GET /id: %v", err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if resp.StatusCode != 200 {
+			t.Fatalf("status = %d body=%q, want 200", resp.StatusCode, body)
+		}
+		id, err := strconv.Atoi(strings.TrimSpace(string(body)))
+		if err != nil {
+			t.Fatalf("worker id body %q: %v", body, err)
+		}
+		seen[id] = true
+	}
+
+	if len(seen) != workers {
+		var got [workers]int64
+		for i := range counts {
+			got[i] = counts[i].Load()
+		}
+		t.Fatalf("requests reached %d/%d workers; counts=%v", len(seen), workers, got)
+	}
+}
+
+func TestRunMultiCoreSetupPanicReturnsError(t *testing.T) {
+	port := freePort(t)
+	handle, err := gogo.RunMultiCore(2, port, func(app *gogo.App) {
+		panic("setup failed")
+	})
+	if err == nil {
+		if handle != nil {
+			handle.Shutdown()
+			handle.Wait()
+		}
+		t.Fatal("RunMultiCore returned nil error after setup panic")
+	}
+	if handle != nil {
+		t.Fatal("RunMultiCore returned a handle after setup panic")
+	}
+	if !strings.Contains(err.Error(), "RunMultiCore setup panic") || !strings.Contains(err.Error(), "setup failed") {
+		t.Fatalf("RunMultiCore error = %q, want setup panic context", err)
+	}
+}
+
+func TestRunMultiCoreAppPublishReachesAllLoops(t *testing.T) {
+	const workers = 4
+	const clientsN = workers * 2
+
+	oldProcs := runtime.GOMAXPROCS(workers)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	port := freePort(t)
+	appCh := make(chan *gogo.App, workers)
+	handle, err := gogo.RunMultiCore(workers, port, func(app *gogo.App) {
+		appCh <- app
+		app.WebSocket("/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				ws.Subscribe("global")
+			},
+		})
+	})
+	if err != nil {
+		t.Fatalf("RunMultiCore: %v", err)
+	}
+	defer func() {
+		handle.Shutdown()
+		handle.Wait()
+	}()
+
+	apps := make([]*gogo.App, 0, workers)
+	for i := 0; i < workers; i++ {
+		apps = append(apps, <-appCh)
+	}
+
+	clients := make([]*wsClient, 0, clientsN)
+	for i := 0; i < clientsN; i++ {
+		c, err := dialWebSocket(port, "/ws")
+		if err != nil {
+			t.Fatalf("dial client %d: %v", i, err)
+		}
+		defer c.Close()
+		clients = append(clients, c)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	apps[0].Publish("global", []byte("broadcast"), gogo.Text)
+	for i, c := range clients {
+		got, err := c.ReadText(2 * time.Second)
+		if err != nil {
+			t.Fatalf("client %d read: %v", i, err)
+		}
+		if got != "broadcast" {
+			t.Fatalf("client %d got %q, want broadcast", i, got)
+		}
+		if err := c.expectNoMessage(300 * time.Millisecond); err != nil {
+			t.Fatalf("client %d got duplicate after Publish: %v", i, err)
+		}
+	}
+}
+
+func TestRunMultiCoreAppPublishBatchReachesAllLoopsOnce(t *testing.T) {
+	const workers = 4
+	const clientsN = workers * 2
+
+	oldProcs := runtime.GOMAXPROCS(workers)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	port := freePort(t)
+	appCh := make(chan *gogo.App, workers)
+	handle, err := gogo.RunMultiCore(workers, port, func(app *gogo.App) {
+		appCh <- app
+		app.WebSocket("/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				ws.Subscribe("global")
+			},
+		})
+	})
+	if err != nil {
+		t.Fatalf("RunMultiCore: %v", err)
+	}
+	defer func() {
+		handle.Shutdown()
+		handle.Wait()
+	}()
+
+	apps := make([]*gogo.App, 0, workers)
+	for i := 0; i < workers; i++ {
+		apps = append(apps, <-appCh)
+	}
+
+	clients := make([]*wsClient, 0, clientsN)
+	for i := 0; i < clientsN; i++ {
+		c, err := dialWebSocket(port, "/ws")
+		if err != nil {
+			t.Fatalf("dial client %d: %v", i, err)
+		}
+		defer c.Close()
+		clients = append(clients, c)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	apps[0].PublishBatch([]gogo.PublishMessage{{
+		Topic:   "global",
+		Message: []byte("batch broadcast"),
+		OpCode:  gogo.Text,
+	}})
+	for i, c := range clients {
+		got, err := c.ReadText(2 * time.Second)
+		if err != nil {
+			t.Fatalf("client %d read: %v", i, err)
+		}
+		if got != "batch broadcast" {
+			t.Fatalf("client %d got %q, want batch broadcast", i, got)
+		}
+		if err := c.expectNoMessage(300 * time.Millisecond); err != nil {
+			t.Fatalf("client %d got duplicate after PublishBatch: %v", i, err)
+		}
+	}
+}
+
+func TestRunMultiCoreWebSocketPublishReachesPeerLoops(t *testing.T) {
+	const workers = 4
+	const clientsN = workers * 2
+
+	oldProcs := runtime.GOMAXPROCS(workers)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	port := freePort(t)
+	handle, err := gogo.RunMultiCore(workers, port, func(app *gogo.App) {
+		app.WebSocket("/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				ws.Subscribe("room")
+			},
+			Message: func(ws *gogo.WebSocket, msg []byte, op gogo.OpCode) {
+				ws.Publish("room", msg, op)
+			},
+		})
+	})
+	if err != nil {
+		t.Fatalf("RunMultiCore: %v", err)
+	}
+	defer func() {
+		handle.Shutdown()
+		handle.Wait()
+	}()
+
+	clients := make([]*wsClient, 0, clientsN)
+	for i := 0; i < clientsN; i++ {
+		c, err := dialWebSocket(port, "/ws")
+		if err != nil {
+			t.Fatalf("dial client %d: %v", i, err)
+		}
+		defer c.Close()
+		clients = append(clients, c)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	if err := clients[0].SendText("hello peers"); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	for i := 1; i < len(clients); i++ {
+		got, err := clients[i].ReadText(2 * time.Second)
+		if err != nil {
+			t.Fatalf("client %d read: %v", i, err)
+		}
+		if got != "hello peers" {
+			t.Fatalf("client %d got %q, want hello peers", i, got)
+		}
+		if err := clients[i].expectNoMessage(300 * time.Millisecond); err != nil {
+			t.Fatalf("client %d got duplicate after WebSocket.Publish: %v", i, err)
+		}
+	}
+	if err := clients[0].expectNoMessage(300 * time.Millisecond); err != nil {
+		t.Fatalf("publisher received its own message: %v", err)
+	}
+}
+
+func TestRunMultiCoreWSHubPublishDoesNotDuplicate(t *testing.T) {
+	const workers = 2
+
+	oldProcs := runtime.GOMAXPROCS(workers)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	port := freePort(t)
+	hub := gogo.NewWSHub(gogo.WithWSHubNodeID("test-node"))
+	defer hub.Close()
+
+	handle, err := gogo.RunMultiCore(workers, port, func(app *gogo.App) {
+		hub.WebSocket(app, "/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				ws.Subscribe("room")
+			},
+		})
+	})
+	if err != nil {
+		t.Fatalf("RunMultiCore: %v", err)
+	}
+	defer func() {
+		handle.Shutdown()
+		handle.Wait()
+	}()
+
+	client, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	if err := hub.Publish("room", []byte("hello"), gogo.Text); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	got, err := client.ReadText(2 * time.Second)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got != "hello" {
+		t.Fatalf("got %q, want hello", got)
+	}
+	if err := client.expectNoMessage(300 * time.Millisecond); err != nil {
+		t.Fatalf("duplicate delivery after Publish: %v", err)
+	}
+}
+
+func TestRunMultiCoreWSHubPublishBatchDoesNotDuplicate(t *testing.T) {
+	const workers = 2
+
+	oldProcs := runtime.GOMAXPROCS(workers)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	port := freePort(t)
+	hub := gogo.NewWSHub(gogo.WithWSHubNodeID("test-node"))
+	defer hub.Close()
+
+	handle, err := gogo.RunMultiCore(workers, port, func(app *gogo.App) {
+		hub.WebSocket(app, "/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				ws.Subscribe("room")
+			},
+		})
+	})
+	if err != nil {
+		t.Fatalf("RunMultiCore: %v", err)
+	}
+	defer func() {
+		handle.Shutdown()
+		handle.Wait()
+	}()
+
+	client, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	if err := hub.PublishBatch([]gogo.PublishMessage{{
+		Topic:   "room",
+		Message: []byte("batch"),
+		OpCode:  gogo.Text,
+	}}); err != nil {
+		t.Fatalf("PublishBatch: %v", err)
+	}
+	got, err := client.ReadText(2 * time.Second)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got != "batch" {
+		t.Fatalf("got %q, want batch", got)
+	}
+	if err := client.expectNoMessage(300 * time.Millisecond); err != nil {
+		t.Fatalf("duplicate delivery after PublishBatch: %v", err)
+	}
+}
+
+func TestRunMultiCoreWSHubPublishFromSkipsSender(t *testing.T) {
+	const workers = 2
+	const clientsN = workers * 2
+
+	oldProcs := runtime.GOMAXPROCS(workers)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	port := freePort(t)
+	hub := gogo.NewWSHub(gogo.WithWSHubNodeID("test-node"))
+	defer hub.Close()
+
+	handle, err := gogo.RunMultiCore(workers, port, func(app *gogo.App) {
+		hub.WebSocket(app, "/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				ws.Subscribe("room")
+			},
+			Message: func(ws *gogo.WebSocket, msg []byte, op gogo.OpCode) {
+				if err := hub.PublishFrom(ws, "room", msg, op); err != nil {
+					t.Errorf("PublishFrom: %v", err)
+				}
+			},
+		})
+	})
+	if err != nil {
+		t.Fatalf("RunMultiCore: %v", err)
+	}
+	defer func() {
+		handle.Shutdown()
+		handle.Wait()
+	}()
+
+	clients := make([]*wsClient, 0, clientsN)
+	for i := 0; i < clientsN; i++ {
+		c, err := dialWebSocket(port, "/ws")
+		if err != nil {
+			t.Fatalf("dial client %d: %v", i, err)
+		}
+		defer c.Close()
+		clients = append(clients, c)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	if err := clients[0].SendText("from"); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	for i := 1; i < len(clients); i++ {
+		got, err := clients[i].ReadText(2 * time.Second)
+		if err != nil {
+			t.Fatalf("client %d read: %v", i, err)
+		}
+		if got != "from" {
+			t.Fatalf("client %d got %q, want from", i, got)
+		}
+		if err := clients[i].expectNoMessage(300 * time.Millisecond); err != nil {
+			t.Fatalf("client %d got duplicate: %v", i, err)
+		}
+	}
+	if err := clients[0].expectNoMessage(300 * time.Millisecond); err != nil {
+		t.Fatalf("publisher received its own hub message: %v", err)
+	}
+}
+
 // noKeepaliveClient avoids HTTP/1.1 keep-alive so the server has no open
 // sockets keeping the loop alive when Shutdown is called.
 var noKeepaliveClient = &http.Client{
@@ -6293,6 +6706,9 @@ func TestWebSocketAppPublish(t *testing.T) {
 	}
 	if got2 != "broadcast 2" {
 		t.Errorf("msg 2: got %q, want %q", got2, "broadcast 2")
+	}
+	if err := client.expectNoMessage(300 * time.Millisecond); err != nil {
+		t.Fatalf("duplicate after App.Publish: %v", err)
 	}
 }
 

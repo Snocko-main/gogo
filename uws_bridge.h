@@ -102,6 +102,7 @@ void uwsgo_app_get_static(uwsgo_app_t *app, const char *pattern,
 // uwsgo_app_listen binds the app to host:port. Pass NULL or "" for host
 // to keep uWS's default behavior (all interfaces, 0.0.0.0).
 int uwsgo_app_listen(uwsgo_app_t *app, const char *host, int port);
+int uwsgo_app_add_child(uwsgo_app_t *parent, uwsgo_app_t *child);
 void uwsgo_app_run(uwsgo_app_t *app);
 void uwsgo_app_stop(uwsgo_app_t *app);
 
@@ -393,7 +394,8 @@ void uwsgo_ws_end(uwsgo_ws_t *ws, int code, const char *message, size_t message_
 // uwsgo_ws_subscribe / unsubscribe return 1 on success, 0 on failure
 // (already in the requested state, or the connection is closing).
 // uwsgo_ws_publish returns 1 if the message was queued for delivery
-// to at least one subscriber (including the publishing socket itself).
+// to at least one subscriber. uWS sender publishes exclude the publishing
+// socket itself.
 int uwsgo_ws_subscribe(uwsgo_ws_t *ws, const char *topic, size_t topic_len);
 int uwsgo_ws_unsubscribe(uwsgo_ws_t *ws, const char *topic, size_t topic_len);
 int uwsgo_ws_publish(uwsgo_ws_t *ws, const char *topic, size_t topic_len,

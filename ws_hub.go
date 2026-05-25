@@ -364,10 +364,11 @@ func (h *WSHub) Publish(topic string, message []byte, opcode OpCode) error {
 	return h.queueAdapterPublish(msg)
 }
 
-// PublishBatch broadcasts many messages with one App.PublishBatch call per
-// local App, then queues each message for the adapter. For local fan-out this
-// keeps the same batching advantage as App.PublishBatch. Adapter publish
-// failures are reported asynchronously through WithWSHubAdapterErrorHandler.
+// PublishBatch broadcasts many messages with one loop-local batch per attached
+// App, then queues each message for the adapter. For local fan-out this keeps
+// the same batching advantage as App.PublishBatch without re-entering
+// RunMultiCore peer fan-out. Adapter publish failures are reported
+// asynchronously through WithWSHubAdapterErrorHandler.
 func (h *WSHub) PublishBatch(msgs []PublishMessage) error {
 	if h == nil || len(msgs) == 0 {
 		return nil
@@ -394,7 +395,7 @@ func (h *WSHub) PublishBatch(msgs []PublishMessage) error {
 	}
 	h.mu.RUnlock()
 	for _, app := range apps {
-		app.PublishBatch(local)
+		app.publishBatchLocal(local)
 	}
 	for _, msg := range local {
 		err := h.queueAdapterPublish(WSHubMessage{
@@ -440,7 +441,7 @@ func (h *WSHub) PublishFrom(ws *WebSocket, topic string, message []byte, opcode 
 	}
 
 	if len(direct) > 0 {
-		origin.PublishBatch(direct)
+		origin.publishBatchLocal(direct)
 	}
 	h.publishLocal(msg, origin)
 	return h.queueAdapterPublish(msg)
@@ -545,15 +546,15 @@ func (h *WSHub) publishLocal(msg WSHubMessage, skip *App) {
 		return
 	}
 	h.mu.RLock()
-	apps := make([]*App, 0, len(h.apps))
+	targets := make([]*App, 0, len(h.apps))
 	for app := range h.apps {
 		if app != skip {
-			apps = append(apps, app)
+			targets = append(targets, app)
 		}
 	}
 	h.mu.RUnlock()
-	for _, app := range apps {
-		app.Publish(msg.Topic, msg.Message, msg.OpCode)
+	for _, app := range targets {
+		app.publishLocal(msg.Topic, msg.Message, msg.OpCode)
 	}
 }
 
