@@ -2248,7 +2248,9 @@ func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, erro
 		err error
 	}
 	starts := make(chan startResult, n)
+	setups := make(chan startResult, n)
 	listens := make(chan startResult, n)
+	configureSetup := make(chan struct{})
 	configureChildren := make(chan struct{})
 	runLoops := make(chan struct{})
 	runReturned := make(chan struct{}, n)
@@ -2280,9 +2282,17 @@ func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, erro
 				starts <- startResult{idx: idx, err: err}
 				return
 			}
-			setup(app)
 
 			starts <- startResult{idx: idx, app: app}
+			select {
+			case <-configureSetup:
+			case <-abort:
+				app.Close()
+				return
+			}
+
+			setup(app)
+			setups <- startResult{idx: idx, app: app}
 			select {
 			case <-configureChildren:
 			case <-abort:
@@ -2315,9 +2325,11 @@ func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, erro
 		}()
 	}
 
-	// First create every App and register routes. Child routing is installed
-	// only after all App pointers exist, because each listener needs the full
-	// set of destination loops for accepted-socket round-robin.
+	// First create every App so peer pub/sub is fully wired before user
+	// setup can start background publishers. Child routing is installed only
+	// after routes are registered and all App pointers exist, because each
+	// listener needs the full set of destination loops for accepted-socket
+	// round-robin.
 	for i := 0; i < n; i++ {
 		r := <-starts
 		if r.err != nil {
@@ -2329,6 +2341,16 @@ func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, erro
 	}
 	for _, app := range apps {
 		app.pubsubPeers = apps
+	}
+	close(configureSetup)
+
+	for i := 0; i < n; i++ {
+		r := <-setups
+		if r.err != nil {
+			abortAll()
+			runWg.Wait()
+			return nil, r.err
+		}
 	}
 
 	close(configureChildren)
