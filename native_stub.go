@@ -32,7 +32,7 @@ func stopSharedWorkersIfIdle() {}
 
 func stopSharedWorkersForRing(uintptr) *sharedWorkerGeneration { return nil }
 
-func freeRequestRingAfterDrain(uintptr, *sharedWorkerGeneration) {}
+func freeRequestRing(uintptr) {}
 
 // WaitForSharedWorkers always returns true in stub builds: there are
 // no workers, so the pool is by definition drained the moment the

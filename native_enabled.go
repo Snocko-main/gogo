@@ -316,18 +316,11 @@ func stopSharedWorkersForRing(ring uintptr) *sharedWorkerGeneration {
 	return gen
 }
 
-func freeRequestRingAfterDrain(ring uintptr, gen *sharedWorkerGeneration) {
+func freeRequestRing(ring uintptr) {
 	if ring == 0 {
 		return
 	}
-	if gen == nil {
-		C.uwsgo_request_ring_free(unsafe.Pointer(ring))
-		return
-	}
-	go func() {
-		<-gen.drained
-		C.uwsgo_request_ring_free(unsafe.Pointer(ring))
-	}()
+	C.uwsgo_request_ring_free(unsafe.Pointer(ring))
 }
 
 // WaitForSharedWorkers blocks until every shared-dispatch worker

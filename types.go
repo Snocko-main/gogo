@@ -2217,7 +2217,7 @@ func (a *App) Close() {
 	defer a.nativeMu.Unlock()
 	a.inner.close()
 	if requestRing != 0 {
-		freeRequestRingAfterDrain(requestRing, requestRingGen)
+		freeRequestRing(requestRing)
 	}
 }
 
