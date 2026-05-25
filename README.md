@@ -1537,7 +1537,8 @@ Tuning knobs that actually matter:
   backend before raising it.
 - `gogo.SetWorkerCount(n)` — controls the `GetAsync` worker pool. Default
   is `NumCPU`; with `RunMultiCore` consider halving this since each loop
-  already owns one core.
+  already owns one core. When `WithMultiCorePerLoopAsyncWorkers` is enabled,
+  that option's `n` controls the per-loop worker count instead.
 - Pin shared resources (DB pools, caches) to one allocation outside
   `setup`.
 - For strict CPU pinning, run under `taskset -c 0-(N-1)`.

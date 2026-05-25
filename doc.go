@@ -185,7 +185,9 @@
 //     Default = NumCPU. With RunMultiCore each loop already owns one
 //     core; the workers compete for the same CPUs, so consider
 //     halving this if your GetAsync handlers are short and your
-//     workload is sync-route-heavy.
+//     workload is sync-route-heavy. When WithMultiCorePerLoopAsyncWorkers
+//     is enabled, that option's N controls the per-loop worker count
+//     instead.
 //   - Shared resources (DB pools, caches) — create ONCE outside
 //     RunMultiCore and capture the pointers into the handler
 //     closures. setup runs once per loop; allocating fresh DB pools
