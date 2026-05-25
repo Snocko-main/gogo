@@ -500,6 +500,10 @@ extern "C" void *uwsgo_app_request_ring(uwsgo_app_t *app) {
     return app->request_ring;
 }
 
+extern "C" void uwsgo_request_ring_free(void *ring) {
+    delete static_cast<PendingRing *>(ring);
+}
+
 extern "C" void uwsgo_app_ws(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id,
     size_t max_payload, int idle_seconds, size_t max_backpressure,
     int send_pings_automatically, int with_upgrade) {
@@ -1074,7 +1078,7 @@ extern "C" void uwsgo_app_free(uwsgo_app_t *app) {
     if (app->pending_ring) {
         delete app->pending_ring;
     }
-    if (app->request_ring) {
+    if (app->request_ring && !app->sharded_request_ring) {
         delete app->request_ring;
     }
     delete app;

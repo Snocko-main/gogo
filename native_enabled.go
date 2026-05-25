@@ -301,6 +301,35 @@ func stopSharedWorkersIfIdle() {
 	}
 }
 
+func stopSharedWorkersForRing(ring uintptr) *sharedWorkerGeneration {
+	if ring == 0 {
+		return nil
+	}
+	sharedWorkerLifecycleMu.Lock()
+	defer sharedWorkerLifecycleMu.Unlock()
+	gen := shardedWorkerGens[ring]
+	if gen == nil {
+		return nil
+	}
+	delete(shardedWorkerGens, ring)
+	close(gen.stop)
+	return gen
+}
+
+func freeRequestRingAfterDrain(ring uintptr, gen *sharedWorkerGeneration) {
+	if ring == 0 {
+		return
+	}
+	if gen == nil {
+		C.uwsgo_request_ring_free(unsafe.Pointer(ring))
+		return
+	}
+	go func() {
+		<-gen.drained
+		C.uwsgo_request_ring_free(unsafe.Pointer(ring))
+	}()
+}
+
 // WaitForSharedWorkers blocks until every shared-dispatch worker
 // goroutine has exited, or timeout elapses (zero = wait forever).
 // Returns true when the pool drained cleanly, false on timeout.

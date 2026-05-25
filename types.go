@@ -2192,14 +2192,20 @@ func (a *App) Close() {
 	for a.pendingTimers.Load() > 0 {
 		runtime.Gosched()
 	}
+	var requestRing uintptr
+	var requestRingGen *sharedWorkerGeneration
+	if a.workerRefAcquired.Load() && !a.workerRefDropped.Swap(true) {
+		if a.sharedRequestRing {
+			requestRing = a.inner.requestRing()
+			requestRingGen = stopSharedWorkersForRing(requestRing)
+		}
+		stopSharedWorkersIfIdle()
+	}
 	a.nativeMu.Lock()
 	a.inner.close()
 	a.nativeMu.Unlock()
-	// Drop the worker pool reference exactly once per shared App.
-	// Multiple Close calls (defensive teardown, force-close timer
-	// overlap) must not over-decrement the global active-apps counter.
-	if a.workerRefAcquired.Load() && !a.workerRefDropped.Swap(true) {
-		stopSharedWorkersIfIdle()
+	if requestRing != 0 {
+		freeRequestRingAfterDrain(requestRing, requestRingGen)
 	}
 }
 

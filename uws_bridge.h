@@ -30,6 +30,7 @@ void uwsgo_app_set_body_limit(uwsgo_app_t *app, size_t limit);
 void uwsgo_app_set_capture_peer_ip(uwsgo_app_t *app, int enable);
 void uwsgo_app_set_sharded_request_ring(uwsgo_app_t *app, int enable);
 void *uwsgo_app_request_ring(uwsgo_app_t *app);
+void uwsgo_request_ring_free(void *ring);
 
 void uwsgo_app_get(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);
 void uwsgo_app_post(uwsgo_app_t *app, const char *pattern, uintptr_t handler_id);
