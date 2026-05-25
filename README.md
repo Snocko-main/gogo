@@ -1826,19 +1826,20 @@ same four `wrk` thread counts, sorted, then medianed.
   in this matrix.
 - **gogo keeps the top 4-worker throughput in every workload**
   while staying inside the 4 performance-core cap.
-- **Latency stays competitive while leading throughput**: gogo p99 is
-  within a few milliseconds of the best tail in most routes, and avoids
-  the large SQLite p99 spikes seen in Actix and net/http.
+- **Single-worker latency stays competitive while leading throughput**:
+  gogo owns the best p99 on the hot GET and echo paths here, while the
+  4-worker run prioritizes throughput and shows wider tails under the
+  higher `wrk` thread counts.
 
 #### Throughput summary
 
 | workload | gogo single | best non-gogo single | gogo 4-worker | best non-gogo 4-worker |
 |---|---:|---:|---:|---:|
-| `GET /hello` | **269k** | uWS.js 206k | **263k** | Actix 192k |
-| `GET /hello/:name` | **254k** | uWS.js 208k | **248k** | uWS.js 206k |
-| `GET /db` | **167k** | uWS.js 140k | **167k** | uWS.js 136k |
-| `POST /echo` | **205k** | Fiber 185k | **199k** | Actix 186k |
-| `POST /query` | **153k** | uWS.js 127k | **132k** | uWS.js 122k |
+| `GET /hello` | **282k** | uWS.js 206k | **246k** | Actix 192k |
+| `GET /hello/:name` | **271k** | uWS.js 208k | **228k** | uWS.js 206k |
+| `GET /db` | **174k** | uWS.js 140k | **151k** | uWS.js 136k |
+| `POST /echo` | **205k** | Fiber 185k | **198k** | Actix 186k |
+| `POST /query` | **177k** | uWS.js 127k | **150k** | uWS.js 122k |
 
 #### Tail latency summary
 
@@ -1846,11 +1847,11 @@ Lower p99 is better.
 
 | workload | gogo single p99 | best non-gogo single p99 | gogo 4-worker p99 | best non-gogo 4-worker p99 |
 |---|---:|---:|---:|---:|
-| `GET /hello` | 3.6 ms | uWS.js 3.3 ms | 3.9 ms | Fiber 5.4 ms |
-| `GET /hello/:name` | 3.6 ms | uWS.js 3.8 ms | 3.9 ms | Fiber 4.9 ms |
-| `GET /db` | 7.5 ms | uWS.js 5.1 ms | 7.8 ms | uWS.js 7.4 ms |
-| `POST /echo` | 3.6 ms | uWS.js 3.7 ms | 4.9 ms | uWS.js 5.7 ms |
-| `POST /query` | 8.1 ms | uWS.js 5.3 ms | 10.9 ms | uWS.js 7.3 ms |
+| `GET /hello` | 3.2 ms | uWS.js 3.3 ms | 7.5 ms | Fiber 5.4 ms |
+| `GET /hello/:name` | 3.3 ms | uWS.js 3.8 ms | 8.6 ms | Fiber 4.9 ms |
+| `GET /db` | 7.3 ms | uWS.js 5.1 ms | 14.9 ms | uWS.js 7.4 ms |
+| `POST /echo` | 3.6 ms | uWS.js 3.7 ms | 14.1 ms | uWS.js 5.7 ms |
+| `POST /query` | 6.6 ms | uWS.js 5.3 ms | 14.7 ms | uWS.js 7.3 ms |
 
 <details>
 <summary>Full per-framework median results</summary>
@@ -1862,7 +1863,7 @@ second.
 
 | framework  | language | `/hello`                          | `/hello/:name`                    | `/db`                              | `POST /echo`                       | `POST /query`                      |
 |------------|----------|----------------------------------:|----------------------------------:|-----------------------------------:|-----------------------------------:|-----------------------------------:|
-| **gogo**   | Go (cgo) | 269k rps<br>p50 1.6 / p99 3.6 ms | 254k rps<br>p50 1.8 / p99 3.6 ms | 167k rps<br>p50 2.7 / p99 7.5 ms | 205k rps<br>p50 2.3 / p99 3.6 ms | 153k rps<br>p50 3.0 / p99 8.1 ms |
+| **gogo**   | Go (cgo) | 282k rps<br>p50 1.6 / p99 3.2 ms | 271k rps<br>p50 1.7 / p99 3.3 ms | 174k rps<br>p50 2.6 / p99 7.3 ms | 205k rps<br>p50 2.3 / p99 3.6 ms | 177k rps<br>p50 2.6 / p99 6.6 ms |
 | uwsjs      | JS (Node)| 206k rps<br>p50 2.3 / p99 3.3 ms | 208k rps<br>p50 2.3 / p99 3.8 ms | 140k rps<br>p50 3.4 / p99 5.1 ms | 181k rps<br>p50 2.7 / p99 3.7 ms | 127k rps<br>p50 3.8 / p99 5.3 ms |
 | fiber      | Go       | 203k rps<br>p50 2.3 / p99 4.0 ms | 199k rps<br>p50 2.4 / p99 4.0 ms |  87k rps<br>p50 5.5 / p99 7.8 ms | 185k rps<br>p50 2.6 / p99 4.0 ms |  88k rps<br>p50 5.5 / p99 8.3 ms |
 | actix      | Rust     | 177k rps<br>p50 2.6 / p99 5.1 ms | 185k rps<br>p50 2.6 / p99 5.5 ms |  99k rps<br>p50 4.7 / p99 28.0 ms | 170k rps<br>p50 2.8 / p99 5.2 ms |  78k rps<br>p50 5.4 / p99 36.4 ms |
@@ -1873,7 +1874,7 @@ second.
 
 | framework  | language | `/hello`                          | `/hello/:name`                    | `/db`                              | `POST /echo`                       | `POST /query`                      |
 |------------|----------|----------------------------------:|----------------------------------:|-----------------------------------:|-----------------------------------:|-----------------------------------:|
-| **gogo**   | Go (cgo) | 263k rps<br>p50 1.7 / p99 3.9 ms | 248k rps<br>p50 1.8 / p99 3.9 ms | 167k rps<br>p50 2.7 / p99 7.8 ms | 199k rps<br>p50 2.4 / p99 4.9 ms | 132k rps<br>p50 3.4 / p99 10.9 ms |
+| **gogo**   | Go (cgo) | 246k rps<br>p50 1.1 / p99 7.5 ms | 228k rps<br>p50 1.2 / p99 8.6 ms | 151k rps<br>p50 3.0 / p99 14.9 ms | 198k rps<br>p50 1.5 / p99 14.1 ms | 150k rps<br>p50 3.0 / p99 14.7 ms |
 | actix      | Rust     | 192k rps<br>p50 1.6 / p99 11.6 ms | 194k rps<br>p50 1.6 / p99 8.0 ms | 114k rps<br>p50 2.8 / p99 34.6 ms | 186k rps<br>p50 1.7 / p99 10.3 ms | 106k rps<br>p50 3.1 / p99 35.6 ms |
 | uwsjs      | JS (Node)| 181k rps<br>p50 2.5 / p99 5.5 ms | 206k rps<br>p50 2.3 / p99 5.3 ms | 136k rps<br>p50 3.5 / p99 7.4 ms | 168k rps<br>p50 2.8 / p99 5.7 ms | 122k rps<br>p50 3.9 / p99 7.3 ms |
 | net/http   | Go       | 179k rps<br>p50 1.8 / p99 7.8 ms | 161k rps<br>p50 2.1 / p99 10.3 ms |  79k rps<br>p50 5.9 / p99 27.5 ms | 153k rps<br>p50 2.3 / p99 9.5 ms |  87k rps<br>p50 5.4 / p99 21.9 ms |
@@ -1892,11 +1893,11 @@ Notes on the spread:
   endpoints on this machine. uwsjs remains close on the uWebSockets-shaped
   routes, while Actix is competitive on pure GET/echo paths and does well
   on SQLite throughput.
-- **Tail latency (p99)**: single-worker uwsjs has the tightest tail on
-  `/db` and `POST /query`; gogo is close while carrying higher
-  throughput. In 4-worker mode, gogo and uwsjs keep the tightest p99
-  on most routes. Actix and net/http have good median latency and
-  throughput but still show wider p99 on the SQLite endpoints.
+- **Tail latency (p99)**: gogo has the tightest single-worker p99 on
+  `/hello`, `/hello/:name`, and `POST /echo`; single-worker uwsjs keeps
+  the tightest tail on `/db` and `POST /query`. In 4-worker mode, this
+  run favors gogo throughput, while uwsjs and Fiber keep tighter p99 on
+  several routes.
 - **POST /echo (sync)** — gogo's sync `app.Post` + `Response.Body`
   collects the body on the loop thread and writes it back without a
   goroutine handoff. It is the fastest single-worker echo result here;
@@ -1931,5 +1932,5 @@ export CGO_ENABLED=1
 cargo build --release --manifest-path benchmark/actix/Cargo.toml
 # On this Apple M3 machine, the default multi-worker cap is 4.
 # Override with MULTI_WORKERS=N if your target host has a different shape.
-./scripts/bench_wrk.sh
+DURATION=10 ./scripts/bench_wrk.sh
 ```
