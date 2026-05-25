@@ -288,6 +288,12 @@ func WaitForSharedWorkers(timeout time.Duration) bool {
 	}
 }
 
+// sharedWorkerSpinLimit balances async wake latency against idle CPU burn.
+// Larger values keep workers hotter for bursty async traffic but make
+// sync-only requests compete with idle shared-dispatch workers. 128 keeps the
+// hot path responsive while reducing scheduler pressure in mixed apps.
+const sharedWorkerSpinLimit = 128
+
 // sharedWorker polls the request ring with adaptive back-off. Spin a handful
 // of iterations, then yield via Gosched, then sleep progressively longer up
 // to a cap. At sustained load the spin path catches work immediately; idle
@@ -301,8 +307,6 @@ func WaitForSharedWorkers(timeout time.Duration) bool {
 // closed channel makes the non-blocking select fall through to the
 // exit path). Hot-path requests are never delayed by the check.
 func sharedWorker(stop <-chan struct{}) {
-	const spinLimit = 256
-
 	headAddr := (*atomic.Uint64)(unsafe.Pointer(shared.requestRing + shared.headOffset))
 	idleSleep := time.Duration(0)
 	spins := 0
@@ -317,7 +321,7 @@ func sharedWorker(stop <-chan struct{}) {
 			// Back off without burning the CPU; the next iteration re-reads
 			// head, which will reflect the consumer that just claimed the slot.
 			spins++
-			if spins > spinLimit {
+			if spins > sharedWorkerSpinLimit {
 				// Check for shutdown only here, on the idle path —
 				// hot requests never pay for the select.
 				select {
