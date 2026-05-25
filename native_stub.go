@@ -15,6 +15,10 @@ import (
 // agnostic code paths ever reads it; nothing currently does.
 var sharedActiveApps atomic.Int32
 
+type sharedWorkerGeneration struct {
+	drained chan struct{}
+}
+
 func acquireSharedWorkerAppRef() {
 	sharedActiveApps.Add(1)
 }
@@ -25,6 +29,10 @@ func acquireSharedWorkerAppRef() {
 // cgo tags (e.g. `go vet`, IDE tooling, downstream users that import
 // the package only for its types).
 func stopSharedWorkersIfIdle() {}
+
+func stopSharedWorkersForRing(uintptr) *sharedWorkerGeneration { return nil }
+
+func freeRequestRingAfterDrain(uintptr, *sharedWorkerGeneration) {}
 
 // WaitForSharedWorkers always returns true in stub builds: there are
 // no workers, so the pool is by definition drained the moment the
@@ -64,6 +72,7 @@ func (appNative) listen(string, int) bool             { return false }
 func (appNative) addChild(appNative) bool             { return false }
 func (appNative) setBodyLimit(int)                    {}
 func (appNative) setCapturePeerIP(bool)               {}
+func (appNative) requestRing() uintptr                { return 0 }
 func (appNative) run()                                {}
 func (appNative) stop()                               {}
 func (appNative) closeListen()                        {}
