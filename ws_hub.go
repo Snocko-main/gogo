@@ -394,7 +394,7 @@ func (h *WSHub) PublishBatch(msgs []PublishMessage) error {
 	}
 	h.mu.RUnlock()
 	for _, app := range apps {
-		app.PublishBatch(local)
+		app.publishBatchLocal(local)
 	}
 	for _, msg := range local {
 		err := h.queueAdapterPublish(WSHubMessage{
@@ -440,7 +440,7 @@ func (h *WSHub) PublishFrom(ws *WebSocket, topic string, message []byte, opcode 
 	}
 
 	if len(direct) > 0 {
-		origin.PublishBatch(direct)
+		origin.publishBatchLocal(direct)
 	}
 	h.publishLocal(msg, origin)
 	return h.queueAdapterPublish(msg)
@@ -553,7 +553,7 @@ func (h *WSHub) publishLocal(msg WSHubMessage, skip *App) {
 	}
 	h.mu.RUnlock()
 	for _, app := range apps {
-		app.Publish(msg.Topic, msg.Message, msg.OpCode)
+		app.publishLocal(msg.Topic, msg.Message, msg.OpCode)
 	}
 }
 

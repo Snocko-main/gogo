@@ -277,6 +277,166 @@ func TestRunMultiCoreWebSocketPublishReachesPeerLoops(t *testing.T) {
 	}
 }
 
+func TestRunMultiCoreWSHubPublishDoesNotDuplicate(t *testing.T) {
+	const workers = 2
+
+	oldProcs := runtime.GOMAXPROCS(workers)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	port := freePort(t)
+	hub := gogo.NewWSHub(gogo.WithWSHubNodeID("test-node"))
+	defer hub.Close()
+
+	handle, err := gogo.RunMultiCore(workers, port, func(app *gogo.App) {
+		hub.WebSocket(app, "/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				ws.Subscribe("room")
+			},
+		})
+	})
+	if err != nil {
+		t.Fatalf("RunMultiCore: %v", err)
+	}
+	defer func() {
+		handle.Shutdown()
+		handle.Wait()
+	}()
+
+	client, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	if err := hub.Publish("room", []byte("hello"), gogo.Text); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	got, err := client.ReadText(2 * time.Second)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got != "hello" {
+		t.Fatalf("got %q, want hello", got)
+	}
+	if err := client.expectNoMessage(300 * time.Millisecond); err != nil {
+		t.Fatalf("duplicate delivery after Publish: %v", err)
+	}
+}
+
+func TestRunMultiCoreWSHubPublishBatchDoesNotDuplicate(t *testing.T) {
+	const workers = 2
+
+	oldProcs := runtime.GOMAXPROCS(workers)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	port := freePort(t)
+	hub := gogo.NewWSHub(gogo.WithWSHubNodeID("test-node"))
+	defer hub.Close()
+
+	handle, err := gogo.RunMultiCore(workers, port, func(app *gogo.App) {
+		hub.WebSocket(app, "/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				ws.Subscribe("room")
+			},
+		})
+	})
+	if err != nil {
+		t.Fatalf("RunMultiCore: %v", err)
+	}
+	defer func() {
+		handle.Shutdown()
+		handle.Wait()
+	}()
+
+	client, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	if err := hub.PublishBatch([]gogo.PublishMessage{{
+		Topic:   "room",
+		Message: []byte("batch"),
+		OpCode:  gogo.Text,
+	}}); err != nil {
+		t.Fatalf("PublishBatch: %v", err)
+	}
+	got, err := client.ReadText(2 * time.Second)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got != "batch" {
+		t.Fatalf("got %q, want batch", got)
+	}
+	if err := client.expectNoMessage(300 * time.Millisecond); err != nil {
+		t.Fatalf("duplicate delivery after PublishBatch: %v", err)
+	}
+}
+
+func TestRunMultiCoreWSHubPublishFromSkipsSender(t *testing.T) {
+	const workers = 2
+	const clientsN = workers * 2
+
+	oldProcs := runtime.GOMAXPROCS(workers)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	port := freePort(t)
+	hub := gogo.NewWSHub(gogo.WithWSHubNodeID("test-node"))
+	defer hub.Close()
+
+	handle, err := gogo.RunMultiCore(workers, port, func(app *gogo.App) {
+		hub.WebSocket(app, "/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				ws.Subscribe("room")
+			},
+			Message: func(ws *gogo.WebSocket, msg []byte, op gogo.OpCode) {
+				if err := hub.PublishFrom(ws, "room", msg, op); err != nil {
+					t.Errorf("PublishFrom: %v", err)
+				}
+			},
+		})
+	})
+	if err != nil {
+		t.Fatalf("RunMultiCore: %v", err)
+	}
+	defer func() {
+		handle.Shutdown()
+		handle.Wait()
+	}()
+
+	clients := make([]*wsClient, 0, clientsN)
+	for i := 0; i < clientsN; i++ {
+		c, err := dialWebSocket(port, "/ws")
+		if err != nil {
+			t.Fatalf("dial client %d: %v", i, err)
+		}
+		defer c.Close()
+		clients = append(clients, c)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	if err := clients[0].SendText("from"); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	for i := 1; i < len(clients); i++ {
+		got, err := clients[i].ReadText(2 * time.Second)
+		if err != nil {
+			t.Fatalf("client %d read: %v", i, err)
+		}
+		if got != "from" {
+			t.Fatalf("client %d got %q, want from", i, got)
+		}
+		if err := clients[i].expectNoMessage(300 * time.Millisecond); err != nil {
+			t.Fatalf("client %d got duplicate: %v", i, err)
+		}
+	}
+	if err := clients[0].expectNoMessage(300 * time.Millisecond); err != nil {
+		t.Fatalf("publisher received its own hub message: %v", err)
+	}
+}
+
 // noKeepaliveClient avoids HTTP/1.1 keep-alive so the server has no open
 // sockets keeping the loop alive when Shutdown is called.
 var noKeepaliveClient = &http.Client{
