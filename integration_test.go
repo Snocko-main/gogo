@@ -170,6 +170,26 @@ func TestRunMultiCoreDistributesAcceptedSockets(t *testing.T) {
 	}
 }
 
+func TestRunMultiCoreSetupPanicReturnsError(t *testing.T) {
+	port := freePort(t)
+	handle, err := gogo.RunMultiCore(2, port, func(app *gogo.App) {
+		panic("setup failed")
+	})
+	if err == nil {
+		if handle != nil {
+			handle.Shutdown()
+			handle.Wait()
+		}
+		t.Fatal("RunMultiCore returned nil error after setup panic")
+	}
+	if handle != nil {
+		t.Fatal("RunMultiCore returned a handle after setup panic")
+	}
+	if !strings.Contains(err.Error(), "RunMultiCore setup panic") || !strings.Contains(err.Error(), "setup failed") {
+		t.Fatalf("RunMultiCore error = %q, want setup panic context", err)
+	}
+}
+
 func TestRunMultiCoreAppPublishReachesAllLoops(t *testing.T) {
 	const workers = 4
 	const clientsN = workers * 2
@@ -6686,6 +6706,9 @@ func TestWebSocketAppPublish(t *testing.T) {
 	}
 	if got2 != "broadcast 2" {
 		t.Errorf("msg 2: got %q, want %q", got2, "broadcast 2")
+	}
+	if err := client.expectNoMessage(300 * time.Millisecond); err != nil {
+		t.Fatalf("duplicate after App.Publish: %v", err)
 	}
 }
 

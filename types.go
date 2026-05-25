@@ -1365,9 +1365,9 @@ func (a *App) WebSocket(pattern string, behavior WebSocketBehavior) {
 //
 // Performance — pick the right entry point:
 //   - Inside an Open/Message/Close handler (loop thread): prefer
-//     WebSocket.Publish. It bypasses the cross-thread defer mutex
-//     and message copy — the cost is just a cgo crossing plus uWS's
-//     own internal publish work.
+//     WebSocket.Publish. On a single App it bypasses the cross-thread defer
+//     mutex and message copy. In RunMultiCore it still has to schedule one
+//     copied peer-loop publish per other App, so the cost is O(peer loops).
 //   - From a worker goroutine, single message: App.Publish. Measures
 //     ~750 ns/op on this VM end-to-end including cgo + heap copy +
 //     Loop::defer mutex + wakeup.
@@ -2227,9 +2227,10 @@ func (h *MultiCoreHandle) Wait() {
 //
 // setup MUST register the same routes on every App for consistent behavior;
 // the framework just calls setup(app) and trusts user code to be
-// deterministic. Heavy shared state (DB pools, caches) should be created
-// ONCE outside RunMultiCore and captured into the handler closures so
-// per-App initialization stays cheap.
+// deterministic. Heavy shared state (DB pools, caches) and any fallible
+// initialization should be created ONCE outside RunMultiCore and captured into
+// the handler closures so per-App initialization stays cheap. If setup panics,
+// RunMultiCore converts it to an error and closes any Apps created so far.
 //
 // Returns a MultiCoreHandle that can Shutdown or Wait. Returns an error if
 // any App fails to start; in that case already-started Apps are shut down
@@ -2291,7 +2292,11 @@ func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, erro
 				return
 			}
 
-			setup(app)
+			if err := runMultiCoreSetup(idx, app, setup); err != nil {
+				setups <- startResult{idx: idx, app: app, err: err}
+				app.Close()
+				return
+			}
 			setups <- startResult{idx: idx, app: app}
 			select {
 			case <-configureChildren:
@@ -2301,8 +2306,18 @@ func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, erro
 			}
 
 			if n > 1 {
-				for _, child := range apps {
-					app.inner.addChild(child.inner)
+				for childIdx, child := range apps {
+					// Keep the accepting App in the child set. This mirrors uWS's
+					// LocalCluster pattern and gives every listener the same complete
+					// round-robin destination list.
+					if !app.inner.addChild(child.inner) {
+						app.Close()
+						listens <- startResult{
+							idx: idx,
+							err: fmt.Errorf("gogo: failed to configure multicore child app %d for worker %d", childIdx, idx),
+						}
+						return
+					}
 				}
 			}
 
@@ -2375,6 +2390,16 @@ func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, erro
 	}()
 
 	return &MultiCoreHandle{apps: apps, done: done}, nil
+}
+
+func runMultiCoreSetup(idx int, app *App, setup func(app *App)) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("gogo: RunMultiCore setup panic on worker %d: %v", idx, recovered)
+		}
+	}()
+	setup(app)
+	return nil
 }
 
 // Response wraps a uWebSockets response.
@@ -5781,11 +5806,12 @@ func (ws *WebSocket) Unsubscribe(topic string) bool {
 // mode, peer-loop fanout is fire-and-forget and is not reflected in
 // this return value.
 //
-// This is the fast path: no cross-thread defer, no message copy,
-// just a cgo crossing into uWS's TopicTree publish. Use it from
-// Open/Message/Close handlers wherever possible. App.Publish exists
-// specifically for the worker-goroutine case where you don't have
-// a live WebSocket pointer on the loop thread.
+// This is the fast path for the publishing socket's local loop: no cross-thread
+// defer, no message copy, just a cgo crossing into uWS's TopicTree publish. In
+// RunMultiCore, peer loops are reached by scheduling one copied publish per
+// other App, so the peer fan-out cost is O(peer loops). App.Publish exists for
+// the worker-goroutine case where you don't have a live WebSocket pointer on
+// the loop thread.
 //
 // Calling this from off the loop thread (e.g. a goroutine you
 // spawned from a handler) corrupts uWS state — the WebSocket

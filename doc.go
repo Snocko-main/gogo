@@ -163,7 +163,9 @@
 // same port. Accepted sockets are round-robined across the App loops,
 // so scaling does not depend on the kernel's SO_REUSEPORT hash
 // distributing connections evenly. setup runs once per instance on
-// the OS thread that instance will own.
+// the OS thread that instance will own. setup has no error return; do
+// fallible shared initialization before RunMultiCore. A setup panic is
+// recovered, converted to an error, and any created Apps are closed.
 //
 // Tuning knobs that actually matter:
 //

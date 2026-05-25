@@ -102,7 +102,7 @@ void uwsgo_app_get_static(uwsgo_app_t *app, const char *pattern,
 // uwsgo_app_listen binds the app to host:port. Pass NULL or "" for host
 // to keep uWS's default behavior (all interfaces, 0.0.0.0).
 int uwsgo_app_listen(uwsgo_app_t *app, const char *host, int port);
-void uwsgo_app_add_child(uwsgo_app_t *parent, uwsgo_app_t *child);
+int uwsgo_app_add_child(uwsgo_app_t *parent, uwsgo_app_t *child);
 void uwsgo_app_run(uwsgo_app_t *app);
 void uwsgo_app_stop(uwsgo_app_t *app);
 

@@ -603,8 +603,8 @@ func (a appNative) listen(host string, port int) bool {
 	return C.uwsgo_app_listen(a.ptr, chost, C.int(port)) != 0
 }
 
-func (a appNative) addChild(child appNative) {
-	C.uwsgo_app_add_child(a.ptr, child.ptr)
+func (a appNative) addChild(child appNative) bool {
+	return C.uwsgo_app_add_child(a.ptr, child.ptr) != 0
 }
 
 func (a appNative) setBodyLimit(limit int) {

@@ -546,14 +546,14 @@ func (h *WSHub) publishLocal(msg WSHubMessage, skip *App) {
 		return
 	}
 	h.mu.RLock()
-	apps := make([]*App, 0, len(h.apps))
+	targets := make([]*App, 0, len(h.apps))
 	for app := range h.apps {
 		if app != skip {
-			apps = append(apps, app)
+			targets = append(targets, app)
 		}
 	}
 	h.mu.RUnlock()
-	for _, app := range apps {
+	for _, app := range targets {
 		app.publishLocal(msg.Topic, msg.Message, msg.OpCode)
 	}
 }

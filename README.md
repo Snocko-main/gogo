@@ -1272,6 +1272,12 @@ handlers, use `hub.Publish` or `hub.PublishBatch`. A successful publish call
 means local fan-out completed and the adapter message was queued; Redis/network
 errors are reported through `WithWSHubAdapterErrorHandler`.
 
+If you call raw `ws.Publish` from a WebSocket handler in `RunMultiCore`, gogo
+publishes locally on the current loop and schedules one copied publish on each
+peer loop. That keeps delivery correct across cores, but the peer part is
+O(worker count); use `WSHub` when you want the skip-sender semantics plus a
+clear place to add Redis/cluster fan-out.
+
 ```go
 go func() {
     for {
