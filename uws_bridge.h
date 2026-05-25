@@ -394,7 +394,8 @@ void uwsgo_ws_end(uwsgo_ws_t *ws, int code, const char *message, size_t message_
 // uwsgo_ws_subscribe / unsubscribe return 1 on success, 0 on failure
 // (already in the requested state, or the connection is closing).
 // uwsgo_ws_publish returns 1 if the message was queued for delivery
-// to at least one subscriber (including the publishing socket itself).
+// to at least one subscriber. uWS sender publishes exclude the publishing
+// socket itself.
 int uwsgo_ws_subscribe(uwsgo_ws_t *ws, const char *topic, size_t topic_len);
 int uwsgo_ws_unsubscribe(uwsgo_ws_t *ws, const char *topic, size_t topic_len);
 int uwsgo_ws_publish(uwsgo_ws_t *ws, const char *topic, size_t topic_len,

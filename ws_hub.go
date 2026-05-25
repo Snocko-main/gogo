@@ -364,10 +364,11 @@ func (h *WSHub) Publish(topic string, message []byte, opcode OpCode) error {
 	return h.queueAdapterPublish(msg)
 }
 
-// PublishBatch broadcasts many messages with one App.PublishBatch call per
-// local App, then queues each message for the adapter. For local fan-out this
-// keeps the same batching advantage as App.PublishBatch. Adapter publish
-// failures are reported asynchronously through WithWSHubAdapterErrorHandler.
+// PublishBatch broadcasts many messages with one loop-local batch per attached
+// App, then queues each message for the adapter. For local fan-out this keeps
+// the same batching advantage as App.PublishBatch without re-entering
+// RunMultiCore peer fan-out. Adapter publish failures are reported
+// asynchronously through WithWSHubAdapterErrorHandler.
 func (h *WSHub) PublishBatch(msgs []PublishMessage) error {
 	if h == nil || len(msgs) == 0 {
 		return nil
