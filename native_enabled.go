@@ -290,8 +290,8 @@ func WaitForSharedWorkers(timeout time.Duration) bool {
 
 // sharedWorkerSpinLimit balances async wake latency against idle CPU burn.
 // Larger values keep workers hotter for bursty async traffic but make
-// sync-only requests compete with idle shared-dispatch workers. 128 keeps the
-// hot path responsive while reducing scheduler pressure in mixed apps.
+// sync-route traffic in mixed apps compete with idle shared-dispatch workers.
+// 128 keeps the hot path responsive while reducing scheduler pressure.
 const sharedWorkerSpinLimit = 128
 
 // sharedWorker polls the request ring with adaptive back-off. Spin a handful
