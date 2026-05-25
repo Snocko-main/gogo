@@ -220,6 +220,69 @@ func TestRunMultiCoreAppPublishReachesAllLoops(t *testing.T) {
 		if got != "broadcast" {
 			t.Fatalf("client %d got %q, want broadcast", i, got)
 		}
+		if err := c.expectNoMessage(300 * time.Millisecond); err != nil {
+			t.Fatalf("client %d got duplicate after Publish: %v", i, err)
+		}
+	}
+}
+
+func TestRunMultiCoreAppPublishBatchReachesAllLoopsOnce(t *testing.T) {
+	const workers = 4
+	const clientsN = workers * 2
+
+	oldProcs := runtime.GOMAXPROCS(workers)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	port := freePort(t)
+	appCh := make(chan *gogo.App, workers)
+	handle, err := gogo.RunMultiCore(workers, port, func(app *gogo.App) {
+		appCh <- app
+		app.WebSocket("/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				ws.Subscribe("global")
+			},
+		})
+	})
+	if err != nil {
+		t.Fatalf("RunMultiCore: %v", err)
+	}
+	defer func() {
+		handle.Shutdown()
+		handle.Wait()
+	}()
+
+	apps := make([]*gogo.App, 0, workers)
+	for i := 0; i < workers; i++ {
+		apps = append(apps, <-appCh)
+	}
+
+	clients := make([]*wsClient, 0, clientsN)
+	for i := 0; i < clientsN; i++ {
+		c, err := dialWebSocket(port, "/ws")
+		if err != nil {
+			t.Fatalf("dial client %d: %v", i, err)
+		}
+		defer c.Close()
+		clients = append(clients, c)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	apps[0].PublishBatch([]gogo.PublishMessage{{
+		Topic:   "global",
+		Message: []byte("batch broadcast"),
+		OpCode:  gogo.Text,
+	}})
+	for i, c := range clients {
+		got, err := c.ReadText(2 * time.Second)
+		if err != nil {
+			t.Fatalf("client %d read: %v", i, err)
+		}
+		if got != "batch broadcast" {
+			t.Fatalf("client %d got %q, want batch broadcast", i, got)
+		}
+		if err := c.expectNoMessage(300 * time.Millisecond); err != nil {
+			t.Fatalf("client %d got duplicate after PublishBatch: %v", i, err)
+		}
 	}
 }
 
@@ -270,6 +333,9 @@ func TestRunMultiCoreWebSocketPublishReachesPeerLoops(t *testing.T) {
 		}
 		if got != "hello peers" {
 			t.Fatalf("client %d got %q, want hello peers", i, got)
+		}
+		if err := clients[i].expectNoMessage(300 * time.Millisecond); err != nil {
+			t.Fatalf("client %d got duplicate after WebSocket.Publish: %v", i, err)
 		}
 	}
 	if err := clients[0].expectNoMessage(300 * time.Millisecond); err != nil {
