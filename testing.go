@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"testing"
 	"time"
 )
 
@@ -161,6 +162,28 @@ func NewTestServer(setup func(*App)) (*TestServer, error) {
 	}
 	locked = false
 	return ts, nil
+}
+
+// NewTestServerT starts a TestServer and registers Close with tb.Cleanup.
+// It fails the test immediately when setup, Listen, or readiness checks fail.
+//
+//	ts := gogo.NewTestServerT(t, func(app *gogo.App) {
+//	    app.Get("/ping", func(res *gogo.Response, req *gogo.Request) {
+//	        res.Send(200, "text/plain", "pong")
+//	    })
+//	})
+//	resp, err := ts.Get("/ping")
+func NewTestServerT(tb testing.TB, setup func(*App)) *TestServer {
+	if tb == nil {
+		panic("gogo: NewTestServerT: testing.TB is nil")
+	}
+	tb.Helper()
+	ts, err := NewTestServer(setup)
+	if err != nil {
+		tb.Fatalf("gogo: NewTestServerT: %v", err)
+	}
+	tb.Cleanup(ts.Close)
+	return ts
 }
 
 // Port returns the loopback port the server is listening on.

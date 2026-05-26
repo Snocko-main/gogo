@@ -311,6 +311,23 @@ func TestNamedRouteStripsTypedAnnotation(t *testing.T) {
 	}
 }
 
+func TestRouterNameIncludesPrefix(t *testing.T) {
+	app, _ := gogo.NewApp()
+	defer app.Close()
+
+	api := app.Group("/api/v1")
+	api.Get("/users/:id<int>", func(res *gogo.Response, req *gogo.Request) {})
+	api.Name("api.user.show", "/users/:id<int>")
+
+	got, err := app.URL("api.user.show", map[string]string{"id": "42"})
+	if err != nil {
+		t.Fatalf("URL: %v", err)
+	}
+	if got != "/api/v1/users/42" {
+		t.Errorf("URL = %q, want /api/v1/users/42", got)
+	}
+}
+
 // TestMountRoutesUnderPrefix ensures Mount registers routes under
 // the prefix and delivers the named middleware inside the callback.
 func TestMountRoutesUnderPrefix(t *testing.T) {

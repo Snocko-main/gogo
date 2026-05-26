@@ -46,6 +46,27 @@ func TestTestServerBasic(t *testing.T) {
 	}
 }
 
+func TestNewTestServerT(t *testing.T) {
+	ts := gogo.NewTestServerT(t, func(app *gogo.App) {
+		app.Get("/ping", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "pong")
+		})
+	})
+
+	resp, err := ts.Get("/ping")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if string(body) != "pong" {
+		t.Errorf("body = %q, want pong", string(body))
+	}
+}
+
 func TestNewTestServerSetupPanicReturnsError(t *testing.T) {
 	ts, err := gogo.NewTestServer(func(app *gogo.App) {
 		panic("boom")

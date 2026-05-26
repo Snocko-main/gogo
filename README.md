@@ -65,7 +65,9 @@ body-parse + SQLite query paths.
 - [Multi-core](#multi-core)
 - [Graceful Shutdown](#graceful-shutdown)
 - [Configuration](#configuration)
+  - [Test server helpers](#test-server-helpers)
   - [TrustProxy and client IPs](#trustproxy-and-client-ips)
+  - [net/http adapter body cap](#nethttp-adapter-body-cap)
   - [Redirect and open redirects](#redirect-and-open-redirects)
 - [Error Handling & Panic Recovery](#error-handling--panic-recovery)
 - [Caveats](#caveats)
@@ -214,7 +216,7 @@ Route API surface:
 | `Use(...middleware)` | yes | yes | sync middleware; `App.Use` also supports a path prefix |
 | `UseAsync(...middleware)` | yes | yes | async middleware for `GetAsync` / `PostAsync`; `App.UseAsync` also supports a path prefix |
 | `Mount(prefix, func(*Router))` | yes | no | callback sugar over `Group` |
-| `Name(name, pattern)` | yes | no | names a route pattern for reverse routing |
+| `Name(name, pattern)` | yes | yes | names a route pattern for reverse routing |
 | `URL(name, params)` | yes | no | builds a URL for a named route |
 | `NotFound(handler)` | yes | no | fallback for unmatched routes |
 | `MethodNotAllowed(handler)` | yes | no | fallback for known path with unsupported method |
@@ -295,6 +297,12 @@ app.Get("/search", func(res *gogo.Response, req *gogo.Request) {
 app.Name("user.show", "/users/:id")
 url, _ := app.URL("user.show", map[string]string{"id": "42"})
 // url == "/users/42"
+
+api := app.Group("/api/v1")
+api.Get("/users/:id", showUser)
+api.Name("api.user.show", "/users/:id")
+url, _ = app.URL("api.user.show", map[string]string{"id": "42"})
+// url == "/api/v1/users/42"
 ```
 
 ### Route groups
@@ -1595,6 +1603,29 @@ characters defensively even when a custom encoder does not mirror
 `encoding/json`'s HTML escaping. `JSONStream` exposes `*json.Encoder` directly,
 so it intentionally keeps using `encoding/json`; use `Response.Stream` when you
 need to stream custom-encoded chunks.
+
+### Test server helpers
+
+`NewTestServer` starts a real loopback listener for integration-style tests.
+`NewTestServerT` is the `testing.TB`-friendly wrapper: it fails the test on
+startup errors and registers `Close` with `t.Cleanup`.
+
+```go
+func TestPing(t *testing.T) {
+    ts := gogo.NewTestServerT(t, func(app *gogo.App) {
+        app.Get("/ping", func(res *gogo.Response, req *gogo.Request) {
+            res.Send(200, "text/plain", "pong")
+        })
+    })
+
+    resp, err := ts.Get("/ping")
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer resp.Body.Close()
+    // assert status/body/headers
+}
+```
 
 ### TrustProxy and client IPs
 

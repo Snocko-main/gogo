@@ -1878,6 +1878,23 @@ func (a *App) URL(name string, params map[string]string) (string, error) {
 	return out.String(), nil
 }
 
+// Name tags a route pattern under this Router's prefix for App.URL reverse
+// routing. The pattern is the same one you pass to Router.Get/Post/etc.; the
+// router prefix is applied automatically.
+//
+//	api := app.Group("/api/v1")
+//	api.Get("/users/:id", showUser)
+//	api.Name("api.user.show", "/users/:id")
+//
+//	url, _ := app.URL("api.user.show", map[string]string{"id": "42"})
+//	// url == "/api/v1/users/42"
+func (r *Router) Name(name, pattern string) {
+	if r == nil || r.app == nil {
+		panic("gogo: Router.Name called on nil Router")
+	}
+	r.app.Name(name, r.prefix+pattern)
+}
+
 // Mount registers routes onto a sub-router rooted at prefix and runs
 // the provided callback against it. It is sugar over App.Group plus
 // the callback pattern that Express / Fiber users expect:
