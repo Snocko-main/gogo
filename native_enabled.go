@@ -386,8 +386,8 @@ func runSharedHandler(handler AsyncHandler, ctxPtr uintptr) {
 	resWrap.async = a
 
 	// Build the request snapshot from ctx memory. C++ has already copied the
-	// fields it could into AsyncCtx; Go materializes only the fields user code
-	// reads while this handler owns the ctx.
+	// fields it could into AsyncCtx; we copy out to Go-owned strings/bytes so
+	// the snapshot survives past ctx release.
 	reqWrap := requestPool.Get().(*Request)
 	reqWrap.snap = newSnapshotFromCtx(ctxPtr)
 	// post_shared routes leave the collected body in ctx memory;
@@ -410,7 +410,6 @@ func runSharedHandler(handler AsyncHandler, ctxPtr uintptr) {
 		if !a.sent {
 			asyncCtxRelease(ctxPtr)
 		}
-		releaseRequestSnapshot(reqWrap.snap)
 		reqWrap.resetForPool()
 		requestPool.Put(reqWrap)
 		resWrap.finishAsync(a)
@@ -442,12 +441,10 @@ func newSnapshotFromCtx(ctxPtr uintptr) *requestSnapshot {
 	}
 
 	snap := acquireRequestSnapshot()
-	snap.setLazyFields(
-		ctxPtr+shared.ctxMethodOff, int(methodLen),
-		ctxPtr+shared.ctxURLOff, int(urlLen),
-		ctxPtr+shared.ctxQueryOff, int(queryLen),
-		ctxPtr+shared.ctxIPOff, int(ipLen),
-	)
+	snap.method = copyAt(ctxPtr+shared.ctxMethodOff, int(methodLen))
+	snap.url = copyAt(ctxPtr+shared.ctxURLOff, int(urlLen))
+	snap.query = copyAt(ctxPtr+shared.ctxQueryOff, int(queryLen))
+	snap.ip = copyAt(ctxPtr+shared.ctxIPOff, int(ipLen))
 	snap.truncated = truncated
 
 	if paramCount > 0 {
@@ -468,7 +465,7 @@ func newSnapshotFromCtx(ctxPtr uintptr) *requestSnapshot {
 	}
 
 	if headersLen > 0 {
-		snap.setLazyHeaders(ctxPtr+shared.ctxHeadersOff, int(headersLen))
+		snap.copyHeadersFrom(unsafe.Pointer(ctxPtr+shared.ctxHeadersOff), int(headersLen))
 	}
 
 	return snap
@@ -1061,11 +1058,101 @@ func (a appNative) startSharedDrain(intervalUs int) {
 // body or content_type exceeds the inline buffer caps; caller should fall
 // back to the cgo defer path in that case.
 func asyncSendShared(ctxHandle uintptr, statusLine, contentType, body string) bool {
-	var bodyPtr unsafe.Pointer
-	if len(body) > 0 {
-		bodyPtr = unsafe.Pointer(unsafe.StringData(body))
+	if !sharedReady || uintptr(len(statusLine)) > shared.statusCap ||
+		uintptr(len(contentType)) > shared.ctCap ||
+		uintptr(len(body)) > shared.bodyCap {
+		return false
 	}
-	return asyncSendSharedData(ctxHandle, statusLine, contentType, bodyPtr, len(body))
+
+	// Write status/ct/body bytes into the ctx's inline buffers.
+	if n := len(statusLine); n > 0 {
+		dst := unsafe.Slice((*byte)(unsafe.Pointer(ctxHandle+shared.ctxStatusOff)), int(shared.statusCap))
+		copy(dst, statusLine)
+	}
+	if n := len(contentType); n > 0 {
+		dst := unsafe.Slice((*byte)(unsafe.Pointer(ctxHandle+shared.ctxCtOff)), int(shared.ctCap))
+		copy(dst, contentType)
+	}
+	if n := len(body); n > 0 {
+		dst := unsafe.Slice((*byte)(unsafe.Pointer(ctxHandle+shared.ctxBodyOff)), int(shared.bodyCap))
+		copy(dst, body)
+	}
+	// Lengths.
+	*(*uint32)(unsafe.Pointer(ctxHandle + shared.ctxStatusLenOff)) = uint32(len(statusLine))
+	*(*uint32)(unsafe.Pointer(ctxHandle + shared.ctxCtLenOff)) = uint32(len(contentType))
+	*(*uint32)(unsafe.Pointer(ctxHandle + shared.ctxBodyLenOff)) = uint32(len(body))
+
+	// Read the App-specific pending ring AND loop pointer this ctx targets
+	// BEFORE publishing the ctx onto the ring. C++ stamps both fields onto
+	// the ctx at request-arrival time and they don't change for the life of
+	// the ctx, so reading them now is fine — but the moment we publish (the
+	// seqAddr.Store below), the loop-thread consumer is free to drain the
+	// slot, send the response, and release the ctx. Any read off ctx after
+	// publish is a use-after-free hazard.
+	ringPtr := *(*uintptr)(unsafe.Pointer(ctxHandle + shared.ctxPendingRingOff))
+	if ringPtr == 0 {
+		return false
+	}
+	loopPtr := *(*uintptr)(unsafe.Pointer(ctxHandle + shared.ctxLoopOff))
+
+	// MPSC enqueue: claim a ready slot with CAS. If the response ring is full
+	// or heavily contended, return false so the caller can fall back to
+	// Loop::defer instead of spinning unbounded on a worker goroutine.
+	tailAddr := (*atomic.Uint64)(unsafe.Pointer(ringPtr + shared.tailOffset))
+	tail := tailAddr.Load()
+	var (
+		slotBase uintptr
+		seqAddr  *atomic.Uint64
+	)
+	for spin := 0; ; spin++ {
+		slotBase = ringPtr + shared.slotsOffset + uintptr(tail&shared.ringMask)*shared.slotStride
+		seqAddr = (*atomic.Uint64)(unsafe.Pointer(slotBase + shared.slotSeqOffset))
+		seq := seqAddr.Load()
+		diff := int64(seq - tail)
+		switch {
+		case diff == 0:
+			if tailAddr.CompareAndSwap(tail, tail+1) {
+				goto claimed
+			}
+			tail = tailAddr.Load()
+		case diff < 0:
+			return false
+		default:
+			tail = tailAddr.Load()
+		}
+		if spin > 100000 {
+			return false
+		}
+		if spin%256 == 0 {
+			runtime.Gosched()
+		}
+	}
+
+claimed:
+	*(*uintptr)(unsafe.Pointer(slotBase + shared.slotCtxOffset)) = ctxHandle
+	seqAddr.Store(tail + 1)
+
+	// Ctx is now owned by the consumer — do NOT touch it again. Use the
+	// cached loopPtr to wake the drain.
+	//
+	// Skip the wake_drain cgo crossing if another producer (or a stale
+	// scheduled wake) already has one pending: drain clears wake_pending
+	// the moment it starts, so a successful CAS(0,1) here means "I'm the
+	// first producer since the last drain pass began, the wake is mine
+	// to call". Under sustained load this drops the cgo wake rate by
+	// the average batch size of the ring — at 91k rps on /db a single
+	// drain commonly consumes dozens of slots, so this typically
+	// eliminates 90%+ of wake_drain crossings.
+	if loopPtr != 0 {
+		wakeAddr := (*atomic.Uint32)(unsafe.Pointer(ringPtr + shared.wakePendingOffset))
+		if wakeAddr.CompareAndSwap(0, 1) {
+			C.uwsgo_wake_drain(
+				(*C.uwsgo_loop_t)(unsafe.Pointer(loopPtr)),
+				unsafe.Pointer(ringPtr),
+			)
+		}
+	}
+	return true
 }
 
 func asyncSendSharedBytes(ctxHandle uintptr, statusLine, contentType string, body []byte) bool {
