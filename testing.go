@@ -25,8 +25,8 @@ import (
 //
 // The server runs on a real port so every cgo path the framework
 // takes in production fires the same way under test (middleware
-// chains, sync wrapping, snapshot-then-async dispatch, the
-// zero-cgo shared-memory ring, …). The trade-off vs an in-process
+// chains, sync wrapping, snapshot-then-async dispatch, optional
+// shared-worker dispatch, ...). The trade-off vs an in-process
 // dispatcher is per-request latency (~50–100 µs vs ~1 µs) and the
 // need for the OS to allocate one port per server — both
 // acceptable for typical unit tests.

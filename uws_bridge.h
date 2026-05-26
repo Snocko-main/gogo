@@ -377,10 +377,10 @@ size_t uwsgo_req_query(uwsgo_req_t *req, char *buffer, size_t buffer_len);
 // missing. uWS performs a linear scan of the query string; cache the value
 // if you need it more than once.
 size_t uwsgo_req_query_param(uwsgo_req_t *req, const char *name, size_t name_len, char *buffer, size_t buffer_len);
-// Writes all headers as "name\0value\0name\0value\0..." into buffer.
-// Returns total bytes written, or the bytes needed if buffer is too small
-// (caller passes buffer_len=0 first to size). Truncates without splitting a
-// key/value pair when the buffer would overflow.
+// Writes headers as "name\0value\0name\0value\0..." into buffer. With
+// buffer == NULL, returns the total packed header bytes needed. With a buffer,
+// writes only complete name/value pairs that fit and returns bytes written, so
+// Go can safely cap snapshots without seeing a split header.
 size_t uwsgo_req_headers_all(uwsgo_req_t *req, char *buffer, size_t buffer_len);
 
 int uwsgo_ws_send(uwsgo_ws_t *ws, const char *message, size_t message_len, int opcode);

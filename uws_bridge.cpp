@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -411,22 +412,34 @@ extern "C" void uwsgo_app_get_static(uwsgo_app_t *app, const char *pattern,
 //     accumulate chunk sizes against the same body_limit and emit
 //     413 + close as soon as the total exceeds the cap. So bypass
 //     here is not a bypass overall — just a different layer.
-static bool body_limit_rejects(uwsgo_app_t *app, uWS::HttpResponse<false> *res, uWS::HttpRequest *req) {
-    if (app->body_limit == 0) return false;
+static bool declared_content_length_exceeds(uWS::HttpRequest *req, size_t limit) {
+    if (limit == 0) return false;
     auto cl = req->getHeader("content-length");
     if (cl.empty()) return false;
     // strtoull-style parse; if the header is malformed we conservatively
     // reject too — clients that send junk Content-Length deserve a 400/413.
     unsigned long long n = 0;
+    unsigned long long cap = static_cast<unsigned long long>(limit);
+    constexpr unsigned long long max = std::numeric_limits<unsigned long long>::max();
     for (char c : cl) {
-        if (c < '0' || c > '9') { n = ~0ULL; break; }
-        n = n * 10 + static_cast<unsigned long long>(c - '0');
-        if (n > app->body_limit) break;
+        if (c < '0' || c > '9') return true;
+        unsigned long long digit = static_cast<unsigned long long>(c - '0');
+        if (n > (max - digit) / 10) return true;
+        n = n * 10 + digit;
+        if (n > cap) return true;
     }
-    if (n <= app->body_limit) return false;
+    return false;
+}
+
+static void write_payload_too_large(uWS::HttpResponse<false> *res) {
     res->writeStatus("413 Payload Too Large");
     res->writeHeader("Content-Type", "text/plain; charset=utf-8");
     res->end("payload too large\n");
+}
+
+static bool body_limit_rejects(uwsgo_app_t *app, uWS::HttpResponse<false> *res, uWS::HttpRequest *req) {
+    if (!declared_content_length_exceeds(req, app->body_limit)) return false;
+    write_payload_too_large(res);
     return true;
 }
 
@@ -1371,6 +1384,10 @@ extern "C" void uwsgo_app_post_shared(uwsgo_app_t *app, const char *pattern,
         max_body = SNAP_BODY_CAP;
     }
     app->app->post(pattern, [app, handler_id, max_body](auto *res, auto *req) {
+        if (declared_content_length_exceeds(req, max_body)) {
+            write_payload_too_large(res);
+            return;
+        }
         AsyncCtx *ctx = acquire_shared_ctx(app, res, handler_id);
         snapshot_request(app, ctx, res, req);
         if (ctx->truncated) {
@@ -1770,13 +1787,16 @@ extern "C" size_t uwsgo_req_query_param(uwsgo_req_t *req, const char *name, size
 
 extern "C" size_t uwsgo_req_headers_all(uwsgo_req_t *req_ptr, char *buffer, size_t buffer_len) {
     auto *req = reinterpret_cast<uWS::HttpRequest *>(req_ptr);
-    // Two-pass: first compute the total size, then write if there's room.
+    // Two-pass contract: buffer == nullptr returns the total size. With a
+    // buffer, write as many complete name/value pairs as fit and return the
+    // bytes actually written. This lets Go cap snapshots without receiving a
+    // dangling key or an all-zero buffer when headers exceed the cap.
     size_t total = 0;
     for (auto it = req->begin(); it != req->end(); ++it) {
         auto kv = *it;
         total += kv.first.size() + 1 + kv.second.size() + 1;
     }
-    if (buffer == nullptr || buffer_len < total) {
+    if (buffer == nullptr) {
         return total;
     }
     size_t pos = 0;
@@ -1784,6 +1804,10 @@ extern "C" size_t uwsgo_req_headers_all(uwsgo_req_t *req_ptr, char *buffer, size
         auto kv = *it;
         std::string_view name = kv.first;
         std::string_view value = kv.second;
+        size_t need = name.size() + 1 + value.size() + 1;
+        if (pos + need > buffer_len) {
+            break;
+        }
         std::memcpy(buffer + pos, name.data(), name.size());
         pos += name.size();
         buffer[pos++] = '\0';

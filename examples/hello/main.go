@@ -33,8 +33,8 @@ func main() {
 		res.Send(200, "text/plain; charset=utf-8", "hi "+req.Parameter(0)+"\n")
 	})
 
-	// Async handler — runs on a goroutine via the shared-memory ring,
-	// zero cgo crossings on the hot path.
+	// Async handler — runs on a goroutine and is free to block.
+	// Without sync middleware, gogo dispatches through the shared worker ring.
 	app.GetAsync("/work", func(res *gogo.Response, req *gogo.Request) {
 		time.Sleep(10 * time.Millisecond)
 		res.Send(200, "text/plain; charset=utf-8", "done\n")

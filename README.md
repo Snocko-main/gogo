@@ -15,8 +15,9 @@ It is intentionally thin:
 
 - Go owns route registration and handlers.
 - C++ owns uWebSockets templates, the event loop, and response/request calls.
-- Async dispatch uses a shared-memory ring so the request hot path crosses
-  cgo zero times for shared-mode handlers.
+- Async `GetAsync` routes without sync middleware use the shared worker ring
+  for high-concurrency throughput; small async responses use the response ring
+  to avoid a cgo send on the hot path.
 
 ## Benchmark Snapshot
 
@@ -335,8 +336,9 @@ app.Get("/plain", func(res *gogo.Response, req *gogo.Request) {
 })
 
 // 2) GetAsync — runs on a goroutine, free to block (DB, HTTP, sleep).
-//    Without middleware, dispatched through a shared-memory ring with
-//    ZERO cgo crossings per request.
+//    Without sync middleware, dispatches through the shared worker ring.
+//    Set Config.SyncEntryGetAsync only if your own low-concurrency benchmark
+//    favors the sync-entry wrapper.
 app.GetAsync("/db", func(res *gogo.Response, req *gogo.Request) {
     var name string
     _ = db.QueryRow("SELECT name FROM users WHERE id=$1", 1).Scan(&name)
@@ -344,7 +346,7 @@ app.GetAsync("/db", func(res *gogo.Response, req *gogo.Request) {
 })
 
 // 3) PostAsync — async handler with the body fully collected up to maxBodyBytes.
-//    Oversize bodies → 413 automatically.
+//    Small no-middleware bodies use the shared collector; oversize -> 413.
 app.PostAsync("/upload", 1<<20, func(res *gogo.Response, req *gogo.Request, body []byte) {
     res.JSON(200, map[string]int{"size": len(body)})
 })
@@ -1339,9 +1341,9 @@ raise Redis publish throughput.
 
 `DynamicSubscriptions` uses gogo's Go-side `ws.Subscribe` / `ws.Unsubscribe`
 tracking rather than a uWS subscription callback, so it does not add an extra
-C-to-Go callback on the WebSocket hot path. HTTP `GetAsync` / `PostAsync`
-handlers keep the same shared-memory zero-cgo dispatch path; the Redis work is
-isolated behind the hub's adapter queue. Subscription changes are reconciled to
+C-to-Go callback on the WebSocket hot path. HTTP async handlers keep Redis work
+isolated behind the hub's adapter queue; no-sync-middleware `GetAsync` routes
+use the shared worker ring by default. Subscription changes are reconciled to
 the latest local topic state, so rapid leave/join churn cannot leave Redis
 subscribed to the wrong final state. For very high subscription churn,
 `gogo.WithWSHubAdapterTopicWorkers(2)` can parallelize reconciliation.
@@ -1526,9 +1528,9 @@ func main() {
 Tuning knobs that actually matter:
 
 - `GOMAXPROCS` — pin to the same N you passed to `RunMultiCore`.
-- `gogo.SetWorkerCount(n)` — controls the `GetAsync` worker pool. Default
-  is `NumCPU`; with `RunMultiCore` consider halving this since each loop
-  already owns one core.
+- `gogo.SetWorkerCount(n)` — controls the shared `GetAsync` worker pool.
+  Default is `NumCPU`; with `RunMultiCore`, lower this if short async
+  handlers show worker contention in your own wrk profile.
 - Pin shared resources (DB pools, caches) to one allocation outside
   `setup`.
 - For strict CPU pinning, run under `taskset -c 0-(N-1)`.
@@ -1562,6 +1564,7 @@ app, _ := gogo.NewApp(gogo.Config{
     BodyReadTimeout: 30 * time.Second, // slow body upload deadline
     BindAddr:        "127.0.0.1",      // localhost only
     CapturePeerIP:   true,             // populate req.IP() on async paths
+    // SyncEntryGetAsync: true,        // opt out of shared GetAsync workers
     TrustProxy:      true,             // honor X-Forwarded-*
     // JSONEncoder:  sonic.Marshal,    // optional: faster JSON responses
     // JSONDecoder:  sonic.Unmarshal,  // optional: faster BodyParser JSON
@@ -1573,7 +1576,8 @@ app, _ := gogo.NewApp(gogo.Config{
 | `BodyLimit`       | 4 MiB                     | Reject Content-Length > limit with 413 on the C++ side  |
 | `BodyReadTimeout` | 30s                       | Deadline for `Response.Body` to finish reading the body |
 | `BindAddr`        | `""`                      | Empty = all interfaces (`0.0.0.0`)                      |
-| `CapturePeerIP`   | `false`                   | Snapshot peer IP for async / shared-dispatch paths      |
+| `CapturePeerIP`   | `false`                   | Snapshot peer IP for `GetAsync` / `PostAsync` paths     |
+| `SyncEntryGetAsync` | `false`                 | Opt no-middleware `GetAsync` out of shared workers      |
 | `TrustProxy`      | `false`                   | Honor `X-Forwarded-*` in `Protocol()`/`Secure()`/`IPs()` |
 | `JSONEncoder`     | `encoding/json.Marshal`   | Encoder for `Response.JSON` and `Response.JSONP`        |
 | `JSONDecoder`     | `encoding/json.Unmarshal` | Decoder for `Request.BodyParser` JSON bodies            |
@@ -1791,10 +1795,10 @@ same four `wrk` thread counts, sorted, then medianed.
 - `POST /query` — body carries an integer id; handler parses it and
   runs `SELECT … FROM users WHERE id = ?` against SQLite, returns the
   row. Realistic API shape: body parse + blocking I/O + JSON
-  response. gogo uses `PostAsync` here — the small body fits the
-  shared-dispatch cap so the request crosses zero cgo callbacks on
-  the hot path, and the handler runs on a worker goroutine so the
-  blocking `sql.DB.QueryRow` doesn't pin the loop thread.
+  response. gogo uses `PostAsync` here — the small body uses the
+  shared C++ collector and request ring, then the handler runs on a
+  goroutine so the blocking `sql.DB.QueryRow` doesn't pin the loop
+  thread.
 
 > **Hardware note** — these numbers come from a local Apple M3 laptop
 > (Darwin arm64, 4 performance cores + 4 efficiency cores, 16 GB RAM).
@@ -1892,11 +1896,11 @@ Notes on the spread:
   fair-comparison shape is sync for pure echo.
 - **POST /query (PostAsync + SQLite)** — gogo is the fastest
   single-worker result and remains near the top in 4-worker mode,
-  because the small body hits the shared-dispatch fast path (zero cgo
-  callbacks) and the blocking SQLite query runs on a worker goroutine
-  without stalling the loop. uwsjs has the tightest 4-worker p99 here;
-  Actix and net/http have higher throughput than before with the
-  4-worker cap, but wider tails.
+  because the small body uses the shared C++ collector and request ring,
+  while the blocking SQLite query runs on a goroutine without stalling
+  the loop. uwsjs has the tightest 4-worker p99 here; Actix and net/http
+  have higher throughput than before with the 4-worker cap, but wider
+  tails.
 - **Actix Rust** posts strong GET and echo throughput, especially with
   multiple workers, but this run still shows wider SQLite p99 than the
   uWS-backed servers.

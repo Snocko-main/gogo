@@ -73,14 +73,19 @@ func (responseNative) header(string, string)       {}
 func (responseNative) headersBatch([]byte, int)    {}
 func (responseNative) write(string)                {}
 func (responseNative) end(string)                  {}
+func (responseNative) endBytes([]byte)             {}
 func (responseNative) send(string, string, string) {}
+func (responseNative) sendBytes(string, string, []byte) {
+}
 func (responseNative) sendSplit(string, string, []byte, string, string) {
 }
 func (responseNative) loop() loopNative          { return loopNative{} }
 func (responseNative) onAborted(any)             {}
 func (responseNative) cork(func())               {}
 func (responseNative) onData(func([]byte, bool)) {}
-func (responseNative) remoteAddr() string        { return "" }
+func (responseNative) onDataRaw(func(unsafe.Pointer, int, bool)) {
+}
+func (responseNative) remoteAddr() string { return "" }
 
 func (loopNative) defer_(func()) {}
 
@@ -89,13 +94,18 @@ func loopFromUintptr(uintptr) *Loop { return &Loop{} }
 func (appNative) startSharedDrain(int)                     {}
 func initSharedLayout()                                    {}
 func asyncSendShared(uintptr, string, string, string) bool { return false }
+func asyncSendSharedBytes(uintptr, string, string, []byte) bool {
+	return false
+}
 
 func (responseNative) beginAsync() (uintptr, uintptr) { return 0, 0 }
 
 func asyncDeferSend(uintptr, uintptr, string, string, string)                    {}
+func asyncDeferSendBytes(uintptr, uintptr, string, string, []byte)               {}
 func asyncDeferSendWithHeaders(uintptr, uintptr, string, string, string, string) {}
 func asyncDeferStreamStart(uintptr, uintptr, string, string, string)             {}
 func asyncDeferStreamWrite(uintptr, uintptr, string)                             {}
+func asyncDeferStreamWriteBytes(uintptr, uintptr, []byte)                        {}
 func asyncDeferStreamEnd(uintptr, uintptr)                                       {}
 func innerBufferedAmount(responseNative) uint64                                  { return 0 }
 func asyncCtxAborted(ctxHandle uintptr) bool                                     { return ctxHandle == 0 }

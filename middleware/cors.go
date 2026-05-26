@@ -147,7 +147,7 @@ func CORS(opts ...CORSOptions) mwhint.Hinted {
 			// status was sent first), so for the preflight 204 we must
 			// call Status BEFORE any Header — otherwise the response
 			// goes out as 200 with our headers attached.
-			isPreflight := req.Method() == "options" &&
+			isPreflight := req.MethodIs("options") &&
 				req.Header("access-control-request-method") != ""
 
 			if isPreflight {

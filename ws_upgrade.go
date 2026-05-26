@@ -83,7 +83,6 @@ func (c *UpgradeContext) Header(name string) string {
 	if name == "" || len(c.headersBlob) == 0 {
 		return ""
 	}
-	needle := lowercaseAsciiString(name)
 	buf := c.headersBlob
 	for len(buf) > 0 {
 		j := indexOfZero(buf)
@@ -101,7 +100,7 @@ func (c *UpgradeContext) Header(name string) string {
 		}
 		value := buf[:j]
 		buf = buf[j+1:]
-		if len(key) == len(needle) && bytesEqualLower(key, needle) {
+		if bytesEqualFoldASCII(key, name) {
 			return string(value)
 		}
 	}
@@ -200,32 +199,6 @@ func validWebSocketSubprotocol(protocol string) bool {
 		}
 	}
 	return true
-}
-
-// lowercaseAsciiString is an allocation-friendly twin of
-// lowercaseAscii that takes a string instead of building one.
-// Used by UpgradeContext.Header to normalize the lookup key.
-func lowercaseAsciiString(s string) string {
-	var hasUpper bool
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c >= 'A' && c <= 'Z' {
-			hasUpper = true
-			break
-		}
-	}
-	if !hasUpper {
-		return s
-	}
-	b := make([]byte, len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c >= 'A' && c <= 'Z' {
-			c += 'a' - 'A'
-		}
-		b[i] = c
-	}
-	return string(b)
 }
 
 // UserData reads back the value stashed by an upgrade callback via

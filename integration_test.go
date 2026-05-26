@@ -1490,10 +1490,9 @@ func TestMiddlewareGlobalAndScopedTogether(t *testing.T) {
 	}
 }
 
-// TestMiddlewarePathScopedGetAsyncFastPath confirms GetAsync still uses the
-// zero-cgo shared-memory dispatch when the only registered middleware is
-// scoped to a path that doesn't include the async route.
-func TestMiddlewarePathScopedGetAsyncFastPath(t *testing.T) {
+// TestMiddlewarePathScopedGetAsync confirms path-scoped sync middleware only
+// wraps matching GetAsync routes.
+func TestMiddlewarePathScopedGetAsync(t *testing.T) {
 	var apiHits atomic.Int32
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.Use("/api/*", func(next gogo.Handler) gogo.Handler {
@@ -1502,8 +1501,7 @@ func TestMiddlewarePathScopedGetAsyncFastPath(t *testing.T) {
 				next(res, req)
 			}
 		})
-		// Async route lives OUTSIDE /api so the scoped middleware must not
-		// pull it onto the sync fallback path.
+		// Async route lives OUTSIDE /api so the scoped middleware must not run.
 		app.GetAsync("/work", func(res *gogo.Response, req *gogo.Request) {
 			time.Sleep(2 * time.Millisecond)
 			res.Send(200, "text/plain", "done")
@@ -1533,7 +1531,7 @@ func TestMiddlewarePathScopedGetAsyncFastPath(t *testing.T) {
 
 // TestAsyncMiddlewareLoadsUser exercises the canonical async middleware
 // flow: a blocking "lookup" runs on the goroutine, sets a Local, and the
-// handler reads it back. Shared dispatch path (no sync middleware).
+// handler reads it back.
 func TestAsyncMiddlewareLoadsUser(t *testing.T) {
 	type user struct {
 		ID   int
@@ -1783,11 +1781,9 @@ func TestUseAsyncRejectsBadArgs(t *testing.T) {
 	}
 }
 
-// TestPostSharedDispatch sends a small JSON body to a PostAsync
-// route registered with maxBodyBytes within the SNAP_BODY_CAP
-// (zero-cgo path). The handler receives the body via the
-// snapshot — no res.Body cgo call needed — and echoes it back.
-func TestPostSharedDispatch(t *testing.T) {
+// TestPostAsyncSmallBody sends a small JSON body to a PostAsync route and
+// confirms the handler receives the exact bytes.
+func TestPostAsyncSmallBody(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.PostAsync("/echo", 4096, func(res *gogo.Response, req *gogo.Request, body []byte) {
 			// Body should match what the client sent verbatim.
@@ -1819,10 +1815,8 @@ func TestPostSharedDispatch(t *testing.T) {
 	}
 }
 
-// TestPostSharedOversize_413 sends a body larger than the route's
-// maxBodyBytes. The shared-dispatch path rejects on the loop
-// thread with 413 — no goroutine ever spawns.
-func TestPostSharedOversize_413(t *testing.T) {
+// TestPostAsyncOversize413 sends a body larger than the route's maxBodyBytes.
+func TestPostAsyncOversize413(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.PostAsync("/echo", 64, func(res *gogo.Response, req *gogo.Request, body []byte) {
 			res.Send(200, "text/plain", "ok")
@@ -1848,15 +1842,12 @@ func TestPostSharedOversize_413(t *testing.T) {
 	}
 }
 
-// TestPostSharedFallbackForLargeBody confirms PostAsync auto-falls
-// back to the cgo-mediated async path when the route's maxBodyBytes
-// exceeds the shared-dispatch cap. The visible behavior should be
-// identical (body echoed back); the difference is the dispatch
-// mechanism, which we don't expose to user code.
-func TestPostSharedFallbackForLargeBody(t *testing.T) {
+// TestPostAsyncLargeBodyEcho confirms larger PostAsync bodies are collected
+// and passed to the handler intact.
+func TestPostAsyncLargeBodyEcho(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
-		// 32 KiB cap — well above the 8 KiB shared-dispatch cap,
-		// forces the fallback path.
+		// 32 KiB cap — verifies PostAsync accepts bodies beyond the small
+		// response fast-path size.
 		app.PostAsync("/big", 32*1024, func(res *gogo.Response, req *gogo.Request, body []byte) {
 			res.Header("X-Body-Len", strconv.Itoa(len(body)))
 			res.Send(200, "application/octet-stream", string(body))
@@ -1864,7 +1855,7 @@ func TestPostSharedFallbackForLargeBody(t *testing.T) {
 	})
 	defer teardown()
 
-	payload := make([]byte, 16*1024) // 16 KiB — fits the 32 KiB cap, exceeds 8 KiB shared cap
+	payload := make([]byte, 16*1024) // 16 KiB — fits the 32 KiB route cap
 	for i := range payload {
 		payload[i] = byte(i)
 	}
@@ -1886,10 +1877,9 @@ func TestPostSharedFallbackForLargeBody(t *testing.T) {
 	}
 }
 
-// TestPostSharedSeesHeaders confirms the request-side snapshot
-// (headers / URL / params / etc.) reaches the worker the same way
-// it does on GetAsync.
-func TestPostSharedSeesHeaders(t *testing.T) {
+// TestPostAsyncSeesHeaders confirms headers / URL / params reach the worker
+// the same way they do on GetAsync.
+func TestPostAsyncSeesHeaders(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.PostAsync("/users/:id", 4096, func(res *gogo.Response, req *gogo.Request, body []byte) {
 			res.Header("X-Param-Id", req.Param("id"))
@@ -1912,6 +1902,75 @@ func TestPostSharedSeesHeaders(t *testing.T) {
 	}
 	if got := resp.Header.Get("X-Saw-Auth"); got != "Bearer abc" {
 		t.Errorf("X-Saw-Auth = %q, want Bearer abc", got)
+	}
+}
+
+func TestPostAsyncHonorsTypedParams(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.PostAsync("/users/:id<int>", 4096, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			res.Send(200, "text/plain", req.Param("id")+":"+string(body))
+		})
+	})
+	defer teardown()
+
+	resp, err := noKeepaliveClient.Post(
+		fmt.Sprintf("http://127.0.0.1:%d/users/42", port),
+		"text/plain", strings.NewReader("ok"))
+	if err != nil {
+		t.Fatalf("POST typed param: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || string(body) != "42:ok" {
+		t.Fatalf("typed param valid: got %d %q, want 200 %q", resp.StatusCode, string(body), "42:ok")
+	}
+
+	resp, err = noKeepaliveClient.Post(
+		fmt.Sprintf("http://127.0.0.1:%d/users/not-int", port),
+		"text/plain", strings.NewReader("ok"))
+	if err != nil {
+		t.Fatalf("POST typed param invalid: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 404 {
+		t.Fatalf("typed param invalid: got %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestPostAsyncClampsToAppBodyLimit(t *testing.T) {
+	var handlerHits atomic.Int32
+	port, teardown := startAppCfg(t, gogo.Config{BodyLimit: 8}, func(app *gogo.App) {
+		app.PostAsync("/upload", 64, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			handlerHits.Add(1)
+			res.Send(200, "text/plain", strconv.Itoa(len(body)))
+		})
+	})
+	defer teardown()
+
+	resp, err := noKeepaliveClient.Post(
+		fmt.Sprintf("http://127.0.0.1:%d/upload", port),
+		"text/plain", strings.NewReader("12345678"))
+	if err != nil {
+		t.Fatalf("POST at app body limit: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || string(body) != "8" {
+		t.Fatalf("at app body limit: got %d %q, want 200 %q", resp.StatusCode, string(body), "8")
+	}
+
+	resp, err = noKeepaliveClient.Post(
+		fmt.Sprintf("http://127.0.0.1:%d/upload", port),
+		"text/plain", strings.NewReader("123456789"))
+	if err != nil {
+		t.Fatalf("POST over app body limit: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 413 {
+		t.Fatalf("over app body limit: got %d, want 413", resp.StatusCode)
+	}
+	if handlerHits.Load() != 1 {
+		t.Fatalf("handler hits = %d, want 1", handlerHits.Load())
 	}
 }
 
@@ -2040,9 +2099,7 @@ func TestRequestHeadersIteratorAsync(t *testing.T) {
 // middleware via App.Use. Raw middleware defaults to "both chains"
 // placement so both a sync and async route should observe exactly
 // one invocation each — proving that the dual-chain registration
-// does NOT cause double-execution. The async route should also keep
-// the zero-cgo dispatch path: alsoAsync entries in the sync chain
-// are skipped by hasMatchingMiddleware.
+// does NOT cause double-execution.
 func TestPlaceBothFiresOnceAndKeepsFastPath(t *testing.T) {
 	var syncCount atomic.Int32
 	port, teardown := startApp(t, func(app *gogo.App) {
@@ -2984,6 +3041,38 @@ func TestBodyReadTimeout(t *testing.T) {
 	}
 }
 
+func TestPostAsyncBodyReadTimeout408(t *testing.T) {
+	var called atomic.Bool
+	port, teardown := startAppCfg(t, gogo.Config{BodyReadTimeout: 150 * time.Millisecond}, func(app *gogo.App) {
+		app.PostAsync("/slow", 64*1024, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			called.Store(true)
+			res.Send(200, "text/plain", "unexpected")
+		})
+	})
+	defer teardown()
+
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	fmt.Fprintf(conn, "POST /slow HTTP/1.1\r\nHost: x\r\nContent-Length: 1024\r\nConnection: close\r\n\r\nhello")
+
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read status: %v", err)
+	}
+	if !strings.Contains(line, " 408 ") {
+		t.Fatalf("status line = %q, want 408", strings.TrimSpace(line))
+	}
+	if called.Load() {
+		t.Fatal("PostAsync handler was called after body read timeout")
+	}
+}
+
 // TestBodyReadTimeoutDoesNotFireOnNormalUpload: a well-behaved POST
 // that finishes promptly must NOT see the timeout error — the timer
 // has to stop on the success path.
@@ -3431,10 +3520,31 @@ func TestGroupPostAsyncBodyAndMW(t *testing.T) {
 	}
 }
 
-// TestGroupGetAsyncFastPathWithoutMW confirms that GetAsync registered through
-// a Group with NO middleware still uses the zero-cgo shared-memory dispatch
-// path (no perf regression for the common case).
-func TestGroupGetAsyncFastPathWithoutMW(t *testing.T) {
+func TestGroupPostAsyncWithoutMW(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		api := app.Group("/api")
+		api.PostAsync("/echo/:tag", 32, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			res.Send(200, "text/plain", req.Param("tag")+":"+string(body))
+		})
+	})
+	defer teardown()
+
+	resp, err := noKeepaliveClient.Post(
+		fmt.Sprintf("http://127.0.0.1:%d/api/echo/fast", port),
+		"text/plain", strings.NewReader("body"))
+	if err != nil {
+		t.Fatalf("POST /api/echo/fast: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || string(body) != "fast:body" {
+		t.Fatalf("POST /api/echo/fast: got %d %q", resp.StatusCode, string(body))
+	}
+}
+
+// TestGroupGetAsyncWithoutMW confirms that GetAsync registered through a Group
+// with no middleware keeps the expected route behavior.
+func TestGroupGetAsyncWithoutMW(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
 		api := app.Group("/api")
 		api.GetAsync("/work", func(res *gogo.Response, req *gogo.Request) {
@@ -3602,7 +3712,7 @@ func TestGroupGlobalUseStillWraps(t *testing.T) {
 
 // startAppCfg mirrors startApp but lets the caller pass an explicit
 // gogo.Config (BodyLimit, BindAddr, …).
-func startAppCfg(t *testing.T, cfg gogo.Config, configure func(app *gogo.App)) (port int, teardown func()) {
+func startAppCfg(t testing.TB, cfg gogo.Config, configure func(app *gogo.App)) (port int, teardown func()) {
 	t.Helper()
 	if cfg.BindAddr == "" {
 		cfg.BindAddr = "127.0.0.1"
@@ -4234,11 +4344,11 @@ func TestWebSocketBehaviorAcceptsLimits(t *testing.T) {
 
 // TestRequestIntrospection covers the P1 request helpers — IP, IPs,
 // Hostname, Get, Protocol, Secure — across sync, async, and the
-// shared-dispatch path. IP comes from the loopback peer (127.0.0.1)
+// shared GetAsync path. IP comes from the loopback peer (127.0.0.1)
 // in the test harness; IPs is X-Forwarded-For; Hostname comes from
 // the Host header (port stripped).
 //
-// CapturePeerIP is enabled so async / shared paths populate the IP
+// CapturePeerIP is enabled so async paths populate the IP
 // snapshot. The default (off) is exercised by TestPeerIPDefaultOff.
 func TestRequestIntrospection(t *testing.T) {
 	type captured struct {
@@ -4280,7 +4390,7 @@ func TestRequestIntrospection(t *testing.T) {
 			})
 			res.Send(200, "text/plain", "async")
 		})
-		// No middleware → shared-dispatch zero-cgo path.
+		// No middleware → shared-dispatch path.
 		app.GetAsync("/shared", func(res *gogo.Response, req *gogo.Request) {
 			shared.Store(&captured{
 				ip:       req.IP(),
@@ -4342,7 +4452,7 @@ func TestRequestIntrospection(t *testing.T) {
 }
 
 // TestPeerIPDefaultOff: with the default Config (CapturePeerIP=false),
-// shared-dispatch and sync-wrapper-async handlers see req.IP() == "".
+// Shared GetAsync and sync-entry async handlers see req.IP() == "".
 // Sync handlers still get the live IP — their lookup goes through the
 // res pointer directly and isn't tied to the snapshot.
 func TestPeerIPDefaultOff(t *testing.T) {

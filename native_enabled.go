@@ -149,12 +149,12 @@ func (a *appNative) postShared(pattern string, handler AsyncHandler, maxBody int
 // after that has no effect. Default = NumCPU — spinning workers compete
 // with the uWS loop thread on GOMAXPROCS, so over-subscribing tanks sync
 // route latency. For workloads dominated by slow IO, raise this via
-// SetWorkerCount before the first GetAsync registers.
+// SetWorkerCount before the first shared GetAsync route registers.
 var workerCount atomic.Int32
 
-// SetWorkerCount configures the shared-dispatch worker pool size. Call
-// before registering any GetAsync route — calls after the pool starts
-// are no-ops. Pass 0 to restore the default (NumCPU).
+// SetWorkerCount configures the shared GetAsync request-dispatch worker pool
+// size. Call before registering the first shared GetAsync route — calls after
+// the pool starts are no-ops. Pass 0 to restore the default (NumCPU).
 func SetWorkerCount(n int) {
 	if n < 0 {
 		n = 0
@@ -358,8 +358,8 @@ func sharedWorker(stop <-chan struct{}) {
 
 		// Run inline on the worker. Workers are sized for typical short
 		// handlers (db queries, in-memory work). For longer-blocking
-		// handlers (large file IO), increase WorkerCount or call
-		// SetWorkerCount before the first GetAsync registration.
+		// handlers (large file IO), increase the worker count or call
+		// SetWorkerCount before the first shared GetAsync registration.
 		runSharedHandler(handler, ctxPtr)
 	}
 }
@@ -410,6 +410,7 @@ func runSharedHandler(handler AsyncHandler, ctxPtr uintptr) {
 		if !a.sent {
 			asyncCtxRelease(ctxPtr)
 		}
+		releaseRequestSnapshot(reqWrap.snap)
 		reqWrap.resetForPool()
 		requestPool.Put(reqWrap)
 		resWrap.finishAsync(a)
@@ -440,13 +441,12 @@ func newSnapshotFromCtx(ctxPtr uintptr) *requestSnapshot {
 		paramCount = uint32(shared.snapParamMax)
 	}
 
-	snap := &requestSnapshot{
-		method:    copyAt(ctxPtr+shared.ctxMethodOff, int(methodLen)),
-		url:       copyAt(ctxPtr+shared.ctxURLOff, int(urlLen)),
-		query:     copyAt(ctxPtr+shared.ctxQueryOff, int(queryLen)),
-		ip:        copyAt(ctxPtr+shared.ctxIPOff, int(ipLen)),
-		truncated: truncated,
-	}
+	snap := acquireRequestSnapshot()
+	snap.method = copyAt(ctxPtr+shared.ctxMethodOff, int(methodLen))
+	snap.url = copyAt(ctxPtr+shared.ctxURLOff, int(urlLen))
+	snap.query = copyAt(ctxPtr+shared.ctxQueryOff, int(queryLen))
+	snap.ip = copyAt(ctxPtr+shared.ctxIPOff, int(ipLen))
+	snap.truncated = truncated
 
 	if paramCount > 0 {
 		paramsBase := ctxPtr + shared.ctxParamsOff
@@ -466,9 +466,7 @@ func newSnapshotFromCtx(ctxPtr uintptr) *requestSnapshot {
 	}
 
 	if headersLen > 0 {
-		hdrs := make([]byte, headersLen)
-		copy(hdrs, unsafe.Slice((*byte)(unsafe.Pointer(ctxPtr+shared.ctxHeadersOff)), int(headersLen)))
-		snap.headers = hdrs
+		snap.copyHeadersFrom(unsafe.Pointer(ctxPtr+shared.ctxHeadersOff), int(headersLen))
 	}
 
 	return snap
@@ -687,6 +685,11 @@ func (r responseNative) end(body string) {
 	C.uwsgo_res_end(r.ptr, unsafeStringData(body), C.size_t(len(body)))
 }
 
+func (r responseNative) endBytes(body []byte) {
+	C.uwsgo_res_end(r.ptr, unsafeByteData(body), C.size_t(len(body)))
+	runtime.KeepAlive(body)
+}
+
 func (r responseNative) send(status, contentType, body string) {
 	C.uwsgo_res_send(
 		r.ptr,
@@ -694,6 +697,16 @@ func (r responseNative) send(status, contentType, body string) {
 		unsafeStringData(contentType), C.size_t(len(contentType)),
 		unsafeStringData(body), C.size_t(len(body)),
 	)
+}
+
+func (r responseNative) sendBytes(status, contentType string, body []byte) {
+	C.uwsgo_res_send(
+		r.ptr,
+		unsafeStringData(status), C.size_t(len(status)),
+		unsafeStringData(contentType), C.size_t(len(contentType)),
+		unsafeByteData(body), C.size_t(len(body)),
+	)
+	runtime.KeepAlive(body)
 }
 
 func (r responseNative) sendSplit(status, contentType string, headers []byte, prefix, body string) {
@@ -746,6 +759,11 @@ func (r responseNative) onData(fn func([]byte, bool)) {
 	C.uwsgo_res_on_data(r.ptr, C.uintptr_t(handle))
 }
 
+func (r responseNative) onDataRaw(fn func(unsafe.Pointer, int, bool)) {
+	handle := cgo.NewHandle(fn)
+	C.uwsgo_res_on_data(r.ptr, C.uintptr_t(handle))
+}
+
 func (l loopNative) defer_(fn func()) {
 	handle := cgo.NewHandle(fn)
 	C.uwsgo_loop_defer(l.ptr, C.uintptr_t(handle))
@@ -765,6 +783,17 @@ func asyncDeferSend(loopPtr, ctxHandle uintptr, status, contentType, body string
 		unsafeStringData(contentType), C.size_t(len(contentType)),
 		unsafeStringData(body), C.size_t(len(body)),
 	)
+}
+
+func asyncDeferSendBytes(loopPtr, ctxHandle uintptr, status, contentType string, body []byte) {
+	C.uwsgo_res_defer_send(
+		(*C.uwsgo_loop_t)(unsafe.Pointer(loopPtr)),
+		unsafe.Pointer(ctxHandle),
+		unsafeStringData(status), C.size_t(len(status)),
+		unsafeStringData(contentType), C.size_t(len(contentType)),
+		unsafeByteData(body), C.size_t(len(body)),
+	)
+	runtime.KeepAlive(body)
 }
 
 // asyncDeferSendWithHeaders is the variant that carries an extra packed
@@ -821,6 +850,23 @@ func asyncDeferStreamWrite(loopPtr, ctxHandle uintptr, chunk string) {
 		unsafe.Pointer(ctxHandle),
 		chunkPtr, C.size_t(len(chunk)),
 	)
+}
+
+// asyncDeferStreamWriteBytes is the []byte sibling used by io.Writer
+// paths. It avoids forcing callers to allocate a temporary string for
+// every streamed chunk while keeping the same C-side copy-before-return
+// lifetime guarantee as asyncDeferStreamWrite.
+func asyncDeferStreamWriteBytes(loopPtr, ctxHandle uintptr, chunk []byte) {
+	var chunkPtr *C.char
+	if len(chunk) > 0 {
+		chunkPtr = unsafeByteData(chunk)
+	}
+	C.uwsgo_res_defer_stream_write(
+		(*C.uwsgo_loop_t)(unsafe.Pointer(loopPtr)),
+		unsafe.Pointer(ctxHandle),
+		chunkPtr, C.size_t(len(chunk)),
+	)
+	runtime.KeepAlive(chunk)
 }
 
 // asyncDeferStreamEnd closes the streaming response with an empty
@@ -1013,9 +1059,25 @@ func (a appNative) startSharedDrain(intervalUs int) {
 // body or content_type exceeds the inline buffer caps; caller should fall
 // back to the cgo defer path in that case.
 func asyncSendShared(ctxHandle uintptr, statusLine, contentType, body string) bool {
+	var bodyPtr unsafe.Pointer
+	if len(body) > 0 {
+		bodyPtr = unsafe.Pointer(unsafe.StringData(body))
+	}
+	return asyncSendSharedData(ctxHandle, statusLine, contentType, bodyPtr, len(body))
+}
+
+func asyncSendSharedBytes(ctxHandle uintptr, statusLine, contentType string, body []byte) bool {
+	var bodyPtr unsafe.Pointer
+	if len(body) > 0 {
+		bodyPtr = unsafe.Pointer(unsafe.SliceData(body))
+	}
+	return asyncSendSharedData(ctxHandle, statusLine, contentType, bodyPtr, len(body))
+}
+
+func asyncSendSharedData(ctxHandle uintptr, statusLine, contentType string, bodyPtr unsafe.Pointer, bodyLen int) bool {
 	if !sharedReady || uintptr(len(statusLine)) > shared.statusCap ||
 		uintptr(len(contentType)) > shared.ctCap ||
-		uintptr(len(body)) > shared.bodyCap {
+		uintptr(bodyLen) > shared.bodyCap {
 		return false
 	}
 
@@ -1028,14 +1090,14 @@ func asyncSendShared(ctxHandle uintptr, statusLine, contentType, body string) bo
 		dst := unsafe.Slice((*byte)(unsafe.Pointer(ctxHandle+shared.ctxCtOff)), int(shared.ctCap))
 		copy(dst, contentType)
 	}
-	if n := len(body); n > 0 {
+	if bodyLen > 0 {
 		dst := unsafe.Slice((*byte)(unsafe.Pointer(ctxHandle+shared.ctxBodyOff)), int(shared.bodyCap))
-		copy(dst, body)
+		copy(dst, unsafe.Slice((*byte)(bodyPtr), bodyLen))
 	}
 	// Lengths.
 	*(*uint32)(unsafe.Pointer(ctxHandle + shared.ctxStatusLenOff)) = uint32(len(statusLine))
 	*(*uint32)(unsafe.Pointer(ctxHandle + shared.ctxCtLenOff)) = uint32(len(contentType))
-	*(*uint32)(unsafe.Pointer(ctxHandle + shared.ctxBodyLenOff)) = uint32(len(body))
+	*(*uint32)(unsafe.Pointer(ctxHandle + shared.ctxBodyLenOff)) = uint32(bodyLen)
 
 	// Read the App-specific pending ring AND loop pointer this ctx targets
 	// BEFORE publishing the ctx onto the ring. C++ stamps both fields onto
@@ -1563,8 +1625,15 @@ func uwsgoReleaseHandle(callbackID C.uintptr_t) {
 //export uwsgoHandleData
 func uwsgoHandleData(callbackID C.uintptr_t, data *C.char, size C.size_t, isLast C.int) {
 	h := cgo.Handle(callbackID)
-	fn := h.Value().(func([]byte, bool))
-	// Copy the chunk into Go memory — uWS reuses its buffer after this call.
+	fn := h.Value()
+	last := isLast != 0
+	if last {
+		h.Delete()
+	}
+	// Public OnData copies each chunk into Go memory — uWS reuses its buffer
+	// after this call. Response.Body uses the raw sibling below to copy
+	// directly into its final accumulator and avoid a second short-lived
+	// allocation per chunk.
 	//
 	// uWS's read chunks are bounded by its per-connection backpressure
 	// (default 64 KiB) and the kernel socket buffer, so C.size_t fitting
@@ -1574,23 +1643,23 @@ func uwsgoHandleData(callbackID C.uintptr_t, data *C.char, size C.size_t, isLast
 	// arrived — defense-in-depth costs one branch on the cold path.
 	if size > C.size_t(maxInt32) {
 		reportPanic(fmt.Errorf("gogo: uwsgoHandleData chunk size %d exceeds int32 max — refusing to truncate", uint64(size)))
-		if isLast != 0 {
-			h.Delete()
-		}
 		return
-	}
-	var chunk []byte
-	if size > 0 {
-		chunk = C.GoBytes(unsafe.Pointer(data), C.int(size))
-	}
-	last := isLast != 0
-	if last {
-		h.Delete()
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			reportPanic(recovered)
 		}
 	}()
-	fn(chunk, last)
+	switch cb := fn.(type) {
+	case func([]byte, bool):
+		var chunk []byte
+		if size > 0 {
+			chunk = C.GoBytes(unsafe.Pointer(data), C.int(size))
+		}
+		cb(chunk, last)
+	case func(unsafe.Pointer, int, bool):
+		cb(unsafe.Pointer(data), int(size), last)
+	default:
+		reportPanic(fmt.Errorf("gogo: invalid onData callback type %T", fn))
+	}
 }

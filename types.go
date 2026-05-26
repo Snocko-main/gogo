@@ -1,6 +1,7 @@
 package gogo
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,29 +27,52 @@ import (
 	"github.com/Snocko-main/gogo/internal/mwhint"
 )
 
-// commonStatusLines caches the formatted status line for codes likely to
-// appear on the hot path so Send/JSON don't pay 2 allocs per response.
-// Anything not in this table falls back to the slow strconv+concat path.
-var commonStatusLines = map[int]string{
-	200: "200 OK",
-	201: "201 Created",
-	202: "202 Accepted",
-	204: "204 No Content",
-	301: "301 Moved Permanently",
-	302: "302 Found",
-	304: "304 Not Modified",
-	400: "400 Bad Request",
-	401: "401 Unauthorized",
-	403: "403 Forbidden",
-	404: "404 Not Found",
-	405: "405 Method Not Allowed",
-	409: "409 Conflict",
-	413: "413 Request Entity Too Large",
-	429: "429 Too Many Requests",
-	500: "500 Internal Server Error",
-	502: "502 Bad Gateway",
-	503: "503 Service Unavailable",
-	504: "504 Gateway Timeout",
+// commonStatusLine returns formatted status lines likely to appear on the
+// hot path. A switch avoids the hash lookup cost a map adds to every Send/JSON
+// call while preserving the zero-allocation common case.
+func commonStatusLine(code int) (string, bool) {
+	switch code {
+	case 200:
+		return "200 OK", true
+	case 201:
+		return "201 Created", true
+	case 202:
+		return "202 Accepted", true
+	case 204:
+		return "204 No Content", true
+	case 301:
+		return "301 Moved Permanently", true
+	case 302:
+		return "302 Found", true
+	case 304:
+		return "304 Not Modified", true
+	case 400:
+		return "400 Bad Request", true
+	case 401:
+		return "401 Unauthorized", true
+	case 403:
+		return "403 Forbidden", true
+	case 404:
+		return "404 Not Found", true
+	case 405:
+		return "405 Method Not Allowed", true
+	case 409:
+		return "409 Conflict", true
+	case 413:
+		return "413 Request Entity Too Large", true
+	case 429:
+		return "429 Too Many Requests", true
+	case 500:
+		return "500 Internal Server Error", true
+	case 502:
+		return "502 Bad Gateway", true
+	case 503:
+		return "503 Service Unavailable", true
+	case 504:
+		return "504 Gateway Timeout", true
+	default:
+		return "", false
+	}
 }
 
 // statusLine formats an HTTP status code into the "<code> <reason>" string
@@ -57,7 +81,7 @@ var commonStatusLines = map[int]string{
 // codes hit the cache and avoid all allocation.
 func statusLine(code int) string {
 	validateStatusCode(code)
-	if cached, ok := commonStatusLines[code]; ok {
+	if cached, ok := commonStatusLine(code); ok {
 		return cached
 	}
 	text := http.StatusText(code)
@@ -255,9 +279,10 @@ type Handler func(*Response, *Request)
 // AsyncHandler handles a request on a goroutine that is free to block.
 // The Response arrives in async mode with the abort context pre-attached.
 // The Request is a snapshot copied from the live uWS request before it was
-// freed. Shared zero-cgo routes reject snapshots past their fixed caps
-// (URL 256, query 512, each param 64, headers buffer 8 KB); middleware
-// fallback snapshots copy the live request fields via cgo before spawning.
+// freed. GetAsync's default shared route path rejects snapshots past its fixed
+// caps (URL 256, query 512, each param 64, headers buffer 8 KB); sync-entry
+// GetAsync and PostAsync paths snapshot from the sync callback before spawning
+// the goroutine.
 type AsyncHandler func(*Response, *Request)
 
 // OpCode identifies a WebSocket frame type.
@@ -358,9 +383,9 @@ type WebSocketBehavior struct {
 //
 // Static replies (Reply, string, []byte targets of App.Get) use their C++
 // fast path only when no matching sync middleware or typed-param constraint
-// needs a Go-side handler. GetAsync / PostAsync keep their shared-memory fast
-// path when only async-capable middleware applies; sync-only middleware makes
-// them fall back to a wrapped sync entry point.
+// needs a Go-side handler. GetAsync uses the shared request-ring dispatcher
+// by default when no matching sync middleware applies; PostAsync uses the body
+// collector path because it benchmarks faster for API POST workloads.
 type Middleware func(next Handler) Handler
 
 // AsyncMiddleware wraps an AsyncHandler the same way Middleware wraps a
@@ -383,13 +408,10 @@ type middlewareEntry struct {
 	prefix string
 	mw     Middleware
 	// alsoAsync marks entries that have a sibling copy in
-	// asyncMiddlewares (PlaceBoth registrations). The framework uses
-	// this to keep the zero-cgo shared-memory dispatch path for async
-	// routes: hasMatchingMiddleware ignores alsoAsync entries because
-	// their work is already going to fire from the async chain inside
-	// the worker. Without this flag, registering a perf-neutral
-	// middleware like Logger via PlaceBoth would force every GetAsync
-	// route off the fast path.
+	// asyncMiddlewares (PlaceBoth registrations). hasMatchingMiddleware
+	// ignores alsoAsync entries because their work is already going to fire
+	// from the async chain. Without this flag, a perf-neutral middleware like
+	// Logger would force GetAsync routes off the shared path.
 	alsoAsync bool
 }
 
@@ -493,21 +515,20 @@ type Config struct {
 	// localhost-only service. Applied at Listen time.
 	BindAddr string
 
-	// CapturePeerIP enables snapshotting the peer IP on the C++ side
-	// before shared-dispatch / async handlers run. When false (default),
-	// req.IP() in shared-dispatch GetAsync handlers and in async handlers
-	// that fell through to the snapshot path will return "". Sync
-	// handlers always get a usable req.IP() — the lookup is lazy and
-	// only pays cgo when actually called, so the flag has no effect
-	// there.
+	// CapturePeerIP enables snapshotting the peer IP before async handlers run.
+	// When false (default), req.IP() in GetAsync/PostAsync snapshots returns "".
+	// Sync handlers always get a usable req.IP() — the lookup is lazy and only
+	// pays cgo when actually called, so the flag has no effect there.
 	//
-	// Cost when enabled: one std::string_view format + ~50-byte memcpy
-	// per shared-dispatch request, plus 64 extra bytes on every
-	// AsyncCtx. Measured at roughly 2–3% throughput on small responses
-	// (e.g. /db at ~75K rps); negligible on routes with significant
-	// per-request work. Enable it when handlers behind GetAsync need to
-	// read the peer IP; otherwise leave it off.
+	// Cost when enabled: one formatted remote-address copy per async request.
+	// Leave it off unless GetAsync/PostAsync handlers need the direct peer IP.
 	CapturePeerIP bool
+
+	// SyncEntryGetAsync opts GetAsync routes without sync middleware out of the
+	// default shared request-ring dispatcher and into the sync-entry async
+	// wrapper. Leave false for maximum high-concurrency API throughput; enable
+	// only if your own low-concurrency benchmarks favor the sync-entry path.
+	SyncEntryGetAsync bool
 
 	// TrustProxy declares that the server sits behind a trusted reverse
 	// proxy (e.g. nginx, an L7 load balancer, a CDN), so X-Forwarded-* /
@@ -849,11 +870,10 @@ func (a *App) applyMeta(meta *routeMeta, h Handler) Handler {
 	}
 }
 
-// applyAppRefAsync wraps h so res.app points back to a before the
-// handler chain runs. Used by GetAsync's fast path where the
-// shared-memory dispatch into the worker bypasses the sync wrap
-// that normally stamps res.app. Without this Response.Render and
-// friends would see res.app == nil on every async-route request.
+// applyAppRefAsync wraps h so res.app points back to a before the handler
+// chain runs. Used by GetAsync's shared path, where the shared-memory request
+// dispatch bypasses the sync wrap that normally stamps res.app. Without this
+// Response.Render and friends would see res.app == nil.
 func (a *App) applyAppRefAsync(h AsyncHandler) AsyncHandler {
 	app := a
 	trustProxy := a.cfg.TrustProxy
@@ -866,10 +886,10 @@ func (a *App) applyAppRefAsync(h AsyncHandler) AsyncHandler {
 	}
 }
 
-// applyMetaAsync is the async-handler twin of applyMeta. Used by the
-// zero-cgo fast path for GetAsync, where the snapshot is built in C++
-// and never sees the sync-side preamble — the worker goroutine has to
-// populate snap.paramNames itself and run constraints there.
+// applyMetaAsync is the async-handler twin of applyMeta. Used by GetAsync's
+// shared path, where the snapshot is built in C++ and never sees the sync-side
+// preamble, so the worker goroutine has to populate snap.paramNames itself and
+// run constraints there.
 func (a *App) applyMetaAsync(meta *routeMeta, h AsyncHandler) AsyncHandler {
 	if meta == nil {
 		return h
@@ -956,10 +976,9 @@ func urlUnderPrefix(url, prefix string) bool {
 	return strings.HasPrefix(url, prefix+"/")
 }
 
-// hasMatchingMiddleware reports whether any registered sync-only
-// middleware could apply to a request that uWS will route to
-// routePattern. Used by GetAsync to choose between the zero-cgo
-// shared path and the sync wrapper fallback.
+// hasMatchingMiddleware reports whether any registered sync-only middleware
+// could apply to a request that uWS will route to routePattern. Used by
+// GetAsync to choose between the shared path and the sync wrapper fallback.
 //
 // Entries with alsoAsync=true (PlaceBoth) are ignored — their work
 // already happens inside the worker via the async chain, so the
@@ -1162,21 +1181,21 @@ func (a *App) preRoute(method, pattern string) (string, *routeMeta) {
 // query/params/headers captured from the live uWS request before it was
 // freed).
 //
-// Without middleware, GetAsync uses the zero-cgo shared-memory dispatch path:
-// C++ snapshots the request, pushes onto a lock-free ring, and a long-lived
-// Go worker pool drains it. SendShared in the handler completes the response
-// without any cgo crossing per request.
+// Without middleware, GetAsync uses the shared-memory dispatch path: C++
+// snapshots the request, pushes onto a lock-free ring, and a long-lived Go
+// worker pool drains it. SendShared in the handler completes small responses
+// without a cgo crossing per request.
 //
-// With middleware registered, GetAsync falls back to a sync cgo handler that
-// runs the middleware chain with the live request, then captures a snapshot
-// and switches to async mode for the user handler. One extra cgo callback
-// per request only when middleware is in use.
+// With middleware registered, or when Config.SyncEntryGetAsync is true,
+// GetAsync falls back to a sync cgo handler that runs the middleware chain
+// with the live request, then captures a snapshot and switches to async mode
+// for the user handler.
 func (a *App) GetAsync(pattern string, handler AsyncHandler) {
 	uwsPattern, meta := a.preRoute("get", pattern)
 
-	if !a.hasMatchingMiddleware(uwsPattern) {
-		// No sync middleware matches → keep the zero-cgo shared-memory
-		// dispatch path. The async chain composes inside the worker
+	if !a.cfg.SyncEntryGetAsync && !a.hasMatchingMiddleware(uwsPattern) {
+		// No sync middleware matches → keep the shared-memory dispatcher.
+		// The async chain composes inside the worker
 		// goroutine alongside the user handler; PlaceBoth entries fire
 		// here because no sync wrapper is running. applyMetaAsync sets
 		// snap.paramNames and runs typed-param validation inside the
@@ -1187,9 +1206,9 @@ func (a *App) GetAsync(pattern string, handler AsyncHandler) {
 		return
 	}
 
-	// Slow path: a sync wrap runs the sync chain on the loop thread
-	// before dispatching to the worker. PlaceBoth entries fire there,
-	// so the async chain composed below must SKIP their twins —
+	// Sync-entry path: a sync wrap runs the sync chain on the loop thread before
+	// dispatching to a goroutine through Response.Async. PlaceBoth entries fire
+	// there, so the async chain composed below must SKIP their twins —
 	// otherwise the same middleware runs twice per request.
 	// applyMeta on the sync side sets req.paramNames + runs typed
 	// validation BEFORE the snapshot is built, so snapshotFromSync
@@ -1201,9 +1220,12 @@ func (a *App) GetAsync(pattern string, handler AsyncHandler) {
 			snapReq := requestPool.Get().(*Request)
 			snapReq.snap = snap
 			snapReq.res = res
+			defer func() {
+				releaseRequestSnapshot(snap)
+				snapReq.resetForPool()
+				requestPool.Put(snapReq)
+			}()
 			wrappedAsync(res, snapReq)
-			snapReq.resetForPool()
-			requestPool.Put(snapReq)
 		})
 	})))
 }
@@ -1214,11 +1236,18 @@ func (a *App) Post(pattern string, handler Handler) {
 	a.inner.post(uwsPattern, a.applyMeta(meta, a.wrap(uwsPattern, handler)))
 }
 
-// postSharedBodyCap mirrors SNAP_BODY_CAP in the C++ bridge. POST
-// routes whose maxBodyBytes fits under this cap route through the
-// zero-cgo shared-dispatch path; larger bodies fall back to the
-// cgo-mediated async path that collects via res.Body. Keep these
-// two constants in sync with the C side (gogo/uws_bridge.cpp).
+func (a *App) effectivePostAsyncBodyLimit(maxBodyBytes int) int {
+	if maxBodyBytes > 0 {
+		if bl := a.cfg.BodyLimit; bl > 0 && bl < maxBodyBytes {
+			return bl
+		}
+	}
+	return maxBodyBytes
+}
+
+// postSharedBodyCap mirrors SNAP_BODY_CAP in uws_bridge.cpp. PostAsync routes
+// at or below this cap can use the C++ shared request-body collector when no
+// sync middleware or typed-param validation needs the Go sync wrapper.
 const postSharedBodyCap = 8 * 1024
 
 // PostAsyncHandler is the handler signature for PostAsync routes. It receives
@@ -1230,9 +1259,11 @@ type PostAsyncHandler func(res *Response, req *Request, body []byte)
 // PostAsync registers a POST route that collects the full request body up to
 // maxBodyBytes, then invokes handler on a goroutine with the collected bytes
 // plus a request snapshot. On bodies that exceed maxBodyBytes the framework
-// sends 413 Payload Too Large automatically and the handler is not called.
+// sends 413 Payload Too Large automatically; on body read timeout it sends
+// 408 Request Timeout. In both cases the handler is not called.
 func (a *App) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandler) {
 	uwsPattern, meta := a.preRoute("post", pattern)
+	effectiveMaxBodyBytes := a.effectivePostAsyncBodyLimit(maxBodyBytes)
 
 	// Adapt the body-receiving handler into the AsyncHandler shape that
 	// AsyncMiddleware expects. The body is stashed on req.body in the
@@ -1242,22 +1273,25 @@ func (a *App) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandl
 		handler(res, req, req.body)
 	})
 
-	// Zero-cgo fast path: small bodies (within the per-ctx
-	// SNAP_BODY_CAP) and no sync middleware → register on the
-	// shared-dispatch ring with body collection in C++. The worker
-	// goroutine reads the assembled body via req.snap + req.body
-	// without paying a single cgo crossing per request.
-	if maxBodyBytes > 0 && maxBodyBytes <= postSharedBodyCap &&
+	// Shared body fast path: small no-middleware routes can collect the body in
+	// C++ and enqueue directly to the shared worker ring. ABBA wrk runs at
+	// t=4/c=500 show this is materially faster for realistic API POSTs than
+	// the sync-entry body collector. Routes that need sync middleware, typed
+	// param validation, or larger bodies fall through to Response.Body below.
+	if effectiveMaxBodyBytes > 0 && effectiveMaxBodyBytes <= postSharedBodyCap &&
 		meta == nil && !a.hasMatchingMiddleware(uwsPattern) {
 		wrappedAsync := a.applyAppRefAsync(a.applyMetaAsync(meta, a.wrapAsync(uwsPattern, finalAsync)))
 		a.acquireSharedWorkerRef()
-		a.inner.postShared(uwsPattern, wrappedAsync, maxBodyBytes)
+		a.inner.postShared(uwsPattern, wrappedAsync, effectiveMaxBodyBytes)
 		return
 	}
 
-	// PostAsync always runs the sync chain via a.wrap before
-	// dispatching the worker — PlaceBoth twins fire there, so the
-	// async chain composed inside res.Async must skip them.
+	// The sync-entry body collector path always runs the sync chain before
+	// dispatching the worker. It also applies Config.BodyReadTimeout via
+	// Response.Body, so slow uploads on non-shared routes get a framework 408.
+	//
+	// PlaceBoth twins fire in the sync chain here, so the async chain composed
+	// inside res.Async must skip them.
 	wrappedAsync := a.wrapAsyncFiltered(uwsPattern, finalAsync, true)
 
 	a.inner.post(uwsPattern, a.applyMeta(meta, a.wrap(uwsPattern, func(res *Response, req *Request) {
@@ -1265,9 +1299,10 @@ func (a *App) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandl
 		// happens via onData callbacks fired after we return, by which time
 		// req would be invalid; the snapshot survives.
 		snap := req.snapshotFromSync(a.cfg.CapturePeerIP)
-		res.Body(maxBodyBytes, func(body []byte, err error) {
-			if err == ErrBodyTooLarge {
-				res.Send(413, "text/plain; charset=utf-8", "payload too large\n")
+		res.Body(effectiveMaxBodyBytes, func(body []byte, err error) {
+			if err != nil {
+				releaseRequestSnapshot(snap)
+				sendPostAsyncBodyError(res, err)
 				return
 			}
 			// Async spawns a goroutine and re-arms onAborted with the async
@@ -1277,12 +1312,27 @@ func (a *App) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandl
 				snapReq.snap = snap
 				snapReq.body = body
 				snapReq.res = res
+				defer func() {
+					releaseRequestSnapshot(snap)
+					snapReq.resetForPool()
+					requestPool.Put(snapReq)
+				}()
 				wrappedAsync(res, snapReq)
-				snapReq.resetForPool()
-				requestPool.Put(snapReq)
 			})
 		})
 	})))
+}
+
+func sendPostAsyncBodyError(res *Response, err error) {
+	switch err {
+	case ErrBodyTooLarge:
+		res.Send(413, "text/plain; charset=utf-8", "payload too large\n")
+	case ErrBodyTimeout:
+		res.Send(408, "text/plain; charset=utf-8", "request body timeout\n")
+	default:
+		reportPanic(fmt.Errorf("gogo: PostAsync body read failed: %w", err))
+		res.Send(500, "text/plain; charset=utf-8", "internal error\n")
+	}
 }
 
 // Any registers a route for every HTTP method.
@@ -1707,13 +1757,14 @@ func (r *Router) Head(pattern string, handler Handler) {
 }
 
 // GetAsync registers a GET route under this Router that runs on a goroutine.
-// Uses the zero-cgo shared-memory dispatch path only when no sync middleware
-// (group or app) touches this route.
+// By default it uses the shared request-ring dispatcher when no sync middleware
+// (group or app) touches this route. Set Config.SyncEntryGetAsync to force the
+// sync-entry async wrapper instead.
 func (r *Router) GetAsync(pattern string, handler AsyncHandler) {
 	full, meta := r.preRoute("get", pattern)
 
-	if len(r.syncMW) == 0 && !r.app.hasMatchingMiddleware(full) {
-		// Fast path — no sync wrapper fires, async chain owns all
+	if !r.app.cfg.SyncEntryGetAsync && len(r.syncMW) == 0 && !r.app.hasMatchingMiddleware(full) {
+		// Shared worker path — no sync wrapper fires, async chain owns all
 		// middleware. applyMetaAsync sets snap.paramNames and runs
 		// typed validation inside the worker; applyAppRefAsync sets
 		// res.app so Response.Render works on async fast-path routes.
@@ -1723,11 +1774,11 @@ func (r *Router) GetAsync(pattern string, handler AsyncHandler) {
 		return
 	}
 
-	// Slow path: sync wrapper runs PlaceBoth twins on the loop
-	// thread, so the async chain must skip alsoSync entries. The
-	// sync side's applyMeta sets req.paramNames + runs typed
-	// validation before snapshotFromSync carries names into the
-	// worker.
+	// Sync-entry path: sync wrapper runs PlaceBoth twins on the loop thread,
+	// then Response.Async runs the user handler on a goroutine. The async chain
+	// must skip alsoSync entries to avoid double runs. The sync side's applyMeta
+	// sets req.paramNames + runs typed validation before snapshotFromSync carries
+	// names into the worker.
 	wrappedAsync := r.app.wrapAsyncFiltered(full, r.wrapGroupAsync(handler), true)
 	syncEntry := func(res *Response, req *Request) {
 		snap := req.snapshotFromSync(r.app.cfg.CapturePeerIP)
@@ -1735,9 +1786,12 @@ func (r *Router) GetAsync(pattern string, handler AsyncHandler) {
 			snapReq := requestPool.Get().(*Request)
 			snapReq.snap = snap
 			snapReq.res = res
+			defer func() {
+				releaseRequestSnapshot(snap)
+				snapReq.resetForPool()
+				requestPool.Put(snapReq)
+			}()
 			wrappedAsync(res, snapReq)
-			snapReq.resetForPool()
-			requestPool.Put(snapReq)
 		})
 	}
 	h := r.app.applyMeta(meta, r.app.wrap(full, r.wrapGroupSync(Handler(syncEntry))))
@@ -1746,22 +1800,28 @@ func (r *Router) GetAsync(pattern string, handler AsyncHandler) {
 
 // PostAsync registers a POST route under this Router that collects the body
 // up to maxBodyBytes then runs handler on a goroutine. On bodies over the cap
-// the framework sends 413 and the handler is not called.
+// the framework sends 413; on body read timeout it sends 408. In both cases
+// the handler is not called.
 func (r *Router) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandler) {
 	full, meta := r.preRoute("post", pattern)
+	effectiveMaxBodyBytes := r.app.effectivePostAsyncBodyLimit(maxBodyBytes)
 
 	finalAsync := AsyncHandler(func(res *Response, req *Request) {
 		handler(res, req, req.body)
 	})
-	// PostAsync always wraps with sync chain → skip PlaceBoth twins
-	// in the async chain to avoid double-firing the same middleware.
+
+	// Router PostAsync uses the body-collector path so group sync middleware
+	// and typed-param validation run before the async handler. The sync wrapper
+	// means PlaceBoth twins fire here, so the async chain must skip them to
+	// avoid double runs.
 	wrappedAsync := r.app.wrapAsyncFiltered(full, r.wrapGroupAsync(finalAsync), true)
 
 	syncEntry := func(res *Response, req *Request) {
 		snap := req.snapshotFromSync(r.app.cfg.CapturePeerIP)
-		res.Body(maxBodyBytes, func(body []byte, err error) {
-			if err == ErrBodyTooLarge {
-				res.Send(413, "text/plain; charset=utf-8", "payload too large\n")
+		res.Body(effectiveMaxBodyBytes, func(body []byte, err error) {
+			if err != nil {
+				releaseRequestSnapshot(snap)
+				sendPostAsyncBodyError(res, err)
 				return
 			}
 			res.Async(func() {
@@ -1769,9 +1829,12 @@ func (r *Router) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHa
 				snapReq.snap = snap
 				snapReq.body = body
 				snapReq.res = res
+				defer func() {
+					releaseRequestSnapshot(snap)
+					snapReq.resetForPool()
+					requestPool.Put(snapReq)
+				}()
 				wrappedAsync(res, snapReq)
-				snapReq.resetForPool()
-				requestPool.Put(snapReq)
 			})
 		})
 	}
@@ -2521,19 +2584,42 @@ func (r *Response) Status(code int) *Response {
 	return r
 }
 
-// headerBlobPool holds the packing buffer used by
-// flushPendingHeaders for the 2+ headers path. Pooling the buffer
-// eliminates the per-request heap allocation that strings.Builder
-// otherwise produced — at 70k RPS that was ~18 MB/sec of garbage
-// that swamped the cgo savings the batch path was meant to
-// capture. The pool's New function pre-grows each fresh buffer to
-// 512 bytes (8 headers × 64 bytes average — wide enough to absorb
-// Helmet-sized stacks without ever reallocating).
+// headerBlobPool holds response-header packing buffers for sync batch writes
+// and async defer paths. Pooling the buffer eliminates the per-request heap
+// allocation that strings.Builder otherwise produced — at 70k RPS that was
+// ~18 MB/sec of garbage that swamped the cgo savings the batch path was meant
+// to capture. The pool's New function pre-grows each fresh buffer to 512 bytes
+// (8 headers × 64 bytes average — wide enough to absorb Helmet-sized stacks
+// without ever reallocating).
 var headerBlobPool = sync.Pool{
 	New: func() any {
 		b := make([]byte, 0, 512)
 		return &b
 	},
+}
+
+const headerBlobMaxRetain = 64 * 1024
+
+func putHeaderBlob(bufp *[]byte, buf []byte) {
+	if cap(buf) > headerBlobMaxRetain {
+		*bufp = nil
+	} else {
+		*bufp = buf[:0]
+	}
+	headerBlobPool.Put(bufp)
+}
+
+// packHeaderBlob frames headers as name\0value\0... for the native bridge.
+func packHeaderBlob(headers []responseHeader) (*[]byte, []byte) {
+	bufp := headerBlobPool.Get().(*[]byte)
+	buf := (*bufp)[:0]
+	for _, h := range headers {
+		buf = append(buf, h.name...)
+		buf = append(buf, 0)
+		buf = append(buf, h.value...)
+		buf = append(buf, 0)
+	}
+	return bufp, buf
 }
 
 // flushPendingHeaders writes every buffered header to the wire.
@@ -2563,21 +2649,13 @@ func (r *Response) flushPendingHeaders() {
 	}
 	// 2+ headers: pack once, cross once. Buffer is pooled to
 	// avoid per-request heap churn under sustained load.
-	bufp := headerBlobPool.Get().(*[]byte)
-	buf := (*bufp)[:0]
-	for _, h := range r.pendingHeaders {
-		buf = append(buf, h.name...)
-		buf = append(buf, 0)
-		buf = append(buf, h.value...)
-		buf = append(buf, 0)
-	}
+	bufp, buf := packHeaderBlob(r.pendingHeaders)
 	r.inner.headersBatch(buf, n)
 	// Stash the (possibly grown) backing array back into the pool
 	// so the next request inherits the capacity. Empty the buffer
 	// before return so a recycled []byte never carries stale
 	// content past a Get / Put boundary.
-	*bufp = buf[:0]
-	headerBlobPool.Put(bufp)
+	putHeaderBlob(bufp, buf)
 	r.pendingHeaders = r.pendingHeaders[:0]
 }
 
@@ -2621,7 +2699,7 @@ func (r *Response) StatusCode() int {
 func (r *Response) Header(key, value string) *Response {
 	validateHeaderName(key)
 	validateHeaderValue(key, value)
-	if r.async != nil && strings.EqualFold(key, "Content-Type") {
+	if r.async != nil && isContentTypeHeader(key) {
 		r.async.contentType = value
 		return r
 	}
@@ -2641,6 +2719,11 @@ func (r *Response) Header(key, value string) *Response {
 // Use for multi-value headers: Set-Cookie, Vary, Link, etc.
 func (r *Response) Append(key, value string) *Response {
 	return r.Header(key, value)
+}
+
+func isContentTypeHeader(key string) bool {
+	const canonical = "Content-Type"
+	return key == canonical || (len(key) == len(canonical) && strings.EqualFold(key, canonical))
 }
 
 // Write appends a response chunk without ending the response.
@@ -2711,11 +2794,11 @@ func (r *Response) End(body string) {
 // handler's mode:
 //
 //   - Sync handler (Get / Post / Any): one cgo crossing into uWS.
-//   - Async handler (GetAsync / PostAsync) with body up to 8 KB:
-//     ZERO cgo per request — written to shared-memory inline buffers and
-//     pushed onto the App's response ring; the loop drains it.
-//   - Async handler with body > 8 KB: cgo Loop::defer with the full
-//     payload, status, and Content-Type.
+//   - Async handler (GetAsync / PostAsync) with a small body and no extra
+//     response headers: written to shared-memory inline buffers and pushed
+//     onto the App's response ring; the loop drains it.
+//   - Async handler with a large body or extra headers: cgo Loop::defer with
+//     the full payload, status, Content-Type, and buffered headers.
 //
 // Pass an empty contentType to omit the header.
 func (r *Response) Send(code int, contentType, body string) {
@@ -2782,22 +2865,69 @@ func (r *Response) Send(code int, contentType, body string) {
 	r.inner.end(body)
 }
 
+// SendBytes writes status code, an optional Content-Type header, and a byte
+// body without forcing callers to copy it through string(body). It follows the
+// same response-ordering and async fast-path rules as Send.
+//
+// The body bytes are copied or written before SendBytes returns. Callers may
+// reuse the slice afterwards.
+func (r *Response) SendBytes(code int, contentType string, body []byte) {
+	r.statusCode = code
+	if contentType != "" {
+		validateHeaderValue("Content-Type", contentType)
+	}
+
+	if r.encoder != nil && !r.encoder.applied {
+		r.Send(code, contentType, bytesAsString(body))
+		runtime.KeepAlive(body)
+		return
+	}
+
+	line := statusLine(code)
+
+	if r.async != nil && !r.async.sent {
+		if r.dropAsyncIfAborted() {
+			return
+		}
+		if len(r.pendingHeaders) == 0 {
+			if asyncSendSharedBytes(r.async.ctxHandle, line, contentType, body) {
+				r.async.sent = true
+				runtime.KeepAlive(body)
+				return
+			}
+			asyncDeferSendBytes(r.async.loopPtr, r.async.ctxHandle, line, contentType, body)
+			r.async.sent = true
+			runtime.KeepAlive(body)
+			return
+		}
+		r.async.status = line
+		r.async.contentType = contentType
+		r.async.body.WriteString(bytesAsString(body))
+		runtime.KeepAlive(body)
+		r.flushAsync()
+		return
+	}
+
+	if len(r.pendingHeaders) == 0 {
+		r.inner.sendBytes(line, contentType, body)
+		return
+	}
+	r.inner.status(line)
+	r.flushPendingHeaders()
+	if contentType != "" {
+		r.inner.header("Content-Type", contentType)
+	}
+	r.inner.endBytes(body)
+}
+
 func (r *Response) sendSplitSync(status, contentType, prefix, body string) {
 	if len(r.pendingHeaders) == 0 {
 		r.inner.sendSplit(status, contentType, nil, prefix, body)
 		return
 	}
-	bufp := headerBlobPool.Get().(*[]byte)
-	buf := (*bufp)[:0]
-	for _, h := range r.pendingHeaders {
-		buf = append(buf, h.name...)
-		buf = append(buf, 0)
-		buf = append(buf, h.value...)
-		buf = append(buf, 0)
-	}
+	bufp, buf := packHeaderBlob(r.pendingHeaders)
 	r.inner.sendSplit(status, contentType, buf, prefix, body)
-	*bufp = buf[:0]
-	headerBlobPool.Put(bufp)
+	putHeaderBlob(bufp, buf)
 	r.pendingHeaders = r.pendingHeaders[:0]
 }
 
@@ -2815,8 +2945,7 @@ func (r *Response) JSON(code int, v any) {
 		r.Send(500, "text/plain; charset=utf-8", "Internal Server Error\n")
 		return
 	}
-	r.Send(code, "application/json", bytesAsString(data))
-	runtime.KeepAlive(data)
+	r.SendBytes(code, "application/json", data)
 }
 
 func (r *Response) jsonEncoder() JSONEncoder {
@@ -2835,8 +2964,7 @@ func (r *Response) jsonEncoder() JSONEncoder {
 // framework does not validate. Content-Type is set to
 // application/json automatically.
 func (r *Response) JSONBytes(code int, b []byte) {
-	r.Send(code, "application/json", bytesAsString(b))
-	runtime.KeepAlive(b)
+	r.SendBytes(code, "application/json", b)
 }
 
 // JSONStream emits a JSON body through a streaming encoder, avoiding
@@ -2931,13 +3059,12 @@ func (r *Response) Stream(status int, contentType string, fn func(w io.Writer) e
 	// Pack pendingHeaders for the initial frame so middleware-set
 	// headers (RequestID echo, CSP, etc.) ship with the status line
 	// instead of being stranded on the now-skipped flushAsync path.
-	var hb strings.Builder
-	for _, h := range r.pendingHeaders {
-		hb.Grow(len(h.name) + len(h.value) + 2)
-		hb.WriteString(h.name)
-		hb.WriteByte(0)
-		hb.WriteString(h.value)
-		hb.WriteByte(0)
+	var headersBlob string
+	var headerBufp *[]byte
+	var headerBuf []byte
+	if len(r.pendingHeaders) > 0 {
+		headerBufp, headerBuf = packHeaderBlob(r.pendingHeaders)
+		headersBlob = bytesAsString(headerBuf)
 	}
 	r.pendingHeaders = r.pendingHeaders[:0]
 
@@ -2945,7 +3072,11 @@ func (r *Response) Stream(status int, contentType string, fn func(w io.Writer) e
 	// response as complete — Stream owns its lifecycle from here.
 	r.async.sent = true
 
-	asyncDeferStreamStart(r.async.loopPtr, r.async.ctxHandle, line, contentType, hb.String())
+	asyncDeferStreamStart(r.async.loopPtr, r.async.ctxHandle, line, contentType, headersBlob)
+	if headerBufp != nil {
+		runtime.KeepAlive(headerBuf)
+		putHeaderBlob(headerBufp, headerBuf)
+	}
 
 	sw := &streamWriter{r: r}
 	fnErr := fn(sw)
@@ -3012,7 +3143,7 @@ func (s *streamWriter) Write(p []byte) (int, error) {
 	if asyncCtxAborted(s.r.async.ctxHandle) {
 		return len(p), nil
 	}
-	asyncDeferStreamWrite(s.r.async.loopPtr, s.r.async.ctxHandle, string(p))
+	asyncDeferStreamWriteBytes(s.r.async.loopPtr, s.r.async.ctxHandle, p)
 	threshold := GetStreamBackpressureBytes()
 	if threshold == 0 {
 		return len(p), nil
@@ -3712,8 +3843,7 @@ func (r *Response) sendBytes(code int, headers []responseHeader, body []byte) {
 	for _, h := range headers {
 		r.inner.header(h.name, h.value)
 	}
-	r.inner.end(bytesAsString(body))
-	runtime.KeepAlive(body)
+	r.inner.endBytes(body)
 }
 
 func captureResponseHeaders(pending, extra []responseHeader) []responseHeader {
@@ -3939,15 +4069,10 @@ func (r *Response) flushAsync() {
 		// defer-send-with-headers cgo shim. Used by Compress (which emits
 		// Content-Encoding + Vary) and by any pre-Async middleware that
 		// added headers via res.Header().
-		var b strings.Builder
-		for _, h := range r.pendingHeaders {
-			b.Grow(len(h.name) + len(h.value) + 2)
-			b.WriteString(h.name)
-			b.WriteByte(0)
-			b.WriteString(h.value)
-			b.WriteByte(0)
-		}
-		asyncDeferSendWithHeaders(a.loopPtr, a.ctxHandle, a.status, a.contentType, b.String(), a.body.String())
+		bufp, buf := packHeaderBlob(r.pendingHeaders)
+		asyncDeferSendWithHeaders(a.loopPtr, a.ctxHandle, a.status, a.contentType, bytesAsString(buf), a.body.String())
+		runtime.KeepAlive(buf)
+		putHeaderBlob(bufp, buf)
 		r.pendingHeaders = r.pendingHeaders[:0]
 	} else {
 		asyncDeferSend(a.loopPtr, a.ctxHandle, a.status, a.contentType, a.body.String())
@@ -4510,19 +4635,21 @@ func (r *Response) Body(maxBytes int, done func(body []byte, err error)) {
 		})
 	}
 
-	r.inner.onData(func(chunk []byte, isLast bool) {
+	r.inner.onDataRaw(func(data unsafe.Pointer, size int, isLast bool) {
 		if finished || aborted.Load() {
 			return
 		}
-		if len(buf)+len(chunk) > maxBytes {
+		if len(buf)+size > maxBytes {
 			done(nil, ErrBodyTooLarge)
 			release()
 			return
 		}
-		if buf == nil && len(chunk) > 0 {
-			buf = make([]byte, 0, len(chunk))
+		if buf == nil && size > 0 {
+			buf = make([]byte, 0, size)
 		}
-		buf = append(buf, chunk...)
+		if size > 0 {
+			buf = append(buf, unsafe.Slice((*byte)(data), size)...)
+		}
 		if isLast {
 			done(buf, nil)
 			release()
@@ -4680,6 +4807,41 @@ type requestSnapshot struct {
 	// C++; we parse on access rather than building a map up front so the hot
 	// path stays allocation-light when headers aren't read.
 	headers []byte
+}
+
+var requestSnapshotPool = sync.Pool{
+	New: func() any {
+		return &requestSnapshot{}
+	},
+}
+
+func acquireRequestSnapshot() *requestSnapshot {
+	return requestSnapshotPool.Get().(*requestSnapshot)
+}
+
+func releaseRequestSnapshot(s *requestSnapshot) {
+	if s == nil {
+		return
+	}
+	headers := s.headers
+	*s = requestSnapshot{}
+	if cap(headers) <= headerBlobMaxRetain {
+		s.headers = headers[:0]
+	}
+	requestSnapshotPool.Put(s)
+}
+
+func (s *requestSnapshot) copyHeadersFrom(ptr unsafe.Pointer, n int) {
+	if n <= 0 {
+		s.headers = s.headers[:0]
+		return
+	}
+	if cap(s.headers) < n {
+		s.headers = make([]byte, n)
+	} else {
+		s.headers = s.headers[:n]
+	}
+	copy(s.headers, unsafe.Slice((*byte)(ptr), n))
 }
 
 // SetLocal stores a request-scoped value under key. Intended for passing
@@ -4869,6 +5031,23 @@ func (r *Request) Method() string {
 	return s
 }
 
+// MethodIs reports whether the request method matches method
+// case-insensitively. It avoids materializing a Go string in sync handlers
+// when the bridge already handed us the parsed method bytes, which is useful
+// for middleware that only needs a quick branch such as OPTIONS preflight.
+func (r *Request) MethodIs(method string) bool {
+	if method == "" {
+		return false
+	}
+	if r.snap != nil {
+		return strings.EqualFold(r.snap.method, method)
+	}
+	if r.syncMethodPtr != nil {
+		return bytesEqualFoldASCII(unsafe.Slice((*byte)(r.syncMethodPtr), r.syncMethodLen), method)
+	}
+	return strings.EqualFold(r.Method(), method)
+}
+
 // Header returns a request header value. Header lookups in async/shared
 // handlers parse the snapshot buffer on every call; cache the value if you
 // need it multiple times.
@@ -4908,22 +5087,6 @@ func lookupHeaderInSyncBlob(ptr unsafe.Pointer, ln int, name string) (string, bo
 		return "", false
 	}
 	buf := unsafe.Slice((*byte)(ptr), ln)
-	needle := name
-	for i := 0; i < len(needle); i++ {
-		c := needle[i]
-		if c >= 'A' && c <= 'Z' {
-			b := make([]byte, len(needle))
-			for j := 0; j < len(needle); j++ {
-				x := needle[j]
-				if x >= 'A' && x <= 'Z' {
-					x += 'a' - 'A'
-				}
-				b[j] = x
-			}
-			needle = string(b)
-			break
-		}
-	}
 	for len(buf) > 0 {
 		j := indexOfZero(buf)
 		if j < 0 {
@@ -4940,7 +5103,7 @@ func lookupHeaderInSyncBlob(ptr unsafe.Pointer, ln int, name string) (string, bo
 		}
 		value := buf[:j]
 		buf = buf[j+1:]
-		if len(key) == len(needle) && bytesEqualLower(key, needle) {
+		if bytesEqualFoldASCII(key, name) {
 			return string(value), true
 		}
 	}
@@ -5278,6 +5441,9 @@ func (r *Request) QueryParam(name string) string {
 	if r.snap != nil {
 		return parseSingleQueryParam(r.snap.query, name)
 	}
+	if r.syncQueryPtr != nil {
+		return parseSingleQueryParamBytes(unsafe.Slice((*byte)(r.syncQueryPtr), r.syncQueryLen), name)
+	}
 	return r.inner.queryParam(name)
 }
 
@@ -5374,8 +5540,6 @@ func (s *requestSnapshot) lookupHeader(name string) string {
 	if len(s.headers) == 0 {
 		return ""
 	}
-	// Match against the lower-cased name so callers don't have to.
-	needle := strings.ToLower(name)
 	buf := s.headers
 	for len(buf) > 0 {
 		i := indexOfZero(buf)
@@ -5390,7 +5554,7 @@ func (s *requestSnapshot) lookupHeader(name string) string {
 		}
 		value := buf[:j]
 		buf = buf[j+1:]
-		if len(key) == len(needle) && bytesEqualLower(key, needle) {
+		if bytesEqualFoldASCII(key, name) {
 			return string(value)
 		}
 	}
@@ -5398,21 +5562,34 @@ func (s *requestSnapshot) lookupHeader(name string) string {
 }
 
 func indexOfZero(b []byte) int {
-	for i, c := range b {
-		if c == 0 {
-			return i
-		}
-	}
-	return -1
+	return bytes.IndexByte(b, 0)
 }
 
-func bytesEqualLower(b []byte, lower string) bool {
+func bytesEqualFoldASCII(b []byte, s string) bool {
+	if len(b) != len(s) {
+		return false
+	}
 	for i := 0; i < len(b); i++ {
-		c := b[i]
-		if c >= 'A' && c <= 'Z' {
-			c += 'a' - 'A'
+		x, y := b[i], s[i]
+		if x >= 'A' && x <= 'Z' {
+			x += 'a' - 'A'
 		}
-		if c != lower[i] {
+		if y >= 'A' && y <= 'Z' {
+			y += 'a' - 'A'
+		}
+		if x != y {
+			return false
+		}
+	}
+	return true
+}
+
+func bytesEqualString(b []byte, s string) bool {
+	if len(b) != len(s) {
+		return false
+	}
+	for i := 0; i < len(b); i++ {
+		if b[i] != s[i] {
 			return false
 		}
 	}
@@ -5428,17 +5605,30 @@ func (r *Request) snapshotFromSync(capturePeerIP bool) *requestSnapshot {
 	if r.snap != nil {
 		return r.snap
 	}
-	snap := &requestSnapshot{
-		method:  r.inner.method(),
-		url:     r.inner.url(),
-		query:   r.inner.query(),
-		headers: r.inner.headersAll(),
+	snap := acquireRequestSnapshot()
+	snap.method = r.Method()
+	snap.url = r.URL()
+	snap.query = r.Query()
+	switch {
+	case r.syncHeadersPtr != nil && r.syncHeadersComplete:
+		if r.syncHeadersLen > 0 {
+			snap.copyHeadersFrom(r.syncHeadersPtr, r.syncHeadersLen)
+		}
+		// Complete but empty also lands here. Keep headers nil and avoid
+		// the cgo dump.
+	default:
+		snap.headers = r.inner.headersAll()
 	}
 	if capturePeerIP {
 		snap.ip = remoteAddrFromPtr(r.syncResPtr)
 	}
 	for i := 0; i < 8; i++ {
-		p := r.inner.parameter(i)
+		var p string
+		if i < len(r.syncParamPtrs) && r.syncParamPtrs[i] != nil {
+			p = goStringFromC(r.syncParamPtrs[i], r.syncParamLens[i])
+		} else {
+			p = r.inner.parameter(i)
+		}
 		if p == "" {
 			break
 		}
@@ -5709,6 +5899,32 @@ func parseSingleQueryParam(q, name string) string {
 		}
 		if k == name {
 			return v
+		}
+	}
+	return ""
+}
+
+func parseSingleQueryParamBytes(q []byte, name string) string {
+	for len(q) > 0 {
+		amp := bytes.IndexByte(q, '&')
+		var pair []byte
+		if amp < 0 {
+			pair = q
+			q = nil
+		} else {
+			pair = q[:amp]
+			q = q[amp+1:]
+		}
+		eq := bytes.IndexByte(pair, '=')
+		var k, v []byte
+		if eq < 0 {
+			k = pair
+		} else {
+			k = pair[:eq]
+			v = pair[eq+1:]
+		}
+		if bytesEqualString(k, name) {
+			return string(v)
 		}
 	}
 	return ""

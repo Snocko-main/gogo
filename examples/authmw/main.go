@@ -1,11 +1,15 @@
 // authmw demonstrates the full middleware stack:
 //
 //   - A global sync logger that wraps every request.
+//
 //   - A sync auth gate scoped to /api/* that checks a bearer token without
 //     blocking.
+//
 //   - An async middleware scoped to /api/* that simulates a DB lookup to
 //     resolve the user, then hands the loaded user down to the route handler
 //     via Request.SetLocal / Request.Local.
+//
+// Run with:
 //
 //	CGO_ENABLED=1 go run -tags gogo ./examples/authmw
 //	curl -i http://localhost:3002/                              # 200, no auth
@@ -102,9 +106,8 @@ func main() {
 	})
 
 	// Async route OUTSIDE /api — none of the /api/* gates apply. The global
-	// sync logger still wraps it, which keeps GetAsync on the sync-wrapper
-	// fallback (one cgo crossing per req). Drop the logger and /work would
-	// run via the zero-cgo shared-memory dispatch path.
+	// sync logger still wraps it, then GetAsync snapshots the request and
+	// runs the handler on a goroutine.
 	app.GetAsync("/work", func(res *gogo.Response, req *gogo.Request) {
 		time.Sleep(20 * time.Millisecond)
 		res.Send(200, "text/plain", "ok\n")

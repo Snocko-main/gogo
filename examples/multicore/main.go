@@ -24,11 +24,10 @@
 // exactly as many Ps as event loops; pinning beyond that wastes
 // scheduling cycles, pinning below it starves loops.
 //
-// SetWorkerCount — controls the GetAsync worker-goroutine pool size.
-// Defaults to NumCPU. With RunMultiCore each loop already saturates
-// one core; the GetAsync workers compete for the same CPUs, so
-// either set this to a smaller number (NumCPU / 2) or trust the
-// default and accept the contention on short async handlers.
+// SetWorkerCount — controls the shared GetAsync worker pool. Defaults
+// to NumCPU. With RunMultiCore each loop already saturates one core;
+// lower this for short async handlers if worker contention shows up in
+// your own wrk profile.
 //
 // Per-worker resources — wrap shared resources in plain Go state
 // captured into setup. The example below uses an atomic.Int64 for

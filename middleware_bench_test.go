@@ -141,9 +141,8 @@ func BenchmarkRequest_SyncRoute_Logger(b *testing.B) {
 }
 
 // BenchmarkRequest_AsyncRoute_Logger exercises an async route with
-// the bundled Logger middleware. Logger is PlaceBoth — async route
-// uses the worker-goroutine async chain, keeping the zero-cgo
-// shared-memory dispatch path alive.
+// the bundled Logger middleware. Logger is PlaceBoth, so the shared async
+// chain runs its twin and no sync wrapper is needed.
 func BenchmarkRequest_AsyncRoute_Logger(b *testing.B) {
 	runHTTPBench(b, func(app *gogo.App) {
 		app.Use(middleware.Logger(middleware.LoggerOptions{Output: io.Discard}))
@@ -170,10 +169,8 @@ func BenchmarkRequest_SyncRoute_RateLimit(b *testing.B) {
 }
 
 // BenchmarkRequest_AsyncRoute_RateLimit exercises an async route
-// with RateLimit. PlaceSync mw on async route triggers the slow path
-// (sync wrap → snapshot → async dispatch), which is intentionally
-// slower than the zero-cgo path — but the trade-off is the rejecter
-// fires before any goroutine spawns.
+// with RateLimit. PlaceSync mw on async routes runs before the handler
+// goroutine, so cheap rejecters fire before any blocking work starts.
 func BenchmarkRequest_AsyncRoute_RateLimit(b *testing.B) {
 	runHTTPBench(b, func(app *gogo.App) {
 		app.Use(middleware.RateLimit(middleware.RateLimitOptions{
@@ -186,10 +183,8 @@ func BenchmarkRequest_AsyncRoute_RateLimit(b *testing.B) {
 	}, "/x")
 }
 
-// BenchmarkRequest_AsyncRoute_NoMW is the async-route baseline. It
-// uses the zero-cgo shared-memory dispatch path with no middleware
-// at all — the upper bound for async-route throughput in this
-// framework.
+// BenchmarkRequest_AsyncRoute_NoMW is the async-route baseline with no
+// middleware at all — the upper bound for default GetAsync throughput.
 func BenchmarkRequest_AsyncRoute_NoMW(b *testing.B) {
 	runHTTPBench(b, func(app *gogo.App) {
 		app.GetAsync("/x", func(res *gogo.Response, req *gogo.Request) {

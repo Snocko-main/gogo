@@ -132,10 +132,10 @@ func main() {
 		})
 		// POST /query: realistic API shape — small body carries an id,
 		// handler runs a blocking SQLite lookup, returns a JSON row.
-		// PostAsync is built for this: body fits the shared-dispatch
-		// cap so the request crosses zero cgo callbacks on the hot
-		// path, and the handler runs on a worker goroutine so the
-		// blocking sql.DB.QueryRow doesn't pin the loop thread.
+		// PostAsync is built for this: the small body uses the shared
+		// C++ collector/request ring, and the handler runs on a
+		// goroutine so the blocking sql.DB.QueryRow doesn't pin the
+		// loop thread.
 		app.PostAsync("/query", 256, func(res *gogo.Response, req *gogo.Request, body []byte) {
 			id, _ := strconv.Atoi(strings.TrimSpace(string(body)))
 			if id < 1 || id > 1000 {

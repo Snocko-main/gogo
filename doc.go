@@ -39,35 +39,35 @@
 //     middleware that doesn't fan out to async work.
 //
 //   - app.GetAsync (AsyncHandler):
-//     handler runs on a goroutine and is free to block. Without middleware,
-//     gogo dispatches through a shared-memory ring with ZERO cgo crossings
-//     per request — the C++ side snapshots the request into the AsyncCtx
-//     and pushes a pointer onto the ring; a pool of long-lived Go workers
-//     drains it. With middleware, the framework falls back to a sync
-//     callback that runs the chain with the live request, then captures a
-//     snapshot and spawns the user goroutine.
+//     handler runs on a goroutine and is free to block. Without sync
+//     middleware, gogo dispatches through the shared request-ring worker pool
+//     controlled by SetWorkerCount. Set Config.SyncEntryGetAsync only if your
+//     own low-concurrency benchmark favors the sync-entry wrapper.
 //
 //   - app.PostAsync (PostAsyncHandler):
 //     async handler that receives a fully-collected body up to maxBodyBytes.
-//     Oversize bodies return 413 automatically. Uses res.OnData internally
-//     and switches to async mode once the body is complete.
+//     Small no-sync-middleware bodies use the shared C++ collector/request
+//     ring. Larger or middleware-wrapped routes use res.OnData internally and
+//     switch to async mode once the body is complete. Oversize bodies return
+//     413 automatically; body-collector fallback timeouts return 408.
 //
 // All async handlers receive a *Request snapshot (URL/method/query/params/
 // headers all captured before uWS freed the live request). Snapshot caps in
-// the zero-cgo shared path: URL 256, query 512, params 8x64, headers 8 KB
+// the shared GetAsync path: URL 256, query 512, params 8x64, headers 8 KB
 // total; requests that exceed those caps are rejected with 431 rather than
-// being silently truncated. The middleware/PostAsync paths copy headers exactly
-// via cgo so they have no cap.
+// being silently truncated. Sync-entry GetAsync/PostAsync paths copy headers
+// exactly from the sync callback so they have no fixed snapshot cap.
 //
 // # Responses
 //
 // Use res.Send for one-shot replies with status, content-type, and body.
 // The framework auto-picks the fastest path:
 //   - Sync handler: one cgo crossing into uWS.
-//   - Async handler with body ≤ 8 KB: ZERO cgo — written into shared-memory
-//     inline buffers and pushed onto the App's response ring; the loop
-//     drains it.
-//   - Async handler with body > 8 KB: cgo Loop::defer falls back.
+//   - Async handler with a small body and no extra response headers: written
+//     into shared-memory inline buffers and pushed onto the App's response
+//     ring; the loop drains it.
+//   - Async handler with a large body or extra headers: cgo Loop::defer
+//     fallback.
 //
 // res.JSON wraps Send with Config.JSONEncoder (encoding/json.Marshal by
 // default) and Content-Type: application/json.
@@ -127,11 +127,9 @@
 //	    res.JSON(200, user)
 //	})
 //
-// Async middleware applies only to GetAsync / PostAsync. If only async
-// middleware matches a GetAsync route (no sync mw), the framework still
-// uses the zero-cgo shared-memory dispatch path; the async chain composes
-// inside the worker goroutine alongside the user handler. Sync routes
-// (Get, Post, Any) never see async middleware.
+// Async middleware applies only to GetAsync / PostAsync and runs on the same
+// goroutine as the user handler. Sync routes (Get, Post, Any) never see async
+// middleware.
 //
 // req.SetLocal / req.Local pass values from middleware to the handler;
 // req.Body() returns the collected body for PostAsync routes (nil
@@ -172,11 +170,9 @@
 //   - GOMAXPROCS — pin to the same N you passed to RunMultiCore. The
 //     scheduler then has exactly one P per loop; oversubscribing
 //     wastes context-switch budget, undersubscribing starves loops.
-//   - SetWorkerCount — controls the GetAsync worker-goroutine pool.
-//     Default = NumCPU. With RunMultiCore each loop already owns one
-//     core; the workers compete for the same CPUs, so consider
-//     halving this if your GetAsync handlers are short and your
-//     workload is sync-route-heavy.
+//   - SetWorkerCount — controls the shared GetAsync worker pool. Default =
+//     NumCPU. With RunMultiCore, lower this if short async handlers show
+//     worker contention in your own wrk profile.
 //   - Shared resources (DB pools, caches) — create ONCE outside
 //     RunMultiCore and capture the pointers into the handler
 //     closures. setup runs once per loop; allocating fresh DB pools
