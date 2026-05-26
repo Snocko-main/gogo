@@ -1234,10 +1234,18 @@ extern "C" void uwsgo_shared_layout(uwsgo_shared_layout_t *out) {
 // AsyncCtx with handler_id stamped on it and pushes it onto the shared
 // request ring. Go worker goroutines (started by the binding at startup)
 // drain the ring with plain atomic ops and run the handler.
+static bool pattern_has_params(const char *pattern) {
+    if (!pattern) return false;
+    for (const char *p = pattern; *p; ++p) {
+        if (*p == ':' || *p == '*') return true;
+    }
+    return false;
+}
+
 // snapshot_request copies the fields of the live uWS HttpRequest into the
 // AsyncCtx so the async goroutine can read them after uWS frees the request.
 // Anything that doesn't fit the fixed buffers is truncated.
-static void snapshot_request(uwsgo_app_t *app, AsyncCtx *ctx, uWS::HttpResponse<false> *res, uWS::HttpRequest *req) {
+static void snapshot_request(uwsgo_app_t *app, AsyncCtx *ctx, uWS::HttpResponse<false> *res, uWS::HttpRequest *req, bool capture_params) {
     bool truncated = false;
     auto copy_view = [&truncated](char *dst, size_t cap, std::string_view src) -> uint32_t {
         size_t n = std::min(cap, src.size());
@@ -1260,15 +1268,19 @@ static void snapshot_request(uwsgo_app_t *app, AsyncCtx *ctx, uWS::HttpResponse<
         ctx->ip_len = 0;
     }
 
-    // Route parameters: walk indices until uWS returns empty.
+    // Route parameters: walk indices only for patterns that can actually bind
+    // params. Most API routes are static paths, and avoiding getParameter on
+    // those keeps the shared async hot path lean.
     uint32_t param_count = 0;
-    for (uint32_t i = 0; i < SNAP_PARAM_MAX; i++) {
-        auto v = req->getParameter(i);
-        if (v.empty()) break;
-        ctx->param_lens[i] = copy_view(ctx->params[i], SNAP_PARAM_CAP, v);
-        param_count = i + 1;
+    if (capture_params) {
+        for (uint32_t i = 0; i < SNAP_PARAM_MAX; i++) {
+            auto v = req->getParameter(i);
+            if (v.empty()) break;
+            ctx->param_lens[i] = copy_view(ctx->params[i], SNAP_PARAM_CAP, v);
+            param_count = i + 1;
+        }
+        if (!req->getParameter(SNAP_PARAM_MAX).empty()) truncated = true;
     }
-    if (!req->getParameter(SNAP_PARAM_MAX).empty()) truncated = true;
     ctx->param_count = param_count;
 
     // Headers: encode as "name\0value\0..." back-to-back. Stop when the next
@@ -1356,11 +1368,12 @@ static AsyncCtx *acquire_shared_ctx(uwsgo_app_t *app, uWS::HttpResponse<false> *
 }
 
 extern "C" void uwsgo_app_get_shared(uwsgo_app_t *app, const char *pattern, uint32_t handler_id) {
-    app->app->get(pattern, [app, handler_id](auto *res, auto *req) {
+    bool capture_params = pattern_has_params(pattern);
+    app->app->get(pattern, [app, handler_id, capture_params](auto *res, auto *req) {
         AsyncCtx *ctx = acquire_shared_ctx(app, res, handler_id);
         // Snapshot before any cgo / Go work — uWS HttpRequest is
         // live only inside this lambda.
-        snapshot_request(app, ctx, res, req);
+        snapshot_request(app, ctx, res, req, capture_params);
         if (ctx->truncated) {
             ctx->release();
             res->writeStatus("431 Request Header Fields Too Large");
@@ -1383,13 +1396,14 @@ extern "C" void uwsgo_app_post_shared(uwsgo_app_t *app, const char *pattern,
     if (max_body == 0 || max_body > SNAP_BODY_CAP) {
         max_body = SNAP_BODY_CAP;
     }
-    app->app->post(pattern, [app, handler_id, max_body](auto *res, auto *req) {
+    bool capture_params = pattern_has_params(pattern);
+    app->app->post(pattern, [app, handler_id, max_body, capture_params](auto *res, auto *req) {
         if (declared_content_length_exceeds(req, max_body)) {
             write_payload_too_large(res);
             return;
         }
         AsyncCtx *ctx = acquire_shared_ctx(app, res, handler_id);
-        snapshot_request(app, ctx, res, req);
+        snapshot_request(app, ctx, res, req, capture_params);
         if (ctx->truncated) {
             ctx->release();
             res->writeStatus("431 Request Header Fields Too Large");

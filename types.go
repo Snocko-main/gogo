@@ -1253,7 +1253,8 @@ const postSharedBodyCap = 8 * 1024
 // PostAsyncHandler is the handler signature for PostAsync routes. It receives
 // the response, a snapshot of the request (URL/query/params/headers all
 // captured before uWS freed the live request), and the fully-collected body.
-// Runs on a goroutine so it is free to block.
+// The body slice is framework-owned; copy it before retaining it past the
+// handler call. Runs on a goroutine so it is free to block.
 type PostAsyncHandler func(res *Response, req *Request, body []byte)
 
 // PostAsync registers a POST route that collects the full request body up to
@@ -4797,16 +4798,26 @@ type Request struct {
 // (middleware fallback path).
 type requestSnapshot struct {
 	method     string
+	methodPtr  uintptr
+	methodLen  int
 	url        string
+	urlPtr     uintptr
+	urlLen     int
 	query      string
+	queryPtr   uintptr
+	queryLen   int
 	ip         string
+	ipPtr      uintptr
+	ipLen      int
 	params     []string
 	paramNames []string
 	truncated  bool
 	// headers is the raw "name\0value\0name\0value\0..." buffer captured from
 	// C++; we parse on access rather than building a map up front so the hot
 	// path stays allocation-light when headers aren't read.
-	headers []byte
+	headers    []byte
+	headersPtr uintptr
+	headersLen int
 }
 
 var requestSnapshotPool = sync.Pool{
@@ -4834,6 +4845,8 @@ func releaseRequestSnapshot(s *requestSnapshot) {
 func (s *requestSnapshot) copyHeadersFrom(ptr unsafe.Pointer, n int) {
 	if n <= 0 {
 		s.headers = s.headers[:0]
+		s.headersPtr = 0
+		s.headersLen = 0
 		return
 	}
 	if cap(s.headers) < n {
@@ -4842,6 +4855,133 @@ func (s *requestSnapshot) copyHeadersFrom(ptr unsafe.Pointer, n int) {
 		s.headers = s.headers[:n]
 	}
 	copy(s.headers, unsafe.Slice((*byte)(ptr), n))
+	s.headersPtr = 0
+	s.headersLen = 0
+}
+
+func (s *requestSnapshot) setLazyFields(
+	methodPtr uintptr, methodLen int,
+	urlPtr uintptr, urlLen int,
+	queryPtr uintptr, queryLen int,
+	ipPtr uintptr, ipLen int,
+) {
+	s.methodPtr = methodPtr
+	s.methodLen = methodLen
+	s.urlPtr = urlPtr
+	s.urlLen = urlLen
+	s.queryPtr = queryPtr
+	s.queryLen = queryLen
+	s.ipPtr = ipPtr
+	s.ipLen = ipLen
+}
+
+func (s *requestSnapshot) setLazyHeaders(ptr uintptr, n int) {
+	if n <= 0 {
+		s.headersPtr = 0
+		s.headersLen = 0
+		return
+	}
+	s.headersPtr = ptr
+	s.headersLen = n
+}
+
+func (s *requestSnapshot) methodString() string {
+	if s.method != "" || s.methodLen <= 0 {
+		return s.method
+	}
+	s.method = methodStringFromBytes(unsafe.Slice((*byte)(unsafe.Pointer(s.methodPtr)), s.methodLen))
+	s.methodPtr = 0
+	s.methodLen = 0
+	return s.method
+}
+
+func (s *requestSnapshot) methodBytes() []byte {
+	if s.methodLen > 0 {
+		return unsafe.Slice((*byte)(unsafe.Pointer(s.methodPtr)), s.methodLen)
+	}
+	if s.method != "" {
+		return unsafe.Slice(unsafe.StringData(s.method), len(s.method))
+	}
+	return nil
+}
+
+func (s *requestSnapshot) urlString() string {
+	if s.url != "" || s.urlLen <= 0 {
+		return s.url
+	}
+	s.url = string(unsafe.Slice((*byte)(unsafe.Pointer(s.urlPtr)), s.urlLen))
+	s.urlPtr = 0
+	s.urlLen = 0
+	return s.url
+}
+
+func (s *requestSnapshot) queryString() string {
+	if s.query != "" || s.queryLen <= 0 {
+		return s.query
+	}
+	s.query = string(unsafe.Slice((*byte)(unsafe.Pointer(s.queryPtr)), s.queryLen))
+	s.queryPtr = 0
+	s.queryLen = 0
+	return s.query
+}
+
+func (s *requestSnapshot) ipString() string {
+	if s.ip != "" || s.ipLen <= 0 {
+		return s.ip
+	}
+	s.ip = string(unsafe.Slice((*byte)(unsafe.Pointer(s.ipPtr)), s.ipLen))
+	s.ipPtr = 0
+	s.ipLen = 0
+	return s.ip
+}
+
+func (s *requestSnapshot) queryBytes() []byte {
+	if s.queryLen > 0 {
+		return unsafe.Slice((*byte)(unsafe.Pointer(s.queryPtr)), s.queryLen)
+	}
+	if s.query != "" {
+		return unsafe.Slice(unsafe.StringData(s.query), len(s.query))
+	}
+	return nil
+}
+
+func (s *requestSnapshot) headersBlob() []byte {
+	if s.headersLen > 0 {
+		return unsafe.Slice((*byte)(unsafe.Pointer(s.headersPtr)), s.headersLen)
+	}
+	return s.headers
+}
+
+func methodStringFromBytes(b []byte) string {
+	switch len(b) {
+	case 3:
+		switch {
+		case b[0] == 'g' && b[1] == 'e' && b[2] == 't':
+			return "get"
+		case b[0] == 'p' && b[1] == 'u' && b[2] == 't':
+			return "put"
+		}
+	case 4:
+		switch {
+		case b[0] == 'p' && b[1] == 'o' && b[2] == 's' && b[3] == 't':
+			return "post"
+		case b[0] == 'h' && b[1] == 'e' && b[2] == 'a' && b[3] == 'd':
+			return "head"
+		}
+	case 5:
+		if b[0] == 'p' && b[1] == 'a' && b[2] == 't' && b[3] == 'c' && b[4] == 'h' {
+			return "patch"
+		}
+	case 6:
+		if b[0] == 'd' && b[1] == 'e' && b[2] == 'l' && b[3] == 'e' && b[4] == 't' && b[5] == 'e' {
+			return "delete"
+		}
+	case 7:
+		if b[0] == 'o' && b[1] == 'p' && b[2] == 't' && b[3] == 'i' && b[4] == 'o' && b[5] == 'n' && b[6] == 's' {
+			return "options"
+		}
+	}
+	return string(b)
 }
 
 // SetLocal stores a request-scoped value under key. Intended for passing
@@ -4990,7 +5130,7 @@ func (r *Request) resetForPool() {
 // cached string. Async/shared handlers read from the captured snapshot.
 func (r *Request) URL() string {
 	if r.snap != nil {
-		return r.snap.url
+		return r.snap.urlString()
 	}
 	if r.urlCached {
 		return r.cachedURL
@@ -5015,7 +5155,7 @@ func (r *Request) URL() string {
 // hot path.
 func (r *Request) Method() string {
 	if r.snap != nil {
-		return r.snap.method
+		return r.snap.methodString()
 	}
 	if r.methodCached {
 		return r.cachedMethod
@@ -5040,7 +5180,7 @@ func (r *Request) MethodIs(method string) bool {
 		return false
 	}
 	if r.snap != nil {
-		return strings.EqualFold(r.snap.method, method)
+		return bytesEqualFoldASCII(r.snap.methodBytes(), method)
 	}
 	if r.syncMethodPtr != nil {
 		return bytesEqualFoldASCII(unsafe.Slice((*byte)(r.syncMethodPtr), r.syncMethodLen), method)
@@ -5168,7 +5308,7 @@ func (r *Request) Headers(fn func(name, value string) bool) int {
 func (r *Request) headersBlobForIteration(fullDump func() []byte) []byte {
 	switch {
 	case r.snap != nil:
-		return r.snap.headers
+		return r.snap.headersBlob()
 	case r.syncHeadersPtr != nil:
 		if r.syncHeadersComplete {
 			return unsafe.Slice((*byte)(r.syncHeadersPtr), r.syncHeadersLen)
@@ -5258,7 +5398,7 @@ func (r *Request) IP() string {
 		return r.cachedIP
 	}
 	if r.snap != nil {
-		r.cachedIP = normalizePeerIP(r.snap.ip)
+		r.cachedIP = normalizePeerIP(r.snap.ipString())
 	} else if r.syncResPtr != nil {
 		r.cachedIP = normalizePeerIP(remoteAddrFromPtr(r.syncResPtr))
 	}
@@ -5415,7 +5555,7 @@ func (r *Request) ParamInt(name string, def int) int {
 // call; subsequent calls hit the cache.
 func (r *Request) Query() string {
 	if r.snap != nil {
-		return r.snap.query
+		return r.snap.queryString()
 	}
 	if r.queryCached {
 		return r.cachedQuery
@@ -5439,7 +5579,7 @@ func (r *Request) QueryParam(name string) string {
 		return ""
 	}
 	if r.snap != nil {
-		return parseSingleQueryParam(r.snap.query, name)
+		return parseSingleQueryParamBytes(r.snap.queryBytes(), name)
 	}
 	if r.syncQueryPtr != nil {
 		return parseSingleQueryParamBytes(unsafe.Slice((*byte)(r.syncQueryPtr), r.syncQueryLen), name)
@@ -5537,10 +5677,10 @@ func (r *Request) ParameterInt64(index int, def int64) int64 {
 // lookupHeader scans the raw "name\0value\0..." buffer for a matching key.
 // Header names are case-insensitive (uWS lower-cases on parse).
 func (s *requestSnapshot) lookupHeader(name string) string {
-	if len(s.headers) == 0 {
+	buf := s.headersBlob()
+	if len(buf) == 0 {
 		return ""
 	}
-	buf := s.headers
 	for len(buf) > 0 {
 		i := indexOfZero(buf)
 		if i < 0 {

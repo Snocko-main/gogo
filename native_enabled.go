@@ -386,8 +386,8 @@ func runSharedHandler(handler AsyncHandler, ctxPtr uintptr) {
 	resWrap.async = a
 
 	// Build the request snapshot from ctx memory. C++ has already copied the
-	// fields it could into AsyncCtx; we copy out to Go-owned strings/bytes so
-	// the snapshot survives past ctx release.
+	// fields it could into AsyncCtx; Go materializes only the fields user code
+	// reads while this handler owns the ctx.
 	reqWrap := requestPool.Get().(*Request)
 	reqWrap.snap = newSnapshotFromCtx(ctxPtr)
 	// post_shared routes leave the collected body in ctx memory;
@@ -420,8 +420,8 @@ func runSharedHandler(handler AsyncHandler, ctxPtr uintptr) {
 }
 
 // newSnapshotFromCtx reads the request-snapshot fields C++ wrote into the
-// AsyncCtx and returns a Go-side requestSnapshot whose strings/bytes do not
-// alias ctx memory — so the snapshot stays valid after ctx is released.
+// AsyncCtx. Strings that most handlers never touch stay as lazy views over the
+// ctx for the duration of the async handler and materialize only on access.
 func newSnapshotFromCtx(ctxPtr uintptr) *requestSnapshot {
 	methodLen := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxMethodLenOff))
 	urlLen := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxURLLenOff))
@@ -442,10 +442,12 @@ func newSnapshotFromCtx(ctxPtr uintptr) *requestSnapshot {
 	}
 
 	snap := acquireRequestSnapshot()
-	snap.method = copyAt(ctxPtr+shared.ctxMethodOff, int(methodLen))
-	snap.url = copyAt(ctxPtr+shared.ctxURLOff, int(urlLen))
-	snap.query = copyAt(ctxPtr+shared.ctxQueryOff, int(queryLen))
-	snap.ip = copyAt(ctxPtr+shared.ctxIPOff, int(ipLen))
+	snap.setLazyFields(
+		ctxPtr+shared.ctxMethodOff, int(methodLen),
+		ctxPtr+shared.ctxURLOff, int(urlLen),
+		ctxPtr+shared.ctxQueryOff, int(queryLen),
+		ctxPtr+shared.ctxIPOff, int(ipLen),
+	)
 	snap.truncated = truncated
 
 	if paramCount > 0 {
@@ -466,7 +468,7 @@ func newSnapshotFromCtx(ctxPtr uintptr) *requestSnapshot {
 	}
 
 	if headersLen > 0 {
-		snap.copyHeadersFrom(unsafe.Pointer(ctxPtr+shared.ctxHeadersOff), int(headersLen))
+		snap.setLazyHeaders(ctxPtr+shared.ctxHeadersOff, int(headersLen))
 	}
 
 	return snap
