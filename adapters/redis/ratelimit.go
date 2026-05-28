@@ -97,24 +97,9 @@ var _ interface {
 // NewRateLimitStore creates a Redis-backed rate-limit store, opening and owning
 // a new Redis client from the supplied options. Close releases that client.
 func NewRateLimitStore(opt RateLimitOptions) (*RateLimitStore, error) {
-	var client goredis.UniversalClient
-	if opt.URL != "" {
-		parsed, err := goredis.ParseURL(opt.URL)
-		if err != nil {
-			return nil, err
-		}
-		client = goredis.NewClient(parsed)
-	} else {
-		addr := opt.Addr
-		if addr == "" {
-			addr = "localhost:6379"
-		}
-		client = goredis.NewClient(&goredis.Options{
-			Addr:     addr,
-			Username: opt.Username,
-			Password: opt.Password,
-			DB:       opt.DB,
-		})
+	client, err := newRedisClient(opt.URL, opt.Addr, opt.Username, opt.Password, opt.DB)
+	if err != nil {
+		return nil, err
 	}
 	s := newRateLimitStore(client, opt)
 	s.own = true
@@ -159,6 +144,9 @@ func newRateLimitStore(client goredis.UniversalClient, opt RateLimitOptions) *Ra
 // shared counter for key in the current window and returns the new count and
 // the time the window resets. On any Redis failure it applies the configured
 // fail-open / fail-closed policy.
+//
+// Window is enforced at Redis's PEXPIRE granularity (milliseconds); windows
+// shorter than 1ms are rounded up to 1ms.
 func (s *RateLimitStore) Hit(key string, window time.Duration) (int, time.Time) {
 	now := time.Now()
 
@@ -204,9 +192,10 @@ func (s *RateLimitStore) onFailure(err error, now time.Time, window time.Duratio
 		s.onError(err)
 	}
 	if s.failClosed {
-		// Report a count guaranteed to exceed any positive Max so the
-		// middleware rejects the request while Redis is unavailable.
-		return math.MaxInt32, now.Add(window)
+		// Report the largest representable count so the middleware's
+		// `count > Max` check rejects the request for any configured Max
+		// while Redis is unavailable.
+		return math.MaxInt, now.Add(window)
 	}
 	// Fail open: report a single hit so the request is allowed through.
 	return 1, now.Add(window)

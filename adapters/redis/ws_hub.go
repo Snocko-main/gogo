@@ -89,24 +89,9 @@ func New(opt Options) (*Adapter, error) {
 		prefix = defaultChannelPrefix
 	}
 
-	var client goredis.UniversalClient
-	if opt.URL != "" {
-		parsed, parseErr := goredis.ParseURL(opt.URL)
-		if parseErr != nil {
-			return nil, parseErr
-		}
-		client = goredis.NewClient(parsed)
-	} else {
-		addr := opt.Addr
-		if addr == "" {
-			addr = "localhost:6379"
-		}
-		client = goredis.NewClient(&goredis.Options{
-			Addr:     addr,
-			Username: opt.Username,
-			Password: opt.Password,
-			DB:       opt.DB,
-		})
+	client, err := newRedisClient(opt.URL, opt.Addr, opt.Username, opt.Password, opt.DB)
+	if err != nil {
+		return nil, err
 	}
 	return &Adapter{
 		client:  client,
@@ -143,6 +128,28 @@ func NewClientOptions(client goredis.UniversalClient, opt Options) (*Adapter, er
 		maxMsg:  maxMessageSize(opt),
 		dynamic: opt.DynamicSubscriptions,
 	}, nil
+}
+
+// newRedisClient builds a go-redis client from either a connection URL or the
+// Addr/Username/Password/DB fields. It is shared by every constructor in this
+// package that owns its client (the WSHub adapter and the rate-limit store).
+func newRedisClient(url, addr, username, password string, db int) (goredis.UniversalClient, error) {
+	if url != "" {
+		parsed, err := goredis.ParseURL(url)
+		if err != nil {
+			return nil, err
+		}
+		return goredis.NewClient(parsed), nil
+	}
+	if addr == "" {
+		addr = "localhost:6379"
+	}
+	return goredis.NewClient(&goredis.Options{
+		Addr:     addr,
+		Username: username,
+		Password: password,
+		DB:       db,
+	}), nil
 }
 
 func channelSize(opt Options) int {

@@ -6,8 +6,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Snocko-main/gogo/middleware"
 	goredis "github.com/redis/go-redis/v9"
 )
+
+// Assert against the real interface here (test-only) so a signature change to
+// middleware.RateLimitStore breaks the build without coupling the production
+// adapter package to middleware.
+var _ middleware.RateLimitStore = (*RateLimitStore)(nil)
 
 func TestNewRateLimitStoreClientNilClient(t *testing.T) {
 	if _, err := NewRateLimitStoreClient(nil, "app:"); err == nil {
@@ -93,8 +99,8 @@ func TestRateLimitOnFailureFailClosed(t *testing.T) {
 	store := &RateLimitStore{failClosed: true}
 	now := time.Now()
 	count, resetAt := store.onFailure(errors.New("boom"), now, time.Minute)
-	if count != math.MaxInt32 {
-		t.Fatalf("fail-closed count = %d, want MaxInt32 (request rejected)", count)
+	if count != math.MaxInt {
+		t.Fatalf("fail-closed count = %d, want MaxInt (request rejected)", count)
 	}
 	if !resetAt.Equal(now.Add(time.Minute)) {
 		t.Fatalf("resetAt = %v, want %v", resetAt, now.Add(time.Minute))
