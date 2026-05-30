@@ -902,17 +902,33 @@ app.Use(mw.RateLimit(mw.RateLimitOptions{
 Set `MaxBuckets: mw.NoRateLimitBucketLimit` to disable the cap entirely
 (tests only — re-introduces the OOM risk).
 
-For multi-instance fleets, plug a Redis-backed `RateLimitStore` instead —
-the cap is irrelevant when state lives in Redis, and counters stay
-consistent across instances:
+For multi-instance fleets, plug the bundled Redis-backed `RateLimitStore`
+from `adapters/redis` instead — the cap is irrelevant when state lives in
+Redis, and counters stay consistent across instances:
 
 ```go
+import redisadapter "github.com/Snocko-main/gogo/adapters/redis"
+
+store, err := redisadapter.NewRateLimitStore(redisadapter.RateLimitOptions{
+    URL: "redis://localhost:6379/0",
+    // FailClosed: true,   // reject when Redis is unreachable (default fails open)
+})
+if err != nil {
+    log.Fatal(err)
+}
+defer store.Close()
+
 app.Use(mw.RateLimit(mw.RateLimitOptions{
-    Max:    100,
-    Window: time.Minute,
-    Store:  &MyRedisStore{client: redisClient},   // implement RateLimitStore
+    Max:        100,
+    Window:     time.Minute,
+    Store:      store,
+    AsyncStore: true, // run the Redis round-trip off the event-loop thread
 }))
 ```
+
+It uses an atomic `INCR` + `PEXPIRE` Lua script for the same fixed-window
+algorithm as the in-memory store. To reuse an existing client, call
+`redisadapter.NewRateLimitStoreClient(client, "gogo:rl:")`.
 
 **Side effect when the cap binds**: eviction resets the rate-limit counter
 for the evicted key. An attacker spamming new keys to fill the cap will
