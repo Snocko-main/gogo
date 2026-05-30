@@ -3,10 +3,14 @@
 //
 // # Build
 //
-// The native binding is opt-in because it links a vendored uWebSockets /
-// uSockets and requires cgo. Build with:
+// The native binding is opt-in because it compiles the vendored uWebSockets /
+// uSockets sources and requires cgo. Native builds need Go 1.24+, CGO_ENABLED=1,
+// a C compiler, a C++20-capable compiler, and the host zlib library/headers.
+// Build with:
 //
 //	CGO_ENABLED=1 go build -tags gogo ./...
+//	CGO_ENABLED=1 go run -tags gogo .
+//	CGO_ENABLED=1 go test -tags gogo ./...
 //
 // Without the gogo build tag the package compiles a stub that returns an
 // error from NewApp — useful for tools that import the package but won't

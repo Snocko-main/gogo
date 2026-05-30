@@ -3,8 +3,9 @@
 package gogo
 
 /*
-#cgo CXXFLAGS: -std=c++20 -I${SRCDIR}/third_party/uWebSockets/src -I${SRCDIR}/third_party/uWebSockets/uSockets/src
-#cgo LDFLAGS: ${SRCDIR}/third_party/uWebSockets/uSockets/uSockets.a -lz
+#cgo CFLAGS: -std=c11 -DLIBUS_NO_SSL -I${SRCDIR}/internal/native/uwebsockets/uSockets/src
+#cgo CXXFLAGS: -std=c++20 -DLIBUS_NO_SSL -I${SRCDIR}/internal/native/uwebsockets/src -I${SRCDIR}/internal/native/uwebsockets/uSockets/src
+#cgo LDFLAGS: -lz
 #cgo linux LDFLAGS: -pthread
 #include <stdlib.h>
 #include "uws_bridge.h"

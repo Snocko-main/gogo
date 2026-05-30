@@ -2,7 +2,8 @@
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-TARGET="$ROOT/third_party/uWebSockets"
+TARGET="$ROOT/.tools/uWebSockets"
+VENDOR="$ROOT/internal/native/uwebsockets"
 USOCKETS_PATCH="$ROOT/patches/uSockets-kqueue-ready-polls.patch"
 UWEBSOCKETS_REPO="${UWEBSOCKETS_REPO:-https://github.com/uNetworking/uWebSockets.git}"
 UWEBSOCKETS_REF="${UWEBSOCKETS_REF:-34809c2eb8210f15369b251c4405eb2f494a334e}"
@@ -31,4 +32,12 @@ if [ -f "$USOCKETS_PATCH" ]; then
 	fi
 fi
 
-make -C "$TARGET/uSockets"
+rm -rf "$VENDOR/src" "$VENDOR/uSockets/src"
+mkdir -p "$VENDOR/uSockets"
+cp -R "$TARGET/src" "$VENDOR/src"
+cp -R "$TARGET/uSockets/src" "$VENDOR/uSockets/src"
+cp "$TARGET/LICENSE" "$VENDOR/LICENSE"
+cp "$TARGET/uSockets/LICENSE" "$VENDOR/uSockets/LICENSE"
+find "$VENDOR" -name .DS_Store -delete
+
+echo "synced vendored uWebSockets sources to $VENDOR"

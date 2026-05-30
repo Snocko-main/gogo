@@ -1,0 +1,15 @@
+//go:build cgo && gogo
+
+#include "internal/native/uwebsockets/uSockets/src/bsd.c"
+#include "internal/native/uwebsockets/uSockets/src/context.c"
+#include "internal/native/uwebsockets/uSockets/src/crypto/openssl.c"
+#include "internal/native/uwebsockets/uSockets/src/eventing/epoll_kqueue.c"
+#include "internal/native/uwebsockets/uSockets/src/eventing/gcd.c"
+#include "internal/native/uwebsockets/uSockets/src/eventing/libuv.c"
+#include "internal/native/uwebsockets/uSockets/src/io_uring/io_context.c"
+#include "internal/native/uwebsockets/uSockets/src/io_uring/io_loop.c"
+#include "internal/native/uwebsockets/uSockets/src/io_uring/io_socket.c"
+#include "internal/native/uwebsockets/uSockets/src/loop.c"
+#include "internal/native/uwebsockets/uSockets/src/quic.c"
+#include "internal/native/uwebsockets/uSockets/src/socket.c"
+#include "internal/native/uwebsockets/uSockets/src/udp.c"
