@@ -96,7 +96,7 @@ To run a real gogo server, the machine building your app needs:
 Install those native build dependencies:
 
 ```sh
-# macOS
+# macOS: install Apple Command Line Tools
 xcode-select --install
 
 # Debian / Ubuntu
