@@ -31,7 +31,7 @@ body-parse + SQLite query paths.
 ## Table of Contents
 
 - [Benchmark Snapshot](#benchmark-snapshot)
-- [Install Native Dependencies](#install-native-dependencies)
+- [Requirements and Native Build](#requirements-and-native-build)
 - [Hello World](#hello-world)
 - [Routing](#routing)
   - [Basic routes](#basic-routes)
@@ -73,28 +73,71 @@ body-parse + SQLite query paths.
 - [Caveats](#caveats)
 - [Benchmarking](#benchmarking)
 
-## Install Native Dependencies
+## Requirements and Native Build
 
-The binding expects uWebSockets to be vendored at:
+The native binding vendors the required uWebSockets/uSockets source inside
+this module:
 
 ```txt
-third_party/uWebSockets
+internal/native/uwebsockets
 ```
 
-One way to set that up:
+Consumers do not need a `third_party` checkout or a prebuilt `uSockets.a`;
+`go get github.com/Snocko-main/gogo` fetches the native source that cgo
+compiles with the package.
+
+To run a real gogo server, the machine building your app needs:
+
+- Go 1.24 or newer
+- cgo enabled (`CGO_ENABLED=1`)
+- a C compiler and C++20-capable compiler (`clang` or `gcc`/`g++`)
+- zlib headers/library from the host system
+
+Install those native build dependencies:
 
 ```sh
-sh scripts/bootstrap_uwebsockets.sh
+# macOS
+xcode-select --install
+
+# Debian / Ubuntu
+sudo apt-get update
+sudo apt-get install -y build-essential zlib1g-dev
+
+# Fedora
+sudo dnf install -y gcc gcc-c++ zlib-devel
+
+# Alpine
+sudo apk add build-base zlib-dev
 ```
 
-Run the same bootstrap step in clean CI jobs before native `-tags gogo`
-tests. The script checks out a pinned uWebSockets commit, initializes
-submodules, and applies the local uSockets patch in
-`patches/uSockets-kqueue-ready-polls.patch` before building `uSockets.a`.
-Override `UWEBSOCKETS_REF` only when deliberately testing an upstream update.
-Linux builds use the epoll backend and do not hit the macOS/kqueue bug the
-patch fixes, but using the bootstrap script keeps every environment on the
-same vendored dependency setup.
+Add gogo to your app:
+
+```sh
+go get github.com/Snocko-main/gogo@latest
+```
+
+Build, run, or test with the `gogo` build tag:
+
+```sh
+CGO_ENABLED=1 go build -tags gogo ./...
+CGO_ENABLED=1 go run -tags gogo .
+CGO_ENABLED=1 go test -tags gogo ./...
+```
+
+For a production binary:
+
+```sh
+CGO_ENABLED=1 go build -tags gogo -o my-server .
+```
+
+Without `-tags gogo`, the package builds a stub and `NewApp` returns a clear
+setup error. This keeps normal Go tooling usable, but it will not run a native
+uWebSockets server. The native build is currently intended for macOS and Linux.
+
+The maintainer-only `scripts/bootstrap_uwebsockets.sh` script refreshes the
+vendored source from the pinned uWebSockets commit and reapplies
+`patches/uSockets-kqueue-ready-polls.patch`. Override `UWEBSOCKETS_REF` only
+when deliberately testing an upstream update.
 
 Then run an example:
 
@@ -102,10 +145,6 @@ Then run an example:
 CGO_ENABLED=1 go run -tags gogo ./examples/hello
 curl http://localhost:3000/hello/inon
 ```
-
-Without `-tags gogo`, the package builds a stub and `NewApp` returns a
-clear setup error. This keeps normal Go tooling usable before the native
-dependency is present.
 
 ## Hello World
 
