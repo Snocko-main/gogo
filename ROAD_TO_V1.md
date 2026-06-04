@@ -80,6 +80,9 @@ files in the same PR unless one agent is explicitly assigned as integrator.
 - [ ] Decide whether `App.Use(args ...any)` remains as the v1 API.
 - [ ] Decide whether `Get(pattern, target any)` and `Router.Get` keep the
       `any` target API, or get typed helpers before v1.
+- [ ] Add or explicitly reject async method helpers for `PutAsync`,
+      `PatchAsync`, and `DeleteAsync` on both `App` and `Router`, including
+      body collection semantics and middleware behavior.
 - [ ] If needed, add typed helpers such as `UsePath` / `UseAsyncPath`.
 - [ ] Fix or permanently document `MethodNotAllowed` behavior for dynamic and
       wildcard routes.
