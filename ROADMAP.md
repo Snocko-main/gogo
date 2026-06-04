@@ -1,5 +1,9 @@
 # gogo Roadmap — Security Fixes + Path to Beat fiber/express
 
+> Status note: this file is historical audit context. The current execution
+> plan toward `v1.0.0` lives in `ROAD_TO_V1.md`. Prefer `ROAD_TO_V1.md` when
+> opening new issues or assigning parallel agent work.
+
 This document is the result of a fresh security + feature-parity audit done
 after PR #1 (middleware bypass + Router/Group + race fixes) landed. Issues
 are grouped by priority, each with file/line references, effort estimate,
