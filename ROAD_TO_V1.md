@@ -4,9 +4,8 @@ This document is the execution plan after `v0.1.0`. It is intentionally
 split into small PR-sized tasks so humans and agents can work in parallel
 without stepping on the same files.
 
-`ROAD_TO_V1.md` is the source of truth for active v1 work. `ROADMAP.md` is
-historical audit context and should be synced or archived during release
-hygiene.
+`ROAD_TO_V1.md` is the source of truth for active v1 work. The older
+`ROADMAP.md` has been removed to avoid competing plans.
 
 ## Release Policy
 
@@ -29,7 +28,7 @@ files in the same PR unless one agent is explicitly assigned as integrator.
 | Middleware | `middleware/**`, `adapters/**`, middleware docs/tests | production defaults, store behavior, integration tests |
 | WebSocket | `ws_*.go`, `ws_hub*.go`, Redis WS adapter/tests | hub contract, backpressure/security tests |
 | Security Gate | review across Go API, Native, Middleware, and WebSocket lanes | threat model, security issues, release blockers |
-| Docs / DX | `README.md`, `doc.go`, `ROADMAP.md`, examples, CI docs | install/build docs, changelog, migration guides |
+| Docs / DX | `README.md`, `doc.go`, examples, CI docs | install/build docs, changelog, migration guides |
 | Release Engineering | `.github/**`, `scripts/**`, release docs | CI, smoke tests, release checklist, branch protection notes |
 
 ## Parallel Work Rules
@@ -52,8 +51,8 @@ files in the same PR unless one agent is explicitly assigned as integrator.
 
 ## v0.1.x - Release Hygiene
 
-- [ ] Mark `ROADMAP.md` as historical or sync it with shipped work so agents do
-      not follow stale "must ship" items.
+- [ ] Migrate any useful historical context from the removed `ROADMAP.md` into
+      issues or this plan before opening v1 work.
 - [ ] Add `CHANGELOG.md` starting with `v0.1.0`.
 - [ ] Add root `LICENSE` / notice file if the project intends to be consumed as
       an open-source framework.
