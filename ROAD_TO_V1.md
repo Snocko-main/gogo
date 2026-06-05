@@ -104,7 +104,7 @@ files in the same PR unless one agent is explicitly assigned as integrator.
 ## v0.3.0 - Config Behavior
 
 - [ ] Decide whether `NewApp(cfg ...Config)` stays variadic for v1.
-- [ ] Validate config inputs before v1: extra configs, negative limits,
+- [x] Validate config inputs before v1: extra configs, negative limits,
       disabled limits, timeout sentinels, and zero-value defaults.
 - [ ] Add `ShutdownContext(ctx)` or another blocking graceful-shutdown API if
       the current non-blocking graceful shutdown is not enough.
