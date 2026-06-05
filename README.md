@@ -434,6 +434,9 @@ Named routes may use typed annotations; `URL` strips the annotation before
 substitution. Parameter values are path-escaped. Missing params, unknown route
 names, and wildcard patterns return errors.
 
+Route registration methods intentionally do not return fluent route handles.
+Use `Name(name, pattern)` explicitly when a route needs reverse routing.
+
 ### Route groups
 
 `App.Group` and `Router.Group` bind middleware and a path prefix to a
@@ -694,6 +697,10 @@ app.PostAsync("/users", 1<<20, func(res *gogo.Response, req *gogo.Request, body 
 Sync handlers that collect a body manually with `Response.Body` should call
 `gogo.ParseBody(contentType, body, &out)` inside the callback instead of
 `Request.BodyParser`.
+
+If the client disconnects while `Response.Body` is still collecting, the body
+callback is not invoked. Use `res.OnAborted()` or `req.Context()` for abort
+cleanup and cancellation.
 
 Multipart value parts parsed by `BodyParser` and `ParseMultipart` are capped by
 `GetDefaultMultipartPartLimit()` (8 MiB by default). Override the process default
