@@ -32,6 +32,33 @@
 //	    app.Run()
 //	}
 //
+// # Routing
+//
+// Route patterns are path-only patterns that must start with "/". gogo uses
+// uWS route syntax for literals, named params such as "/users/:id", and
+// trailing wildcards such as "/files/*", then adds typed annotations such as
+// "/users/:id<int>". Typed annotations are stripped before registration and
+// checked before middleware or handlers run; invalid values receive 404.
+//
+// For a concrete HTTP method, literal segments take precedence over named
+// params, and named params take precedence over wildcard catch-alls.
+// Method-specific routes run before Any routes. Custom NotFound and
+// MethodNotAllowed handlers are installed as a catch-all at Listen time after
+// user routes, so explicit routes retain precedence. MethodNotAllowed
+// distinguishes wrong-method requests for literal, named-param, typed-param,
+// and terminal wildcard routes; typed-param constraints must match before the
+// route contributes to the Allow header.
+//
+// Use Group or Mount to bind a prefix and middleware to a router identity:
+//
+//	api := app.Group("/api", authMW)
+//	api.Get("/users/:id", showUser)
+//
+// Group prefixes may include named or typed params, reject wildcards, strip
+// trailing slashes, and concatenate with child patterns that also start with
+// "/". Router middleware composes at route registration with no per-request
+// prefix check; parent middleware wraps child middleware.
+//
 // # Handler styles
 //
 // gogo offers three handler styles, picking the lowest-overhead dispatch
@@ -96,10 +123,11 @@
 //	    }
 //	}
 //
-// The first argument to Use may optionally be a path pattern that scopes the
-// middleware to routes whose pattern starts with that prefix. "/api/*" and
-// "/api" mean the same thing — trailing "/*" or "/**" is stripped. Without a
-// pattern, middleware applies to every later-registered route.
+// The first argument to Use may optionally be a path prefix that scopes the
+// middleware to request URLs under that prefix. "/api/*", "/api/**", and
+// "/api" mean exact "/api" plus children under "/api/"; "/", "/*", and
+// "/**" mean global. Without a pattern, middleware applies to every
+// later-registered route.
 //
 // Global middleware composes at route registration with no per-request string
 // comparison. Scoped middleware matches the live request URL so dynamic routes

@@ -5091,7 +5091,8 @@ func TestShutdownHooksFireOnceAcrossGracefulAndImmediate(t *testing.T) {
 
 // TestMethodNotAllowed: a path with registered methods returns 405 +
 // Allow header for unregistered methods; the handler can customize the
-// response body. Parametric paths fall to NotFound instead.
+// response body. Literal, parametric, wildcard, router-prefixed, and
+// typed-param routes all participate in the lookup.
 func TestMethodNotAllowed(t *testing.T) {
 	var notAllowedHits atomic.Int32
 	var capturedApp *gogo.App
@@ -5105,6 +5106,13 @@ func TestMethodNotAllowed(t *testing.T) {
 		})
 		app.Get("/api/:section", func(res *gogo.Response, req *gogo.Request) {
 			res.Send(200, "text/plain", "section="+req.Parameter(0))
+		})
+		app.Get("/assets/*", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "asset")
+		})
+		api := app.Group("/v1")
+		api.Delete("/items/:id<int>", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "delete-item")
 		})
 		app.NotFound(func(res *gogo.Response, req *gogo.Request) {
 			res.Send(404, "text/plain", "missing:"+req.URL())
@@ -5125,23 +5133,29 @@ func TestMethodNotAllowed(t *testing.T) {
 	})
 	defer teardown()
 
+	doReq := func(method, path string) (int, string, string) {
+		t.Helper()
+		req, _ := http.NewRequest(method, fmt.Sprintf("http://127.0.0.1:%d%s", port, path), nil)
+		resp, err := noKeepaliveClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", method, path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp.StatusCode, string(body), resp.Header.Get("Allow")
+	}
+
 	// Allowed method → 200.
 	if status, body := httpGet(t, port, "/users"); status != 200 || body != "list" {
 		t.Fatalf("GET /users: got %d %q", status, body)
 	}
 
 	// Unregistered method on a literal path → 405 with Allow header.
-	req, _ := http.NewRequest("DELETE", fmt.Sprintf("http://127.0.0.1:%d/users", port), nil)
-	resp, err := noKeepaliveClient.Do(req)
-	if err != nil {
-		t.Fatalf("DELETE /users: %v", err)
+	status, body, allow := doReq("DELETE", "/users")
+	if status != 405 || body != "no:/users" {
+		t.Fatalf("DELETE /users: got %d %q", status, body)
 	}
-	b, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode != 405 || string(b) != "no:/users" {
-		t.Fatalf("DELETE /users: got %d %q", resp.StatusCode, string(b))
-	}
-	if allow := resp.Header.Get("Allow"); allow != "GET, POST" {
+	if allow != "GET, POST" {
 		t.Errorf("Allow header: got %q, want GET, POST", allow)
 	}
 	if notAllowedHits.Load() != 1 {
@@ -5149,21 +5163,52 @@ func TestMethodNotAllowed(t *testing.T) {
 	}
 
 	// Unknown path → NotFound handler.
-	status, body := httpGet(t, port, "/nope")
+	status, body = httpGet(t, port, "/nope")
 	if status != 404 || body != "missing:/nope" {
 		t.Fatalf("/nope: got %d %q", status, body)
 	}
 
-	// Parametric path with wrong method → falls to NotFound (documented).
-	req, _ = http.NewRequest("DELETE", fmt.Sprintf("http://127.0.0.1:%d/api/admin", port), nil)
-	resp, err = noKeepaliveClient.Do(req)
-	if err != nil {
-		t.Fatalf("DELETE /api/admin: %v", err)
+	// Parametric path with wrong method → 405.
+	status, body, allow = doReq("DELETE", "/api/admin")
+	if status != 405 || body != "no:/api/admin" {
+		t.Fatalf("DELETE /api/admin: got %d %q, want 405 no:/api/admin", status, body)
 	}
-	b, _ = io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode != 404 {
-		t.Fatalf("parametric wrong-method: got %d %q (want 404 per documented limitation)", resp.StatusCode, string(b))
+	if allow != "GET" {
+		t.Errorf("parametric Allow: got %q, want GET", allow)
+	}
+
+	// Terminal wildcard path with wrong method → 405.
+	status, body, allow = doReq("POST", "/assets/css/site.css")
+	if status != 405 || body != "no:/assets/css/site.css" {
+		t.Fatalf("POST /assets/css/site.css: got %d %q, want 405 wildcard", status, body)
+	}
+	if allow != "GET" {
+		t.Errorf("wildcard Allow: got %q, want GET", allow)
+	}
+
+	// uWS wildcard semantics require a segment at the wildcard position.
+	status, body, _ = doReq("POST", "/assets")
+	if status != 404 || body != "missing:/assets" {
+		t.Fatalf("POST /assets: got %d %q, want 404 missing:/assets", status, body)
+	}
+
+	// Router-prefixed typed route: valid typed path participates in 405.
+	status, body, allow = doReq("PATCH", "/v1/items/42")
+	if status != 405 || body != "no:/v1/items/42" {
+		t.Fatalf("PATCH /v1/items/42: got %d %q, want 405 typed route", status, body)
+	}
+	if allow != "DELETE" {
+		t.Errorf("typed Allow: got %q, want DELETE", allow)
+	}
+
+	// Typed constraint mismatch is still a path miss, not MethodNotAllowed.
+	status, body, _ = doReq("PATCH", "/v1/items/alice")
+	if status != 404 || body != "missing:/v1/items/alice" {
+		t.Fatalf("PATCH /v1/items/alice: got %d %q, want 404 typed mismatch", status, body)
+	}
+
+	if notAllowedHits.Load() != 4 {
+		t.Errorf("MethodNotAllowed hits = %d, want 4", notAllowedHits.Load())
 	}
 }
 
@@ -5175,23 +5220,31 @@ func TestMethodNotAllowedDefault405(t *testing.T) {
 		app.Get("/users", func(res *gogo.Response, req *gogo.Request) {
 			res.Send(200, "text/plain", "list")
 		})
+		app.Get("/api/:section", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "section")
+		})
+		app.Get("/assets/*", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "asset")
+		})
 		app.NotFound(func(res *gogo.Response, req *gogo.Request) {
 			res.Send(404, "text/plain", "missing")
 		})
 	})
 	defer teardown()
 
-	req, _ := http.NewRequest("POST", fmt.Sprintf("http://127.0.0.1:%d/users", port), nil)
-	resp, err := noKeepaliveClient.Do(req)
-	if err != nil {
-		t.Fatalf("POST /users: %v", err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != 405 {
-		t.Fatalf("default 405: got %d, want 405", resp.StatusCode)
-	}
-	if allow := resp.Header.Get("Allow"); allow != "GET" {
-		t.Errorf("Allow: got %q, want GET", allow)
+	for _, path := range []string{"/users", "/api/admin", "/assets/css/site.css"} {
+		req, _ := http.NewRequest("POST", fmt.Sprintf("http://127.0.0.1:%d%s", port, path), nil)
+		resp, err := noKeepaliveClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 405 {
+			t.Fatalf("default 405 for %s: got %d, want 405", path, resp.StatusCode)
+		}
+		if allow := resp.Header.Get("Allow"); allow != "GET" {
+			t.Errorf("Allow for %s: got %q, want GET", path, allow)
+		}
 	}
 }
 
