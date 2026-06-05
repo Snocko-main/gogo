@@ -33,7 +33,8 @@ files in the same PR unless one agent is explicitly assigned as integrator.
 
 ## Parallel Work Rules
 
-1. One branch per agent lane, prefixed with `codex/`.
+1. One branch per agent lane, prefixed with `feat/`, `fix/`, `chore/`, or
+   `doc/` according to the change type.
 2. Each PR should have a single owner lane and a short issue checklist.
 3. Avoid cross-lane edits unless the PR description names the dependency.
 4. Every issue should state owner lane, type, touched files, required tests,
