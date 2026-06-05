@@ -7,6 +7,13 @@ minor releases may include breaking API changes when they move the project
 toward a stable API. Breaking changes should be called out in the release
 notes for the release that introduces them.
 
+## Unreleased
+
+### Added
+
+- Root Apache-2.0 project license and third-party notices for bundled
+  uWebSockets/uSockets native sources.
+
 ## v0.1.0 - 2026-05-30
 
 Initial public preview release of gogo.
@@ -39,5 +46,5 @@ Initial public preview release of gogo.
 - Without `-tags gogo`, the package builds a stub so ordinary Go tooling can
   import the module, but `NewApp` returns a setup error instead of running a
   native uWebSockets server.
-- A root license file is intentionally absent until the repository owner
-  chooses the project license.
+- The `v0.1.0` tag did not include a root license file; the project license is
+  documented in a later `v0.1.x` release.

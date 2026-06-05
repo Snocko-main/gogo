@@ -55,7 +55,7 @@ files in the same PR unless one agent is explicitly assigned as integrator.
 - [x] Migrate any useful historical context from the removed `ROADMAP.md` into
       issues or this plan before opening v1 work.
 - [x] Add `CHANGELOG.md` starting with `v0.1.0`.
-- [ ] Choose and add a root `LICENSE` / notice file before presenting the
+- [x] Choose and add a root `LICENSE` / notice file before presenting the
       project as an open-source framework.
 - [x] Add `SECURITY.md` with supported versions and vulnerability reporting.
 - [x] Add CI matrix for Linux and macOS with C++20, zlib, Go 1.24, and the

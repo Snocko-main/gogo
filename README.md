@@ -33,6 +33,7 @@ body-parse + SQLite query paths.
 - [Benchmark Snapshot](#benchmark-snapshot)
 - [Requirements and Native Build](#requirements-and-native-build)
 - [Version Policy](#version-policy)
+- [License](#license)
 - [Hello World](#hello-world)
 - [Routing](#routing)
   - [Basic routes](#basic-routes)
@@ -168,6 +169,13 @@ go get github.com/Snocko-main/gogo@v0.1.0
 Release maintainers should follow [`docs/release-checklist.md`](docs/release-checklist.md)
 and [`docs/branch-protection.md`](docs/branch-protection.md) before cutting
 public tags.
+
+## License
+
+gogo is licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE).
+
+Vendored uWebSockets/uSockets native sources retain their upstream Apache-2.0
+license notices. See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
 ## Hello World
 
