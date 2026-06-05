@@ -32,6 +32,7 @@ body-parse + SQLite query paths.
 
 - [Benchmark Snapshot](#benchmark-snapshot)
 - [Requirements and Native Build](#requirements-and-native-build)
+- [Version Policy](#version-policy)
 - [Hello World](#hello-world)
 - [Routing](#routing)
   - [Basic routes](#basic-routes)
@@ -144,6 +145,24 @@ Then run an example:
 ```sh
 CGO_ENABLED=1 go run -tags gogo ./examples/hello
 curl http://localhost:3000/hello/inon
+```
+
+## Version Policy
+
+gogo is currently on the `v0.x` public preview line.
+
+- `v0.x`: APIs may change, including breaking changes, when the change moves
+  the project closer to a stable `v1`. Release notes should call out breaking
+  changes and migration steps.
+- `v0.9.x`: planned release-candidate period. Breaking changes need a specific
+  v1-readiness reason.
+- `v1.0.0`: routing, middleware, WebSocket, testing, and configuration APIs
+  are expected to be stable except for backward-compatible additions.
+
+Use pinned tags for applications that need repeatable builds:
+
+```sh
+go get github.com/Snocko-main/gogo@v0.1.0
 ```
 
 ## Hello World
