@@ -1037,6 +1037,25 @@ func httpPost(t *testing.T, port int, path, contentType string, body []byte) (st
 	return resp.StatusCode, string(b)
 }
 
+func httpBody(t *testing.T, port int, method, path, contentType string, body []byte) (status int, respBody string, header http.Header) {
+	t.Helper()
+	req, err := http.NewRequest(method, fmt.Sprintf("http://127.0.0.1:%d%s", port, path), bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, path, err)
+	}
+	req.Header.Set("Content-Type", contentType)
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, path, err)
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return resp.StatusCode, string(b), resp.Header.Clone()
+}
+
 func TestPostAsyncBody(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.PostAsync("/echo", 64*1024, func(res *gogo.Response, req *gogo.Request, body []byte) {
@@ -1087,6 +1106,56 @@ func TestPostAsyncTooLarge(t *testing.T) {
 	status, body := httpPost(t, port, "/upload", "text/plain", payload)
 	if status != 413 {
 		t.Fatalf("got %d, want 413; body=%q", status, body)
+	}
+}
+
+func TestBodyAsyncMethodHelpers(t *testing.T) {
+	var tooLargeHandlerCalled atomic.Bool
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(gogo.AsyncMiddleware(func(next gogo.AsyncHandler) gogo.AsyncHandler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				req.SetLocal("mw-body", string(req.Body()))
+				next(res, req)
+			}
+		}))
+
+		handler := func(res *gogo.Response, req *gogo.Request, body []byte) {
+			res.Send(200, "text/plain", fmt.Sprintf("%s|%s|%s|%v",
+				req.Method(), req.Param("id"), string(body), req.Local("mw-body")))
+		}
+		app.PutAsync("/put/:id", 64, handler)
+		app.PatchAsync("/patch/:id", 64, handler)
+		app.DeleteAsync("/delete/:id", 64, handler)
+		app.PutAsync("/too-large", 8, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			tooLargeHandlerCalled.Store(true)
+			res.Send(200, "text/plain", "unexpected")
+		})
+	})
+	defer teardown()
+
+	for _, tc := range []struct {
+		method string
+		path   string
+		body   string
+		want   string
+	}{
+		{"PUT", "/put/42", "replace", "put|42|replace|replace"},
+		{"PATCH", "/patch/42", "patch", "patch|42|patch|patch"},
+		{"DELETE", "/delete/42", "delete", "delete|42|delete|delete"},
+	} {
+		status, body, _ := httpBody(t, port, tc.method, tc.path, "text/plain", []byte(tc.body))
+		if status != 200 || body != tc.want {
+			t.Fatalf("%s %s: got %d %q, want 200 %q", tc.method, tc.path, status, body, tc.want)
+		}
+	}
+
+	status, body, _ := httpBody(t, port, "PUT", "/too-large", "text/plain", []byte("0123456789"))
+	if status != 413 {
+		t.Fatalf("PUT /too-large: got %d %q, want 413", status, body)
+	}
+	if tooLargeHandlerCalled.Load() {
+		t.Fatal("PutAsync handler ran for oversized body")
 	}
 }
 
@@ -3428,6 +3497,56 @@ func TestGroupPostAsyncBodyAndMW(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != 413 {
 		t.Fatalf("POST /api/echo large: got %d, want 413", resp.StatusCode)
+	}
+}
+
+func TestGroupBodyAsyncMethodHelpersAndMW(t *testing.T) {
+	var syncHits atomic.Int32
+	port, teardown := startApp(t, func(app *gogo.App) {
+		api := app.Group("/api", func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				syncHits.Add(1)
+				res.Header("X-Group-MW", "sync")
+				next(res, req)
+			}
+		})
+		api.UseAsync(func(next gogo.AsyncHandler) gogo.AsyncHandler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				req.SetLocal("group-body", string(req.Body()))
+				next(res, req)
+			}
+		})
+
+		handler := func(res *gogo.Response, req *gogo.Request, body []byte) {
+			res.Send(200, "text/plain", fmt.Sprintf("%s|%s|%s|%v",
+				req.Method(), req.Param("id"), string(body), req.Local("group-body")))
+		}
+		api.PutAsync("/put/:id", 64, handler)
+		api.PatchAsync("/patch/:id", 64, handler)
+		api.DeleteAsync("/delete/:id", 64, handler)
+	})
+	defer teardown()
+
+	for _, tc := range []struct {
+		method string
+		path   string
+		body   string
+		want   string
+	}{
+		{"PUT", "/api/put/7", "replace", "put|7|replace|replace"},
+		{"PATCH", "/api/patch/7", "patch", "patch|7|patch|patch"},
+		{"DELETE", "/api/delete/7", "delete", "delete|7|delete|delete"},
+	} {
+		status, body, header := httpBody(t, port, tc.method, tc.path, "text/plain", []byte(tc.body))
+		if status != 200 || body != tc.want {
+			t.Fatalf("%s %s: got %d %q, want 200 %q", tc.method, tc.path, status, body, tc.want)
+		}
+		if header.Get("X-Group-MW") != "sync" {
+			t.Fatalf("%s %s: X-Group-MW=%q, want sync", tc.method, tc.path, header.Get("X-Group-MW"))
+		}
+	}
+	if got := syncHits.Load(); got != 3 {
+		t.Fatalf("sync group middleware hits = %d, want 3", got)
 	}
 }
 

@@ -358,19 +358,20 @@ type WebSocketBehavior struct {
 //
 // Static replies (Reply, string, []byte targets of App.Get) use their C++
 // fast path only when no matching sync middleware or typed-param constraint
-// needs a Go-side handler. GetAsync / PostAsync keep their shared-memory fast
-// path when only async-capable middleware applies; sync-only middleware makes
-// them fall back to a wrapped sync entry point.
+// needs a Go-side handler. GetAsync and small PostAsync routes keep their
+// shared-memory fast path when only async-capable middleware applies;
+// sync-only middleware makes them fall back to a wrapped sync entry point.
 type Middleware func(next Handler) Handler
 
 // AsyncMiddleware wraps an AsyncHandler the same way Middleware wraps a
 // Handler, but executes on the goroutine that runs the user's async handler
 // so it is free to block (DB queries, downstream HTTP calls, etc.).
 //
-// Async middleware applies only to GetAsync and PostAsync routes. Use it
-// when the cross-cutting work itself needs to block; for cheap header /
-// query inspection prefer sync Middleware (smaller per-request overhead and
-// also applicable to sync routes).
+// Async middleware applies only to GetAsync and body-async routes such as
+// PostAsync, PutAsync, PatchAsync, and DeleteAsync. Use it when the
+// cross-cutting work itself needs to block; for cheap header / query
+// inspection prefer sync Middleware (smaller per-request overhead and also
+// applicable to sync routes).
 //
 // Pass data through to the user handler via Request.SetLocal / Request.Local.
 type AsyncMiddleware func(next AsyncHandler) AsyncHandler
@@ -1239,18 +1240,50 @@ func (a *App) Post(pattern string, handler Handler) {
 // two constants in sync with the C side (gogo/uws_bridge.cpp).
 const postSharedBodyCap = 8 * 1024
 
-// PostAsyncHandler is the handler signature for PostAsync routes. It receives
-// the response, a snapshot of the request (URL/query/params/headers all
-// captured before uWS freed the live request), and the fully-collected body.
-// Runs on a goroutine so it is free to block.
-type PostAsyncHandler func(res *Response, req *Request, body []byte)
+// BodyAsyncHandler is the handler signature for async routes that collect a
+// request body before dispatching to a goroutine. It receives the response, a
+// snapshot of the request (URL/query/params/headers all captured before uWS
+// freed the live request), and the fully-collected body.
+type BodyAsyncHandler func(res *Response, req *Request, body []byte)
+
+// PostAsyncHandler is kept for source compatibility with earlier releases.
+type PostAsyncHandler = BodyAsyncHandler
 
 // PostAsync registers a POST route that collects the full request body up to
 // maxBodyBytes, then invokes handler on a goroutine with the collected bytes
 // plus a request snapshot. On bodies that exceed maxBodyBytes the framework
 // sends 413 Payload Too Large automatically and the handler is not called.
 func (a *App) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandler) {
-	uwsPattern, meta := a.preRoute("post", pattern)
+	a.bodyAsync("post", pattern, maxBodyBytes, handler)
+}
+
+// PutAsync registers a PUT route that collects the full request body up to
+// maxBodyBytes, then invokes handler on a goroutine with the collected bytes
+// plus a request snapshot. On bodies that exceed maxBodyBytes the framework
+// sends 413 Payload Too Large automatically and the handler is not called.
+func (a *App) PutAsync(pattern string, maxBodyBytes int, handler BodyAsyncHandler) {
+	a.bodyAsync("put", pattern, maxBodyBytes, handler)
+}
+
+// PatchAsync registers a PATCH route that collects the full request body up to
+// maxBodyBytes, then invokes handler on a goroutine with the collected bytes
+// plus a request snapshot. On bodies that exceed maxBodyBytes the framework
+// sends 413 Payload Too Large automatically and the handler is not called.
+func (a *App) PatchAsync(pattern string, maxBodyBytes int, handler BodyAsyncHandler) {
+	a.bodyAsync("patch", pattern, maxBodyBytes, handler)
+}
+
+// DeleteAsync registers a DELETE route that collects the full request body up
+// to maxBodyBytes, then invokes handler on a goroutine with the collected
+// bytes plus a request snapshot. On bodies that exceed maxBodyBytes the
+// framework sends 413 Payload Too Large automatically and the handler is not
+// called.
+func (a *App) DeleteAsync(pattern string, maxBodyBytes int, handler BodyAsyncHandler) {
+	a.bodyAsync("delete", pattern, maxBodyBytes, handler)
+}
+
+func (a *App) bodyAsync(method, pattern string, maxBodyBytes int, handler BodyAsyncHandler) {
+	uwsPattern, meta := a.preRoute(method, pattern)
 
 	// Adapt the body-receiving handler into the AsyncHandler shape that
 	// AsyncMiddleware expects. The body is stashed on req.body in the
@@ -1265,7 +1298,8 @@ func (a *App) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandl
 	// shared-dispatch ring with body collection in C++. The worker
 	// goroutine reads the assembled body via req.snap + req.body
 	// without paying a single cgo crossing per request.
-	if maxBodyBytes > 0 && maxBodyBytes <= postSharedBodyCap &&
+	if method == "post" &&
+		maxBodyBytes > 0 && maxBodyBytes <= postSharedBodyCap &&
 		meta == nil && !a.hasMatchingMiddleware(uwsPattern) {
 		wrappedAsync := a.applyAppRefAsync(a.applyMetaAsync(meta, a.wrapAsync(uwsPattern, finalAsync)))
 		a.acquireSharedWorkerRef()
@@ -1273,12 +1307,12 @@ func (a *App) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandl
 		return
 	}
 
-	// PostAsync always runs the sync chain via a.wrap before
+	// Body async methods run the sync chain via a.wrap before
 	// dispatching the worker — PlaceBoth twins fire there, so the
 	// async chain composed inside res.Async must skip them.
 	wrappedAsync := a.wrapAsyncFiltered(uwsPattern, finalAsync, true)
 
-	a.inner.post(uwsPattern, a.applyMeta(meta, a.wrap(uwsPattern, func(res *Response, req *Request) {
+	a.registerBodyRoute(method, uwsPattern, a.applyMeta(meta, a.wrap(uwsPattern, func(res *Response, req *Request) {
 		// Snapshot the request before its lifetime ends. Body collection
 		// happens via onData callbacks fired after we return, by which time
 		// req would be invalid; the snapshot survives.
@@ -1301,6 +1335,21 @@ func (a *App) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandl
 			})
 		})
 	})))
+}
+
+func (a *App) registerBodyRoute(method, pattern string, handler Handler) {
+	switch method {
+	case "post":
+		a.inner.post(pattern, handler)
+	case "put":
+		a.inner.put(pattern, handler)
+	case "patch":
+		a.inner.patch(pattern, handler)
+	case "delete":
+		a.inner.deleteM(pattern, handler)
+	default:
+		panic(fmt.Sprintf("gogo: unsupported async body method %q for %q", method, pattern))
+	}
 }
 
 // Any registers a route for every HTTP method.
@@ -1552,7 +1601,7 @@ func (r *Router) Use(mws ...Middleware) {
 }
 
 // UseAsync appends async middleware to this Router. Applies only to GetAsync
-// and PostAsync routes registered through this Router.
+// and body-async routes registered through this Router.
 func (r *Router) UseAsync(mws ...AsyncMiddleware) {
 	r.asyncMW = append(r.asyncMW, mws...)
 }
@@ -1767,13 +1816,39 @@ func (r *Router) GetAsync(pattern string, handler AsyncHandler) {
 // up to maxBodyBytes then runs handler on a goroutine. On bodies over the cap
 // the framework sends 413 and the handler is not called.
 func (r *Router) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandler) {
-	full, meta := r.preRoute("post", pattern)
+	r.bodyAsync("post", pattern, maxBodyBytes, handler)
+}
+
+// PutAsync registers a PUT route under this Router that collects the body up
+// to maxBodyBytes then runs handler on a goroutine. On bodies over the cap the
+// framework sends 413 and the handler is not called.
+func (r *Router) PutAsync(pattern string, maxBodyBytes int, handler BodyAsyncHandler) {
+	r.bodyAsync("put", pattern, maxBodyBytes, handler)
+}
+
+// PatchAsync registers a PATCH route under this Router that collects the body
+// up to maxBodyBytes then runs handler on a goroutine. On bodies over the cap
+// the framework sends 413 and the handler is not called.
+func (r *Router) PatchAsync(pattern string, maxBodyBytes int, handler BodyAsyncHandler) {
+	r.bodyAsync("patch", pattern, maxBodyBytes, handler)
+}
+
+// DeleteAsync registers a DELETE route under this Router that collects the
+// body up to maxBodyBytes then runs handler on a goroutine. On bodies over the
+// cap the framework sends 413 and the handler is not called.
+func (r *Router) DeleteAsync(pattern string, maxBodyBytes int, handler BodyAsyncHandler) {
+	r.bodyAsync("delete", pattern, maxBodyBytes, handler)
+}
+
+func (r *Router) bodyAsync(method, pattern string, maxBodyBytes int, handler BodyAsyncHandler) {
+	full, meta := r.preRoute(method, pattern)
 
 	finalAsync := AsyncHandler(func(res *Response, req *Request) {
 		handler(res, req, req.body)
 	})
-	// PostAsync always wraps with sync chain → skip PlaceBoth twins
-	// in the async chain to avoid double-firing the same middleware.
+	// Body async methods wrap with the sync chain first, so skip
+	// PlaceBoth twins in the async chain to avoid double-firing the
+	// same middleware.
 	wrappedAsync := r.app.wrapAsyncFiltered(full, r.wrapGroupAsync(finalAsync), true)
 
 	syncEntry := func(res *Response, req *Request) {
@@ -1795,7 +1870,7 @@ func (r *Router) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHa
 		})
 	}
 	h := r.app.applyMeta(meta, r.app.wrap(full, r.wrapGroupSync(Handler(syncEntry))))
-	r.app.inner.post(full, h)
+	r.app.registerBodyRoute(method, full, h)
 }
 
 // WebSocket registers a WebSocket route under this Router. Middleware does
@@ -2769,7 +2844,7 @@ func (r *Response) End(body string) {
 // handler's mode:
 //
 //   - Sync handler (Get / Post / Any): one cgo crossing into uWS.
-//   - Async handler (GetAsync / PostAsync) with body up to 8 KB:
+//   - Async handler (GetAsync / small PostAsync) with body up to 8 KB:
 //     ZERO cgo per request — written to shared-memory inline buffers and
 //     pushed onto the App's response ring; the loop drains it.
 //   - Async handler with body > 8 KB: cgo Loop::defer with the full
@@ -2914,7 +2989,7 @@ func (r *Response) JSONBytes(code int, b []byte) {
 // write through Response.Stream or send pre-marshaled bytes with
 // Response.JSONBytes.
 //
-// Async only — call from GetAsync/PostAsync or wrap a sync handler
+// Async only — call from GetAsync, a body-async route, or wrap a sync handler
 // in Response.Async. The underlying Response.Stream applies the
 // default backpressure cap (StreamBackpressureBytes), so a slow
 // consumer parks the producer goroutine rather than spiking memory.
@@ -2935,7 +3010,7 @@ func (r *Response) JSONStream(code int, fn func(*json.Encoder) error) error {
 // Stream is meant for Server-Sent Events, NDJSON feeds, log tails,
 // and similar long-running responses where you don't know the full
 // body up front and you don't want to materialize it before the
-// first byte goes out. Call it from a GetAsync / PostAsync handler.
+// first byte goes out. Call it from a GetAsync or body-async handler.
 // On a sync route call res.Async() first; on a plain sync handler
 // streaming would block the event-loop thread, which is almost
 // never what you want.
@@ -2969,7 +3044,7 @@ func (r *Response) JSONStream(code int, fn func(*json.Encoder) error) error {
 // early on disconnect.)
 func (r *Response) Stream(status int, contentType string, fn func(w io.Writer) error) error {
 	if r.async == nil {
-		panic("gogo: Stream requires an async response; call from GetAsync / PostAsync or use res.Async first")
+		panic("gogo: Stream requires an async response; call from GetAsync, a body-async route, or use res.Async first")
 	}
 	if r.async.sent {
 		panic("gogo: Stream: response already sent")
@@ -4623,10 +4698,10 @@ type Request struct {
 	inner requestNative
 	snap  *requestSnapshot
 
-	// body is the fully collected request body for PostAsync routes, set
+	// body is the fully collected request body for body-async routes, set
 	// by the runtime wrapper before invoking the async middleware chain so
-	// async middleware can inspect it via Body() and the final user
-	// PostAsyncHandler receives it as a parameter.
+	// async middleware can inspect it via Body() and the final user handler
+	// receives it as a parameter.
 	body []byte
 
 	// locals carries request-scoped key/value state between middleware and
@@ -4763,9 +4838,10 @@ func (r *Request) Local(key string) any {
 	return r.locals[key]
 }
 
-// Body returns the fully collected request body for PostAsync routes; for
-// other routes (Get, Post, GetAsync, Any) it returns nil. The slice is owned
-// by the framework — do not retain it past the handler call.
+// Body returns the fully collected request body for body-async routes such as
+// PostAsync, PutAsync, PatchAsync, and DeleteAsync; for other routes it
+// returns nil. The slice is owned by the framework — do not retain it past the
+// handler call.
 func (r *Request) Body() []byte {
 	return r.body
 }
@@ -5479,7 +5555,7 @@ func bytesEqualLower(b []byte, lower string) bool {
 
 // snapshotFromSync materializes a snapshot from a sync-mode Request so the
 // data survives past the cgo callback's return. The middleware-fallback path
-// in GetAsync/PostAsync calls this before spawning the async goroutine.
+// in async route helpers calls this before spawning the async goroutine.
 // capturePeerIP=false skips the cgo getRemoteAddressAsText lookup; the
 // resulting snap.ip is empty and req.IP() in the async goroutine returns "".
 func (r *Request) snapshotFromSync(capturePeerIP bool) *requestSnapshot {
