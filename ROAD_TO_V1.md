@@ -110,7 +110,7 @@ files in the same PR unless one agent is explicitly assigned as integrator.
         current no-callback abort contract is final.
   - [x] Fix `BodyParser` / `ErrNoBody` docs for sync handlers that must use
         `ParseBody` after `Response.Body`.
-  - [ ] Add missing named helper `Request.ParamInt64`.
+  - [x] Add missing named helper `Request.ParamInt64`.
   - [x] Refresh SSE docs for body-async methods and disconnect handling.
 
 ## v0.3.0 - Config Behavior

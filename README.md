@@ -356,6 +356,9 @@ app.Get("/posts/:id", func(res *gogo.Response, req *gogo.Request) {
 })
 ```
 
+Use `req.ParamInt64(name, def)` or `req.ParameterInt64(i, def)` for larger
+integer identifiers.
+
 Wildcards are supported via uWS pattern syntax:
 
 ```go
