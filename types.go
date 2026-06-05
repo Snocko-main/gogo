@@ -590,9 +590,10 @@ type App struct {
 	// match the live URL against them at runtime without re-doing uWS's
 	// router work; requests to dynamic-pattern paths under the wrong
 	// method fall to the 404 handler instead.
-	routeMethods    map[string]map[string]struct{}
-	onListenHooks   []func(port int)
-	onShutdownHooks []func()
+	routeMethods       map[string]map[string]struct{}
+	onListenHooks      []func(port int)
+	onShutdownHooks    []func()
+	shutdownHooksFired atomic.Bool
 
 	// namedRoutes maps a user-chosen name to the uWS-stripped pattern
 	// so App.URL can do reverse routing (`URL("user.show", {"id":"42"})`
@@ -2123,8 +2124,8 @@ func (a *App) fireListenHooks(port int) {
 // of Shutdown / ShutdownGracefully (before the C++ close is dispatched
 // to the loop). Use it to flush logs, close DB pools, etc. Hooks run in
 // registration order and run on whatever goroutine called Shutdown.
-// Idempotent: a second Shutdown call still fires every hook again. Calling
-// OnShutdown(nil) is a no-op.
+// Hooks fire at most once per App lifecycle, even if Shutdown and
+// ShutdownGracefully are both called. Calling OnShutdown(nil) is a no-op.
 func (a *App) OnShutdown(fn func()) {
 	if fn == nil {
 		return
@@ -2136,6 +2137,9 @@ func (a *App) OnShutdown(fn func()) {
 // per-callback panic recovery so a buggy hook doesn't strand the
 // shutdown.
 func (a *App) fireShutdownHooks() {
+	if !a.shutdownHooksFired.CompareAndSwap(false, true) {
+		return
+	}
 	for _, fn := range a.onShutdownHooks {
 		func(f func()) {
 			defer func() {
