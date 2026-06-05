@@ -688,6 +688,10 @@ app.PostAsync("/users", 1<<20, func(res *gogo.Response, req *gogo.Request, body 
 })
 ```
 
+Sync handlers that collect a body manually with `Response.Body` should call
+`gogo.ParseBody(contentType, body, &out)` inside the callback instead of
+`Request.BodyParser`.
+
 Multipart value parts parsed by `BodyParser` and `ParseMultipart` are capped by
 `GetDefaultMultipartPartLimit()` (8 MiB by default). Override the process default
 with `SetDefaultMultipartPartLimit(n)` before registering handlers, or pass

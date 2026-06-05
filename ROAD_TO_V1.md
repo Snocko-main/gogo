@@ -108,7 +108,7 @@ files in the same PR unless one agent is explicitly assigned as integrator.
         nil-body handler invocation.
   - [ ] Decide whether body-read aborts need a public sentinel or whether the
         current no-callback abort contract is final.
-  - [ ] Fix `BodyParser` / `ErrNoBody` docs for sync handlers that must use
+  - [x] Fix `BodyParser` / `ErrNoBody` docs for sync handlers that must use
         `ParseBody` after `Response.Body`.
   - [ ] Add missing named helper `Request.ParamInt64`.
   - [x] Refresh SSE docs for body-async methods and disconnect handling.
