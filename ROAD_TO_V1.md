@@ -52,28 +52,28 @@ files in the same PR unless one agent is explicitly assigned as integrator.
 
 ## v0.1.x - Release Hygiene
 
-- [ ] Migrate any useful historical context from the removed `ROADMAP.md` into
+- [x] Migrate any useful historical context from the removed `ROADMAP.md` into
       issues or this plan before opening v1 work.
-- [ ] Add `CHANGELOG.md` starting with `v0.1.0`.
-- [ ] Add root `LICENSE` / notice file if the project intends to be consumed as
-      an open-source framework.
-- [ ] Add `SECURITY.md` with supported versions and vulnerability reporting.
-- [ ] Add CI matrix for Linux and macOS with C++20, zlib, Go 1.24, and the
+- [x] Add `CHANGELOG.md` starting with `v0.1.0`.
+- [ ] Choose and add a root `LICENSE` / notice file before presenting the
+      project as an open-source framework.
+- [x] Add `SECURITY.md` with supported versions and vulnerability reporting.
+- [x] Add CI matrix for Linux and macOS with C++20, zlib, Go 1.24, and the
       current stable Go version.
-- [ ] Add normal test job: `go test ./...`.
-- [ ] Add native test job: `CGO_ENABLED=1 go test -tags gogo ./...`.
-- [ ] Decide whether `go vet` and `CGO_ENABLED=1 go vet -tags gogo ./...` are
+- [x] Add normal test job: `go test ./...`.
+- [x] Add native test job: `CGO_ENABLED=1 go test -tags gogo ./...`.
+- [x] Decide whether `go vet` and `CGO_ENABLED=1 go vet -tags gogo ./...` are
       CI gates; if yes, fix or document the native vet baseline first.
-- [ ] Add `govulncheck ./...` and `govulncheck -tags gogo ./...` as release
+- [x] Add `govulncheck ./...` and `govulncheck -tags gogo ./...` as release
       checks.
-- [ ] Add a downstream smoke script or exact temp-module recipe that tests
+- [x] Add a downstream smoke script or exact temp-module recipe that tests
       `@<sha>`, `@vX.Y.Z`, and `@latest` by importing gogo and building with
       `CGO_ENABLED=1 go build -tags gogo .`.
-- [ ] Add a tracked-file check proving downstream builds do not depend on local
+- [x] Add a tracked-file check proving downstream builds do not depend on local
       `third_party/`.
-- [ ] Add README version policy for `v0.x` vs `v1`.
-- [ ] Add release checklist for future tags.
-- [ ] Document branch protection expectations before the v1 release candidate.
+- [x] Add README version policy for `v0.x` vs `v1`.
+- [x] Add release checklist for future tags.
+- [x] Document branch protection expectations before the v1 release candidate.
 - [ ] Verify all README examples compile.
 
 ## v0.2.0 - Correctness and API Freeze Prep

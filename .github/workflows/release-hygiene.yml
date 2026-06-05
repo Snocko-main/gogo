@@ -106,6 +106,9 @@ jobs:
       - name: Check tracked native sources
         run: scripts/check_tracked_native_sources.sh
 
+      - name: Run go vet
+        run: go vet ./...
+
       - name: Run downstream smoke build
         run: scripts/downstream_smoke_build.sh --local "$GITHUB_WORKSPACE"
 
