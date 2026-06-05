@@ -583,25 +583,22 @@ type App struct {
 	// the pool open.
 	workerRefAcquired atomic.Bool
 	workerRefDropped  atomic.Bool
-	// routeMethods maps a LITERAL pattern to the set of HTTP methods
-	// registered against it. Used by the catch-all at Listen time to
-	// distinguish "path exists but the method is wrong" (→ 405 with
-	// Allow header) from "path doesn't exist at all" (→ 404). Patterns
-	// with ':' or '*' aren't tracked here because we can't reliably
-	// match the live URL against them at runtime without re-doing uWS's
-	// router work; requests to dynamic-pattern paths under the wrong
-	// method fall to the 404 handler instead.
-	routeMethods       map[string]map[string]struct{}
+	// routeMethods records every method-specific route registered on
+	// the App. The catch-all installed at Listen uses these entries to
+	// distinguish "path exists but the method is wrong" (405 + Allow)
+	// from "path doesn't exist" (404), including dynamic and wildcard
+	// patterns. routeMethodIndex lets repeated registration of the same
+	// method/pattern replace the prior metadata, matching uWS's
+	// remove-then-add behavior.
+	routeMethods       []routeMethodEntry
+	routeMethodIndex   map[string]int
 	onListenHooks      []func(port int)
 	onShutdownHooks    []func()
 	shutdownHooksFired atomic.Bool
 
 	// namedRoutes maps a user-chosen name to the uWS-stripped pattern
 	// so App.URL can do reverse routing (`URL("user.show", {"id":"42"})`
-	// → "/users/42"). Names are set via the Route returned from a
-	// dynamic Get/Post/etc; static-target routes can't be named because
-	// reverse routing needs a path with params, and static replies
-	// don't carry them.
+	// → "/users/42"). Names are set via App.Name or Router.Name.
 	namedRoutes map[string]string
 
 	// templateEngine is the TemplateEngine installed via SetTemplateEngine.
@@ -1172,7 +1169,7 @@ func (a *App) preRoute(method, pattern string) (string, *routeMeta) {
 	uwsPattern, meta := parseRoutePattern(pattern)
 	validatePattern(uwsPattern)
 	if method != "" {
-		a.trackRouteMethod(method, uwsPattern)
+		a.trackRouteMethod(method, uwsPattern, meta)
 	}
 	return uwsPattern, meta
 }
@@ -1721,7 +1718,7 @@ func (r *Router) preRoute(method, pattern string) (string, *routeMeta) {
 	full, meta := parseRoutePattern(r.prefix + pattern)
 	validatePattern(full)
 	if method != "" {
-		r.app.trackRouteMethod(method, full)
+		r.app.trackRouteMethod(method, full, meta)
 	}
 	return full, meta
 }
@@ -2053,42 +2050,131 @@ func (a *App) Listen(port int) bool {
 }
 
 // MethodNotAllowed sets the fallback handler for requests whose path
-// matches a literal-pattern route but whose method has no registered
-// handler — e.g. `app.Get("/users", h)` and the client sends `POST
-// /users`. The framework writes the standard Allow header listing
-// methods that ARE registered for that path before invoking the
-// handler.
+// matches a registered route but whose method has no registered
+// handler, e.g. app.Get("/users", h) and the client sends POST
+// /users. Literal, parametric, typed-param, and terminal wildcard
+// routes participate in the lookup. A typed-param route counts only
+// when the live path satisfies its constraint; /api/* matches /api/
+// and descendants, but not bare /api, matching uWS route behavior.
 //
-// Limitation: only literal-pattern routes participate. Requests to
-// parametric or wildcard paths (e.g. /api/:section) with an
-// unmatched method fall through to the NotFound handler instead —
-// the framework cannot replay uWS's pattern matching from inside
-// the Go-side catch-all to tell "wrong method on /api/admin" apart
-// from "no such path /api/admin".
+// The default fallback writes a 405 response with the standard Allow
+// header. Custom handlers are responsible for their own response and
+// can call AllowedMethods(req.URL()) to build the Allow header.
 //
 // Calling MethodNotAllowed(nil) clears the handler.
 func (a *App) MethodNotAllowed(h Handler) {
 	a.methodNotAllowedHandler = h
 }
 
-// trackRouteMethod is called from every route-registration helper so
-// the catch-all installed at Listen can distinguish 404 from 405. Only
-// literal patterns are tracked; dynamic (':' / '*') ones are skipped
-// because runtime URL matching against them would mean reimplementing
-// uWS's router on the Go side.
-func (a *App) trackRouteMethod(method, pattern string) {
-	if strings.ContainsAny(pattern, ":*") {
+type routeMethodSegmentKind uint8
+
+const (
+	routeMethodSegmentStatic routeMethodSegmentKind = iota
+	routeMethodSegmentParam
+	routeMethodSegmentWildcard
+)
+
+type routeMethodSegment struct {
+	kind  routeMethodSegmentKind
+	value string
+}
+
+type routeMethodEntry struct {
+	method   string
+	segments []routeMethodSegment
+	meta     *routeMeta
+}
+
+func newRouteMethodEntry(method, pattern string, meta *routeMeta) routeMethodEntry {
+	rawSegments := splitRoutePath(pattern)
+	segments := make([]routeMethodSegment, len(rawSegments))
+	for i, segment := range rawSegments {
+		kind := routeMethodSegmentStatic
+		if segment != "" {
+			switch segment[0] {
+			case ':':
+				kind = routeMethodSegmentParam
+			case '*':
+				kind = routeMethodSegmentWildcard
+			}
+		}
+		segments[i] = routeMethodSegment{kind: kind, value: segment}
+	}
+	return routeMethodEntry{
+		method:   method,
+		segments: segments,
+		meta:     meta,
+	}
+}
+
+func splitRoutePath(path string) []string {
+	if path == "" || path[0] != '/' {
+		return nil
+	}
+	segments := make([]string, 0, strings.Count(path, "/"))
+	for len(path) > 0 {
+		path = path[1:]
+		nextSlash := strings.IndexByte(path, '/')
+		if nextSlash < 0 {
+			return append(segments, path)
+		}
+		segments = append(segments, path[:nextSlash])
+		path = path[nextSlash:]
+	}
+	return segments
+}
+
+func (e routeMethodEntry) matches(path string) bool {
+	pathSegments := splitRoutePath(path)
+	if len(pathSegments) == 0 && path != "/" {
+		return false
+	}
+	paramIdx := 0
+	for i, segment := range e.segments {
+		if i >= len(pathSegments) {
+			return false
+		}
+		value := pathSegments[i]
+		switch segment.kind {
+		case routeMethodSegmentWildcard:
+			return i == len(e.segments)-1
+		case routeMethodSegmentParam:
+			if value == "" {
+				return false
+			}
+			if e.meta != nil {
+				if constraint, ok := e.meta.constraints[paramIdx]; ok && !constraint.check(value) {
+					return false
+				}
+			}
+			paramIdx++
+		default:
+			if value != segment.value {
+				return false
+			}
+		}
+	}
+	return len(pathSegments) == len(e.segments)
+}
+
+func routeMethodKey(method, pattern string) string {
+	return method + "\x00" + pattern
+}
+
+// trackRouteMethod is called from every method-specific route-registration
+// helper so the catch-all installed at Listen can distinguish 404 from 405.
+func (a *App) trackRouteMethod(method, pattern string, meta *routeMeta) {
+	entry := newRouteMethodEntry(method, pattern, meta)
+	if a.routeMethodIndex == nil {
+		a.routeMethodIndex = make(map[string]int)
+	}
+	key := routeMethodKey(method, pattern)
+	if idx, ok := a.routeMethodIndex[key]; ok {
+		a.routeMethods[idx] = entry
 		return
 	}
-	if a.routeMethods == nil {
-		a.routeMethods = make(map[string]map[string]struct{})
-	}
-	m := a.routeMethods[pattern]
-	if m == nil {
-		m = make(map[string]struct{})
-		a.routeMethods[pattern] = m
-	}
-	m[method] = struct{}{}
+	a.routeMethodIndex[key] = len(a.routeMethods)
+	a.routeMethods = append(a.routeMethods, entry)
 }
 
 // AllowedMethods returns the HTTP methods registered for path (uppercase,
@@ -2103,19 +2189,34 @@ func (a *App) trackRouteMethod(method, pattern string) {
 //	    res.End("no\n")
 //	})
 //
-// Returns nil if the path has no registered routes (or is a parametric
-// pattern, which the framework does not track).
+// Returns nil if the path has no registered routes. Parametric and wildcard
+// routes are included using the same route semantics described on
+// MethodNotAllowed.
 func (a *App) AllowedMethods(path string) []string {
-	m, ok := a.routeMethods[path]
-	if !ok {
+	methods := a.allowedMethodSet(path)
+	if len(methods) == 0 {
 		return nil
 	}
-	out := make([]string, 0, len(m))
-	for k := range m {
+	out := make([]string, 0, len(methods))
+	for k := range methods {
 		out = append(out, strings.ToUpper(k))
 	}
 	sort.Strings(out)
 	return out
+}
+
+func (a *App) allowedMethodSet(path string) map[string]struct{} {
+	var methods map[string]struct{}
+	for _, entry := range a.routeMethods {
+		if !entry.matches(path) {
+			continue
+		}
+		if methods == nil {
+			methods = make(map[string]struct{})
+		}
+		methods[entry.method] = struct{}{}
+	}
+	return methods
 }
 
 // catchAllRoutingHandler is the single Any("/*") handler installed at
@@ -2128,7 +2229,7 @@ func (a *App) AllowedMethods(path string) []string {
 func (a *App) catchAllRoutingHandler() Handler {
 	return func(res *Response, req *Request) {
 		url := req.URL()
-		if methods, ok := a.routeMethods[url]; ok {
+		if methods := a.allowedMethodSet(url); len(methods) > 0 {
 			// Path exists; this is a method mismatch → 405.
 			if a.methodNotAllowedHandler != nil {
 				a.methodNotAllowedHandler(res, req)

@@ -37,6 +37,7 @@ body-parse + SQLite query paths.
 - [Hello World](#hello-world)
 - [Routing](#routing)
   - [Basic routes](#basic-routes)
+  - [Route pattern syntax and precedence](#route-pattern-syntax-and-precedence)
   - [Route parameters](#route-parameters)
   - [Typed parameters](#typed-parameters)
   - [Query strings](#query-strings)
@@ -67,6 +68,7 @@ body-parse + SQLite query paths.
 - [Multi-core](#multi-core)
 - [Graceful Shutdown](#graceful-shutdown)
 - [Configuration](#configuration)
+  - [Global state audit](#global-state-audit)
   - [Test server helpers](#test-server-helpers)
   - [TrustProxy and client IPs](#trustproxy-and-client-ips)
   - [net/http adapter body cap](#nethttp-adapter-body-cap)
@@ -298,6 +300,40 @@ Route API surface:
 | `NotFound(handler)` | yes | no | fallback for unmatched routes |
 | `MethodNotAllowed(handler)` | yes | no | fallback for known path with unsupported method |
 
+### Route pattern syntax and precedence
+
+Route patterns are path patterns, not full URLs. Query strings are not part
+of matching; read them with `req.QueryParam`, `req.QueryInt`, or
+`req.QueryBool`. A pattern must be non-empty, start with `/`, and contain no
+NUL, CR, or LF bytes. Invalid patterns panic during registration. Matching is
+case-sensitive. Trailing slashes are significant for route patterns: `/users`
+and `/users/` are different routes unless you register both.
+
+Supported route segments:
+
+| Segment | Meaning |
+|---|---|
+| `users` | literal path segment; matches only `users` |
+| `:id` | one non-empty path segment; available with `req.Parameter(i)` or `req.Param("id")` |
+| `:id<int>` | named segment plus a gogo type constraint checked before middleware and the handler |
+| trailing wildcard segment | catch-all wildcard, for example `/files/*`, `/files/**`, or `/*` |
+
+Parameter names are metadata for request helpers and reverse routing; they do
+not make two otherwise identical native route shapes distinct. Avoid
+registering ambiguous patterns such as `/users/:id` and `/users/:name` for the
+same method.
+
+For a request on a concrete HTTP method, the native router prefers literal
+segments over named parameters, and named parameters over wildcard catch-alls.
+Method-specific routes are tried before `Any` routes. gogo's own catch-all for
+`NotFound`, `MethodNotAllowed`, and middleware on unmatched paths is installed
+just before `Listen`, after user routes, so explicit routes keep precedence.
+
+`MethodNotAllowed` distinguishes wrong-method requests for literal,
+named-parameter, typed-parameter, and terminal wildcard routes. Typed
+constraints must match before a route contributes to the `Allow` header; a
+typed mismatch is still a path miss and falls through to `NotFound`.
+
 ### Route parameters
 
 Read positional parameters with `req.Parameter(i)` or by name with
@@ -324,7 +360,11 @@ Wildcards are supported via uWS pattern syntax:
 
 ```go
 app.Get("/files/*", serveFile)         // matches /files/anything/here
+app.Any("/*", serveSPA)                // catch-all fallback
 ```
+
+Wildcard text is not exposed as a route parameter. Use `req.URL()` if the
+handler needs to inspect the matched suffix.
 
 ### Typed parameters
 
@@ -355,6 +395,11 @@ gogo.RegisterParamType("hex", func(s string) bool {
 app.Get("/blobs/:digest<hex>", handler)
 ```
 
+Malformed annotations, empty parameter names, and unknown type names panic at
+registration. Constraint checks run before middleware and before static replies
+are sent, so a typed route cannot bypass auth or serve a cached body for an
+invalid value.
+
 ### Query strings
 
 ```go
@@ -382,11 +427,19 @@ url, _ = app.URL("api.user.show", map[string]string{"id": "42"})
 // url == "/api/v1/users/42"
 ```
 
+Named routes may use typed annotations; `URL` strips the annotation before
+substitution. Parameter values are path-escaped. Missing params, unknown route
+names, and wildcard patterns return errors.
+
 ### Route groups
 
 `App.Group` and `Router.Group` bind middleware and a path prefix to a
 subtree of routes. Group-bound middleware composes at registration time, so
-there is no per-request URL check.
+there is no per-request URL check. A group prefix must start with `/`, may
+contain named or typed parameters, must not contain wildcards, and has trailing
+slashes stripped. `Group("/")` is equivalent to no prefix. Child route patterns
+must also start with `/`; gogo concatenates the group prefix and child pattern
+literally, then parses them as one route.
 
 ```go
 api := app.Group("/api/v1", authMW, loggerMW)
@@ -397,6 +450,12 @@ admin := api.Group("/admin", adminMW)      // composes auth + logger + admin
 admin.Delete("/users/:id", deleteUser)     // → DELETE /api/v1/admin/users/:id
 ```
 
+`Router.Use` and `Router.UseAsync` append middleware to that router for routes
+registered afterward. Child groups created after the call inherit the new
+middleware. Execution is outermost-first: app middleware, parent group
+middleware, child group middleware, then the handler. Typed-parameter
+rejection happens before all middleware.
+
 `App.Mount` is a tiny convenience for building a Router with a callback:
 
 ```go
@@ -406,6 +465,25 @@ app.Mount("/api/v1", func(r *gogo.Router) {
     r.Post("/users", createUser)
 })
 ```
+
+`Mount` returns the `*Router`, so callers can keep registering on it after the
+callback. Calling `Mount` twice with the same prefix creates independent
+routers; there is no automatic merge.
+
+Path-scoped app middleware uses the same segment-aware prefix rules without
+creating a router:
+
+```go
+app.Use("/api/*", authMW)        // /api and /api/...; not /apiv2
+app.Use("/api/**", auditMW)      // same scope as /api/*
+app.Use("/", requestIDMW)        // global
+```
+
+Scoped `App.Use` still follows registration order: only later routes see the
+middleware. The prefix is matched against the live request URL at request time,
+not the registered route pattern, so dynamic and wildcard routes cannot bypass
+a scoped guard. Prefer `Group` for new subtrees when possible; it gives the
+same scope by router identity with registration-time composition.
 
 ## Handler Styles
 
@@ -669,9 +747,11 @@ app.Get("/api/me", handleMe)
 ```
 
 The first argument to `Use` may optionally be a path pattern that scopes
-the middleware to routes whose URL starts with that prefix at request
-time. Trailing `/*` or `/**` is stripped — `/api/*` and `/api` mean the
-same thing.
+the middleware to request URLs under that prefix. Trailing `/*` or `/**`
+is stripped, so `/api/*`, `/api/**`, and `/api` all mean exact `/api` plus
+children under `/api/`; `/apiv2` does not match. `/`, `/*`, and `/**` mean
+global. The match uses the live request URL at request time, so parametric
+and wildcard routes cannot bypass a scoped guard.
 
 ### Async middleware
 
@@ -1699,6 +1779,13 @@ characters defensively even when a custom encoder does not mirror
 so it intentionally keeps using `encoding/json`; use `Response.Stream` when you
 need to stream custom-encoded chunks.
 
+### Global state audit
+
+Most configuration is per `App`, route, middleware, or hub instance. The
+remaining process-wide knobs and exported mutable sentinels are audited in
+[`docs/global-state.md`](docs/global-state.md), including panic handling, typed
+parameter registration, worker count settings, and package-level limits.
+
 ### Test server helpers
 
 `NewTestServer` starts a real loopback listener for integration-style tests.
@@ -1823,8 +1910,10 @@ app.NotFound(func(res *gogo.Response, req *gogo.Request) {
 
 app.MethodNotAllowed(func(res *gogo.Response, req *gogo.Request) {
     allow := strings.Join(app.AllowedMethods(req.URL()), ", ")
+    res.Status(405)
     res.Header("Allow", allow)
-    res.JSON(405, map[string]string{"error": "method not allowed"})
+    res.Header("Content-Type", "application/json")
+    res.End(`{"error":"method not allowed"}`)
 })
 ```
 

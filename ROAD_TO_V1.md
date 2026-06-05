@@ -79,25 +79,26 @@ files in the same PR unless one agent is explicitly assigned as integrator.
 
 ## v0.2.0 - Correctness and API Freeze Prep
 
-- [ ] Decide whether `App.Use(args ...any)` remains as the v1 API.
-- [ ] Decide whether `Get(pattern, target any)` and `Router.Get` keep the
+- [x] Decide whether `App.Use(args ...any)` remains as the v1 API.
+- [x] Decide whether `Get(pattern, target any)` and `Router.Get` keep the
       `any` target API, or get typed helpers before v1.
 - [x] Add or explicitly reject async method helpers for `PutAsync`,
       `PatchAsync`, and `DeleteAsync` on both `App` and `Router`, including
       body collection semantics and middleware behavior.
-- [ ] If needed, add typed helpers such as `UsePath` / `UseAsyncPath`.
-- [ ] Fix or permanently document `MethodNotAllowed` behavior for dynamic and
+- [x] Explicitly skip typed helpers such as `UsePath` / `UseAsyncPath` for
+      v1; `Group` remains the preferred typed scoping API.
+- [x] Fix or permanently document `MethodNotAllowed` behavior for dynamic and
       wildcard routes.
 - [x] Lock router child-pattern validation so `router.Get("users", ...)` cannot
       accidentally register an unexpected concatenated path.
 - [ ] Decide whether route registration should return a route handle for
       fluent naming, e.g. `app.Get(...).Name(...)`.
-- [ ] Freeze route pattern syntax: named params, typed params, wildcard,
+- [x] Freeze route pattern syntax: named params, typed params, wildcard,
       trailing slash, and case-sensitivity behavior.
-- [ ] Add table-driven compatibility tests for route matching and reverse
+- [x] Add table-driven compatibility tests for route matching and reverse
       routing.
-- [ ] Document group, mount, scoped middleware, and precedence rules.
-- [ ] Add a public global-state audit for `SetPanicHandler`,
+- [x] Document group, mount, scoped middleware, and precedence rules.
+- [x] Add a public global-state audit for `SetPanicHandler`,
       `RegisterParamType`, worker-count settings, and package-level limits.
 - [ ] Add request/response API cleanup issues for exported abort/drain errors,
       stale docs, and any missing named helpers.
