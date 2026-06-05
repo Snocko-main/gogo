@@ -328,6 +328,101 @@ func TestRouterNameIncludesPrefix(t *testing.T) {
 	}
 }
 
+func TestRouterChildPatternMustStartWithSlash(t *testing.T) {
+	cases := []struct {
+		name     string
+		register func(*gogo.Router)
+	}{
+		{
+			name: "Get",
+			register: func(r *gogo.Router) {
+				r.Get("users", func(res *gogo.Response, req *gogo.Request) {})
+			},
+		},
+		{
+			name: "Post",
+			register: func(r *gogo.Router) {
+				r.Post("users", func(res *gogo.Response, req *gogo.Request) {})
+			},
+		},
+		{
+			name: "Any",
+			register: func(r *gogo.Router) {
+				r.Any("users", func(res *gogo.Response, req *gogo.Request) {})
+			},
+		},
+		{
+			name: "Put",
+			register: func(r *gogo.Router) {
+				r.Put("users", func(res *gogo.Response, req *gogo.Request) {})
+			},
+		},
+		{
+			name: "Patch",
+			register: func(r *gogo.Router) {
+				r.Patch("users", func(res *gogo.Response, req *gogo.Request) {})
+			},
+		},
+		{
+			name: "Delete",
+			register: func(r *gogo.Router) {
+				r.Delete("users", func(res *gogo.Response, req *gogo.Request) {})
+			},
+		},
+		{
+			name: "Options",
+			register: func(r *gogo.Router) {
+				r.Options("users", func(res *gogo.Response, req *gogo.Request) {})
+			},
+		},
+		{
+			name: "Head",
+			register: func(r *gogo.Router) {
+				r.Head("users", func(res *gogo.Response, req *gogo.Request) {})
+			},
+		},
+		{
+			name: "GetAsync",
+			register: func(r *gogo.Router) {
+				r.GetAsync("users", func(res *gogo.Response, req *gogo.Request) {})
+			},
+		},
+		{
+			name: "PostAsync",
+			register: func(r *gogo.Router) {
+				r.PostAsync("users", 1024, func(res *gogo.Response, req *gogo.Request, body []byte) {})
+			},
+		},
+		{
+			name: "WebSocket",
+			register: func(r *gogo.Router) {
+				r.WebSocket("users", gogo.WebSocketBehavior{})
+			},
+		},
+		{
+			name: "Name",
+			register: func(r *gogo.Router) {
+				r.Name("api.users", "users")
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			app, _ := gogo.NewApp()
+			defer app.Close()
+			api := app.Group("/api")
+
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("%s accepted child pattern without leading slash", tc.name)
+				}
+			}()
+			tc.register(api)
+		})
+	}
+}
+
 // TestMountRoutesUnderPrefix ensures Mount registers routes under
 // the prefix and delivers the named middleware inside the callback.
 func TestMountRoutesUnderPrefix(t *testing.T) {

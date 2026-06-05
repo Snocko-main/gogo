@@ -1642,13 +1642,14 @@ func (r *Router) Get(pattern string, target any) {
 	}
 }
 
-// preRoute is the Router's twin of App.preRoute. The user pattern is
-// concatenated with the router's prefix and parsed as a single unit
-// so typed-param annotations anywhere along the full path are
-// recognized — e.g. a Group("/users/:userID<int>") with a child
-// Get("/posts/:postID<uuid>") yields a routeMeta covering both
-// names and both constraints.
+// preRoute is the Router's twin of App.preRoute. The child pattern must be a
+// complete route fragment starting with '/', then it is concatenated with the
+// router's prefix and parsed as a single unit so typed-param annotations
+// anywhere along the full path are recognized — e.g. a
+// Group("/users/:userID<int>") with a child Get("/posts/:postID<uuid>") yields
+// a routeMeta covering both names and both constraints.
 func (r *Router) preRoute(method, pattern string) (string, *routeMeta) {
+	validatePattern(pattern)
 	full, meta := parseRoutePattern(r.prefix + pattern)
 	validatePattern(full)
 	if method != "" {
@@ -1892,6 +1893,7 @@ func (r *Router) Name(name, pattern string) {
 	if r == nil || r.app == nil {
 		panic("gogo: Router.Name called on nil Router")
 	}
+	validatePattern(pattern)
 	r.app.Name(name, r.prefix+pattern)
 }
 
