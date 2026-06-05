@@ -14,7 +14,7 @@ accepted as residual risk.
       untrusted clients.
 - [ ] Verify `req.Protocol()`, `req.Secure()`, `req.IP()`, and `req.IPs()` do
       not trust forwarded headers when the app is directly internet-facing.
-- [ ] Document `CapturePeerIP` requirements for async/shared-dispatch routes,
+- [x] Document `CapturePeerIP` requirements for async/shared-dispatch routes,
       rate limiting, audit logs, and auth decisions that depend on peer IP.
 
 ## WebSocket Origin And Auth
