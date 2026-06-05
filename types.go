@@ -1250,7 +1250,8 @@ type PostAsyncHandler = BodyAsyncHandler
 // PostAsync registers a POST route that collects the full request body up to
 // maxBodyBytes, then invokes handler on a goroutine with the collected bytes
 // plus a request snapshot. On bodies that exceed maxBodyBytes the framework
-// sends 413 Payload Too Large automatically and the handler is not called.
+// sends 413 Payload Too Large automatically; on Config.BodyReadTimeout it sends
+// 408 Request Timeout. In both cases the handler is not called.
 func (a *App) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandler) {
 	a.bodyAsync("post", pattern, maxBodyBytes, handler)
 }
@@ -1258,7 +1259,8 @@ func (a *App) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandl
 // PutAsync registers a PUT route that collects the full request body up to
 // maxBodyBytes, then invokes handler on a goroutine with the collected bytes
 // plus a request snapshot. On bodies that exceed maxBodyBytes the framework
-// sends 413 Payload Too Large automatically and the handler is not called.
+// sends 413 Payload Too Large automatically; on Config.BodyReadTimeout it sends
+// 408 Request Timeout. In both cases the handler is not called.
 func (a *App) PutAsync(pattern string, maxBodyBytes int, handler BodyAsyncHandler) {
 	a.bodyAsync("put", pattern, maxBodyBytes, handler)
 }
@@ -1266,7 +1268,8 @@ func (a *App) PutAsync(pattern string, maxBodyBytes int, handler BodyAsyncHandle
 // PatchAsync registers a PATCH route that collects the full request body up to
 // maxBodyBytes, then invokes handler on a goroutine with the collected bytes
 // plus a request snapshot. On bodies that exceed maxBodyBytes the framework
-// sends 413 Payload Too Large automatically and the handler is not called.
+// sends 413 Payload Too Large automatically; on Config.BodyReadTimeout it sends
+// 408 Request Timeout. In both cases the handler is not called.
 func (a *App) PatchAsync(pattern string, maxBodyBytes int, handler BodyAsyncHandler) {
 	a.bodyAsync("patch", pattern, maxBodyBytes, handler)
 }
@@ -1274,8 +1277,9 @@ func (a *App) PatchAsync(pattern string, maxBodyBytes int, handler BodyAsyncHand
 // DeleteAsync registers a DELETE route that collects the full request body up
 // to maxBodyBytes, then invokes handler on a goroutine with the collected
 // bytes plus a request snapshot. On bodies that exceed maxBodyBytes the
-// framework sends 413 Payload Too Large automatically and the handler is not
-// called.
+// framework sends 413 Payload Too Large automatically; on
+// Config.BodyReadTimeout it sends 408 Request Timeout. In both cases the
+// handler is not called.
 func (a *App) DeleteAsync(pattern string, maxBodyBytes int, handler BodyAsyncHandler) {
 	a.bodyAsync("delete", pattern, maxBodyBytes, handler)
 }
@@ -1316,8 +1320,7 @@ func (a *App) bodyAsync(method, pattern string, maxBodyBytes int, handler BodyAs
 		// req would be invalid; the snapshot survives.
 		snap := req.snapshotFromSync(a.cfg.CapturePeerIP)
 		res.Body(maxBodyBytes, func(body []byte, err error) {
-			if err == ErrBodyTooLarge {
-				res.Send(413, "text/plain; charset=utf-8", "payload too large\n")
+			if handleBodyCollectionError(res, err) {
 				return
 			}
 			// Async spawns a goroutine and re-arms onAborted with the async
@@ -1333,6 +1336,21 @@ func (a *App) bodyAsync(method, pattern string, maxBodyBytes int, handler BodyAs
 			})
 		})
 	})))
+}
+
+func handleBodyCollectionError(res *Response, err error) bool {
+	switch err {
+	case nil:
+		return false
+	case ErrBodyTooLarge:
+		res.Send(413, "text/plain; charset=utf-8", "payload too large\n")
+	case ErrBodyTimeout:
+		res.Send(408, "text/plain; charset=utf-8", "request timeout\n")
+	default:
+		reportPanic(err)
+		res.Send(500, "text/plain; charset=utf-8", "internal server error\n")
+	}
+	return true
 }
 
 func (a *App) registerBodyRoute(method, pattern string, handler Handler) {
@@ -1812,28 +1830,32 @@ func (r *Router) GetAsync(pattern string, handler AsyncHandler) {
 
 // PostAsync registers a POST route under this Router that collects the body
 // up to maxBodyBytes then runs handler on a goroutine. On bodies over the cap
-// the framework sends 413 and the handler is not called.
+// the framework sends 413; on Config.BodyReadTimeout it sends 408. In both
+// cases the handler is not called.
 func (r *Router) PostAsync(pattern string, maxBodyBytes int, handler PostAsyncHandler) {
 	r.bodyAsync("post", pattern, maxBodyBytes, handler)
 }
 
 // PutAsync registers a PUT route under this Router that collects the body up
 // to maxBodyBytes then runs handler on a goroutine. On bodies over the cap the
-// framework sends 413 and the handler is not called.
+// framework sends 413; on Config.BodyReadTimeout it sends 408. In both cases
+// the handler is not called.
 func (r *Router) PutAsync(pattern string, maxBodyBytes int, handler BodyAsyncHandler) {
 	r.bodyAsync("put", pattern, maxBodyBytes, handler)
 }
 
 // PatchAsync registers a PATCH route under this Router that collects the body
 // up to maxBodyBytes then runs handler on a goroutine. On bodies over the cap
-// the framework sends 413 and the handler is not called.
+// the framework sends 413; on Config.BodyReadTimeout it sends 408. In both
+// cases the handler is not called.
 func (r *Router) PatchAsync(pattern string, maxBodyBytes int, handler BodyAsyncHandler) {
 	r.bodyAsync("patch", pattern, maxBodyBytes, handler)
 }
 
 // DeleteAsync registers a DELETE route under this Router that collects the
 // body up to maxBodyBytes then runs handler on a goroutine. On bodies over the
-// cap the framework sends 413 and the handler is not called.
+// cap the framework sends 413; on Config.BodyReadTimeout it sends 408. In both
+// cases the handler is not called.
 func (r *Router) DeleteAsync(pattern string, maxBodyBytes int, handler BodyAsyncHandler) {
 	r.bodyAsync("delete", pattern, maxBodyBytes, handler)
 }
@@ -1852,8 +1874,7 @@ func (r *Router) bodyAsync(method, pattern string, maxBodyBytes int, handler Bod
 	syncEntry := func(res *Response, req *Request) {
 		snap := req.snapshotFromSync(r.app.cfg.CapturePeerIP)
 		res.Body(maxBodyBytes, func(body []byte, err error) {
-			if err == ErrBodyTooLarge {
-				res.Send(413, "text/plain; charset=utf-8", "payload too large\n")
+			if handleBodyCollectionError(res, err) {
 				return
 			}
 			res.Async(func() {

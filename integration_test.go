@@ -3053,6 +3053,76 @@ func TestBodyReadTimeout(t *testing.T) {
 	}
 }
 
+func TestBodyAsyncReadTimeoutSends408WithoutHandler(t *testing.T) {
+	var handlerCalls atomic.Int32
+	handler := func(res *gogo.Response, req *gogo.Request, body []byte) {
+		handlerCalls.Add(1)
+		res.Send(200, "text/plain", "unexpected")
+	}
+
+	port, teardown := startAppCfg(t, gogo.Config{BodyReadTimeout: 100 * time.Millisecond}, func(app *gogo.App) {
+		app.PostAsync("/post", 64*1024, handler)
+		app.PutAsync("/put", 64*1024, handler)
+		app.PatchAsync("/patch", 64*1024, handler)
+		app.DeleteAsync("/delete", 64*1024, handler)
+
+		api := app.Group("/api")
+		api.PostAsync("/post", 64*1024, handler)
+	})
+	defer teardown()
+
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{"POST", "/post"},
+		{"PUT", "/put"},
+		{"PATCH", "/patch"},
+		{"DELETE", "/delete"},
+		{"POST", "/api/post"},
+	} {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			status, body := slowBodyResponse(t, port, tc.method, tc.path)
+			if status != 408 {
+				t.Fatalf("got %d %q, want 408", status, body)
+			}
+			if body != "request timeout\n" {
+				t.Fatalf("got body %q, want request timeout", body)
+			}
+		})
+	}
+
+	if got := handlerCalls.Load(); got != 0 {
+		t.Fatalf("body-async handler calls = %d, want 0", got)
+	}
+}
+
+func slowBodyResponse(t *testing.T, port int, method, path string) (status int, body string) {
+	t.Helper()
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := fmt.Fprintf(conn, "%s %s HTTP/1.1\r\nHost: x\r\nContent-Length: 1024\r\nConnection: close\r\n\r\nhello", method, path); err != nil {
+		t.Fatalf("write slow request: %v", err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	return resp.StatusCode, string(b)
+}
+
 // TestBodyReadTimeoutDoesNotFireOnNormalUpload: a well-behaved POST
 // that finishes promptly must NOT see the timeout error — the timer
 // has to stop on the success path.
