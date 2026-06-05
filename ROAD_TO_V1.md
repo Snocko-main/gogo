@@ -74,7 +74,8 @@ files in the same PR unless one agent is explicitly assigned as integrator.
 - [x] Add README version policy for `v0.x` vs `v1`.
 - [x] Add release checklist for future tags.
 - [x] Document branch protection expectations before the v1 release candidate.
-- [ ] Verify all README examples compile.
+- [x] Verify runnable README examples and `examples/...` packages compile;
+      README snippets are treated as documented fragments.
 
 ## v0.2.0 - Correctness and API Freeze Prep
 
