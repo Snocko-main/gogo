@@ -1915,11 +1915,12 @@ func (a *App) NotFound(h Handler) {
 	a.notFoundHandler = h
 }
 
-// Name tags a previously-registered route pattern with a name so
-// App.URL can perform reverse routing. The pattern must be the same
-// (post-strip) form that the route was registered with — typically
-// the literal string you passed to Get / Post / etc., minus any
-// <type> annotations. The simplest usage:
+// Name tags a previously-registered route pattern with a name so App.URL can
+// perform reverse routing. Route registration methods intentionally do not
+// return fluent route handles; use Name explicitly when a route needs reverse
+// routing. The pattern must be the same (post-strip) form that the route was
+// registered with — typically the literal string you passed to Get / Post /
+// etc., minus any <type> annotations. The simplest usage:
 //
 //	app.Get("/users/:id", showUser)
 //	app.Name("user.show", "/users/:id")
@@ -4702,9 +4703,10 @@ func (e errFramework) Error() string { return string(e) }
 
 // Body collects the full request body and invokes done once it has arrived.
 // If the body exceeds the effective limit, done is called with err =
-// ErrBodyTooLarge and the response is closed without sending. Call inside
-// the route handler before it returns; done runs on the loop thread (spawn
-// a goroutine for blocking work).
+// ErrBodyTooLarge and the response is closed without sending. If the client
+// aborts before the body completes, done is not called; use OnAborted or
+// Request.Context for abort cleanup. Call inside the route handler before it
+// returns; done runs on the loop thread (spawn a goroutine for blocking work).
 //
 // The effective limit is the LOWER of maxBytes and Config.BodyLimit when
 // BOTH are positive. A handler that asks for 10 MiB on an app configured

@@ -91,8 +91,9 @@ files in the same PR unless one agent is explicitly assigned as integrator.
       wildcard routes.
 - [x] Lock router child-pattern validation so `router.Get("users", ...)` cannot
       accidentally register an unexpected concatenated path.
-- [ ] Decide whether route registration should return a route handle for
-      fluent naming, e.g. `app.Get(...).Name(...)`.
+- [x] Keep explicit route naming via `app.Name(name, pattern)` /
+      `router.Name(name, pattern)` for v1; route registration methods do not
+      return fluent route handles.
 - [x] Freeze route pattern syntax: named params, typed params, wildcard,
       trailing slash, and case-sensitivity behavior.
 - [x] Add table-driven compatibility tests for route matching and reverse
@@ -106,7 +107,7 @@ files in the same PR unless one agent is explicitly assigned as integrator.
         `Response.Stream`.
   - [x] Fix body-async timeout behavior so `ErrBodyTimeout` does not dispatch a
         nil-body handler invocation.
-  - [ ] Decide whether body-read aborts need a public sentinel or whether the
+  - [x] Decide whether body-read aborts need a public sentinel or whether the
         current no-callback abort contract is final.
   - [x] Fix `BodyParser` / `ErrNoBody` docs for sync handlers that must use
         `ParseBody` after `Response.Body`.

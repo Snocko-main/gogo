@@ -4331,10 +4331,13 @@ func TestOnDataPreservesUserOnAborted(t *testing.T) {
 // ref when the client disconnects before isLast.
 func TestBodyPreservesUserOnAborted(t *testing.T) {
 	started := make(chan *gogo.Aborted, 1)
+	bodyDone := make(chan error, 1)
 	port, teardown := startAppCfg(t, gogo.Config{BodyLimit: 1 << 20}, func(app *gogo.App) {
 		app.Post("/upload", func(res *gogo.Response, req *gogo.Request) {
 			aborted := res.OnAborted()
-			res.Body(1<<20, func(body []byte, err error) {})
+			res.Body(1<<20, func(body []byte, err error) {
+				bodyDone <- err
+			})
 			started <- aborted
 		})
 	})
@@ -4342,6 +4345,11 @@ func TestBodyPreservesUserOnAborted(t *testing.T) {
 
 	aborted := openChunkedUploadAndAbort(t, port, "/upload", started)
 	waitForAbortFlag(t, aborted)
+	select {
+	case err := <-bodyDone:
+		t.Fatalf("Body callback ran after client abort: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
 }
 
 func openChunkedUploadAndAbort(t *testing.T, port int, path string, started <-chan *gogo.Aborted) *gogo.Aborted {
