@@ -165,6 +165,10 @@ Use pinned tags for applications that need repeatable builds:
 go get github.com/Snocko-main/gogo@v0.1.0
 ```
 
+Release maintainers should follow [`docs/release-checklist.md`](docs/release-checklist.md)
+and [`docs/branch-protection.md`](docs/branch-protection.md) before cutting
+public tags.
+
 ## Hello World
 
 The smallest possible gogo~ server:
