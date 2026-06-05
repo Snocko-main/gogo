@@ -423,6 +423,10 @@ const (
 // app creation and bind time. The struct is intentionally narrow — knobs
 // only get added here when they need a single, app-wide value.
 //
+// Panic recovery is intentionally not part of Config. The supported panic
+// hook is SetPanicHandler, which is process-wide because recovery sites include
+// package-level workers and callbacks that are not owned by a single App.
+//
 // # Connection-level timeouts and limits
 //
 // A few knobs that look like they belong here are deliberately not
@@ -648,7 +652,8 @@ func defaultConfig(c Config) Config {
 
 // NewApp creates a non-TLS uWebSockets app. With no Config the app uses safe
 // production defaults; pass at most one Config to override. The variadic shape
-// is retained only for backward compatibility with the old zero-arg signature.
+// is the compatibility contract: NewApp() remains valid, NewApp(Config{...})
+// applies overrides, and more than one Config returns an error.
 func NewApp(cfg ...Config) (*App, error) {
 	if len(cfg) > 1 {
 		return nil, fmt.Errorf("gogo: NewApp accepts at most one Config (got %d)", len(cfg))

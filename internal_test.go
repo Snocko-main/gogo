@@ -153,6 +153,44 @@ func TestNewAppRejectsInvalidConfigBeforeNativeSetup(t *testing.T) {
 	}
 }
 
+func TestSetPanicHandlerUsesGlobalHandler(t *testing.T) {
+	t.Cleanup(func() { SetPanicHandler(nil) })
+
+	var got []any
+	SetPanicHandler(func(recovered any) {
+		got = append(got, recovered)
+	})
+
+	reportPanic("first")
+	reportPanic("second")
+
+	if len(got) != 2 {
+		t.Fatalf("panic handler calls = %d, want 2", len(got))
+	}
+	if got[0] != "first" || got[1] != "second" {
+		t.Fatalf("panic handler payloads = %#v, want first, second", got)
+	}
+}
+
+func TestSetPanicHandlerRecoversHandlerPanic(t *testing.T) {
+	t.Cleanup(func() { SetPanicHandler(nil) })
+
+	SetPanicHandler(func(any) {
+		panic("panic handler failed")
+	})
+
+	panicked := false
+	func() {
+		defer func() {
+			panicked = recover() != nil
+		}()
+		reportPanic("boom")
+	}()
+	if panicked {
+		t.Fatal("reportPanic propagated a panic from the panic handler")
+	}
+}
+
 func TestDefaultConfigJSONCodecs(t *testing.T) {
 	cfg := defaultConfig(Config{})
 	if cfg.JSONEncoder == nil {

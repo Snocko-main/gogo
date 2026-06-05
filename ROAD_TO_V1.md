@@ -116,15 +116,15 @@ files in the same PR unless one agent is explicitly assigned as integrator.
 
 ## v0.3.0 - Config Behavior
 
-- [ ] Decide whether `NewApp(cfg ...Config)` stays variadic for v1.
+- [x] Keep `NewApp(cfg ...Config)` variadic for v1 compatibility: zero or one
+      config is supported, extra configs return an error.
 - [x] Validate config inputs before v1: extra configs, negative limits,
       disabled limits, timeout sentinels, and zero-value defaults.
 - [ ] Add `ShutdownContext(ctx)` or another blocking graceful-shutdown API if
       the current non-blocking graceful shutdown is not enough.
 - [x] Fix lifecycle hook contract: `OnListen` panic recovery, nil hooks, and
       repeated `Shutdown` / `ShutdownGracefully` hook behavior.
-- [ ] Add app-scoped panic handling in `Config`, or explicitly keep the global
-      handler as the supported model.
+- [x] Keep `SetPanicHandler` global as the supported panic-recovery model.
 - [ ] Add `RunMultiCore` config/options support or explicitly document the
       current process-wide config limits.
 - [ ] Add graceful multicore shutdown or document immediate shutdown only.
