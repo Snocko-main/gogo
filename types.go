@@ -1971,9 +1971,7 @@ func (a *App) Listen(port int) bool {
 	}
 	ok := a.inner.listen(a.cfg.BindAddr, port)
 	if ok {
-		for _, fn := range a.onListenHooks {
-			fn(port)
-		}
+		a.fireListenHooks(port)
 	}
 	return ok
 }
@@ -2097,17 +2095,40 @@ func joinAllowHeader(methods map[string]struct{}) string {
 // agent, sending a "ready" signal to a supervisor. Hooks run in the
 // order they were registered and panic-recover at framework level so a
 // misbehaving hook can't block the rest. Safe to call before or after
-// route registration; not safe to call concurrently with Listen.
+// route registration; not safe to call concurrently with Listen. Calling
+// OnListen(nil) is a no-op.
 func (a *App) OnListen(fn func(port int)) {
+	if fn == nil {
+		return
+	}
 	a.onListenHooks = append(a.onListenHooks, fn)
+}
+
+// fireListenHooks runs every registered OnListen callback with per-callback
+// panic recovery so a buggy hook cannot prevent later hooks from running.
+func (a *App) fireListenHooks(port int) {
+	for _, fn := range a.onListenHooks {
+		func(f func(int)) {
+			defer func() {
+				if r := recover(); r != nil {
+					reportPanic(r)
+				}
+			}()
+			f(port)
+		}(fn)
+	}
 }
 
 // OnShutdown registers a callback that fires synchronously at the start
 // of Shutdown / ShutdownGracefully (before the C++ close is dispatched
 // to the loop). Use it to flush logs, close DB pools, etc. Hooks run in
 // registration order and run on whatever goroutine called Shutdown.
-// Idempotent: a second Shutdown call still fires every hook again.
+// Idempotent: a second Shutdown call still fires every hook again. Calling
+// OnShutdown(nil) is a no-op.
 func (a *App) OnShutdown(fn func()) {
+	if fn == nil {
+		return
+	}
 	a.onShutdownHooks = append(a.onShutdownHooks, fn)
 }
 

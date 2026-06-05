@@ -4823,6 +4823,49 @@ func TestLifecycleHooks(t *testing.T) {
 	}
 }
 
+func TestLifecycleHookPanicsAreRecovered(t *testing.T) {
+	var panicked atomic.Int32
+	gogo.SetPanicHandler(func(recovered any) {
+		panicked.Add(1)
+	})
+	defer gogo.SetPanicHandler(nil)
+
+	var listenAfter atomic.Bool
+	var shutdownAfter atomic.Bool
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.OnListen(nil)
+		app.OnListen(func(int) { panic("listen hook boom") })
+		app.OnListen(func(int) { listenAfter.Store(true) })
+
+		app.OnShutdown(nil)
+		app.OnShutdown(func() { panic("shutdown hook boom") })
+		app.OnShutdown(func() { shutdownAfter.Store(true) })
+
+		app.Get("/x", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+
+	if !listenAfter.Load() {
+		t.Fatal("OnListen hook after panic did not run")
+	}
+	if got := panicked.Load(); got != 1 {
+		t.Fatalf("panic handler after OnListen = %d, want 1", got)
+	}
+	if status, _ := httpGet(t, port, "/x"); status != 200 {
+		t.Fatalf("post-OnListen-panic request failed: %d", status)
+	}
+
+	teardown()
+
+	if !shutdownAfter.Load() {
+		t.Fatal("OnShutdown hook after panic did not run")
+	}
+	if got := panicked.Load(); got != 2 {
+		t.Fatalf("panic handler after OnShutdown = %d, want 2", got)
+	}
+}
+
 // TestShutdownHooksFireOnGraceful: same hooks fire from
 // ShutdownGracefully as from Shutdown.
 func TestShutdownHooksFireOnGraceful(t *testing.T) {
