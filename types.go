@@ -574,6 +574,8 @@ type App struct {
 	stopping      atomic.Bool
 	closed        atomic.Bool
 	pendingTimers atomic.Int32
+	runDone       chan struct{}
+	runDoneOnce   sync.Once
 	// nativeMu serializes App.Close with cross-thread native calls that keep
 	// using the app pointer after leaving Go, such as WebSocket publishes.
 	nativeMu sync.RWMutex
@@ -668,7 +670,7 @@ func NewApp(cfg ...Config) (*App, error) {
 	initSharedLayout()
 	inner.setBodyLimit(c.BodyLimit)
 	inner.setCapturePeerIP(c.CapturePeerIP)
-	return &App{inner: inner, cfg: c}, nil
+	return &App{inner: inner, cfg: c, runDone: make(chan struct{})}, nil
 }
 
 func (a *App) acquireSharedWorkerRef() {
@@ -2354,8 +2356,18 @@ func (a *App) fireShutdownHooks() {
 // the shared-memory drain timer on this loop so SendShared responses can be
 // flushed by the loop thread.
 func (a *App) Run() {
+	defer a.finishRun()
 	a.inner.startSharedDrain(200) // 200μs drain interval
 	a.inner.run()
+}
+
+func (a *App) finishRun() {
+	if a.runDone == nil {
+		return
+	}
+	a.runDoneOnce.Do(func() {
+		close(a.runDone)
+	})
 }
 
 // Shutdown stops the app immediately: the listen socket and every
@@ -2425,6 +2437,32 @@ func (a *App) ShutdownGracefully(timeout time.Duration) {
 	}()
 }
 
+// ShutdownContext starts a graceful shutdown and blocks until Run exits or
+// ctx is done. It closes the listen socket immediately, lets accepted
+// connections drain naturally, and returns nil when the loop exits.
+//
+// If ctx is done before the loop exits, ShutdownContext force-closes active
+// connections with Shutdown and returns ctx.Err(). Call Close after Run
+// returns to free native resources. Passing a nil context returns an error.
+func (a *App) ShutdownContext(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("gogo: ShutdownContext requires a non-nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		a.Shutdown()
+		return err
+	}
+
+	a.ShutdownGracefully(0)
+	select {
+	case <-a.runDone:
+		return nil
+	case <-ctx.Done():
+		a.Shutdown()
+		return ctx.Err()
+	}
+}
+
 // Close frees native resources. Call it only after Run has returned, or
 // before Run if the app was never started. Waits for any in-flight
 // ShutdownGracefully force-close goroutine to settle so a delayed
@@ -2449,6 +2487,7 @@ func (a *App) Close() {
 	a.nativeMu.Lock()
 	a.inner.close()
 	a.nativeMu.Unlock()
+	a.finishRun()
 	// Drop the worker pool reference exactly once per shared App.
 	// Multiple Close calls (defensive teardown, force-close timer
 	// overlap) must not over-decrement the global active-apps counter.

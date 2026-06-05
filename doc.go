@@ -233,11 +233,15 @@
 //
 // # Graceful shutdown
 //
-//	app.Shutdown() // close listen socket + drain timer; returns immediately
+//	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+//	defer cancel()
+//	if err := app.ShutdownContext(ctx); err != nil {
+//	    log.Printf("forced shutdown: %v", err)
+//	}
 //	// when Run() returns, call:
-//	app.Close()    // free native resources
+//	app.Close() // free native resources
 //
-// Shutdown is safe from any goroutine.
+// Shutdown, ShutdownGracefully, and ShutdownContext are safe from any goroutine.
 //
 // # Performance characteristics
 //
