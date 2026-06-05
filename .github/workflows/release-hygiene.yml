@@ -1,0 +1,121 @@
+name: Release Hygiene
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_STABLE_VERSION: 1.26.x
+
+jobs:
+  go-tests:
+    name: Go tests (${{ matrix.os }}, Go ${{ matrix.go-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+        go-version:
+          - 1.24.x
+          - 1.26.x
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+
+      - name: Run Go tests
+        run: go test ./...
+
+  native-tests:
+    name: Native tests (${{ matrix.os }}, Go ${{ matrix.go-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+        go-version:
+          - 1.24.x
+          - 1.26.x
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+
+      - name: Install native dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential zlib1g-dev
+
+      - name: Verify C++20 and zlib toolchain
+        run: |
+          c++ --version
+          printf '#include <version>\nint main() { return 0; }\n' | c++ -std=c++20 -x c++ - -o /tmp/gogo-cxx20-check
+          printf '#include <zlib.h>\nint main() { return 0; }\n' | cc -x c - -lz -o /tmp/gogo-zlib-check
+
+      - name: Run native Go tests
+        run: CGO_ENABLED=1 go test -tags gogo ./...
+
+  release-checks:
+    name: Release checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_STABLE_VERSION }}
+          cache: true
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential zlib1g-dev
+
+      - name: Check shell scripts
+        run: sh -n scripts/check_tracked_native_sources.sh scripts/downstream_smoke_build.sh
+
+      - name: Check tracked native sources
+        run: scripts/check_tracked_native_sources.sh
+
+      - name: Run downstream smoke build
+        run: scripts/downstream_smoke_build.sh --local "$GITHUB_WORKSPACE"
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Run govulncheck
+        run: |
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+      - name: Run native govulncheck
+        run: |
+          CGO_ENABLED=1 "$(go env GOPATH)/bin/govulncheck" -tags gogo ./...
