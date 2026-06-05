@@ -1723,11 +1723,26 @@ func main() {
     sigCh := make(chan os.Signal, 1)
     signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
     <-sigCh
-    log.Println("draining workers")
+    log.Println("stopping workers")
     handle.Shutdown()
     handle.Wait()
 }
 ```
+
+`RunMultiCore` currently has no `Config` or options parameter. Each worker
+`App` is created with the zero-value `Config`, so app-scoped fields such as
+`BodyLimit`, `BodyReadTimeout`, `BindAddr`, `CapturePeerIP`, `TrustProxy`,
+`JSONEncoder`, and `JSONDecoder` cannot be supplied through this helper today.
+Set process-wide knobs before `RunMultiCore`, register per-route/per-middleware
+options inside `setup`, and create shared resources outside `setup` so every
+worker captures the same instance.
+
+`MultiCoreHandle.Shutdown` is immediate: it calls `Shutdown` on every worker,
+which closes the listen socket and active connections. It is safe and
+idempotent, and `Wait` blocks until every worker loop exits and native
+resources are freed. There is not yet a multicore equivalent of
+`App.ShutdownGracefully`; use a single-loop `App` when you need the built-in
+graceful drain behavior.
 
 Tuning knobs that actually matter:
 
@@ -1759,6 +1774,10 @@ app.ShutdownGracefully(30 * time.Second)   // wait for in-flight requests
 
 `Shutdown` closes the listen socket and drains the loop; `Close` frees
 native resources. Both are safe from any goroutine.
+
+`ShutdownGracefully` is an `App` API. `RunMultiCore` currently exposes only
+`MultiCoreHandle.Shutdown`, which stops every worker immediately and may drop
+in-flight responses.
 
 ## Configuration
 

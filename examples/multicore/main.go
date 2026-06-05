@@ -7,8 +7,7 @@
 //     so per-worker initialization stays cheap
 //   - Per-worker request counters aggregated through a /metrics
 //     endpoint formatted as Prometheus text exposition
-//   - Graceful shutdown driven by SIGINT / SIGTERM — every worker
-//     drains its in-flight requests before exiting
+//   - Signal-driven immediate shutdown via SIGINT / SIGTERM
 //
 // Run with:
 //
@@ -34,6 +33,11 @@
 // captured into setup. The example below uses an atomic.Int64 for
 // counts; a production app would create a *sql.DB once at startup
 // and pass it into every handler closure.
+//
+// Config boundary — RunMultiCore currently creates each worker App
+// with the zero-value gogo.Config. App-scoped Config fields are not
+// configurable through this helper; use process-wide knobs before
+// RunMultiCore and per-route/per-middleware options inside setup.
 //
 // Pinning to CPUs — gogo doesn't pin loops to specific cores
 // today. With a `RunMultiCore(N=NumCPU)` config the kernel typically
@@ -83,18 +87,18 @@ func main() {
 	log.Printf("gogo~ multicore listening on :3000 (%d cores, GOMAXPROCS=%d, started in %s)",
 		cores, runtime.GOMAXPROCS(0), time.Since(startedAt))
 
-	// Signal-driven graceful shutdown: SIGINT (Ctrl+C) or SIGTERM
-	// (container stop) triggers Shutdown on every worker, then we
-	// Wait for the loops to drain before the process exits. Without
-	// the signal handler the binary would exit on Ctrl+C with
-	// in-flight requests dropped.
+	// Signal-driven immediate shutdown: SIGINT (Ctrl+C) or SIGTERM
+	// (container stop) triggers Shutdown on every worker, then Wait
+	// blocks until all loops have exited. MultiCoreHandle does not
+	// currently expose a graceful drain API; active connections may be
+	// closed before in-flight responses complete.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
-	log.Printf("shutdown signal received — draining workers")
+	log.Printf("shutdown signal received — stopping workers")
 	handle.Shutdown()
 	handle.Wait()
-	log.Printf("graceful exit after %s, served %d requests",
+	log.Printf("stopped after %s, served %d requests",
 		time.Since(startedAt), stats.totalRequests.Load())
 }
 

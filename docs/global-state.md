@@ -23,6 +23,27 @@ found there.
   parallel execution unless the test owns the whole process state for its
   duration.
 
+## RunMultiCore Configuration Boundary
+
+`RunMultiCore(n, port, setup)` currently creates each worker with `NewApp()`
+and the zero-value `Config`. It has no `Config` or options parameter, so these
+app-scoped fields cannot be supplied through the multicore helper today:
+
+- `BodyLimit`
+- `BodyReadTimeout`
+- `BindAddr`
+- `CapturePeerIP`
+- `TrustProxy`
+- `JSONEncoder`
+- `JSONDecoder`
+
+Configuration that is process-wide by design, such as `SetWorkerCount`,
+`SetPanicHandler`, `RegisterParamType`, and the package-level limit setters
+below, should be applied before `RunMultiCore`. Route, middleware, WebSocket,
+hub, upload, and file-serving options should be registered inside `setup` so
+every worker receives the same routes and options. Use single-loop
+`NewApp(cfg)` + `Run` when an app-scoped `Config` field is required.
+
 ## Public Global Configuration
 
 | API or state | Default | Scope | Mutation and timing |

@@ -125,9 +125,9 @@ files in the same PR unless one agent is explicitly assigned as integrator.
       repeated `Shutdown` / `ShutdownGracefully` hook behavior.
 - [ ] Add app-scoped panic handling in `Config`, or explicitly keep the global
       handler as the supported model.
-- [ ] Add `RunMultiCore` config/options support or explicitly document the
+- [x] Add `RunMultiCore` config/options support or explicitly document the
       current process-wide config limits.
-- [ ] Add graceful multicore shutdown or document immediate shutdown only.
+- [x] Add graceful multicore shutdown or document immediate shutdown only.
 - [ ] Replace or extend `TrustProxy bool` with trusted proxy CIDR/range support
       before v1, or document why the boolean API is final.
 - [ ] Document `CapturePeerIP` behavior for async and shared-dispatch routes.
