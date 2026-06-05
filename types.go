@@ -614,12 +614,25 @@ type App struct {
 
 const defaultBodyReadTimeout = 30 * time.Second
 
-// defaultConfig fills in safe production defaults for any zero Config
-// fields. Mutates and returns the input.
+// validateConfig rejects ambiguous or unsafe config values before native
+// resources are allocated.
+func validateConfig(c Config) error {
+	if c.BodyLimit < 0 && c.BodyLimit != NoBodyLimit {
+		return fmt.Errorf("gogo: Config.BodyLimit must be non-negative or NoBodyLimit (got %d)", c.BodyLimit)
+	}
+	if c.BodyReadTimeout < 0 && c.BodyReadTimeout != NoBodyReadTimeout {
+		return fmt.Errorf("gogo: Config.BodyReadTimeout must be non-negative or NoBodyReadTimeout (got %s)", c.BodyReadTimeout)
+	}
+	return nil
+}
+
+// defaultConfig fills in safe production defaults for any zero Config fields.
+// Mutates and returns the input. Call validateConfig before defaultConfig when
+// accepting user input.
 func defaultConfig(c Config) Config {
 	if c.BodyLimit == 0 {
 		c.BodyLimit = 4 << 20 // 4 MiB
-	} else if c.BodyLimit < 0 {
+	} else if c.BodyLimit == NoBodyLimit {
 		c.BodyLimit = 0
 	}
 	if c.BodyReadTimeout == 0 {
@@ -634,21 +647,26 @@ func defaultConfig(c Config) Config {
 	return c
 }
 
-// NewApp creates a non-TLS uWebSockets app. With no Config the app uses
-// safe production defaults; pass one Config to override (extra Configs
-// are ignored — variadic only for backward compat with the old zero-arg
-// signature).
+// NewApp creates a non-TLS uWebSockets app. With no Config the app uses safe
+// production defaults; pass at most one Config to override. The variadic shape
+// is retained only for backward compatibility with the old zero-arg signature.
 func NewApp(cfg ...Config) (*App, error) {
+	if len(cfg) > 1 {
+		return nil, fmt.Errorf("gogo: NewApp accepts at most one Config (got %d)", len(cfg))
+	}
+	var c Config
+	if len(cfg) > 0 {
+		c = cfg[0]
+	}
+	if err := validateConfig(c); err != nil {
+		return nil, err
+	}
+	c = defaultConfig(c)
 	inner, err := newAppNative()
 	if err != nil {
 		return nil, err
 	}
 	initSharedLayout()
-	var c Config
-	if len(cfg) > 0 {
-		c = cfg[0]
-	}
-	c = defaultConfig(c)
 	inner.setBodyLimit(c.BodyLimit)
 	inner.setCapturePeerIP(c.CapturePeerIP)
 	return &App{inner: inner, cfg: c}, nil

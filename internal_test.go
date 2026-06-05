@@ -84,6 +84,50 @@ func TestDefaultConfigKeepsExplicitBodyReadTimeout(t *testing.T) {
 	}
 }
 
+func TestValidateConfigRejectsInvalidNegativeBodyLimit(t *testing.T) {
+	if err := validateConfig(Config{BodyLimit: -2}); err == nil {
+		t.Fatal("validateConfig accepted negative BodyLimit other than NoBodyLimit")
+	}
+	if err := validateConfig(Config{BodyLimit: NoBodyLimit}); err != nil {
+		t.Fatalf("validateConfig rejected NoBodyLimit: %v", err)
+	}
+}
+
+func TestValidateConfigRejectsInvalidNegativeBodyReadTimeout(t *testing.T) {
+	if err := validateConfig(Config{BodyReadTimeout: -2 * time.Second}); err == nil {
+		t.Fatal("validateConfig accepted negative BodyReadTimeout other than NoBodyReadTimeout")
+	}
+	if err := validateConfig(Config{BodyReadTimeout: NoBodyReadTimeout}); err != nil {
+		t.Fatalf("validateConfig rejected NoBodyReadTimeout: %v", err)
+	}
+}
+
+func TestNewAppRejectsMultipleConfigs(t *testing.T) {
+	app, err := NewApp(Config{}, Config{})
+	if err == nil {
+		if app != nil {
+			app.Close()
+		}
+		t.Fatal("NewApp accepted multiple Config values")
+	}
+	if !strings.Contains(err.Error(), "at most one Config") {
+		t.Fatalf("NewApp multiple Config error = %v", err)
+	}
+}
+
+func TestNewAppRejectsInvalidConfigBeforeNativeSetup(t *testing.T) {
+	app, err := NewApp(Config{BodyLimit: -2})
+	if err == nil {
+		if app != nil {
+			app.Close()
+		}
+		t.Fatal("NewApp accepted invalid BodyLimit")
+	}
+	if !strings.Contains(err.Error(), "Config.BodyLimit") {
+		t.Fatalf("NewApp invalid config error = %v", err)
+	}
+}
+
 func TestDefaultConfigJSONCodecs(t *testing.T) {
 	cfg := defaultConfig(Config{})
 	if cfg.JSONEncoder == nil {
