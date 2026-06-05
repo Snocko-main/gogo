@@ -101,7 +101,11 @@ jobs:
           sudo apt-get install -y build-essential zlib1g-dev
 
       - name: Check shell scripts
-        run: sh -n scripts/check_tracked_native_sources.sh scripts/downstream_smoke_build.sh
+        run: |
+          sh -n \
+            scripts/check_tracked_native_sources.sh \
+            scripts/downstream_smoke_build.sh \
+            scripts/check_readme_examples.sh
 
       - name: Check tracked native sources
         run: scripts/check_tracked_native_sources.sh
@@ -111,6 +115,9 @@ jobs:
 
       - name: Run downstream smoke build
         run: scripts/downstream_smoke_build.sh --local "$GITHUB_WORKSPACE"
+
+      - name: Check README examples
+        run: scripts/check_readme_examples.sh
 
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
