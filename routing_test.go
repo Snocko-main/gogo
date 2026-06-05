@@ -394,6 +394,24 @@ func TestRouterChildPatternMustStartWithSlash(t *testing.T) {
 			},
 		},
 		{
+			name: "PutAsync",
+			register: func(r *gogo.Router) {
+				r.PutAsync("users", 1024, func(res *gogo.Response, req *gogo.Request, body []byte) {})
+			},
+		},
+		{
+			name: "PatchAsync",
+			register: func(r *gogo.Router) {
+				r.PatchAsync("users", 1024, func(res *gogo.Response, req *gogo.Request, body []byte) {})
+			},
+		},
+		{
+			name: "DeleteAsync",
+			register: func(r *gogo.Router) {
+				r.DeleteAsync("users", 1024, func(res *gogo.Response, req *gogo.Request, body []byte) {})
+			},
+		},
+		{
 			name: "WebSocket",
 			register: func(r *gogo.Router) {
 				r.WebSocket("users", gogo.WebSocketBehavior{})

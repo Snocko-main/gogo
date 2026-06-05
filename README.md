@@ -242,6 +242,9 @@ Async route handlers run on a goroutine and receive a request snapshot:
 ```go
 app.GetAsync("/users/:id", showUserFromDB)
 app.PostAsync("/uploads", 10<<20, uploadFile) // max body bytes, then handler
+app.PutAsync("/users/:id", 1<<20, replaceUser)
+app.PatchAsync("/users/:id", 1<<20, patchUser)
+app.DeleteAsync("/users/:id", 64<<10, deleteUserWithBody)
 ```
 
 The same route registration APIs are available on a `*gogo.Router` returned
@@ -253,6 +256,7 @@ api.Get("/health", health)
 api.GetAsync("/users/:id", showUserFromDB)
 api.Post("/users", createUser)
 api.PostAsync("/uploads", 10<<20, uploadFile)
+api.PatchAsync("/users/:id", 1<<20, patchUser)
 ```
 
 Route API surface:
@@ -262,17 +266,20 @@ Route API surface:
 | `Get(pattern, target)` | yes | yes | `Handler`, `func(*Response, *Request)`, `Reply`, `string`, or `[]byte` |
 | `GetAsync(pattern, handler)` | yes | yes | `AsyncHandler` |
 | `Post(pattern, handler)` | yes | yes | `Handler` |
-| `PostAsync(pattern, maxBodyBytes, handler)` | yes | yes | `PostAsyncHandler` with collected body |
+| `PostAsync(pattern, maxBodyBytes, handler)` | yes | yes | `BodyAsyncHandler` / `PostAsyncHandler` with collected body |
 | `Put(pattern, handler)` | yes | yes | `Handler` |
+| `PutAsync(pattern, maxBodyBytes, handler)` | yes | yes | `BodyAsyncHandler` with collected body |
 | `Patch(pattern, handler)` | yes | yes | `Handler` |
+| `PatchAsync(pattern, maxBodyBytes, handler)` | yes | yes | `BodyAsyncHandler` with collected body |
 | `Delete(pattern, handler)` | yes | yes | `Handler` |
+| `DeleteAsync(pattern, maxBodyBytes, handler)` | yes | yes | `BodyAsyncHandler` with collected body |
 | `Options(pattern, handler)` | yes | yes | `Handler` |
 | `Head(pattern, handler)` | yes | yes | `Handler` |
 | `Any(pattern, handler)` | yes | yes | `Handler` for every HTTP method |
 | `WebSocket(pattern, behavior)` | yes | yes | `WebSocketBehavior` |
 | `Group(prefix, ...middleware)` | yes | yes | returns a scoped `*Router` |
 | `Use(...middleware)` | yes | yes | sync middleware; `App.Use` also supports a path prefix |
-| `UseAsync(...middleware)` | yes | yes | async middleware for `GetAsync` / `PostAsync`; `App.UseAsync` also supports a path prefix |
+| `UseAsync(...middleware)` | yes | yes | async middleware for `GetAsync` and body-async routes; `App.UseAsync` also supports a path prefix |
 | `Mount(prefix, func(*Router))` | yes | no | callback sugar over `Group` |
 | `Name(name, pattern)` | yes | yes | names a route pattern for reverse routing |
 | `URL(name, params)` | yes | no | builds a URL for a named route |
@@ -409,7 +416,7 @@ app.GetAsync("/db", func(res *gogo.Response, req *gogo.Request) {
     res.Send(200, "text/plain", "hi "+name)
 })
 
-// 3) PostAsync — async handler with the body fully collected up to maxBodyBytes.
+// 3) Body async — async handler with the body fully collected up to maxBodyBytes.
 //    Oversize bodies → 413 automatically.
 app.PostAsync("/upload", 1<<20, func(res *gogo.Response, req *gogo.Request, body []byte) {
     res.JSON(200, map[string]int{"size": len(body)})
@@ -563,6 +570,8 @@ the built-in HTML engine does this so the cap is enforced while rendering.
 Content-Type. Supported: `application/json`, `application/x-www-form-urlencoded`,
 `multipart/form-data` (value parts only). JSON uses `Config.JSONDecoder` when
 configured; `Response.JSON` and `Response.JSONP` use `Config.JSONEncoder`.
+Use it from body-async handlers such as `PostAsync`, `PutAsync`, `PatchAsync`,
+and `DeleteAsync`.
 
 ```go
 type CreateUser struct {
@@ -654,7 +663,7 @@ same thing.
 
 ### Async middleware
 
-`AsyncMiddleware` wraps `GetAsync` / `PostAsync` handlers and runs on the
+`AsyncMiddleware` wraps `GetAsync` and body-async handlers and runs on the
 same goroutine as the user handler, so it IS free to block (DB lookups,
 remote calls). Typical use: resolve a user from a token, then pass it down
 via `SetLocal`.
@@ -1095,7 +1104,7 @@ func main() {
         res.JSON(200, u)
     })
 
-    // PostAsync — body is pre-collected, BodyParser deserializes JSON / form.
+    // Body-async methods pre-collect the body; BodyParser deserializes JSON / form.
     app.PostAsync("/users", 1<<20, func(res *gogo.Response, req *gogo.Request, body []byte) {
         var in struct {
             Name string `json:"name"`

@@ -51,7 +51,8 @@
 //     callback that runs the chain with the live request, then captures a
 //     snapshot and spawns the user goroutine.
 //
-//   - app.PostAsync (PostAsyncHandler):
+//   - app.PostAsync / app.PutAsync / app.PatchAsync / app.DeleteAsync
+//     (BodyAsyncHandler):
 //     async handler that receives a fully-collected body up to maxBodyBytes.
 //     Oversize bodies return 413 automatically. Uses res.OnData internally
 //     and switches to async mode once the body is complete.
@@ -60,8 +61,8 @@
 // headers all captured before uWS freed the live request). Snapshot caps in
 // the zero-cgo shared path: URL 256, query 512, params 8x64, headers 8 KB
 // total; requests that exceed those caps are rejected with 431 rather than
-// being silently truncated. The middleware/PostAsync paths copy headers exactly
-// via cgo so they have no cap.
+// being silently truncated. The middleware/body-async paths copy headers
+// exactly via cgo so they have no cap.
 //
 // # Responses
 //
@@ -108,7 +109,7 @@
 //
 // # Async middleware
 //
-// AsyncMiddleware wraps GetAsync / PostAsync handlers and runs on the same
+// AsyncMiddleware wraps GetAsync and body-async handlers and runs on the same
 // goroutine as the user handler, so it IS free to block — typical use:
 // resolve a user from a session token via a DB lookup, then hand the
 // loaded user to the handler.
@@ -131,14 +132,14 @@
 //	    res.JSON(200, user)
 //	})
 //
-// Async middleware applies only to GetAsync / PostAsync. If only async
-// middleware matches a GetAsync route (no sync mw), the framework still
+// Async middleware applies only to GetAsync and body-async routes. If only
+// async middleware matches a GetAsync route (no sync mw), the framework still
 // uses the zero-cgo shared-memory dispatch path; the async chain composes
 // inside the worker goroutine alongside the user handler. Sync routes
-// (Get, Post, Any) never see async middleware.
+// (Get, Post, Put, Patch, Delete, Any) never see async middleware.
 //
 // req.SetLocal / req.Local pass values from middleware to the handler;
-// req.Body() returns the collected body for PostAsync routes (nil
+// req.Body() returns the collected body for body-async routes (nil
 // otherwise), so async middleware can inspect the body before the handler.
 //
 // # Cookies, JSON
