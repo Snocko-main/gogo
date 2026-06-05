@@ -1785,6 +1785,9 @@ app, _ := gogo.NewApp(gogo.Config{
 | `JSONEncoder`     | `encoding/json.Marshal`   | Encoder for `Response.JSON` and `Response.JSONP`        |
 | `JSONDecoder`     | `encoding/json.Unmarshal` | Decoder for `Request.BodyParser` JSON bodies            |
 
+See [`docs/configuration.md`](docs/configuration.md) for local development,
+reverse proxy, and production configuration examples.
+
 `BodyReadTimeout` protects `Response.Body` users from slow body uploads that
 drip bytes forever without exceeding `BodyLimit`. Keep the 30s default for
 ordinary APIs, lower it for small JSON-only endpoints, raise it for legitimate
