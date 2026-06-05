@@ -87,7 +87,7 @@ files in the same PR unless one agent is explicitly assigned as integrator.
 - [ ] If needed, add typed helpers such as `UsePath` / `UseAsyncPath`.
 - [ ] Fix or permanently document `MethodNotAllowed` behavior for dynamic and
       wildcard routes.
-- [ ] Lock router child-pattern validation so `router.Get("users", ...)` cannot
+- [x] Lock router child-pattern validation so `router.Get("users", ...)` cannot
       accidentally register an unexpected concatenated path.
 - [ ] Decide whether route registration should return a route handle for
       fluent naming, e.g. `app.Get(...).Name(...)`.
