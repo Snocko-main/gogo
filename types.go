@@ -3144,9 +3144,9 @@ func (r *Response) JSONStream(code int, fn func(*json.Encoder) error) error {
 // when no Content-Length is set, which is the expected mode for
 // streaming. If the client disconnects mid-stream the underlying
 // AsyncCtx is marked aborted and subsequent Write calls become
-// silent no-ops on the C side; the caller's loop will still run to
-// completion. (A future res.Aborted helper will let callers stop
-// early on disconnect.)
+// silent no-ops on the C side. If the stream is parked on backpressure,
+// Write and AwaitDrain return ErrStreamAborted so callers can stop
+// their generator early.
 func (r *Response) Stream(status int, contentType string, fn func(w io.Writer) error) error {
 	if r.async == nil {
 		panic("gogo: Stream requires an async response; call from GetAsync, a body-async route, or use res.Async first")
@@ -3326,9 +3326,8 @@ func (r *Response) streamBufferedAmount() uint64 {
 // Only valid while a Stream is in flight (r.async != nil); calling
 // outside that scope returns nil with no work done.
 //
-// Returns context.Canceled (well, a sentinel "stream aborted"
-// error) when the client disconnects before the buffer drains —
-// callers in a streaming loop should propagate the error to break
+// Returns ErrStreamAborted when the client disconnects before the buffer
+// drains. Callers in a streaming loop should propagate the error to break
 // out of their generator.
 func (r *Response) AwaitDrain(threshold uint64) error {
 	if r.async == nil {
@@ -3346,16 +3345,17 @@ const drainPollInterval = 2 * time.Millisecond
 func waitForDrain(buffered func() uint64, aborted func() bool, threshold uint64) error {
 	for buffered() > threshold {
 		if aborted() {
-			return errStreamAborted
+			return ErrStreamAborted
 		}
 		time.Sleep(drainPollInterval)
 	}
 	return nil
 }
 
-// errStreamAborted is the sentinel returned by AwaitDrain when
-// the response went away while the goroutine was parked.
-var errStreamAborted = errors.New("gogo: stream aborted while waiting on backpressure drain")
+// ErrStreamAborted is returned by AwaitDrain, and by Stream writes that are
+// parked on AwaitDrain, when the client disconnects before the response's
+// backpressure buffer drains.
+var ErrStreamAborted = errors.New("gogo: stream aborted while waiting on backpressure drain")
 
 // JSONP writes a JSONP response — the JSON-encoded value v wrapped in
 // a function call named callback, served with Content-Type

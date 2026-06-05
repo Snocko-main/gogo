@@ -19,8 +19,8 @@
 // SSE auto-installs Content-Type: text/event-stream, Cache-Control:
 // no-cache, Connection: keep-alive, and X-Accel-Buffering: no (so an
 // nginx in front doesn't buffer the stream and break pushes). Then
-// it delegates to Response.Stream, which means SSE is async-only —
-// register the route via GetAsync / PostAsync.
+// it delegates to Response.Stream, which means SSE is async-only. Call from
+// GetAsync, a body-async route, or a handler that first entered res.Async.
 
 package gogo
 
@@ -223,16 +223,16 @@ func splitSSELines(s string) []string {
 //	Connection:       keep-alive
 //	X-Accel-Buffering: no       (defeats nginx proxy_buffering)
 //
-// Internally delegates to Response.Stream, so SSE inherits its
-// constraints: async-only (call from GetAsync or PostAsync),
-// streaming chunked-encoded body, panic-on-sync-handler.
+// Internally delegates to Response.Stream, so SSE inherits its constraints:
+// async-only (call from GetAsync, a body-async route, or res.Async), streaming
+// chunked-encoded body, panic-on-sync-handler.
 //
-// fn returns when the stream is complete — typically because the
-// upstream event source closed, a context cancellation fired, or
-// the client disconnected (detectable via res.BufferedAmount
-// growing without bound, or via OnAborted). The error fn returns
-// is the error SSE returns; the stream itself is always closed
-// cleanly regardless.
+// fn returns when the stream is complete — typically because the upstream event
+// source closed, a context cancellation fired, or the client disconnected while
+// the producer was parked on backpressure. Use errors.Is(err,
+// ErrStreamAborted) to treat disconnects as normal client churn. The error fn
+// returns is the error SSE returns; the stream itself is always closed cleanly
+// regardless.
 func (r *Response) SSE(fn func(*SSEStream) error) error {
 	r.Header("Cache-Control", "no-cache")
 	r.Header("Connection", "keep-alive")
