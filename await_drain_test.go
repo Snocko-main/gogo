@@ -42,8 +42,8 @@ func TestWaitForDrainReturnsStreamAborted(t *testing.T) {
 
 	select {
 	case err := <-done:
-		if !errors.Is(err, errStreamAborted) {
-			t.Fatalf("waitForDrain error = %v, want %v", err, errStreamAborted)
+		if !errors.Is(err, ErrStreamAborted) {
+			t.Fatalf("waitForDrain error = %v, want %v", err, ErrStreamAborted)
 		}
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("waitForDrain hung after abort")

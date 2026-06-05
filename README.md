@@ -608,16 +608,21 @@ handlers only.
 app.GetAsync("/stream", func(res *gogo.Response, req *gogo.Request) {
     err := res.Stream(200, "text/plain", func(w io.Writer) error {
         for i := 0; i < 5; i++ {
-            fmt.Fprintf(w, "chunk %d\n", i)
+            if _, err := fmt.Fprintf(w, "chunk %d\n", i); err != nil {
+                return err
+            }
             time.Sleep(200 * time.Millisecond)
         }
         return nil
     })
-    if err != nil {
+    if err != nil && !errors.Is(err, gogo.ErrStreamAborted) {
         log.Printf("stream error: %v", err)
     }
 })
 ```
+
+`Response.AwaitDrain` and stream writes return `gogo.ErrStreamAborted` when a
+client disconnects while the producer is waiting for backpressure to drain.
 
 ### Templates
 
@@ -1252,8 +1257,9 @@ app.Use("/api/*", func(next gogo.AsyncHandler) gogo.AsyncHandler {
 
 ## Server-Sent Events (SSE)
 
-SSE is async-only — register the route via `GetAsync` or `PostAsync` and
-call `res.SSE(...)`. The framework installs the right headers
+SSE is async-only — register the route via `GetAsync`, a body-async route
+such as `PostAsync`, `PutAsync`, `PatchAsync`, or `DeleteAsync`, or call
+`res.Async(...)` before `res.SSE(...)`. The framework installs the right headers
 (`Content-Type: text/event-stream`, `Cache-Control: no-cache`,
 `X-Accel-Buffering: no`) and hands you a `*SSEStream`.
 
@@ -1281,7 +1287,7 @@ app.GetAsync("/events", func(res *gogo.Response, req *gogo.Request) {
                     Event: "tick",
                     Data:  map[string]any{"n": n, "at": t.Format(time.RFC3339)},
                 }); err != nil {
-                    return err               // client disconnected
+                    return err
                 }
             case <-pinger.C:
                 if err := s.Ping(); err != nil {
@@ -1292,6 +1298,9 @@ app.GetAsync("/events", func(res *gogo.Response, req *gogo.Request) {
     })
 })
 ```
+
+SSE uses `Response.Stream`, so disconnects while waiting on backpressure return
+`gogo.ErrStreamAborted`.
 
 Browser-side:
 

@@ -60,6 +60,7 @@ applications:
 - `ErrRenderTooLarge`
 - `ErrHTTPAdapterBodyTooLarge`
 - `ErrFileTooLarge`
+- `ErrStreamAborted`
 - `ErrBodyTooLarge`
 - `ErrBodyTimeout`
 - `ErrWSHubClosed`

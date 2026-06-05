@@ -100,8 +100,18 @@ files in the same PR unless one agent is explicitly assigned as integrator.
 - [x] Document group, mount, scoped middleware, and precedence rules.
 - [x] Add a public global-state audit for `SetPanicHandler`,
       `RegisterParamType`, worker-count settings, and package-level limits.
-- [ ] Add request/response API cleanup issues for exported abort/drain errors,
+- [x] Add request/response API cleanup issues for exported abort/drain errors,
       stale docs, and any missing named helpers.
+  - [x] Export and document `ErrStreamAborted` for `Response.AwaitDrain` /
+        `Response.Stream`.
+  - [ ] Fix body-async timeout behavior so `ErrBodyTimeout` does not dispatch a
+        nil-body handler invocation.
+  - [ ] Decide whether body-read aborts need a public sentinel or whether the
+        current no-callback abort contract is final.
+  - [ ] Fix `BodyParser` / `ErrNoBody` docs for sync handlers that must use
+        `ParseBody` after `Response.Body`.
+  - [ ] Add missing named helper `Request.ParamInt64`.
+  - [x] Refresh SSE docs for body-async methods and disconnect handling.
 
 ## v0.3.0 - Config Behavior
 
