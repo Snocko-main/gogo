@@ -108,7 +108,7 @@ files in the same PR unless one agent is explicitly assigned as integrator.
       disabled limits, timeout sentinels, and zero-value defaults.
 - [ ] Add `ShutdownContext(ctx)` or another blocking graceful-shutdown API if
       the current non-blocking graceful shutdown is not enough.
-- [ ] Fix lifecycle hook contract: `OnListen` panic recovery, nil hooks, and
+- [x] Fix lifecycle hook contract: `OnListen` panic recovery, nil hooks, and
       repeated `Shutdown` / `ShutdownGracefully` hook behavior.
 - [ ] Add app-scoped panic handling in `Config`, or explicitly keep the global
       handler as the supported model.

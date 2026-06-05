@@ -4907,6 +4907,69 @@ func TestShutdownHooksFireOnGraceful(t *testing.T) {
 	<-runDone
 }
 
+func TestShutdownHooksFireOnce(t *testing.T) {
+	var fired atomic.Int32
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.OnShutdown(func() { fired.Add(1) })
+		app.Get("/x", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+
+	if status, _ := httpGet(t, port, "/x"); status != 200 {
+		t.Fatalf("pre-shutdown request failed: %d", status)
+	}
+
+	teardown()
+
+	if got := fired.Load(); got != 1 {
+		t.Fatalf("OnShutdown fired %d times after teardown, want 1", got)
+	}
+}
+
+func TestShutdownHooksFireOnceAcrossGracefulAndImmediate(t *testing.T) {
+	var fired atomic.Int32
+
+	port := freePort(t)
+	ready := make(chan *gogo.App, 1)
+	runDone := make(chan struct{})
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		app, err := gogo.NewApp()
+		if err != nil {
+			t.Errorf("NewApp: %v", err)
+			close(runDone)
+			return
+		}
+		app.OnShutdown(func() { fired.Add(1) })
+		if !app.Listen(port) {
+			t.Errorf("Listen :%d failed", port)
+			app.Close()
+			close(runDone)
+			return
+		}
+		ready <- app
+		app.Run()
+		app.Close()
+		close(runDone)
+	}()
+	app := <-ready
+
+	app.ShutdownGracefully(time.Second)
+	app.Shutdown()
+
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not exit after Shutdown")
+	}
+	if got := fired.Load(); got != 1 {
+		t.Fatalf("OnShutdown fired %d times after graceful+immediate shutdown, want 1", got)
+	}
+}
+
 // TestMethodNotAllowed: a path with registered methods returns 405 +
 // Allow header for unregistered methods; the handler can customize the
 // response body. Parametric paths fall to NotFound instead.
