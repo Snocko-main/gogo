@@ -119,7 +119,7 @@ files in the same PR unless one agent is explicitly assigned as integrator.
       before v1, or document why the boolean API is final.
 - [ ] Document `CapturePeerIP` behavior for async and shared-dispatch routes.
 - [ ] Add config examples for local development, reverse proxy, and production.
-- [ ] Add tests that lock zero-value config defaults.
+- [x] Add tests that lock zero-value config defaults.
 - [ ] Define uWS loop and OS-thread ownership for single-app usage: own a
       locked native loop goroutine internally, or document/enforce same-thread
       `NewApp` / route registration / `Listen` / `Run` / `Close`.

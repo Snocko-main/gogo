@@ -84,6 +84,31 @@ func TestDefaultConfigKeepsExplicitBodyReadTimeout(t *testing.T) {
 	}
 }
 
+func TestZeroValueConfigDefaults(t *testing.T) {
+	cfg := defaultConfig(Config{})
+	if cfg.BodyLimit != 4<<20 {
+		t.Fatalf("BodyLimit default = %d, want 4 MiB", cfg.BodyLimit)
+	}
+	if cfg.BodyReadTimeout != defaultBodyReadTimeout {
+		t.Fatalf("BodyReadTimeout default = %s, want %s", cfg.BodyReadTimeout, defaultBodyReadTimeout)
+	}
+	if cfg.BindAddr != "" {
+		t.Fatalf("BindAddr default = %q, want empty string", cfg.BindAddr)
+	}
+	if cfg.CapturePeerIP {
+		t.Fatal("CapturePeerIP default = true, want false")
+	}
+	if cfg.TrustProxy {
+		t.Fatal("TrustProxy default = true, want false")
+	}
+	if cfg.JSONEncoder == nil {
+		t.Fatal("JSONEncoder default is nil")
+	}
+	if cfg.JSONDecoder == nil {
+		t.Fatal("JSONDecoder default is nil")
+	}
+}
+
 func TestValidateConfigRejectsInvalidNegativeBodyLimit(t *testing.T) {
 	if err := validateConfig(Config{BodyLimit: -2}); err == nil {
 		t.Fatal("validateConfig accepted negative BodyLimit other than NoBodyLimit")
