@@ -7,7 +7,7 @@ minor releases may include breaking API changes when they move the project
 toward a stable API. Breaking changes should be called out in the release
 notes for the release that introduces them.
 
-## Unreleased
+## v0.1.1 - 2026-06-05
 
 ### Added
 
