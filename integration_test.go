@@ -4619,6 +4619,132 @@ func TestIPsRequiresTrustProxy(t *testing.T) {
 	}
 }
 
+func TestTrustedProxiesAllowForwardedHeadersForMatchingPeer(t *testing.T) {
+	type captured struct {
+		ip       string
+		ips      []string
+		protocol string
+		secure   bool
+	}
+	var sync, async, shared atomic.Pointer[captured]
+
+	cfg := gogo.Config{TrustedProxies: []string{"127.0.0.1/32", "::1/128"}}
+	port, teardown := startAppCfg(t, cfg, func(app *gogo.App) {
+		app.Get("/sync", func(res *gogo.Response, req *gogo.Request) {
+			sync.Store(&captured{
+				ip:       req.IP(),
+				ips:      req.IPs(),
+				protocol: req.Protocol(),
+				secure:   req.Secure(),
+			})
+			res.Send(200, "text/plain", "sync")
+		})
+		// Force the sync-wrapper async path. The trusted-proxy decision is
+		// made while the live request can still read its immediate peer and
+		// then carried onto the async snapshot.
+		app.Use("/async/*", func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) { next(res, req) }
+		})
+		app.GetAsync("/async/snap", func(res *gogo.Response, req *gogo.Request) {
+			async.Store(&captured{
+				ip:       req.IP(),
+				ips:      req.IPs(),
+				protocol: req.Protocol(),
+				secure:   req.Secure(),
+			})
+			res.Send(200, "text/plain", "async")
+		})
+		app.GetAsync("/shared", func(res *gogo.Response, req *gogo.Request) {
+			shared.Store(&captured{
+				ip:       req.IP(),
+				ips:      req.IPs(),
+				protocol: req.Protocol(),
+				secure:   req.Secure(),
+			})
+			res.Send(200, "text/plain", "shared")
+		})
+	})
+	defer teardown()
+
+	doRequest := func(path string) {
+		req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d%s", port, path), nil)
+		req.Header.Set("X-Forwarded-For", "203.0.113.5, 198.51.100.7")
+		req.Header.Set("X-Forwarded-Proto", "https")
+		resp, err := noKeepaliveClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		resp.Body.Close()
+	}
+	doRequest("/sync")
+	doRequest("/async/snap")
+	doRequest("/shared")
+
+	check := func(name string, c *captured) {
+		t.Helper()
+		if c == nil {
+			t.Fatalf("%s handler did not record", name)
+		}
+		if c.ip == "" || (!strings.HasPrefix(c.ip, "127.0.0.1") && c.ip != "::1") {
+			t.Errorf("%s: ip=%q, want loopback", name, c.ip)
+		}
+		if !reflect.DeepEqual(c.ips, []string{"203.0.113.5", "198.51.100.7"}) {
+			t.Errorf("%s: ips=%v, want forwarded chain", name, c.ips)
+		}
+		if c.protocol != "https" || !c.secure {
+			t.Errorf("%s: protocol/secure=%q/%t, want https/true", name, c.protocol, c.secure)
+		}
+	}
+	check("sync", sync.Load())
+	check("async-snap", async.Load())
+	check("shared", shared.Load())
+}
+
+func TestTrustedProxiesOverrideTrustProxyForNonMatchingPeer(t *testing.T) {
+	type result struct {
+		ips      []string
+		protocol string
+		secure   bool
+	}
+	var captured atomic.Pointer[result]
+
+	cfg := gogo.Config{
+		TrustProxy:     true,
+		TrustedProxies: []string{"10.0.0.0/8"},
+	}
+	port, teardown := startAppCfg(t, cfg, func(app *gogo.App) {
+		app.Get("/", func(res *gogo.Response, req *gogo.Request) {
+			captured.Store(&result{
+				ips:      req.IPs(),
+				protocol: req.Protocol(),
+				secure:   req.Secure(),
+			})
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/", port), nil)
+	req.Header.Set("X-Forwarded-For", "203.0.113.5")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	resp.Body.Close()
+
+	got := captured.Load()
+	if got == nil {
+		t.Fatal("handler did not record result")
+	}
+	if got.ips != nil {
+		t.Errorf("IPs() = %v with non-matching TrustedProxies, want nil", got.ips)
+	}
+	if got.protocol != "http" || got.secure {
+		t.Errorf("protocol/secure = %q/%t, want http/false", got.protocol, got.secure)
+	}
+}
+
 func TestIPsNormalizesAndDropsInvalidForwardedEntries(t *testing.T) {
 	type result struct {
 		ips []string
