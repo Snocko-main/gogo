@@ -6047,7 +6047,11 @@ func TestQueryAndParamConversion(t *testing.T) {
 			res.Send(200, "text/plain", fmt.Sprintf("id=%d", id))
 		})
 		app.Get("/items64/:id", func(res *gogo.Response, req *gogo.Request) {
-			id := req.ParameterInt64(0, -1)
+			id := req.ParamInt64("id", -1)
+			res.Send(200, "text/plain", fmt.Sprintf("id=%d", id))
+		})
+		app.GetAsync("/async-items64/:id", func(res *gogo.Response, req *gogo.Request) {
+			id := req.ParamInt64("id", -1)
 			res.Send(200, "text/plain", fmt.Sprintf("id=%d", id))
 		})
 	})
@@ -6077,6 +6081,8 @@ func TestQueryAndParamConversion(t *testing.T) {
 		{"/items/42", "id=42"},
 		{"/items/abc", "id=-1"},
 		{"/items64/9999999999", "id=9999999999"},
+		{"/items64/abc", "id=-1"},
+		{"/async-items64/9999999999", "id=9999999999"},
 	}
 	for _, tc := range cases {
 		status, body := httpGet(t, port, tc.path)

@@ -5502,6 +5502,20 @@ func (r *Request) ParamInt(name string, def int) int {
 	return n
 }
 
+// ParamInt64 parses Param(name) as a signed decimal int64. Returns def when
+// the param is missing or doesn't parse. Mirrors QueryInt64.
+func (r *Request) ParamInt64(name string, def int64) int64 {
+	v := r.Param(name)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
 // Query returns the raw query string portion of the URL with the leading '?'
 // stripped. Returns "" if the request has no query string.
 //
@@ -5612,10 +5626,9 @@ func (r *Request) ParameterInt(index int, def int) int {
 	return n
 }
 
-// ParameterInt64 parses the route parameter at index as a base-10
-// int64. Missing or non-numeric values fall back to def. Positional
-// twin of ParamInt64 (not yet provided); call ParamInt64(name, def)
-// once a named variant lands. For now use this for int64.
+// ParameterInt64 parses the route parameter at index as a base-10 int64.
+// Missing or non-numeric values fall back to def. Positional twin of
+// ParamInt64(name, def); use whichever matches your access style.
 func (r *Request) ParameterInt64(index int, def int64) int64 {
 	v := r.Parameter(index)
 	if v == "" {
