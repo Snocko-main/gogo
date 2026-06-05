@@ -104,7 +104,7 @@ files in the same PR unless one agent is explicitly assigned as integrator.
       stale docs, and any missing named helpers.
   - [x] Export and document `ErrStreamAborted` for `Response.AwaitDrain` /
         `Response.Stream`.
-  - [ ] Fix body-async timeout behavior so `ErrBodyTimeout` does not dispatch a
+  - [x] Fix body-async timeout behavior so `ErrBodyTimeout` does not dispatch a
         nil-body handler invocation.
   - [ ] Decide whether body-read aborts need a public sentinel or whether the
         current no-callback abort contract is final.
