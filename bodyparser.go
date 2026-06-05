@@ -14,11 +14,12 @@ import (
 	"strings"
 )
 
-// ErrNoBody is returned by Request.BodyParser when the request body has
-// not been collected yet. Sync handlers must call Response.Body before
-// reaching for BodyParser; PostAsync handlers always have the body
-// pre-collected.
-var ErrNoBody = errors.New("gogo: BodyParser requires a collected body; use PostAsync or Response.Body first")
+// ErrNoBody is returned by Request.BodyParser when the request body has not
+// been collected onto the Request. Body-async routes such as PostAsync,
+// PutAsync, PatchAsync, and DeleteAsync pre-collect the body; sync handlers
+// that collect manually with Response.Body should call ParseBody inside the
+// callback instead.
+var ErrNoBody = errors.New("gogo: BodyParser requires a collected body; use a body-async route or ParseBody after Response.Body")
 
 // ErrUnsupportedMediaType is returned by ParseBody / BodyParser when the
 // Content-Type header doesn't match any of the parser's supported media

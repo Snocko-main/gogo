@@ -320,10 +320,9 @@ func ParseMultipartStream(contentType string, body []byte, opt MultipartOptions,
 	}
 }
 
-// Multipart is the Request-side wrapper for ParseMultipart. Use it
-// from PostAsync handlers where the body is pre-collected; sync
-// handlers should collect the body via Response.Body first and call
-// ParseMultipart directly.
+// Multipart is the Request-side wrapper for ParseMultipart. Use it from
+// body-async handlers where the body is pre-collected; sync handlers should
+// collect the body via Response.Body first and call ParseMultipart directly.
 //
 // Returns ErrNoBody when the body has not been collected, or
 // ErrUnsupportedMediaType when the request's Content-Type is not
