@@ -23,6 +23,11 @@ The `v07-http` route set runs `gogo`, `fiber`, and `nethttp` only. That keeps
 the new middleware route comparable without changing the Node, Bun, or Actix
 benchmark servers.
 
+For gogo, the benchmark pins shared-dispatch workers to the server shape:
+`GOGO_WORKERS=1` in `single` mode and `GOGO_WORKERS=$MULTI_WORKERS` in `multi`
+mode. That keeps `GetAsync` measurements from depending on the host CPU count
+when the benchmark is intentionally running one uWS loop.
+
 Covered GET workloads:
 
 | workload | purpose |

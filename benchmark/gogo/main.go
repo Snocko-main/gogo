@@ -70,6 +70,13 @@ func main() {
 			n = v
 		}
 	}
+	workers := n
+	if env := os.Getenv("GOGO_WORKERS"); env != "" {
+		if v, err := strconv.Atoi(env); err == nil && v >= 0 {
+			workers = v
+		}
+	}
+	gogo.SetWorkerCount(workers)
 
 	setup := func(app *gogo.App) {
 		app.Get("/plain", func(res *gogo.Response, req *gogo.Request) {

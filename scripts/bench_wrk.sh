@@ -30,6 +30,7 @@
 #   FRAMEWORKS     subset to run                        (route-set default)
 #   MODES          subset to run                        (default "single multi")
 #   MULTI_WORKERS  server workers/processes for multi   (default min(NumCPU, 4))
+#   GOGO_WORKERS   shared-dispatch workers for gogo     (default: mode workers)
 #   WARMUP         seconds of warmup hits before timing (default 2)
 #   RESULTS_DIR    where to write logs                  (default benchmark/results)
 #
@@ -191,12 +192,12 @@ start_server() {
 	case "$fw:$mode" in
 	gogo:single)
 		build_go_binary gogo-bench gogo ./gogo
-		( GOGO_CORES=1 "$BENCH_BIN_DIR/gogo-bench" >/tmp/bench-gogo.log 2>&1 ) &
+		( GOGO_CORES=1 GOGO_WORKERS="${GOGO_WORKERS:-1}" "$BENCH_BIN_DIR/gogo-bench" >/tmp/bench-gogo.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	gogo:multi)
 		build_go_binary gogo-bench gogo ./gogo
-		( GOMAXPROCS="$MULTI_WORKERS" GOGO_CORES="$MULTI_WORKERS" "$BENCH_BIN_DIR/gogo-bench" >/tmp/bench-gogo.log 2>&1 ) &
+		( GOMAXPROCS="$MULTI_WORKERS" GOGO_CORES="$MULTI_WORKERS" GOGO_WORKERS="${GOGO_WORKERS:-$MULTI_WORKERS}" "$BENCH_BIN_DIR/gogo-bench" >/tmp/bench-gogo.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	fiber:single)
