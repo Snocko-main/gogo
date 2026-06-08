@@ -1,8 +1,8 @@
 # Native Lifecycle Status for v0.3
 
 This note records the native lifecycle decisions that were reviewed during the
-v0.3 config pass. It separates behavior that is already implemented, accepted
-v1 direction, and the remaining native-boundary follow-ups.
+v0.3 config pass. It separates behavior that is already implemented from the
+remaining native-boundary follow-ups.
 
 ## Closed Decisions
 
@@ -28,51 +28,39 @@ return when needed, then call `Close` to free native resources. `Close` is not a
 general cancellation primitive for arbitrary user goroutines; handlers that
 need to stop early should observe `Response.OnAborted` or `Request.Context`.
 
-## Accepted v1 Direction
-
 ### Shared handler registry cleanup
 
-Shared async route registration currently appends handlers to a process-wide
-registry and publishes immutable snapshots for worker reads. That is safe for a
-single boot-defined app, but it must not become the v1 lifecycle contract: a
-process that repeatedly creates and closes apps would retain every shared
-handler closure until process exit.
+Shared async route registration appends handlers to a process-wide registry and
+publishes immutable snapshots for worker reads, but the registry is no longer
+process-lifetime retention for handler closures. `App.Close` tombstones the
+closing App's shared handler slots after native close has started, then
+publishes a new snapshot so the closures and any large captured objects can be
+garbage collected.
 
-The v1 direction is to release an app's shared handlers after graceful shutdown
-has drained that app's shared work. Cleanup must run after the app can no longer
-produce or consume shared callbacks, not at the beginning of
-`ShutdownGracefully`, because in-flight handlers and queued shared responses may
-still need the registered handler IDs while the drain is in progress.
-
-The likely implementation shape is tombstones or generations rather than
-shrinking the registry. Old numeric handler IDs must remain safe to observe
-after cleanup, while the handler closures themselves should be released so large
-captured objects can be garbage collected.
-
-## Remaining Follow-Ups
+Handler IDs are not reused. Old numeric IDs remain safe to observe after
+cleanup: a worker that sees a tombstoned or out-of-range handler ID releases the
+request context instead of calling a removed handler or accidentally dispatching
+to a newly registered handler from another App generation.
 
 ### Single-app loop ownership
 
-`uwsgo_app_new` captures the uWS loop for the OS thread that creates the app.
-`RunMultiCore` and `NewTestServer` already honor that by creating, registering,
-listening, running, and closing each app on a locked OS thread. The public
-single-app path still needs a v1 owner decision:
-
-- document and enforce same-thread `NewApp` / route registration / `Listen` /
-  `Run` / `Close`, or
-- move single-app ownership behind an internal locked loop goroutine.
+Native builds now create each App's uWS object on an internal locked owner
+goroutine. Route registration, static route registration, WebSocket
+registration, `Listen`, `Run`, shared-drain timer setup, and `Close` are
+serialized through that owner so single-app users do not need to call
+`runtime.LockOSThread` themselves.
 
 Cross-thread methods should remain limited to the explicitly safe APIs that
 defer to the loop or use native synchronization, such as `Shutdown`,
 `ShutdownGracefully`, `ShutdownContext`, `Publish`, `PublishBatch`, and
 deferred async responses.
 
-### Shared handler registry cleanup
+`RunMultiCore` and `NewTestServer` keep their public setup shapes, but they no
+longer rely on their caller goroutine being the uWS owner thread. Routes should
+still be registered before `Listen` / `Run`; hot route registration while the
+loop is serving traffic remains outside the public contract.
 
-Implement cleanup for shared handler slots after graceful/shared drain. Tests
-should cover repeated `NewApp` / route registration / `ShutdownGracefully` /
-`Close` cycles and verify that stale handler IDs cannot call a removed handler
-or a newly registered handler from another app generation.
+## Remaining Follow-Ups
 
 ### Native boundary audit
 

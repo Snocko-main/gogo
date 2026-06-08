@@ -8,7 +8,28 @@ package gogo
 #cgo LDFLAGS: -lz
 #cgo linux LDFLAGS: -pthread
 #include <stdlib.h>
+#include <stdint.h>
+#if defined(__APPLE__)
+#include <pthread.h>
+#elif defined(__linux__)
+#include <sys/syscall.h>
+#include <unistd.h>
+#else
+#include <pthread.h>
+#endif
 #include "uws_bridge.h"
+
+static uint64_t uwsgo_current_thread_id(void) {
+#if defined(__APPLE__)
+    uint64_t tid = 0;
+    pthread_threadid_np(NULL, &tid);
+    return tid;
+#elif defined(__linux__)
+    return (uint64_t) syscall(SYS_gettid);
+#else
+    return (uint64_t) (uintptr_t) pthread_self();
+#endif
+}
 */
 import "C"
 
@@ -30,8 +51,10 @@ import (
 const maxInt32 = 1<<31 - 1
 
 type appNative struct {
-	ptr     *C.uwsgo_app_t
-	handles []cgo.Handle
+	ptr              *C.uwsgo_app_t
+	handles          []cgo.Handle
+	owner            *nativeOwner
+	sharedHandlerIDs []uint32
 }
 
 type responseNative struct {
@@ -50,20 +73,106 @@ type loopNative struct {
 	ptr *C.uwsgo_loop_t
 }
 
+type nativeCall struct {
+	fn   func()
+	done chan struct{}
+}
+
+type nativeOwner struct {
+	calls    chan nativeCall
+	threadID atomic.Uint64
+	closed   atomic.Bool
+}
+
+func newNativeOwner() *nativeOwner {
+	owner := &nativeOwner{calls: make(chan nativeCall)}
+	ready := make(chan struct{})
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+
+		owner.threadID.Store(currentNativeThreadID())
+		close(ready)
+		for call := range owner.calls {
+			call.fn()
+			close(call.done)
+		}
+		owner.threadID.Store(0)
+	}()
+	<-ready
+	return owner
+}
+
+func currentNativeThreadID() uint64 {
+	return uint64(C.uwsgo_current_thread_id())
+}
+
+func (o *nativeOwner) onOwnerThread() bool {
+	if o == nil {
+		return true
+	}
+	id := o.threadID.Load()
+	return id != 0 && id == currentNativeThreadID()
+}
+
+func (o *nativeOwner) call(fn func()) {
+	if o == nil || o.onOwnerThread() {
+		fn()
+		return
+	}
+	if o.closed.Load() {
+		panic("gogo: native app owner is closed")
+	}
+	done := make(chan struct{})
+	o.calls <- nativeCall{fn: fn, done: done}
+	<-done
+}
+
+func (o *nativeOwner) close() {
+	if o == nil || o.closed.Swap(true) {
+		return
+	}
+	close(o.calls)
+}
+
 func newAppNative() (appNative, error) {
-	return appNative{ptr: C.uwsgo_app_new()}, nil
+	owner := newNativeOwner()
+	var ptr *C.uwsgo_app_t
+	owner.call(func() {
+		ptr = C.uwsgo_app_new()
+	})
+	return appNative{ptr: ptr, owner: owner}, nil
+}
+
+func (a *appNative) onOwner(fn func()) {
+	if a.owner == nil {
+		fn()
+		return
+	}
+	a.owner.call(fn)
+}
+
+func (a *appNative) onOwnerBool(fn func() bool) bool {
+	var ok bool
+	a.onOwner(func() {
+		ok = fn()
+	})
+	return ok
 }
 
 func (a *appNative) get(pattern string, handler Handler) {
 	cpattern, handle := a.prepareRoute(pattern, handler)
 	defer C.free(unsafe.Pointer(cpattern))
 
-	C.uwsgo_app_get(a.ptr, cpattern, C.uintptr_t(handle))
+	a.onOwner(func() {
+		C.uwsgo_app_get(a.ptr, cpattern, C.uintptr_t(handle))
+	})
 }
 
 // Shared-dispatch handler registry. C++ pushes the handler_id (a small int)
-// into AsyncCtx; Go workers look it up here. Slots are append-only — handlers
-// register at app setup time, never expire.
+// into AsyncCtx; Go workers look it up here. Slot indexes are never reused so
+// stale ctxs cannot call a new handler by accident; App.Close tombstones that
+// App's slots so captured handler closures can be garbage collected.
 var (
 	// sharedHandlers is append-only after registration. Registration takes
 	// the mutex; workers read via an atomic snapshot to keep the request
@@ -106,18 +215,61 @@ func registerSharedHandler(h AsyncHandler) uint32 {
 	sharedHandlersMu.Lock()
 	defer sharedHandlersMu.Unlock()
 	sharedHandlers = append(sharedHandlers, h)
-	// Publish a fresh snapshot so workers see the new handler via an atomic
-	// pointer swap — no lock acquired on the request hot path.
-	snap := append([]AsyncHandler(nil), sharedHandlers...)
-	sharedHandlersSnap.Store(&snap)
+	publishSharedHandlersLocked()
 	return uint32(len(sharedHandlers) - 1)
 }
 
+func publishSharedHandlersLocked() {
+	// Publish a fresh snapshot so workers see handler changes via an atomic
+	// pointer swap — no lock acquired on the request hot path.
+	snap := append([]AsyncHandler(nil), sharedHandlers...)
+	sharedHandlersSnap.Store(&snap)
+}
+
+func lookupSharedHandler(id uint32) (AsyncHandler, bool) {
+	snap := sharedHandlersSnap.Load()
+	if snap == nil || int(id) >= len(*snap) {
+		return nil, false
+	}
+	handler := (*snap)[id]
+	if handler == nil {
+		return nil, false
+	}
+	return handler, true
+}
+
+func cleanupSharedHandlers(ids []uint32) {
+	if len(ids) == 0 {
+		return
+	}
+	sharedHandlersMu.Lock()
+	defer sharedHandlersMu.Unlock()
+	changed := false
+	for _, id := range ids {
+		if int(id) >= len(sharedHandlers) || sharedHandlers[id] == nil {
+			continue
+		}
+		sharedHandlers[id] = nil
+		changed = true
+	}
+	if changed {
+		publishSharedHandlersLocked()
+	}
+}
+
+func (a *appNative) registerSharedHandler(h AsyncHandler) uint32 {
+	id := registerSharedHandler(h)
+	a.sharedHandlerIDs = append(a.sharedHandlerIDs, id)
+	return id
+}
+
 func (a *appNative) getShared(pattern string, handler AsyncHandler) {
-	id := registerSharedHandler(handler)
+	id := a.registerSharedHandler(handler)
 	cpattern := C.CString(pattern)
 	defer C.free(unsafe.Pointer(cpattern))
-	C.uwsgo_app_get_shared(a.ptr, cpattern, C.uint32_t(id))
+	a.onOwner(func() {
+		C.uwsgo_app_get_shared(a.ptr, cpattern, C.uint32_t(id))
+	})
 	sharedActive.Store(true)
 	// Lazily start worker goroutines on first shared route registration.
 	ensureSharedWorkers()
@@ -134,13 +286,15 @@ func (a *appNative) getShared(pattern string, handler AsyncHandler) {
 // Bodies larger than the active cap short-circuit with 413 on
 // the loop thread — the goroutine is never spawned.
 func (a *appNative) postShared(pattern string, handler AsyncHandler, maxBody int) {
-	id := registerSharedHandler(handler)
+	id := a.registerSharedHandler(handler)
 	cpattern := C.CString(pattern)
 	defer C.free(unsafe.Pointer(cpattern))
 	if maxBody < 0 {
 		maxBody = 0
 	}
-	C.uwsgo_app_post_shared(a.ptr, cpattern, C.uint32_t(id), C.size_t(maxBody))
+	a.onOwner(func() {
+		C.uwsgo_app_post_shared(a.ptr, cpattern, C.uint32_t(id), C.size_t(maxBody))
+	})
 	sharedActive.Store(true)
 	ensureSharedWorkers()
 }
@@ -356,10 +510,14 @@ func sharedWorker(stop <-chan struct{}) {
 		}
 		handlerID := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxHandlerIDOff))
 
-		// Read the handler from the atomic snapshot — append-only after
-		// registration, so no lock on the hot path.
-		snap := sharedHandlersSnap.Load()
-		handler := (*snap)[handlerID]
+		// Read the handler from the atomic snapshot. Closed Apps tombstone
+		// their slots; stale ctxs are released instead of dispatching to a
+		// removed handler or panicking on a corrupt/out-of-range ID.
+		handler, ok := lookupSharedHandler(handlerID)
+		if !ok {
+			asyncCtxRelease(ctxPtr)
+			continue
+		}
 
 		// Run inline on the worker. Workers are sized for typical short
 		// handlers (db queries, in-memory work). For longer-blocking
@@ -504,55 +662,71 @@ func (a *appNative) getStatic(pattern, status, contentType, body string) {
 	cpattern := C.CString(pattern)
 	defer C.free(unsafe.Pointer(cpattern))
 
-	C.uwsgo_app_get_static(a.ptr, cpattern,
-		unsafeStringData(status), C.size_t(len(status)),
-		unsafeStringData(contentType), C.size_t(len(contentType)),
-		unsafeStringData(body), C.size_t(len(body)),
-	)
+	a.onOwner(func() {
+		C.uwsgo_app_get_static(a.ptr, cpattern,
+			unsafeStringData(status), C.size_t(len(status)),
+			unsafeStringData(contentType), C.size_t(len(contentType)),
+			unsafeStringData(body), C.size_t(len(body)),
+		)
+	})
 }
 
 func (a *appNative) post(pattern string, handler Handler) {
 	cpattern, handle := a.prepareRoute(pattern, handler)
 	defer C.free(unsafe.Pointer(cpattern))
 
-	C.uwsgo_app_post(a.ptr, cpattern, C.uintptr_t(handle))
+	a.onOwner(func() {
+		C.uwsgo_app_post(a.ptr, cpattern, C.uintptr_t(handle))
+	})
 }
 
 func (a *appNative) any(pattern string, handler Handler) {
 	cpattern, handle := a.prepareRoute(pattern, handler)
 	defer C.free(unsafe.Pointer(cpattern))
 
-	C.uwsgo_app_any(a.ptr, cpattern, C.uintptr_t(handle))
+	a.onOwner(func() {
+		C.uwsgo_app_any(a.ptr, cpattern, C.uintptr_t(handle))
+	})
 }
 
 func (a *appNative) put(pattern string, handler Handler) {
 	cpattern, handle := a.prepareRoute(pattern, handler)
 	defer C.free(unsafe.Pointer(cpattern))
-	C.uwsgo_app_put(a.ptr, cpattern, C.uintptr_t(handle))
+	a.onOwner(func() {
+		C.uwsgo_app_put(a.ptr, cpattern, C.uintptr_t(handle))
+	})
 }
 
 func (a *appNative) patch(pattern string, handler Handler) {
 	cpattern, handle := a.prepareRoute(pattern, handler)
 	defer C.free(unsafe.Pointer(cpattern))
-	C.uwsgo_app_patch(a.ptr, cpattern, C.uintptr_t(handle))
+	a.onOwner(func() {
+		C.uwsgo_app_patch(a.ptr, cpattern, C.uintptr_t(handle))
+	})
 }
 
 func (a *appNative) deleteM(pattern string, handler Handler) {
 	cpattern, handle := a.prepareRoute(pattern, handler)
 	defer C.free(unsafe.Pointer(cpattern))
-	C.uwsgo_app_delete(a.ptr, cpattern, C.uintptr_t(handle))
+	a.onOwner(func() {
+		C.uwsgo_app_delete(a.ptr, cpattern, C.uintptr_t(handle))
+	})
 }
 
 func (a *appNative) options(pattern string, handler Handler) {
 	cpattern, handle := a.prepareRoute(pattern, handler)
 	defer C.free(unsafe.Pointer(cpattern))
-	C.uwsgo_app_options(a.ptr, cpattern, C.uintptr_t(handle))
+	a.onOwner(func() {
+		C.uwsgo_app_options(a.ptr, cpattern, C.uintptr_t(handle))
+	})
 }
 
 func (a *appNative) head(pattern string, handler Handler) {
 	cpattern, handle := a.prepareRoute(pattern, handler)
 	defer C.free(unsafe.Pointer(cpattern))
-	C.uwsgo_app_head(a.ptr, cpattern, C.uintptr_t(handle))
+	a.onOwner(func() {
+		C.uwsgo_app_head(a.ptr, cpattern, C.uintptr_t(handle))
+	})
 }
 
 func (a *appNative) websocket(pattern string, behavior WebSocketBehavior) {
@@ -587,9 +761,11 @@ func (a *appNative) websocket(pattern string, behavior WebSocketBehavior) {
 		withUpgrade = 1
 	}
 
-	C.uwsgo_app_ws(a.ptr, cpattern, C.uintptr_t(handle),
-		C.size_t(maxPayload), C.int(idleSec), C.size_t(maxBp), C.int(pings),
-		C.int(withUpgrade))
+	a.onOwner(func() {
+		C.uwsgo_app_ws(a.ptr, cpattern, C.uintptr_t(handle),
+			C.size_t(maxPayload), C.int(idleSec), C.size_t(maxBp), C.int(pings),
+			C.int(withUpgrade))
+	})
 }
 
 func (a *appNative) prepareRoute(pattern string, handler Handler) (*C.char, cgo.Handle) {
@@ -599,40 +775,50 @@ func (a *appNative) prepareRoute(pattern string, handler Handler) (*C.char, cgo.
 	return cpattern, handle
 }
 
-func (a appNative) listen(host string, port int) bool {
+func (a *appNative) listen(host string, port int) bool {
 	var chost *C.char
 	if host != "" {
 		chost = C.CString(host)
 		defer C.free(unsafe.Pointer(chost))
 	}
-	return C.uwsgo_app_listen(a.ptr, chost, C.int(port)) != 0
+	return a.onOwnerBool(func() bool {
+		return C.uwsgo_app_listen(a.ptr, chost, C.int(port)) != 0
+	})
 }
 
-func (a appNative) addChild(child appNative) bool {
-	return C.uwsgo_app_add_child(a.ptr, child.ptr) != 0
+func (a *appNative) addChild(child appNative) bool {
+	return a.onOwnerBool(func() bool {
+		return C.uwsgo_app_add_child(a.ptr, child.ptr) != 0
+	})
 }
 
-func (a appNative) setBodyLimit(limit int) {
-	C.uwsgo_app_set_body_limit(a.ptr, C.size_t(limit))
+func (a *appNative) setBodyLimit(limit int) {
+	a.onOwner(func() {
+		C.uwsgo_app_set_body_limit(a.ptr, C.size_t(limit))
+	})
 }
 
-func (a appNative) setCapturePeerIP(enable bool) {
+func (a *appNative) setCapturePeerIP(enable bool) {
 	v := C.int(0)
 	if enable {
 		v = 1
 	}
-	C.uwsgo_app_set_capture_peer_ip(a.ptr, v)
+	a.onOwner(func() {
+		C.uwsgo_app_set_capture_peer_ip(a.ptr, v)
+	})
 }
 
-func (a appNative) run() {
-	C.uwsgo_app_run(a.ptr)
+func (a *appNative) run() {
+	a.onOwner(func() {
+		C.uwsgo_app_run(a.ptr)
+	})
 }
 
-func (a appNative) stop() {
+func (a *appNative) stop() {
 	C.uwsgo_app_stop(a.ptr)
 }
 
-func (a appNative) closeListen() {
+func (a *appNative) closeListen() {
 	C.uwsgo_app_close_listen(a.ptr)
 }
 
@@ -641,7 +827,10 @@ func (a *appNative) close() {
 		return
 	}
 
-	C.uwsgo_app_free(a.ptr)
+	ptr := a.ptr
+	a.onOwner(func() {
+		C.uwsgo_app_free(ptr)
+	})
 	a.ptr = nil
 
 	for _, handle := range a.handles {
@@ -649,6 +838,9 @@ func (a *appNative) close() {
 	}
 
 	a.handles = nil
+	cleanupSharedHandlers(a.sharedHandlerIDs)
+	a.sharedHandlerIDs = nil
+	a.owner.close()
 }
 
 func (r responseNative) status(status string) {
@@ -1056,8 +1248,10 @@ func finishSharedSend(statePtr uintptr) {
 	(*atomic.Int32)(unsafe.Pointer(statePtr + shared.stateActiveSendsOff)).Add(-1)
 }
 
-func (a appNative) startSharedDrain(intervalUs int) {
-	C.uwsgo_app_start_drain(a.ptr, C.int(intervalUs))
+func (a *appNative) startSharedDrain(intervalUs int) {
+	a.onOwner(func() {
+		C.uwsgo_app_start_drain(a.ptr, C.int(intervalUs))
+	})
 }
 
 // asyncSendShared writes the response bytes directly into the AsyncCtx memory

@@ -126,7 +126,7 @@ accepted as residual risk.
       deferred responses.
 - [x] Shared-dispatch shutdown quiesces active work before native app memory is
       freed.
-- [ ] Shared handler registry cleanup releases per-app handler closures after
+- [x] Shared handler registry cleanup releases per-app handler closures after
       graceful/shared drain without reusing stale handler IDs unsafely.
 - [ ] Native fuzz/stress coverage includes oversized headers, bodies, WebSocket
       frames, malformed subprotocols, aborted streams, and shutdown races.

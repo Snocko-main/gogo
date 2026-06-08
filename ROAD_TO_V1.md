@@ -132,13 +132,13 @@ files in the same PR unless one agent is explicitly assigned as integrator.
 - [x] Document `CapturePeerIP` behavior for async and shared-dispatch routes.
 - [x] Add config examples for local development, reverse proxy, and production.
 - [x] Add tests that lock zero-value config defaults.
-- [ ] Define uWS loop and OS-thread ownership for single-app usage: own a
-      locked native loop goroutine internally, or document/enforce same-thread
-      `NewApp` / route registration / `Listen` / `Run` / `Close`.
+- [x] Define uWS loop and OS-thread ownership for single-app usage: native
+      builds own a locked App goroutine internally for route registration,
+      `Listen`, `Run`, and `Close`.
 - [x] Define shared-dispatch quiescence before freeing native app memory.
 - [x] Decide shared handler registry lifetime: release handlers after
       graceful/shared drain; process-lifetime retention is not the v1 contract.
-- [ ] Implement shared handler registry cleanup with tombstones or generations
+- [x] Implement shared handler registry cleanup with tombstones or generations
       so stale handler IDs cannot call removed handlers.
 
 ## v0.4.0 - Middleware Production Pass
