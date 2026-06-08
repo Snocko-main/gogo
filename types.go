@@ -423,6 +423,10 @@ const (
 // app creation and bind time. The struct is intentionally narrow — knobs
 // only get added here when they need a single, app-wide value.
 //
+// Panic recovery is intentionally not part of Config. The supported panic
+// hook is SetPanicHandler, which is process-wide because recovery sites include
+// package-level workers and callbacks that are not owned by a single App.
+//
 // # Connection-level timeouts and limits
 //
 // A few knobs that look like they belong here are deliberately not
@@ -510,18 +514,30 @@ type Config struct {
 	// read the peer IP; otherwise leave it off.
 	CapturePeerIP bool
 
-	// TrustProxy declares that the server sits behind a trusted reverse
-	// proxy (e.g. nginx, an L7 load balancer, a CDN), so X-Forwarded-* /
-	// X-Real-IP / Forwarded headers from the client are safe to surface
-	// to the application:
+	// TrustProxy declares that every immediate peer is a trusted reverse
+	// proxy (e.g. nginx, an L7 load balancer, a CDN), so the X-Forwarded-*
+	// headers used by gogo helpers are safe to surface to the application:
 	//
 	//   - req.Protocol() / req.Secure() honor X-Forwarded-Proto.
 	//   - req.IPs() exposes the normalized X-Forwarded-For chain.
 	//
-	// Leave OFF when the server is directly internet-facing — otherwise
-	// any client can spoof their apparent protocol / origin by sending
-	// X-Forwarded-* headers. Default false.
+	// Leave OFF when the server is directly internet-facing, and prefer
+	// TrustedProxies when only specific proxy addresses should be trusted.
+	// Otherwise any client can spoof their apparent protocol / origin by
+	// sending X-Forwarded-* headers. Default false.
 	TrustProxy bool
+
+	// TrustedProxies narrows forwarded-header trust to requests whose
+	// immediate TCP peer matches one of these IP addresses or CIDR ranges.
+	// Entries may be single IPs ("127.0.0.1", "2001:db8::1") or CIDR
+	// prefixes ("10.0.0.0/8", "2001:db8::/32"). When non-empty, this
+	// allow-list is used instead of the broad TrustProxy switch; forwarded
+	// headers are ignored for peers outside the list.
+	//
+	// Setting TrustedProxies enables CapturePeerIP automatically because
+	// async/shared-dispatch routes must snapshot the immediate peer before
+	// they can decide whether proxy headers are trusted.
+	TrustedProxies []string
 
 	// JSONEncoder is used by Response.JSON and Response.JSONP. Nil uses
 	// encoding/json.Marshal. Override it with a faster compatible encoder
@@ -574,6 +590,8 @@ type App struct {
 	stopping      atomic.Bool
 	closed        atomic.Bool
 	pendingTimers atomic.Int32
+	runDone       chan struct{}
+	runDoneOnce   sync.Once
 	// nativeMu serializes App.Close with cross-thread native calls that keep
 	// using the app pointer after leaving Go, such as WebSocket publishes.
 	nativeMu sync.RWMutex
@@ -592,6 +610,7 @@ type App struct {
 	// remove-then-add behavior.
 	routeMethods       []routeMethodEntry
 	routeMethodIndex   map[string]int
+	trustedProxyRanges []netip.Prefix
 	onListenHooks      []func(port int)
 	onShutdownHooks    []func()
 	shutdownHooksFired atomic.Bool
@@ -622,6 +641,9 @@ func validateConfig(c Config) error {
 	if c.BodyReadTimeout < 0 && c.BodyReadTimeout != NoBodyReadTimeout {
 		return fmt.Errorf("gogo: Config.BodyReadTimeout must be non-negative or NoBodyReadTimeout (got %s)", c.BodyReadTimeout)
 	}
+	if _, err := parseTrustedProxyRanges(c.TrustedProxies); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -637,6 +659,9 @@ func defaultConfig(c Config) Config {
 	if c.BodyReadTimeout == 0 {
 		c.BodyReadTimeout = defaultBodyReadTimeout
 	}
+	if len(c.TrustedProxies) > 0 {
+		c.CapturePeerIP = true
+	}
 	if c.JSONEncoder == nil {
 		c.JSONEncoder = json.Marshal
 	}
@@ -648,7 +673,8 @@ func defaultConfig(c Config) Config {
 
 // NewApp creates a non-TLS uWebSockets app. With no Config the app uses safe
 // production defaults; pass at most one Config to override. The variadic shape
-// is retained only for backward compatibility with the old zero-arg signature.
+// is the compatibility contract: NewApp() remains valid, NewApp(Config{...})
+// applies overrides, and more than one Config returns an error.
 func NewApp(cfg ...Config) (*App, error) {
 	if len(cfg) > 1 {
 		return nil, fmt.Errorf("gogo: NewApp accepts at most one Config (got %d)", len(cfg))
@@ -660,6 +686,10 @@ func NewApp(cfg ...Config) (*App, error) {
 	if err := validateConfig(c); err != nil {
 		return nil, err
 	}
+	trustedProxyRanges, err := parseTrustedProxyRanges(c.TrustedProxies)
+	if err != nil {
+		return nil, err
+	}
 	c = defaultConfig(c)
 	inner, err := newAppNative()
 	if err != nil {
@@ -668,7 +698,52 @@ func NewApp(cfg ...Config) (*App, error) {
 	initSharedLayout()
 	inner.setBodyLimit(c.BodyLimit)
 	inner.setCapturePeerIP(c.CapturePeerIP)
-	return &App{inner: inner, cfg: c}, nil
+	return &App{inner: inner, cfg: c, trustedProxyRanges: trustedProxyRanges, runDone: make(chan struct{})}, nil
+}
+
+func parseTrustedProxyRanges(values []string) ([]netip.Prefix, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	out := make([]netip.Prefix, 0, len(values))
+	for _, raw := range values {
+		v := strings.TrimSpace(raw)
+		if v == "" {
+			return nil, fmt.Errorf("gogo: Config.TrustedProxies contains an empty entry")
+		}
+		if strings.Contains(v, "/") {
+			prefix, err := netip.ParsePrefix(v)
+			if err != nil {
+				return nil, fmt.Errorf("gogo: Config.TrustedProxies entry %q is not a valid CIDR prefix: %w", raw, err)
+			}
+			out = append(out, normalizeTrustedProxyPrefix(prefix))
+			continue
+		}
+		addr, err := netip.ParseAddr(v)
+		if err != nil {
+			return nil, fmt.Errorf("gogo: Config.TrustedProxies entry %q is not a valid IP or CIDR prefix: %w", raw, err)
+		}
+		if addr.Is4In6() {
+			addr = addr.Unmap()
+		}
+		out = append(out, netip.PrefixFrom(addr, addr.BitLen()))
+	}
+	return out, nil
+}
+
+func normalizeTrustedProxyPrefix(prefix netip.Prefix) netip.Prefix {
+	addr := prefix.Addr()
+	bits := prefix.Bits()
+	if addr.Is4In6() {
+		addr = addr.Unmap()
+		if bits >= 96 {
+			bits -= 96
+		} else {
+			bits = 0
+		}
+		prefix = netip.PrefixFrom(addr, bits)
+	}
+	return prefix.Masked()
 }
 
 func (a *App) acquireSharedWorkerRef() {
@@ -873,12 +948,9 @@ func (a *App) applyMeta(meta *routeMeta, h Handler) Handler {
 // friends would see res.app == nil on every async-route request.
 func (a *App) applyAppRefAsync(h AsyncHandler) AsyncHandler {
 	app := a
-	trustProxy := a.cfg.TrustProxy
 	return func(res *Response, req *Request) {
 		res.app = app
-		if trustProxy {
-			req.trustProxy = true
-		}
+		req.trustProxy = app.trustsProxyPeer(req)
 		h(res, req)
 	}
 }
@@ -909,7 +981,6 @@ func (a *App) applyMetaAsync(meta *routeMeta, h AsyncHandler) AsyncHandler {
 }
 
 func (a *App) wrap(routePattern string, h Handler) Handler {
-	trustProxy := a.cfg.TrustProxy
 	if len(a.middlewares) == 0 {
 		// No middleware: still wrap so res.app gets the back-pointer
 		// (Response.Render and friends need it). One extra function
@@ -918,9 +989,7 @@ func (a *App) wrap(routePattern string, h Handler) Handler {
 		inner := h
 		return func(res *Response, req *Request) {
 			res.app = a
-			if trustProxy {
-				req.trustProxy = true
-			}
+			req.trustProxy = a.trustsProxyPeer(req)
 			inner(res, req)
 		}
 	}
@@ -938,9 +1007,7 @@ func (a *App) wrap(routePattern string, h Handler) Handler {
 		inner := h
 		return func(res *Response, req *Request) {
 			res.app = a
-			if trustProxy {
-				req.trustProxy = true
-			}
+			req.trustProxy = a.trustsProxyPeer(req)
 			inner(res, req)
 		}
 	}
@@ -949,9 +1016,7 @@ func (a *App) wrap(routePattern string, h Handler) Handler {
 	inner := h
 	return func(res *Response, req *Request) {
 		res.app = a
-		if trustProxy {
-			req.trustProxy = true
-		}
+		req.trustProxy = a.trustsProxyPeer(req)
 		url := req.URL()
 		chain := inner
 		for i := len(entries) - 1; i >= 0; i-- {
@@ -962,6 +1027,29 @@ func (a *App) wrap(routePattern string, h Handler) Handler {
 		}
 		chain(res, req)
 	}
+}
+
+func (a *App) trustsProxyPeer(req *Request) bool {
+	if len(a.trustedProxyRanges) == 0 {
+		return a.cfg.TrustProxy
+	}
+	ip := req.IP()
+	if ip == "" {
+		return false
+	}
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return false
+	}
+	if addr.Is4In6() {
+		addr = addr.Unmap()
+	}
+	for _, prefix := range a.trustedProxyRanges {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // urlUnderPrefix reports whether the request URL falls within the path
@@ -1214,10 +1302,12 @@ func (a *App) GetAsync(pattern string, handler AsyncHandler) {
 	wrappedAsync := a.wrapAsyncFiltered(uwsPattern, handler, true)
 	a.inner.get(uwsPattern, a.applyMeta(meta, a.wrap(uwsPattern, func(res *Response, req *Request) {
 		snap := req.snapshotFromSync(a.cfg.CapturePeerIP)
+		trustProxy := req.trustProxy
 		res.Async(func() {
 			snapReq := requestPool.Get().(*Request)
 			snapReq.snap = snap
 			snapReq.res = res
+			snapReq.trustProxy = trustProxy
 			wrappedAsync(res, snapReq)
 			snapReq.resetForPool()
 			requestPool.Put(snapReq)
@@ -1319,6 +1409,7 @@ func (a *App) bodyAsync(method, pattern string, maxBodyBytes int, handler BodyAs
 		// happens via onData callbacks fired after we return, by which time
 		// req would be invalid; the snapshot survives.
 		snap := req.snapshotFromSync(a.cfg.CapturePeerIP)
+		trustProxy := req.trustProxy
 		res.Body(maxBodyBytes, func(body []byte, err error) {
 			if handleBodyCollectionError(res, err) {
 				return
@@ -1330,6 +1421,7 @@ func (a *App) bodyAsync(method, pattern string, maxBodyBytes int, handler BodyAs
 				snapReq.snap = snap
 				snapReq.body = body
 				snapReq.res = res
+				snapReq.trustProxy = trustProxy
 				wrappedAsync(res, snapReq)
 				snapReq.resetForPool()
 				requestPool.Put(snapReq)
@@ -1815,10 +1907,12 @@ func (r *Router) GetAsync(pattern string, handler AsyncHandler) {
 	wrappedAsync := r.app.wrapAsyncFiltered(full, r.wrapGroupAsync(handler), true)
 	syncEntry := func(res *Response, req *Request) {
 		snap := req.snapshotFromSync(r.app.cfg.CapturePeerIP)
+		trustProxy := req.trustProxy
 		res.Async(func() {
 			snapReq := requestPool.Get().(*Request)
 			snapReq.snap = snap
 			snapReq.res = res
+			snapReq.trustProxy = trustProxy
 			wrappedAsync(res, snapReq)
 			snapReq.resetForPool()
 			requestPool.Put(snapReq)
@@ -1873,6 +1967,7 @@ func (r *Router) bodyAsync(method, pattern string, maxBodyBytes int, handler Bod
 
 	syncEntry := func(res *Response, req *Request) {
 		snap := req.snapshotFromSync(r.app.cfg.CapturePeerIP)
+		trustProxy := req.trustProxy
 		res.Body(maxBodyBytes, func(body []byte, err error) {
 			if handleBodyCollectionError(res, err) {
 				return
@@ -1882,6 +1977,7 @@ func (r *Router) bodyAsync(method, pattern string, maxBodyBytes int, handler Bod
 				snapReq.snap = snap
 				snapReq.body = body
 				snapReq.res = res
+				snapReq.trustProxy = trustProxy
 				wrappedAsync(res, snapReq)
 				snapReq.resetForPool()
 				requestPool.Put(snapReq)
@@ -2319,11 +2415,12 @@ func (a *App) fireListenHooks(port int) {
 }
 
 // OnShutdown registers a callback that fires synchronously at the start
-// of Shutdown / ShutdownGracefully (before the C++ close is dispatched
-// to the loop). Use it to flush logs, close DB pools, etc. Hooks run in
-// registration order and run on whatever goroutine called Shutdown.
-// Hooks fire at most once per App lifecycle, even if Shutdown and
-// ShutdownGracefully are both called. Calling OnShutdown(nil) is a no-op.
+// of Shutdown, ShutdownGracefully, or ShutdownContext (before the C++
+// close is dispatched to the loop). Use it to flush logs, close DB
+// pools, etc. Hooks run in registration order and run on whatever
+// goroutine called the shutdown API. Hooks fire at most once per App
+// lifecycle, even if multiple shutdown APIs are called. Calling
+// OnShutdown(nil) is a no-op.
 func (a *App) OnShutdown(fn func()) {
 	if fn == nil {
 		return
@@ -2354,8 +2451,18 @@ func (a *App) fireShutdownHooks() {
 // the shared-memory drain timer on this loop so SendShared responses can be
 // flushed by the loop thread.
 func (a *App) Run() {
+	defer a.finishRun()
 	a.inner.startSharedDrain(200) // 200μs drain interval
 	a.inner.run()
+}
+
+func (a *App) finishRun() {
+	if a.runDone == nil {
+		return
+	}
+	a.runDoneOnce.Do(func() {
+		close(a.runDone)
+	})
 }
 
 // Shutdown stops the app immediately: the listen socket and every
@@ -2425,6 +2532,32 @@ func (a *App) ShutdownGracefully(timeout time.Duration) {
 	}()
 }
 
+// ShutdownContext starts a graceful shutdown and blocks until Run exits or
+// ctx is done. It closes the listen socket immediately, lets accepted
+// connections drain naturally, and returns nil when the loop exits.
+//
+// If ctx is done before the loop exits, ShutdownContext force-closes active
+// connections with Shutdown and returns ctx.Err(). Call Close after Run
+// returns to free native resources. Passing a nil context returns an error.
+func (a *App) ShutdownContext(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("gogo: ShutdownContext requires a non-nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		a.Shutdown()
+		return err
+	}
+
+	a.ShutdownGracefully(0)
+	select {
+	case <-a.runDone:
+		return nil
+	case <-ctx.Done():
+		a.Shutdown()
+		return ctx.Err()
+	}
+}
+
 // Close frees native resources. Call it only after Run has returned, or
 // before Run if the app was never started. Waits for any in-flight
 // ShutdownGracefully force-close goroutine to settle so a delayed
@@ -2449,6 +2582,7 @@ func (a *App) Close() {
 	a.nativeMu.Lock()
 	a.inner.close()
 	a.nativeMu.Unlock()
+	a.finishRun()
 	// Drop the worker pool reference exactly once per shared App.
 	// Multiple Close calls (defensive teardown, force-close timer
 	// overlap) must not over-decrement the global active-apps counter.
@@ -3201,20 +3335,31 @@ func (r *Response) Stream(status int, contentType string, fn func(w io.Writer) e
 	}
 	r.pendingHeaders = r.pendingHeaders[:0]
 
-	// Mark sent so the normal async release path treats this
-	// response as complete — Stream owns its lifecycle from here.
-	r.async.sent = true
+	ctxHandle := r.async.ctxHandle
+	loopPtr := r.async.loopPtr
+	if !asyncDeferStreamStart(loopPtr, ctxHandle, line, contentType, hb.String()) {
+		r.async.sent = true
+		asyncCtxRelease(ctxHandle)
+		return nil
+	}
 
-	asyncDeferStreamStart(r.async.loopPtr, r.async.ctxHandle, line, contentType, hb.String())
+	// Mark sent so the normal async release path treats this response as
+	// complete. Stream owns the original async ctx ref from here; every native
+	// stream operation retains/releases its own defer ref, and the defer below
+	// drops the original ref exactly once even if fn panics.
+	r.async.sent = true
+	defer func() {
+		if !asyncCtxAborted(ctxHandle) {
+			asyncDeferStreamEnd(loopPtr, ctxHandle)
+		}
+		asyncCtxRelease(ctxHandle)
+	}()
 
 	sw := &streamWriter{r: r}
 	fnErr := fn(sw)
-	// Always close — even on user error — so the response doesn't
-	// hang the connection. The user's error is propagated back to
-	// the caller for logging / metrics.
-	if !asyncCtxAborted(r.async.ctxHandle) {
-		asyncDeferStreamEnd(r.async.loopPtr, r.async.ctxHandle)
-	}
+	// The deferred close above runs even on user error so the response doesn't
+	// hang the connection. The user's error is propagated back to the caller for
+	// logging / metrics.
 	return fnErr
 }
 
@@ -3570,26 +3715,16 @@ func (r *Response) Redirect(location string, code int) {
 	r.statusCode = code
 	line := statusLine(code)
 	if r.async != nil && !r.async.sent {
+		if r.dropAsyncIfAborted() {
+			return
+		}
 		r.async.sent = true
-		inner := r.inner
-		// Cached pointer — see sendBytes for why we don't call res.Loop()
-		// from off-loop-thread.
-		loop := loopFromUintptr(r.async.loopPtr)
-		ctx := r.async.ctxHandle
-		loc := location
-		headers := captureResponseHeaders(r.pendingHeaders, nil)
+		headers := captureResponseHeaders(r.pendingHeaders, []responseHeader{{
+			name:  "Location",
+			value: location,
+		}})
 		r.pendingHeaders = r.pendingHeaders[:0]
-		loop.Defer(func() {
-			defer asyncCtxRelease(ctx)
-			inner.cork(func() {
-				inner.status(line)
-				for _, h := range headers {
-					inner.header(h.name, h.value)
-				}
-				inner.header("Location", loc)
-				inner.end("")
-			})
-		})
+		asyncDeferSendWithHeaders(r.async.loopPtr, r.async.ctxHandle, line, "", responseHeadersBlob(headers), "")
 		return
 	}
 	r.inner.status(line)
@@ -3947,24 +4082,15 @@ func (r *Response) sendBytes(code int, headers []responseHeader, body []byte) {
 	r.statusCode = code
 	line := statusLine(code)
 	if r.async != nil && !r.async.sent {
+		if r.dropAsyncIfAborted() {
+			runtime.KeepAlive(body)
+			return
+		}
 		r.async.sent = true
-		loop := loopFromUintptr(r.async.loopPtr)
-		inner := r.inner
-		ctx := r.async.ctxHandle
 		hs := captureResponseHeaders(r.pendingHeaders, headers)
 		r.pendingHeaders = r.pendingHeaders[:0]
-		bs := body
-		loop.Defer(func() {
-			defer asyncCtxRelease(ctx)
-			inner.cork(func() {
-				inner.status(line)
-				for _, h := range hs {
-					inner.header(h.name, h.value)
-				}
-				inner.end(bytesAsString(bs))
-			})
-			runtime.KeepAlive(bs)
-		})
+		asyncDeferSendWithHeaders(r.async.loopPtr, r.async.ctxHandle, line, "", responseHeadersBlob(hs), bytesAsString(body))
+		runtime.KeepAlive(body)
 		return
 	}
 	r.inner.status(line)
@@ -3984,6 +4110,21 @@ func captureResponseHeaders(pending, extra []responseHeader) []responseHeader {
 	out = append(out, pending...)
 	out = append(out, extra...)
 	return out
+}
+
+func responseHeadersBlob(headers []responseHeader) string {
+	if len(headers) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, h := range headers {
+		b.Grow(len(h.name) + len(h.value) + 2)
+		b.WriteString(h.name)
+		b.WriteByte(0)
+		b.WriteString(h.value)
+		b.WriteByte(0)
+	}
+	return b.String()
 }
 
 // bytesAsString aliases body as a Go string without copying. The string
@@ -5317,11 +5458,11 @@ func hostnameFromHostHeader(host string) string {
 
 // Protocol returns "http" or "https". The framework itself only speaks
 // plaintext — gogo is intended to run behind a TLS-terminating gateway
-// such as nginx, an L7 load balancer, or a CDN. When Config.TrustProxy
-// is enabled the X-Forwarded-Proto header from the gateway is honored
-// so the application sees the original client protocol; otherwise the
-// answer is always "http" so an untrusted client can't spoof its way
-// to appearing as https.
+// such as nginx, an L7 load balancer, or a CDN. When the request's immediate
+// peer is trusted by Config.TrustProxy or Config.TrustedProxies, the
+// X-Forwarded-Proto header from the gateway is honored so the application sees
+// the original client protocol; otherwise the answer is always "http" so an
+// untrusted client can't spoof its way to appearing as https.
 func (r *Request) Protocol() string {
 	if r.trustProxy {
 		if v := r.Header("x-forwarded-proto"); v != "" {
@@ -5339,7 +5480,8 @@ func (r *Request) Protocol() string {
 }
 
 // Secure reports whether the connection is encrypted (TLS / HTTPS).
-// Honors X-Forwarded-Proto only when Config.TrustProxy is enabled.
+// Honors X-Forwarded-Proto only when the immediate peer is trusted by
+// Config.TrustProxy or Config.TrustedProxies.
 func (r *Request) Secure() bool {
 	return r.Protocol() == "https"
 }
@@ -5385,12 +5527,13 @@ func normalizePeerIP(ip string) string {
 // the header is absent, empty, or contains no valid IP entries. Empty and
 // malformed entries are skipped; IPv4-mapped IPv6 addresses are unmapped.
 //
-// Returns nil when Config.TrustProxy is false — without that flag, the
-// X-Forwarded-For header is attacker-controlled and any IP in it should
-// be treated as untrusted input, not exposed via this helper. Callers
-// that genuinely need the raw header value on an internet-facing server
-// (rare, and almost always a logging mistake) can read it via
-// req.Header("x-forwarded-for") and parse it themselves.
+// Returns nil when the immediate peer is not trusted by Config.TrustProxy or
+// Config.TrustedProxies. Without a trusted peer, the X-Forwarded-For header is
+// attacker-controlled and any IP in it should be treated as untrusted input,
+// not exposed via this helper. Callers that genuinely need the raw header
+// value on an internet-facing server (rare, and almost always a logging
+// mistake) can read it via req.Header("x-forwarded-for") and parse it
+// themselves.
 func (r *Request) IPs() []string {
 	if !r.trustProxy {
 		return nil

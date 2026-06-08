@@ -187,7 +187,7 @@
 //	    // … same routes / middleware as a single-loop app …
 //	})
 //	if err != nil { log.Fatal(err) }
-//	// signal-driven graceful shutdown:
+//	// signal-driven immediate shutdown:
 //	<-sigCh
 //	handle.Shutdown()
 //	handle.Wait()
@@ -199,6 +199,15 @@
 // the OS thread that instance will own. setup has no error return; do
 // fallible shared initialization before RunMultiCore. A setup panic is
 // recovered, converted to an error, and any created Apps are closed.
+// RunMultiCore currently creates each worker with the zero-value Config; there
+// is no Config/options parameter for app-scoped settings such as BodyLimit,
+// BodyReadTimeout, BindAddr, CapturePeerIP, TrustProxy, or custom JSON codecs.
+// Use process-wide knobs before RunMultiCore and per-route/per-middleware
+// options inside setup.
+//
+// MultiCoreHandle.Shutdown calls Shutdown on every worker App, so multicore
+// shutdown is immediate and active connections are closed. There is no
+// multicore equivalent of App.ShutdownGracefully yet.
 //
 // Tuning knobs that actually matter:
 //
@@ -228,16 +237,30 @@
 // per core consistently outruns fiber per core on this hardware
 // (+86 % at 1 core, +48 % at 4 cores, both routes saturated).
 //
-// See examples/multicore for a full setup with graceful shutdown
+// See examples/multicore for a full setup with signal handling
 // + a /metrics endpoint formatted as Prometheus text exposition.
 //
 // # Graceful shutdown
 //
-//	app.Shutdown() // close listen socket + drain timer; returns immediately
-//	// when Run() returns, call:
-//	app.Close()    // free native resources
+//	runDone := make(chan struct{})
+//	go func() {
+//	    app.Run()
+//	    close(runDone)
+//	}()
 //
-// Shutdown is safe from any goroutine.
+//	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+//	defer cancel()
+//	if err := app.ShutdownContext(ctx); err != nil {
+//	    log.Printf("forced shutdown: %v", err)
+//	}
+//	<-runDone
+//	app.Close() // free native resources after Run returns
+//
+// ShutdownContext returns nil only after Run exits. If the context expires
+// first, it force-closes active connections and returns the context error;
+// wait for Run to return before calling Close.
+//
+// Shutdown, ShutdownGracefully, and ShutdownContext are safe from any goroutine.
 //
 // # Performance characteristics
 //

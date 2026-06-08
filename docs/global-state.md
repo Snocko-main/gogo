@@ -23,6 +23,27 @@ found there.
   parallel execution unless the test owns the whole process state for its
   duration.
 
+## RunMultiCore Configuration Boundary
+
+`RunMultiCore(n, port, setup)` currently creates each worker with `NewApp()`
+and the zero-value `Config`. It has no `Config` or options parameter, so these
+app-scoped fields cannot be supplied through the multicore helper today:
+
+- `BodyLimit`
+- `BodyReadTimeout`
+- `BindAddr`
+- `CapturePeerIP`
+- `TrustProxy`
+- `JSONEncoder`
+- `JSONDecoder`
+
+Configuration that is process-wide by design, such as `SetWorkerCount`,
+`SetPanicHandler`, `RegisterParamType`, and the package-level limit setters
+below, should be applied before `RunMultiCore`. Route, middleware, WebSocket,
+hub, upload, and file-serving options should be registered inside `setup` so
+every worker receives the same routes and options. Use single-loop
+`NewApp(cfg)` + `Run` when an app-scoped `Config` field is required.
+
 ## Public Global Configuration
 
 | API or state | Default | Scope | Mutation and timing |
@@ -31,6 +52,11 @@ found there.
 | `RegisterParamType(name, check)` | Built-ins: `int`, `uint`, `uuid`, `alpha`, `alnum`, `slug` | Typed route parameter registry for the whole process | Protected by a mutex. Route registration captures the check function, so changes affect routes registered after the call; existing routes keep their previously captured checker. Re-registering any name, including a built-in, overwrites that registry entry for future routes. |
 | `SetWorkerCount(n)` | `0`, interpreted as `runtime.NumCPU()` when workers start | Native shared-dispatch worker pool used by shared async routes | Native builds only. Negative values are clamped to `0`. The value is read when a shared worker generation starts. Calls after workers are already running do not resize that generation; set it before the first shared async route is registered. |
 | `WaitForSharedWorkers(timeout)` | Not a setting | Native shared-dispatch worker generations | Observes worker drain state. It does not configure global state, but it is the public observation hook for the process-wide shared worker pool. Stub builds always return `true`. |
+
+`SetPanicHandler` is intentionally the supported panic-recovery configuration
+model for v1. There is no per-`App` `Config` hook: some recovery sites are
+owned by package-level workers or shared callback paths where no single `App`
+is available, so a process-wide handler keeps reporting behavior consistent.
 
 ## Package-Level Limits
 

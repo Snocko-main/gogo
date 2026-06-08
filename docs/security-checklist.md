@@ -7,12 +7,14 @@ accepted as residual risk.
 
 ## Proxy Trust
 
-- [ ] Decide whether `Config.TrustProxy bool` is final for v1 or must become a
-      trusted CIDR/range allow-list.
-- [ ] When `TrustProxy` is enabled, document the trusted edge component that
+- [x] Decide whether `Config.TrustProxy bool` is final for v1 or must become a
+      trusted CIDR/range allow-list. v0.3 extends it with
+      `Config.TrustedProxies` while keeping the bool as a compatibility
+      shortcut.
+- [x] When `TrustProxy` is enabled, document the trusted edge component that
       strips or overwrites `X-Forwarded-*`, `Forwarded`, and `X-Real-IP` from
       untrusted clients.
-- [ ] Verify `req.Protocol()`, `req.Secure()`, `req.IP()`, and `req.IPs()` do
+- [x] Verify `req.Protocol()`, `req.Secure()`, `req.IP()`, and `req.IPs()` do
       not trust forwarded headers when the app is directly internet-facing.
 - [x] Document `CapturePeerIP` requirements for async/shared-dispatch routes,
       rate limiting, audit logs, and auth decisions that depend on peer IP.

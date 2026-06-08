@@ -21,8 +21,11 @@ type RateLimitOptions struct {
 	// boundary. Required.
 	Window time.Duration
 
-	// KeyFunc derives the bucket key from the request. Default
-	// req.IP(). Override to rate-limit by user ID, API key, etc.
+	// KeyFunc derives the bucket key from the request. Default req.IP(), which
+	// is the immediate TCP peer. Behind trusted proxies, override this when you
+	// want end-client limits, for example by selecting from req.IPs(). For
+	// AsyncStore on async routes, req.IP() requires Config.CapturePeerIP unless
+	// Config.TrustedProxies auto-enabled it.
 	KeyFunc func(*gogo.Request) string
 
 	// SkipFunc, when non-nil and returning true, bypasses the limit

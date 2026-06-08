@@ -677,6 +677,190 @@ func TestSharedWorkersDrainOnAppClose(t *testing.T) {
 	}
 }
 
+func TestSharedDispatchCloseBeforeInlineSend(t *testing.T) {
+	testSharedDispatchCloseBeforeSend(t, "late")
+}
+
+func TestSharedDispatchCloseBeforeFallbackSend(t *testing.T) {
+	testSharedDispatchCloseBeforeResponse(t, func(res *gogo.Response) {
+		res.Send(200, "text/plain", strings.Repeat("x", 16*1024))
+	})
+}
+
+func testSharedDispatchCloseBeforeSend(t *testing.T, body string) {
+	testSharedDispatchCloseBeforeResponse(t, func(res *gogo.Response) {
+		res.Send(200, "text/plain", body)
+	})
+}
+
+func TestSharedDispatchCloseBeforeRedirect(t *testing.T) {
+	testSharedDispatchCloseBeforeResponse(t, func(res *gogo.Response) {
+		res.Redirect("/late", 302)
+	})
+}
+
+func TestSharedDispatchCloseBeforeStream(t *testing.T) {
+	testSharedDispatchCloseBeforeResponse(t, func(res *gogo.Response) {
+		if err := res.Stream(200, "text/plain", func(w io.Writer) error {
+			_, err := w.Write([]byte("late"))
+			return err
+		}); err != nil {
+			t.Errorf("Stream: %v", err)
+		}
+	})
+}
+
+func TestSharedDispatchCloseDuringPostBody(t *testing.T) {
+	var handlerRan atomic.Bool
+	port := freePort(t)
+	ready := make(chan *gogo.App, 1)
+	runDone := make(chan struct{})
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		app, err := gogo.NewApp(gogo.Config{BindAddr: "127.0.0.1"})
+		if err != nil {
+			t.Errorf("NewApp: %v", err)
+			close(runDone)
+			return
+		}
+		app.PostAsync("/upload", 1<<20, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			handlerRan.Store(true)
+			res.Send(200, "text/plain", fmt.Sprintf("got %d", len(body)))
+		})
+		if !app.Listen(port) {
+			t.Errorf("Listen :%d failed", port)
+			app.Close()
+			close(runDone)
+			return
+		}
+		ready <- app
+		app.Run()
+		app.Close()
+		close(runDone)
+	}()
+
+	var app *gogo.App
+	select {
+	case app = <-ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("app setup timed out")
+	}
+
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), time.Second)
+	if err != nil {
+		app.Shutdown()
+		t.Fatalf("dial: %v", err)
+	}
+	fmt.Fprintf(conn, "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 100000\r\nConnection: close\r\n\r\npartial")
+	time.Sleep(50 * time.Millisecond)
+
+	app.Shutdown()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		conn.Close()
+		t.Fatal("Run did not exit after Shutdown with partial PostAsync body")
+	}
+	conn.Close()
+	if handlerRan.Load() {
+		t.Fatal("partial PostAsync body reached shared handler after close")
+	}
+	if !gogo.WaitForSharedWorkers(5 * time.Second) {
+		t.Fatal("shared workers did not drain after close during PostAsync body")
+	}
+}
+
+func testSharedDispatchCloseBeforeResponse(t *testing.T, respond func(*gogo.Response)) {
+	t.Helper()
+
+	handlerStarted := make(chan struct{})
+	handlerRelease := make(chan struct{})
+	handlerDone := make(chan struct{})
+	var released atomic.Bool
+	releaseHandler := func() {
+		if !released.Swap(true) {
+			close(handlerRelease)
+		}
+	}
+	defer releaseHandler()
+
+	port := freePort(t)
+	ready := make(chan *gogo.App, 1)
+	runDone := make(chan struct{})
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		app, err := gogo.NewApp(gogo.Config{BindAddr: "127.0.0.1"})
+		if err != nil {
+			t.Errorf("NewApp: %v", err)
+			close(runDone)
+			return
+		}
+		app.GetAsync("/blocked", func(res *gogo.Response, req *gogo.Request) {
+			close(handlerStarted)
+			<-handlerRelease
+			respond(res)
+			close(handlerDone)
+		})
+		if !app.Listen(port) {
+			t.Errorf("Listen :%d failed", port)
+			app.Close()
+			close(runDone)
+			return
+		}
+		ready <- app
+		app.Run()
+		app.Close()
+		close(runDone)
+	}()
+
+	var app *gogo.App
+	select {
+	case app = <-ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("app setup timed out")
+	}
+
+	reqDone := make(chan struct{})
+	go func() {
+		defer close(reqDone)
+		resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/blocked", port))
+		if err == nil && resp != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+	}()
+
+	select {
+	case <-handlerStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shared handler did not start")
+	}
+
+	app.Shutdown()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not exit after Shutdown")
+	}
+
+	releaseHandler()
+	select {
+	case <-handlerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shared handler did not finish after App.Close")
+	}
+	select {
+	case <-reqDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("client did not finish after App.Close")
+	}
+	if !gogo.WaitForSharedWorkers(5 * time.Second) {
+		t.Fatal("shared workers did not drain after close-before-send")
+	}
+}
+
 func TestSharedWorkersDrainWithSyncOnlyAppOpen(t *testing.T) {
 	syncOnly, err := gogo.NewApp(gogo.Config{BindAddr: "127.0.0.1"})
 	if err != nil {
@@ -3756,6 +3940,26 @@ func TestGroupPrefixRejectsWildcard(t *testing.T) {
 	}
 }
 
+func TestNewAppAllowsZeroOrOneConfig(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  []gogo.Config
+	}{
+		{name: "default"},
+		{name: "one config", cfg: []gogo.Config{{BindAddr: "127.0.0.1"}}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			app, err := gogo.NewApp(tc.cfg...)
+			if err != nil {
+				t.Fatalf("NewApp: %v", err)
+			}
+			app.Close()
+		})
+	}
+}
+
 // TestGroupGlobalUseStillWraps: a global App.Use ALWAYS wraps routes
 // registered via a Group, regardless of the group's prefix.
 func TestGroupGlobalUseStillWraps(t *testing.T) {
@@ -4619,6 +4823,132 @@ func TestIPsRequiresTrustProxy(t *testing.T) {
 	}
 }
 
+func TestTrustedProxiesAllowForwardedHeadersForMatchingPeer(t *testing.T) {
+	type captured struct {
+		ip       string
+		ips      []string
+		protocol string
+		secure   bool
+	}
+	var sync, async, shared atomic.Pointer[captured]
+
+	cfg := gogo.Config{TrustedProxies: []string{"127.0.0.1/32", "::1/128"}}
+	port, teardown := startAppCfg(t, cfg, func(app *gogo.App) {
+		app.Get("/sync", func(res *gogo.Response, req *gogo.Request) {
+			sync.Store(&captured{
+				ip:       req.IP(),
+				ips:      req.IPs(),
+				protocol: req.Protocol(),
+				secure:   req.Secure(),
+			})
+			res.Send(200, "text/plain", "sync")
+		})
+		// Force the sync-wrapper async path. The trusted-proxy decision is
+		// made while the live request can still read its immediate peer and
+		// then carried onto the async snapshot.
+		app.Use("/async/*", func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) { next(res, req) }
+		})
+		app.GetAsync("/async/snap", func(res *gogo.Response, req *gogo.Request) {
+			async.Store(&captured{
+				ip:       req.IP(),
+				ips:      req.IPs(),
+				protocol: req.Protocol(),
+				secure:   req.Secure(),
+			})
+			res.Send(200, "text/plain", "async")
+		})
+		app.GetAsync("/shared", func(res *gogo.Response, req *gogo.Request) {
+			shared.Store(&captured{
+				ip:       req.IP(),
+				ips:      req.IPs(),
+				protocol: req.Protocol(),
+				secure:   req.Secure(),
+			})
+			res.Send(200, "text/plain", "shared")
+		})
+	})
+	defer teardown()
+
+	doRequest := func(path string) {
+		req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d%s", port, path), nil)
+		req.Header.Set("X-Forwarded-For", "203.0.113.5, 198.51.100.7")
+		req.Header.Set("X-Forwarded-Proto", "https")
+		resp, err := noKeepaliveClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		resp.Body.Close()
+	}
+	doRequest("/sync")
+	doRequest("/async/snap")
+	doRequest("/shared")
+
+	check := func(name string, c *captured) {
+		t.Helper()
+		if c == nil {
+			t.Fatalf("%s handler did not record", name)
+		}
+		if c.ip == "" || (!strings.HasPrefix(c.ip, "127.0.0.1") && c.ip != "::1") {
+			t.Errorf("%s: ip=%q, want loopback", name, c.ip)
+		}
+		if !reflect.DeepEqual(c.ips, []string{"203.0.113.5", "198.51.100.7"}) {
+			t.Errorf("%s: ips=%v, want forwarded chain", name, c.ips)
+		}
+		if c.protocol != "https" || !c.secure {
+			t.Errorf("%s: protocol/secure=%q/%t, want https/true", name, c.protocol, c.secure)
+		}
+	}
+	check("sync", sync.Load())
+	check("async-snap", async.Load())
+	check("shared", shared.Load())
+}
+
+func TestTrustedProxiesOverrideTrustProxyForNonMatchingPeer(t *testing.T) {
+	type result struct {
+		ips      []string
+		protocol string
+		secure   bool
+	}
+	var captured atomic.Pointer[result]
+
+	cfg := gogo.Config{
+		TrustProxy:     true,
+		TrustedProxies: []string{"10.0.0.0/8"},
+	}
+	port, teardown := startAppCfg(t, cfg, func(app *gogo.App) {
+		app.Get("/", func(res *gogo.Response, req *gogo.Request) {
+			captured.Store(&result{
+				ips:      req.IPs(),
+				protocol: req.Protocol(),
+				secure:   req.Secure(),
+			})
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/", port), nil)
+	req.Header.Set("X-Forwarded-For", "203.0.113.5")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	resp.Body.Close()
+
+	got := captured.Load()
+	if got == nil {
+		t.Fatal("handler did not record result")
+	}
+	if got.ips != nil {
+		t.Errorf("IPs() = %v with non-matching TrustedProxies, want nil", got.ips)
+	}
+	if got.protocol != "http" || got.secure {
+		t.Errorf("protocol/secure = %q/%t, want http/false", got.protocol, got.secure)
+	}
+}
+
 func TestIPsNormalizesAndDropsInvalidForwardedEntries(t *testing.T) {
 	type result struct {
 		ips []string
@@ -4977,6 +5307,205 @@ func TestShutdownGracefullyForceCloseTimeout(t *testing.T) {
 	close(hold) // unblock any leftover handler goroutine
 }
 
+func TestShutdownContextDrainsInFlight(t *testing.T) {
+	requestStarted := make(chan struct{})
+	requestFinish := make(chan struct{})
+
+	port := freePort(t)
+	ready := make(chan *gogo.App, 1)
+	runReturned := make(chan struct{})
+	runDone := make(chan struct{})
+
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		app, err := gogo.NewApp()
+		if err != nil {
+			t.Errorf("NewApp: %v", err)
+			close(runDone)
+			return
+		}
+		app.GetAsync("/slow", func(res *gogo.Response, req *gogo.Request) {
+			close(requestStarted)
+			<-requestFinish
+			res.Send(200, "text/plain", "done")
+		})
+		if !app.Listen(port) {
+			t.Errorf("Listen :%d failed", port)
+			app.Close()
+			close(runDone)
+			return
+		}
+		ready <- app
+		app.Run()
+		close(runReturned)
+		app.Close()
+		close(runDone)
+	}()
+
+	var app *gogo.App
+	select {
+	case app = <-ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("app setup timed out")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 50*time.Millisecond)
+		if err == nil {
+			c.Close()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	respCh := make(chan *http.Response, 1)
+	reqErrCh := make(chan error, 1)
+	go func() {
+		resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/slow", port))
+		if err != nil {
+			reqErrCh <- err
+			return
+		}
+		respCh <- resp
+	}()
+	<-requestStarted
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	shutdownErr := make(chan error, 1)
+	go func() {
+		shutdownErr <- app.ShutdownContext(ctx)
+	}()
+
+	select {
+	case err := <-shutdownErr:
+		t.Fatalf("ShutdownContext returned before in-flight response finished: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(requestFinish)
+	var resp *http.Response
+	select {
+	case resp = <-respCh:
+	case err := <-reqErrCh:
+		t.Fatalf("slow GET: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("slow GET did not finish")
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || string(body) != "done" {
+		t.Fatalf("in-flight response: got %d %q, want 200 done", resp.StatusCode, string(body))
+	}
+
+	select {
+	case err := <-shutdownErr:
+		if err != nil {
+			t.Fatalf("ShutdownContext: %v", err)
+		}
+		select {
+		case <-runReturned:
+		default:
+			t.Fatal("ShutdownContext returned nil before Run exited")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("ShutdownContext did not return after graceful drain")
+	}
+	select {
+	case <-runDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run did not exit after ShutdownContext graceful drain")
+	}
+}
+
+func TestShutdownContextForcesOnDeadline(t *testing.T) {
+	port := freePort(t)
+	ready := make(chan *gogo.App, 1)
+	runDone := make(chan struct{})
+	requestStarted := make(chan struct{})
+	hold := make(chan struct{})
+	defer close(hold)
+
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		app, err := gogo.NewApp()
+		if err != nil {
+			t.Errorf("NewApp: %v", err)
+			close(runDone)
+			return
+		}
+		app.GetAsync("/hang", func(res *gogo.Response, req *gogo.Request) {
+			close(requestStarted)
+			<-hold
+			res.Send(200, "text/plain", "never")
+		})
+		if !app.Listen(port) {
+			t.Errorf("Listen :%d failed", port)
+			app.Close()
+			close(runDone)
+			return
+		}
+		ready <- app
+		app.Run()
+		app.Close()
+		close(runDone)
+	}()
+
+	var app *gogo.App
+	select {
+	case app = <-ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("app setup timed out")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 50*time.Millisecond)
+		if err == nil {
+			c.Close()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	reqDone := make(chan struct{})
+	go func() {
+		resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/hang", port))
+		if err == nil && resp != nil {
+			resp.Body.Close()
+		}
+		close(reqDone)
+	}()
+	<-requestStarted
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := app.ShutdownContext(ctx)
+	elapsed := time.Since(start)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ShutdownContext error = %v, want context deadline exceeded", err)
+	}
+	if elapsed < 150*time.Millisecond {
+		t.Fatalf("ShutdownContext returned before context deadline: %v", elapsed)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("ShutdownContext returned too late after context deadline: %v", elapsed)
+	}
+
+	select {
+	case <-runDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not exit after ShutdownContext deadline force-close")
+	}
+	select {
+	case <-reqDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("hung request did not finish after force-close")
+	}
+}
+
 // TestLifecycleHooks: OnListen fires once after Listen succeeds with
 // the bound port; OnShutdown fires synchronously when Shutdown is
 // invoked. Multiple hooks run in registration order.
@@ -5102,6 +5631,53 @@ func TestShutdownHooksFireOnGraceful(t *testing.T) {
 		t.Fatal("OnShutdown hook never fired on graceful path")
 	}
 	<-runDone
+}
+
+func TestShutdownHooksFireOnShutdownContext(t *testing.T) {
+	fired := make(chan struct{}, 1)
+
+	port := freePort(t)
+	ready := make(chan *gogo.App, 1)
+	runDone := make(chan struct{})
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		app, err := gogo.NewApp()
+		if err != nil {
+			t.Errorf("NewApp: %v", err)
+			close(runDone)
+			return
+		}
+		app.OnShutdown(func() { fired <- struct{}{} })
+		if !app.Listen(port) {
+			t.Errorf("Listen :%d failed", port)
+			app.Close()
+			close(runDone)
+			return
+		}
+		ready <- app
+		app.Run()
+		app.Close()
+		close(runDone)
+	}()
+	app := <-ready
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := app.ShutdownContext(ctx); err != nil {
+		t.Fatalf("ShutdownContext: %v", err)
+	}
+
+	select {
+	case <-fired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnShutdown hook never fired on ShutdownContext path")
+	}
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not exit after ShutdownContext")
+	}
 }
 
 func TestShutdownHooksFireOnce(t *testing.T) {

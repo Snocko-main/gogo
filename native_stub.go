@@ -94,7 +94,7 @@ func (responseNative) beginAsync() (uintptr, uintptr) { return 0, 0 }
 
 func asyncDeferSend(uintptr, uintptr, string, string, string)                    {}
 func asyncDeferSendWithHeaders(uintptr, uintptr, string, string, string, string) {}
-func asyncDeferStreamStart(uintptr, uintptr, string, string, string)             {}
+func asyncDeferStreamStart(uintptr, uintptr, string, string, string) bool        { return false }
 func asyncDeferStreamWrite(uintptr, uintptr, string)                             {}
 func asyncDeferStreamEnd(uintptr, uintptr)                                       {}
 func innerBufferedAmount(responseNative) uint64                                  { return 0 }

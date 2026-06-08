@@ -1020,6 +1020,11 @@ The cap binds tightly when your `KeyFunc` returns many distinct values
 per window — user IDs, API keys, tokens, headers. For `KeyFunc = req.IP()`
 behind a CDN it almost never binds.
 
+The default `KeyFunc` is `req.IP()`, which is the immediate TCP peer. Behind
+a trusted proxy or CDN that usually means the proxy address, not the end
+client. To rate-limit by end-client IP, configure `TrustedProxies` and provide
+a `KeyFunc` that chooses from `req.IPs()` with a fallback to `req.IP()`.
+
 | `KeyFunc` returns        | Typical cardinality      | 100k enough? |
 | ------------------------ | ------------------------ | ------------ |
 | `req.IP()` behind a CDN  | 1 (the CDN's address)    | yes          |
@@ -1036,6 +1041,21 @@ app.Use(mw.RateLimit(mw.RateLimitOptions{
     Window:     time.Minute,
     KeyFunc:    func(req *gogo.Request) string { return req.Local("userID").(string) },
     MaxBuckets: 2_000_000,                    // ~200 MiB worst case
+}))
+```
+
+Example client-IP key behind trusted proxies:
+
+```go
+app.Use(mw.RateLimit(mw.RateLimitOptions{
+    Max:    100,
+    Window: time.Minute,
+    KeyFunc: func(req *gogo.Request) string {
+        if ips := req.IPs(); len(ips) > 0 {
+            return ips[0]
+        }
+        return req.IP()
+    },
 }))
 ```
 
@@ -1724,11 +1744,26 @@ func main() {
     sigCh := make(chan os.Signal, 1)
     signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
     <-sigCh
-    log.Println("draining workers")
+    log.Println("stopping workers")
     handle.Shutdown()
     handle.Wait()
 }
 ```
+
+`RunMultiCore` currently has no `Config` or options parameter. Each worker
+`App` is created with the zero-value `Config`, so app-scoped fields such as
+`BodyLimit`, `BodyReadTimeout`, `BindAddr`, `CapturePeerIP`, `TrustProxy`,
+`JSONEncoder`, and `JSONDecoder` cannot be supplied through this helper today.
+Set process-wide knobs before `RunMultiCore`, register per-route/per-middleware
+options inside `setup`, and create shared resources outside `setup` so every
+worker captures the same instance.
+
+`MultiCoreHandle.Shutdown` is immediate: it calls `Shutdown` on every worker,
+which closes the listen socket and active connections. It is safe and
+idempotent, and `Wait` blocks until every worker loop exits and native
+resources are freed. There is not yet a multicore equivalent of
+`App.ShutdownGracefully`; use a single-loop `App` when you need the built-in
+graceful drain behavior.
 
 Tuning knobs that actually matter:
 
@@ -1750,40 +1785,66 @@ app.OnShutdown(func() {
     db.Close()
 })
 
+runDone := make(chan struct{})
+go func() {
+    app.Run()
+    close(runDone)
+}()
+
 sigCh := make(chan os.Signal, 1)
 signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 <-sigCh
 
-app.ShutdownGracefully(30 * time.Second)   // wait for in-flight requests
-// Run() returns once the loop has drained.
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+if err := app.ShutdownContext(ctx); err != nil {
+    log.Printf("forced shutdown: %v", err)
+}
+<-runDone
+app.Close() // free native resources after Run returns
 ```
 
-`Shutdown` closes the listen socket and drains the loop; `Close` frees
-native resources. Both are safe from any goroutine.
+`ShutdownContext` starts a graceful drain and returns nil after `Run` exits. If
+the context expires first, it force-closes active connections and returns the
+context error; wait for `Run` to return before calling `Close`.
+`ShutdownGracefully` starts the same graceful drain without blocking. `Shutdown`
+closes the listen socket and active connections immediately; `Close` frees
+native resources. Shutdown APIs are safe from any goroutine.
+
+`ShutdownGracefully` is an `App` API. `RunMultiCore` currently exposes only
+`MultiCoreHandle.Shutdown`, which stops every worker immediately and may drop
+in-flight responses.
 
 ## Configuration
 
 ```go
 app, _ := gogo.NewApp(gogo.Config{
-    BodyLimit:       4 << 20,          // 4 MiB; oversize -> 413
-    BodyReadTimeout: 30 * time.Second, // slow body upload deadline
-    BindAddr:        "127.0.0.1",      // localhost only
-    CapturePeerIP:   true,             // populate req.IP() on async paths
-    TrustProxy:      true,             // honor X-Forwarded-*
+    BodyLimit:       4 << 20,                    // 4 MiB; oversize -> 413
+    BodyReadTimeout: 30 * time.Second,           // slow body upload deadline
+    BindAddr:        "127.0.0.1",                // localhost only
+    TrustedProxies:  []string{"10.0.0.0/8"},     // honor forwarded headers from these peers
     // JSONEncoder:  sonic.Marshal,    // optional: faster JSON responses
     // JSONDecoder:  sonic.Unmarshal,  // optional: faster BodyParser JSON
 })
 ```
 
-| Field             | Default                   | Notes                                                   |
-| ----------------- | ------------------------- | ------------------------------------------------------- |
-| `BodyLimit`       | 4 MiB                     | Reject Content-Length > limit with 413 on the C++ side  |
-| `BodyReadTimeout` | 30s                       | Deadline for `Response.Body` to finish reading the body |
-| `BindAddr`        | `""`                      | Empty = all interfaces (`0.0.0.0`)                      |
-| `CapturePeerIP`   | `false`                   | Snapshot peer IP for async / shared-dispatch paths      |
-| `TrustProxy`      | `false`                   | Honor `X-Forwarded-*` in `Protocol()`/`Secure()`/`IPs()` |
-| `JSONEncoder`     | `encoding/json.Marshal`   | Encoder for `Response.JSON` and `Response.JSONP`        |
-| `JSONDecoder`     | `encoding/json.Unmarshal` | Decoder for `Request.BodyParser` JSON bodies            |
+`NewApp` intentionally accepts either no argument or one `Config`: `NewApp()`
+uses safe defaults, and `NewApp(gogo.Config{...})` applies overrides. Passing
+multiple configs returns an error so configuration stays unambiguous.
+
+| Field              | Default                   | Notes                                                     |
+| ------------------ | ------------------------- | --------------------------------------------------------- |
+| `BodyLimit`        | 4 MiB                     | Reject Content-Length > limit with 413 on the C++ side    |
+| `BodyReadTimeout`  | 30s                       | Deadline for `Response.Body` to finish reading the body   |
+| `BindAddr`         | `""`                      | Empty = all interfaces (`0.0.0.0`)                        |
+| `CapturePeerIP`    | `false`                   | Snapshot peer IP for async / shared-dispatch paths        |
+| `TrustProxy`       | `false`                   | Compatibility shortcut: trust forwarded headers from any peer |
+| `TrustedProxies`   | empty                     | Trust forwarded headers only from listed IPs/CIDR ranges  |
+| `JSONEncoder`      | `encoding/json.Marshal`   | Encoder for `Response.JSON` and `Response.JSONP`          |
+| `JSONDecoder`      | `encoding/json.Unmarshal` | Decoder for `Request.BodyParser` JSON bodies              |
+
+See [`docs/configuration.md`](docs/configuration.md) for local development,
+reverse proxy, and production configuration examples.
 
 `BodyReadTimeout` protects `Response.Body` users from slow body uploads that
 drip bytes forever without exceeding `BodyLimit`. Keep the 30s default for
@@ -1835,22 +1896,29 @@ func TestPing(t *testing.T) {
 
 ### TrustProxy and client IPs
 
-When `TrustProxy` is **off** (the default), the framework treats every
-`X-Forwarded-*` header as untrusted attacker input:
+When `TrustProxy` and `TrustedProxies` are both unset (the default), the
+framework treats every `X-Forwarded-*` header as untrusted attacker input:
 
 - `req.Protocol()` / `req.Secure()` ignore `X-Forwarded-Proto`.
 - `req.IPs()` returns `nil` (the X-Forwarded-For chain is not exposed).
 - `req.IP()` returns the immediate TCP peer — the proxy itself if you have one.
 
-Turn `TrustProxy` **on** only when the server actually sits behind a
-trusted reverse proxy (nginx, an L7 load balancer, a CDN with origin
-shielding). Once on, `req.IPs()` normalizes valid IP entries from
-`X-Forwarded-For`, drops malformed entries, and returns the chain in order;
-the leftmost entry is the client IP as reported by your proxy chain.
+Use `TrustedProxies` for production when only specific reverse proxies,
+load balancers, or private edge ranges should be trusted. Entries may be
+single IPs or CIDR ranges. When the immediate TCP peer matches the list,
+`req.Protocol()` / `req.Secure()` honor `X-Forwarded-Proto` and `req.IPs()`
+normalizes valid entries from `X-Forwarded-For` in order. The leftmost entry is
+the client IP as reported by your proxy chain.
+
+The trusted edge must strip or overwrite incoming `X-Forwarded-*`, `Forwarded`,
+and `X-Real-IP` headers from untrusted clients before adding its own values.
+Otherwise an attacker can smuggle a spoofed client IP into the forwarded chain.
 
 ```go
-// Behind a CDN — opt in so req.IPs() returns the real client.
-app, _ := gogo.NewApp(gogo.Config{TrustProxy: true})
+// Behind a private load balancer or CDN edge range.
+app, _ := gogo.NewApp(gogo.Config{
+    TrustedProxies: []string{"10.0.0.0/8", "127.0.0.1"},
+})
 
 app.Get("/whoami", func(res *gogo.Response, req *gogo.Request) {
     ips := req.IPs()
@@ -1861,6 +1929,16 @@ app.Get("/whoami", func(res *gogo.Response, req *gogo.Request) {
     res.Send(200, "text/plain", "you are "+client+"\n")
 })
 ```
+
+`TrustedProxies` automatically enables `CapturePeerIP` so async and
+shared-dispatch routes can evaluate the immediate peer before trusting
+forwarded headers. You may still set `CapturePeerIP` yourself when async
+handlers need `req.IP()` even without proxy headers.
+
+`TrustProxy: true` remains available for deployments where every possible
+immediate peer is already trusted by the network boundary. Prefer
+`TrustedProxies` when the app can be reached from both trusted and untrusted
+peers, or when you want the application to enforce the proxy trust boundary.
 
 Internet-facing servers that read X-Forwarded-For anyway (against
 recommendation) must call `req.Header("x-forwarded-for")` and parse it
@@ -1880,8 +1958,9 @@ rate-limiting, or auth decisions.
 | Body-async routes (`PostAsync`, `PutAsync`, `PatchAsync`, `DeleteAsync`) | `req.IP()` is `""` in the async snapshot | `req.IP()` is populated from the TCP peer |
 
 `req.IPs()` reads `X-Forwarded-For` from request headers and is controlled by
-`TrustProxy`, not by `CapturePeerIP`. If an async route sits behind a trusted
-proxy and wants the original client, enable `TrustProxy` and use `req.IPs()`.
+`TrustProxy` / `TrustedProxies`, not by `CapturePeerIP`. If an async route sits
+behind a trusted proxy and wants the original client, configure
+`TrustedProxies` and use `req.IPs()`.
 If it wants the proxy/socket peer, enable `CapturePeerIP` and use `req.IP()`.
 
 ### net/http adapter body cap
@@ -1941,7 +2020,8 @@ gogo.SetPanicHandler(func(recovered any) {
 
 The framework catches handler panics across HTTP, async, WebSocket, defer,
 and body callbacks. It emits a best-effort 500 where an HTTP response is
-still available and keeps the server alive.
+still available and keeps the server alive. `SetPanicHandler` is process-wide;
+install it during startup when a process hosts multiple `App` instances.
 
 Custom 404 / 405:
 
@@ -1980,7 +2060,8 @@ app.MethodNotAllowed(func(res *gogo.Response, req *gogo.Request) {
   for `middleware.WebSocketAuth`.
 - TLS / HTTP/2 are out of scope here; terminate at a reverse proxy
   (nginx, Caddy, an L7 load balancer).
-- `req.IPs()` returns `nil` unless `Config.TrustProxy=true` — see
+- `req.IPs()` returns `nil` unless `Config.TrustProxy=true` or the immediate
+  peer matches `Config.TrustedProxies` — see
   [TrustProxy and client IPs](#trustproxy-and-client-ips).
 - `res.Redirect` does not protect against open redirects — caller must
   allow-list targets. See [Redirect and open redirects](#redirect-and-open-redirects).
@@ -1990,6 +2071,8 @@ app.MethodNotAllowed(func(res *gogo.Response, req *gogo.Request) {
 - `mw.RateLimit()` caps the in-memory store at 100k buckets — raise via
   `MaxBuckets` or plug a Redis store for high-cardinality keys. See
   [RateLimit memory cap](#ratelimit-memory-cap).
+- `mw.RateLimit()` defaults to the immediate peer IP. Behind trusted proxies,
+  use a `KeyFunc` based on `req.IPs()` when you want end-client quotas.
 - Custom middleware that runs cleanup AFTER the handler must use
   `Response.OnFinish` (not `next; cleanup` directly) — otherwise a
   handler that upgrades via `res.Async` will run its real work after

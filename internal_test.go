@@ -1,6 +1,7 @@
 package gogo
 
 import (
+	"net/netip"
 	"reflect"
 	"strconv"
 	"strings"
@@ -98,6 +99,9 @@ func TestZeroValueConfigDefaults(t *testing.T) {
 	if cfg.CapturePeerIP {
 		t.Fatal("CapturePeerIP default = true, want false")
 	}
+	if len(cfg.TrustedProxies) != 0 {
+		t.Fatalf("TrustedProxies default = %v, want empty", cfg.TrustedProxies)
+	}
 	if cfg.TrustProxy {
 		t.Fatal("TrustProxy default = true, want false")
 	}
@@ -127,6 +131,49 @@ func TestValidateConfigRejectsInvalidNegativeBodyReadTimeout(t *testing.T) {
 	}
 }
 
+func TestValidateConfigRejectsInvalidTrustedProxies(t *testing.T) {
+	for _, proxies := range [][]string{
+		{""},
+		{"not-an-ip"},
+		{"10.0.0.0/not-bits"},
+	} {
+		if err := validateConfig(Config{TrustedProxies: proxies}); err == nil {
+			t.Fatalf("validateConfig accepted TrustedProxies=%v", proxies)
+		}
+	}
+}
+
+func TestParseTrustedProxyRanges(t *testing.T) {
+	ranges, err := parseTrustedProxyRanges([]string{
+		" 127.0.0.1 ",
+		"10.0.0.0/8",
+		"::ffff:192.0.2.0/120",
+	})
+	if err != nil {
+		t.Fatalf("parseTrustedProxyRanges: %v", err)
+	}
+	checks := []struct {
+		addr string
+		idx  int
+	}{
+		{"127.0.0.1", 0},
+		{"10.20.30.40", 1},
+		{"192.0.2.42", 2},
+	}
+	for _, tc := range checks {
+		if !ranges[tc.idx].Contains(netip.MustParseAddr(tc.addr)) {
+			t.Fatalf("range %d = %s does not contain %s", tc.idx, ranges[tc.idx], tc.addr)
+		}
+	}
+}
+
+func TestDefaultConfigTrustedProxiesEnableCapturePeerIP(t *testing.T) {
+	cfg := defaultConfig(Config{TrustedProxies: []string{"127.0.0.1"}})
+	if !cfg.CapturePeerIP {
+		t.Fatal("TrustedProxies should enable CapturePeerIP for async/shared trust decisions")
+	}
+}
+
 func TestNewAppRejectsMultipleConfigs(t *testing.T) {
 	app, err := NewApp(Config{}, Config{})
 	if err == nil {
@@ -150,6 +197,44 @@ func TestNewAppRejectsInvalidConfigBeforeNativeSetup(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "Config.BodyLimit") {
 		t.Fatalf("NewApp invalid config error = %v", err)
+	}
+}
+
+func TestSetPanicHandlerUsesGlobalHandler(t *testing.T) {
+	t.Cleanup(func() { SetPanicHandler(nil) })
+
+	var got []any
+	SetPanicHandler(func(recovered any) {
+		got = append(got, recovered)
+	})
+
+	reportPanic("first")
+	reportPanic("second")
+
+	if len(got) != 2 {
+		t.Fatalf("panic handler calls = %d, want 2", len(got))
+	}
+	if got[0] != "first" || got[1] != "second" {
+		t.Fatalf("panic handler payloads = %#v, want first, second", got)
+	}
+}
+
+func TestSetPanicHandlerRecoversHandlerPanic(t *testing.T) {
+	t.Cleanup(func() { SetPanicHandler(nil) })
+
+	SetPanicHandler(func(any) {
+		panic("panic handler failed")
+	})
+
+	panicked := false
+	func() {
+		defer func() {
+			panicked = recover() != nil
+		}()
+		reportPanic("boom")
+	}()
+	if panicked {
+		t.Fatal("reportPanic propagated a panic from the panic handler")
 	}
 }
 
