@@ -159,21 +159,21 @@ files in the same PR unless one agent is explicitly assigned as integrator.
 
 ## v0.5.0 - WebSocket Stabilization
 
-- [ ] Write the `WSHubAdapter` contract: ordering, retry, delivery guarantees,
+- [x] Write the `WSHubAdapter` contract: ordering, retry, delivery guarantees,
       cancellation, slow subscribers, and close semantics.
-- [ ] Include `WSHubAdapter.Start` idempotency, deliver concurrency, worker
+- [x] Include `WSHubAdapter.Start` idempotency, deliver concurrency, worker
       ordering, close/cancel behavior, and topic adapter retry semantics in the
       contract.
-- [ ] Add Redis WSHub integration tests.
-- [ ] Decide whether to expose drain/backpressure visibility before v1.
-- [ ] Decide whether ping/pong callbacks belong in the public API.
-- [ ] Freeze `UnsafeAutoUpgrade` naming and default security behavior.
-- [ ] Freeze nil `Upgrade`, browser Origin, and `WebSocketAuth` default
+- [x] Add Redis WSHub integration tests.
+- [x] Decide whether to expose drain/backpressure visibility before v1.
+- [x] Decide whether ping/pong callbacks belong in the public API.
+- [x] Freeze `UnsafeAutoUpgrade` naming and default security behavior.
+- [x] Freeze nil `Upgrade`, browser Origin, and `WebSocketAuth` default
       semantics before v1.
-- [ ] Document or enforce the thread contract for `WebSocket.Send`,
+- [x] Document or enforce the thread contract for `WebSocket.Send`,
       `SendText`, and `End`, or add safe deferred send/close APIs.
-- [ ] Add WebSocket auth/origin/subprotocol production example.
-- [ ] Add stress tests for subscribe, publish, unsubscribe, close, and hub
+- [x] Add WebSocket auth/origin/subprotocol production example.
+- [x] Add stress tests for subscribe, publish, unsubscribe, close, and hub
       adapter failure.
 
 ## v0.6.0 - Testing Helpers and Migration
