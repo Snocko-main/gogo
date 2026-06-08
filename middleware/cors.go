@@ -103,7 +103,7 @@ func CORS(opts ...CORSOptions) mwhint.Hinted {
 	validateCORSHeaders("ExposeHeaders", opt.ExposeHeaders, false)
 
 	methodsCSV := strings.Join(opt.AllowMethods, ", ")
-	headersCSV := strings.Join(opt.AllowHeaders, ", ")
+	headersCSV := configuredCORSAllowHeaders(opt.AllowHeaders, opt.AllowCredentials)
 	exposeCSV := strings.Join(opt.ExposeHeaders, ", ")
 	maxAgeStr := ""
 	if opt.MaxAge > 0 {
@@ -245,6 +245,24 @@ func validateCORSHeaders(field string, headers []string, allowWildcard bool) {
 			}
 		}
 	}
+}
+
+func configuredCORSAllowHeaders(headers []string, allowCredentials bool) string {
+	if !allowCredentials {
+		return strings.Join(headers, ", ")
+	}
+
+	var b strings.Builder
+	for _, h := range headers {
+		if h == "*" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(h)
+	}
+	return b.String()
 }
 
 func normalizeCORSOriginPatterns(patterns []string) []string {

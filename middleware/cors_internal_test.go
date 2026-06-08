@@ -49,6 +49,47 @@ func TestCORSAcceptsWildcardAllowHeaders(t *testing.T) {
 	})
 }
 
+func TestConfiguredCORSAllowHeadersIgnoresWildcardWithCredentials(t *testing.T) {
+	cases := []struct {
+		name             string
+		headers          []string
+		allowCredentials bool
+		want             string
+	}{
+		{
+			name:             "wildcard only without credentials",
+			headers:          []string{"*"},
+			allowCredentials: false,
+			want:             "*",
+		},
+		{
+			name:             "wildcard only with credentials",
+			headers:          []string{"*"},
+			allowCredentials: true,
+			want:             "",
+		},
+		{
+			name:             "mixed wildcard without credentials",
+			headers:          []string{"*", "Content-Type", "X-CSRF-Token"},
+			allowCredentials: false,
+			want:             "*, Content-Type, X-CSRF-Token",
+		},
+		{
+			name:             "mixed wildcard with credentials",
+			headers:          []string{"*", "Content-Type", "X-CSRF-Token"},
+			allowCredentials: true,
+			want:             "Content-Type, X-CSRF-Token",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := configuredCORSAllowHeaders(tc.headers, tc.allowCredentials); got != tc.want {
+				t.Fatalf("configuredCORSAllowHeaders() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCORSRejectsInvalidConfiguredOrigins(t *testing.T) {
 	cases := []string{
 		"",
