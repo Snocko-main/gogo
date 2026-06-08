@@ -1,6 +1,7 @@
 package gogo
 
 import (
+	"net/netip"
 	"reflect"
 	"strconv"
 	"strings"
@@ -98,6 +99,9 @@ func TestZeroValueConfigDefaults(t *testing.T) {
 	if cfg.CapturePeerIP {
 		t.Fatal("CapturePeerIP default = true, want false")
 	}
+	if len(cfg.TrustedProxies) != 0 {
+		t.Fatalf("TrustedProxies default = %v, want empty", cfg.TrustedProxies)
+	}
 	if cfg.TrustProxy {
 		t.Fatal("TrustProxy default = true, want false")
 	}
@@ -124,6 +128,49 @@ func TestValidateConfigRejectsInvalidNegativeBodyReadTimeout(t *testing.T) {
 	}
 	if err := validateConfig(Config{BodyReadTimeout: NoBodyReadTimeout}); err != nil {
 		t.Fatalf("validateConfig rejected NoBodyReadTimeout: %v", err)
+	}
+}
+
+func TestValidateConfigRejectsInvalidTrustedProxies(t *testing.T) {
+	for _, proxies := range [][]string{
+		{""},
+		{"not-an-ip"},
+		{"10.0.0.0/not-bits"},
+	} {
+		if err := validateConfig(Config{TrustedProxies: proxies}); err == nil {
+			t.Fatalf("validateConfig accepted TrustedProxies=%v", proxies)
+		}
+	}
+}
+
+func TestParseTrustedProxyRanges(t *testing.T) {
+	ranges, err := parseTrustedProxyRanges([]string{
+		" 127.0.0.1 ",
+		"10.0.0.0/8",
+		"::ffff:192.0.2.0/120",
+	})
+	if err != nil {
+		t.Fatalf("parseTrustedProxyRanges: %v", err)
+	}
+	checks := []struct {
+		addr string
+		idx  int
+	}{
+		{"127.0.0.1", 0},
+		{"10.20.30.40", 1},
+		{"192.0.2.42", 2},
+	}
+	for _, tc := range checks {
+		if !ranges[tc.idx].Contains(netip.MustParseAddr(tc.addr)) {
+			t.Fatalf("range %d = %s does not contain %s", tc.idx, ranges[tc.idx], tc.addr)
+		}
+	}
+}
+
+func TestDefaultConfigTrustedProxiesEnableCapturePeerIP(t *testing.T) {
+	cfg := defaultConfig(Config{TrustedProxies: []string{"127.0.0.1"}})
+	if !cfg.CapturePeerIP {
+		t.Fatal("TrustedProxies should enable CapturePeerIP for async/shared trust decisions")
 	}
 }
 

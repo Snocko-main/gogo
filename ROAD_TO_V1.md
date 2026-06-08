@@ -127,7 +127,7 @@ files in the same PR unless one agent is explicitly assigned as integrator.
 - [x] Add `RunMultiCore` config/options support or explicitly document the
       current process-wide config limits.
 - [x] Add graceful multicore shutdown or document immediate shutdown only.
-- [ ] Replace or extend `TrustProxy bool` with trusted proxy CIDR/range support
+- [x] Extend `TrustProxy bool` with trusted proxy CIDR/range support
       before v1, or document why the boolean API is final.
 - [x] Document `CapturePeerIP` behavior for async and shared-dispatch routes.
 - [x] Add config examples for local development, reverse proxy, and production.

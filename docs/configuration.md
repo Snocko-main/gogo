@@ -35,8 +35,7 @@ app, err := gogo.NewApp(gogo.Config{
 	BindAddr:        "127.0.0.1",
 	BodyLimit:       8 << 20,
 	BodyReadTimeout: 30 * time.Second,
-	TrustProxy:      true,
-	CapturePeerIP:   true,
+	TrustedProxies:  []string{"10.0.0.0/8", "127.0.0.1"},
 })
 if err != nil {
 	log.Fatal(err)
@@ -45,10 +44,11 @@ if err != nil {
 
 Why:
 
-- `TrustProxy: true` makes `Protocol`, `Secure`, and `IPs` honor forwarded
-  headers from the trusted edge.
-- `CapturePeerIP: true` lets async routes read the immediate TCP peer with
-  `req.IP()` for audit logs or socket-peer rate limits.
+- `TrustedProxies` makes `Protocol`, `Secure`, and `IPs` honor forwarded
+  headers only when the immediate peer is in the configured IP/CIDR allow-list.
+- `TrustedProxies` also enables peer-IP capture for async routes, so `req.IP()`
+  can still read the immediate TCP peer for audit logs or socket-peer rate
+  limits.
 - Keep a proxy-level request body cap at or below the app-level `BodyLimit`.
 
 ## Internet-Facing Without A Proxy
@@ -84,8 +84,9 @@ Why:
   stricter cap.
 - Keep `BodyReadTimeout` enabled. Use route-level upload design rather than
   disabling the timeout globally.
-- Enable `TrustProxy` only behind an edge that strips or overwrites forwarded
-  headers from untrusted clients.
+- Prefer `TrustedProxies` over `TrustProxy` so the app enforces which proxy
+  peers may supply forwarded headers. Use `TrustProxy` only when every possible
+  peer is already trusted by deployment topology.
 - Enable `CapturePeerIP` when async handlers, rate limiters, auth, or audit
   logs need the socket peer through `req.IP()`.
 - Leave `JSONEncoder` and `JSONDecoder` nil until a benchmark shows JSON is a
