@@ -344,6 +344,37 @@ func (a *ctxBlockingWSHubAdapter) Publish(ctx context.Context, _ WSHubMessage) e
 
 func (a *ctxBlockingWSHubAdapter) Close() error { return nil }
 
+func TestWSHubAdapterQueueFullReturnsError(t *testing.T) {
+	adapter := &ctxBlockingWSHubAdapter{entered: make(chan struct{}, 1)}
+	hub := NewWSHub(
+		WithWSHubAdapter(adapter),
+		WithWSHubAdapterQueueSize(1),
+		WithWSHubAdapterPublishTimeout(time.Hour),
+		WithWSHubCloseTimeout(20*time.Millisecond),
+		WithWSHubAdapterErrorHandler(nil),
+	)
+	defer func() {
+		if err := hub.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}()
+
+	if err := hub.Publish("room", []byte("first"), Text); err != nil {
+		t.Fatalf("first Publish: %v", err)
+	}
+	select {
+	case <-adapter.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("adapter publish was not started")
+	}
+	if err := hub.Publish("room", []byte("queued"), Text); err != nil {
+		t.Fatalf("queued Publish: %v", err)
+	}
+	if err := hub.Publish("room", []byte("overflow"), Text); !errors.Is(err, ErrWSHubAdapterQueueFull) {
+		t.Fatalf("overflow Publish error = %v, want ErrWSHubAdapterQueueFull", err)
+	}
+}
+
 type failingPublishWSHubAdapter struct {
 	err error
 }
@@ -453,6 +484,29 @@ func TestWSHubCloseBoundsInFlightAdapterPublish(t *testing.T) {
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("Close waited too long for adapter publish")
+	}
+}
+
+func TestWSHubCloseRejectsPublishAndStart(t *testing.T) {
+	adapter := &fakeWSHubAdapter{}
+	hub := NewWSHub(WithWSHubAdapter(adapter))
+
+	if err := hub.Publish("room", []byte("before-close"), Text); err != nil {
+		t.Fatalf("Publish before Close: %v", err)
+	}
+	waitForAdapterPublish(t, adapter, 1)
+	if err := hub.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := hub.Publish("room", []byte("after-close"), Text); !errors.Is(err, ErrWSHubClosed) {
+		t.Fatalf("Publish after Close error = %v, want ErrWSHubClosed", err)
+	}
+	if err := hub.Start(); !errors.Is(err, ErrWSHubClosed) {
+		t.Fatalf("Start after Close error = %v, want ErrWSHubClosed", err)
+	}
+	_, _, published := adapter.snapshot()
+	if len(published) != 1 {
+		t.Fatalf("adapter published %d messages after Close, want only the pre-close publish", len(published))
 	}
 }
 
@@ -747,5 +801,120 @@ func TestWSHubRejectsInvalidOpCode(t *testing.T) {
 		OpCode:  OpCode(99),
 	}}); !errors.Is(err, ErrWSHubInvalidOpCode) {
 		t.Fatalf("PublishBatch error = %v, want ErrWSHubInvalidOpCode", err)
+	}
+}
+
+func TestWSHubConcurrentMembershipAndPublishTargets(t *testing.T) {
+	const (
+		sockets    = 32
+		churners   = 8
+		publishers = 4
+		iterations = 500
+	)
+
+	hub := NewWSHub()
+	app := &App{}
+	tokens := make([]uint64, sockets)
+	hub.mu.Lock()
+	for i := 0; i < sockets; i++ {
+		key := uintptr(i + 1)
+		token := uint64(i + 100)
+		tokens[i] = token
+		hub.sockets[key] = &hubSocket{
+			app:    app,
+			direct: "direct",
+			token:  token,
+			topics: make(map[string]struct{}),
+		}
+	}
+	hub.mu.Unlock()
+
+	sender := &WebSocket{}
+	sender.hubToken.Store(tokens[0])
+
+	var start sync.WaitGroup
+	var done sync.WaitGroup
+	errs := make(chan string, 1)
+	report := func(msg string) {
+		select {
+		case errs <- msg:
+		default:
+		}
+	}
+
+	start.Add(1)
+	for worker := 0; worker < churners; worker++ {
+		worker := worker
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			start.Wait()
+			for i := 0; i < iterations; i++ {
+				idx := (worker + i) % sockets
+				key := uintptr(idx + 1)
+				token := tokens[idx]
+				hub.addMembership(key, token, "room")
+				hub.removeMembershipIfCurrent(key, token+1, "room")
+				if (worker+i)%3 == 0 {
+					hub.removeMembershipIfCurrent(key, token, "room")
+				}
+			}
+		}()
+	}
+	for worker := 0; worker < publishers; worker++ {
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			start.Wait()
+			for i := 0; i < iterations; i++ {
+				origin, direct := hub.publishFromTargets(sender, 1, WSHubMessage{
+					Topic:   "room",
+					Message: []byte("payload"),
+					OpCode:  Text,
+				})
+				if origin != app {
+					report("publishFromTargets returned the wrong origin")
+					return
+				}
+				for _, msg := range direct {
+					if msg.Topic != "direct" || string(msg.Message) != "payload" || msg.OpCode != Text {
+						report("publishFromTargets returned a malformed direct publish")
+						return
+					}
+				}
+			}
+		}()
+	}
+	start.Done()
+	done.Wait()
+
+	select {
+	case err := <-errs:
+		t.Fatal(err)
+	default:
+	}
+
+	hub.mu.RLock()
+	defer hub.mu.RUnlock()
+	for topic, members := range hub.members {
+		if topic != "room" {
+			t.Fatalf("unexpected topic %q in members", topic)
+		}
+		for key := range members {
+			socket := hub.sockets[key]
+			if socket == nil {
+				t.Fatalf("member key %d has no socket", key)
+			}
+			if _, ok := socket.topics[topic]; !ok {
+				t.Fatalf("member key %d missing socket topic %q", key, topic)
+			}
+		}
+	}
+	for key, socket := range hub.sockets {
+		for topic := range socket.topics {
+			if _, ok := hub.members[topic][key]; !ok {
+				t.Fatalf("socket key %d topic %q missing member entry", key, topic)
+			}
+		}
 	}
 }
