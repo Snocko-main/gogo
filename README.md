@@ -2037,15 +2037,18 @@ If it wants the proxy/socket peer, enable `CapturePeerIP` and use `req.IP()`.
 
 ### net/http adapter body cap
 
-`gogo.HTTPAdapter(h)` and `gogo.HTTPAdapterWithBody(h, body)` are migration
-helpers for small stdlib handlers. They stage the wrapped handler's response
-before sending it through gogo, so the staged body is capped by
+`gogo.HTTPAdapter(h)` and `gogo.HTTPAdapterWithBody(h, body)` are compatibility
+helpers for small stdlib handlers: use them as a route-by-route migration
+bridge, or as a testing/ops convenience for stdlib endpoints such as expvar and
+pprof. They stage the wrapped handler's response before sending it through
+gogo, so the staged body is capped by
 `gogo.GetMaxHTTPAdapterBodyBytes()` (default 8 MiB; set to
 `gogo.SetMaxHTTPAdapterBodyBytes(gogo.NoHTTPAdapterBodyLimit)` to disable).
 The adapter accepts `http.Flusher` for compatibility, but `Flush()` only
 commits the staged status code; it does not stream bytes to the client.
-Handlers that stream large downloads should be ported to native gogo streaming
-APIs instead of going through the adapter.
+Large or streaming routes should be ported to native gogo APIs instead of
+going through the adapter. See `examples/httpadapter` for expvar and pprof
+debug endpoints registered through `HTTPAdapter`.
 
 ### Redirect and open redirects
 
@@ -2162,6 +2165,7 @@ app.MethodNotAllowed(func(res *gogo.Response, req *gogo.Request) {
 - [`examples/sse`](examples/sse) — Server-Sent Events with reconnect resume
 - [`examples/websocket`](examples/websocket) — browser WebSocket + upgrade gate + pub/sub
 - [`examples/multicore`](examples/multicore) — `RunMultiCore` + `/metrics` + graceful shutdown
+- [`examples/httpadapter`](examples/httpadapter) — stdlib expvar + pprof through `HTTPAdapter`
 
 ## Why There Is a C++ Bridge
 
