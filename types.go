@@ -2321,11 +2321,12 @@ func (a *App) fireListenHooks(port int) {
 }
 
 // OnShutdown registers a callback that fires synchronously at the start
-// of Shutdown / ShutdownGracefully (before the C++ close is dispatched
-// to the loop). Use it to flush logs, close DB pools, etc. Hooks run in
-// registration order and run on whatever goroutine called Shutdown.
-// Hooks fire at most once per App lifecycle, even if Shutdown and
-// ShutdownGracefully are both called. Calling OnShutdown(nil) is a no-op.
+// of Shutdown, ShutdownGracefully, or ShutdownContext (before the C++
+// close is dispatched to the loop). Use it to flush logs, close DB
+// pools, etc. Hooks run in registration order and run on whatever
+// goroutine called the shutdown API. Hooks fire at most once per App
+// lifecycle, even if multiple shutdown APIs are called. Calling
+// OnShutdown(nil) is a no-op.
 func (a *App) OnShutdown(fn func()) {
 	if fn == nil {
 		return

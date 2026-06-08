@@ -5095,6 +5095,7 @@ func TestShutdownContextDrainsInFlight(t *testing.T) {
 
 	port := freePort(t)
 	ready := make(chan *gogo.App, 1)
+	runReturned := make(chan struct{})
 	runDone := make(chan struct{})
 
 	go func() {
@@ -5119,6 +5120,7 @@ func TestShutdownContextDrainsInFlight(t *testing.T) {
 		}
 		ready <- app
 		app.Run()
+		close(runReturned)
 		app.Close()
 		close(runDone)
 	}()
@@ -5183,6 +5185,11 @@ func TestShutdownContextDrainsInFlight(t *testing.T) {
 	case err := <-shutdownErr:
 		if err != nil {
 			t.Fatalf("ShutdownContext: %v", err)
+		}
+		select {
+		case <-runReturned:
+		default:
+			t.Fatal("ShutdownContext returned nil before Run exited")
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("ShutdownContext did not return after graceful drain")
@@ -5406,6 +5413,53 @@ func TestShutdownHooksFireOnGraceful(t *testing.T) {
 		t.Fatal("OnShutdown hook never fired on graceful path")
 	}
 	<-runDone
+}
+
+func TestShutdownHooksFireOnShutdownContext(t *testing.T) {
+	fired := make(chan struct{}, 1)
+
+	port := freePort(t)
+	ready := make(chan *gogo.App, 1)
+	runDone := make(chan struct{})
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		app, err := gogo.NewApp()
+		if err != nil {
+			t.Errorf("NewApp: %v", err)
+			close(runDone)
+			return
+		}
+		app.OnShutdown(func() { fired <- struct{}{} })
+		if !app.Listen(port) {
+			t.Errorf("Listen :%d failed", port)
+			app.Close()
+			close(runDone)
+			return
+		}
+		ready <- app
+		app.Run()
+		app.Close()
+		close(runDone)
+	}()
+	app := <-ready
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := app.ShutdownContext(ctx); err != nil {
+		t.Fatalf("ShutdownContext: %v", err)
+	}
+
+	select {
+	case <-fired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnShutdown hook never fired on ShutdownContext path")
+	}
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not exit after ShutdownContext")
+	}
 }
 
 func TestShutdownHooksFireOnce(t *testing.T) {
