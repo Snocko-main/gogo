@@ -135,9 +135,11 @@ files in the same PR unless one agent is explicitly assigned as integrator.
 - [ ] Define uWS loop and OS-thread ownership for single-app usage: own a
       locked native loop goroutine internally, or document/enforce same-thread
       `NewApp` / route registration / `Listen` / `Run` / `Close`.
-- [ ] Define shared-dispatch quiescence before freeing native app memory.
-- [ ] Decide shared handler registry lifetime: cleanup, generations/tombstones,
-      or documented process-lifetime retention.
+- [x] Define shared-dispatch quiescence before freeing native app memory.
+- [x] Decide shared handler registry lifetime: release handlers after
+      graceful/shared drain; process-lifetime retention is not the v1 contract.
+- [ ] Implement shared handler registry cleanup with tombstones or generations
+      so stale handler IDs cannot call removed handlers.
 
 ## v0.4.0 - Middleware Production Pass
 
