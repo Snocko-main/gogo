@@ -48,7 +48,14 @@ import (
 // truncation of a chunk write. The cap is symbolic — uWS's per-
 // connection backpressure (default 64 KiB) and kernel socket buffer
 // keep real chunks several orders of magnitude smaller.
-const maxInt32 = 1<<31 - 1
+const (
+	maxInt32  = 1<<31 - 1
+	minInt32  = -1 << 31
+	maxUint16 = 1<<16 - 1
+	maxUint32 = 1<<32 - 1
+)
+
+var maxGoInt = int(^uint(0) >> 1)
 
 type appNative struct {
 	ptr              *C.uwsgo_app_t
@@ -105,6 +112,81 @@ func newNativeOwner() *nativeOwner {
 
 func currentNativeThreadID() uint64 {
 	return uint64(C.uwsgo_current_thread_id())
+}
+
+func clampNonNegativeInt(n int) int {
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+func cIntFromInt(n int) C.int {
+	if n > maxInt32 {
+		return C.int(maxInt32)
+	}
+	if n < minInt32 {
+		return C.int(minInt32)
+	}
+	return C.int(n)
+}
+
+func cIntFromNonNegative(n int) C.int {
+	if n <= 0 {
+		return 0
+	}
+	if n > maxInt32 {
+		return C.int(maxInt32)
+	}
+	return C.int(n)
+}
+
+func cUint32SizeFromPositive(n, fallback int) C.size_t {
+	if n <= 0 {
+		n = fallback
+	}
+	if uint64(n) > maxUint32 {
+		return C.size_t(maxUint32)
+	}
+	return C.size_t(n)
+}
+
+func cUint16IntFromDurationSeconds(d time.Duration, fallback int64) C.int {
+	seconds := int64(d / time.Second)
+	if seconds <= 0 {
+		seconds = fallback
+	}
+	if seconds > maxUint16 {
+		return C.int(maxUint16)
+	}
+	return C.int(seconds)
+}
+
+func goIntFromCSize(size C.size_t, label string) (int, bool) {
+	if size > C.size_t(maxGoInt) {
+		reportPanic(fmt.Errorf("gogo: %s length %d exceeds Go int max", label, uint64(size)))
+		return 0, false
+	}
+	return int(size), true
+}
+
+func cgoCopyLen(size C.size_t, label string) (C.int, bool) {
+	if size > C.size_t(maxInt32) {
+		reportPanic(fmt.Errorf("gogo: %s length %d exceeds C.int max", label, uint64(size)))
+		return 0, false
+	}
+	return C.int(size), true
+}
+
+func boundedUint32Len(n uint32, cap uintptr) int {
+	limit := uintptr(n)
+	if limit > cap {
+		limit = cap
+	}
+	if limit > uintptr(maxGoInt) {
+		limit = uintptr(maxGoInt)
+	}
+	return int(limit)
 }
 
 func (o *nativeOwner) onOwnerThread() bool {
@@ -289,9 +371,7 @@ func (a *appNative) postShared(pattern string, handler AsyncHandler, maxBody int
 	id := a.registerSharedHandler(handler)
 	cpattern := C.CString(pattern)
 	defer C.free(unsafe.Pointer(cpattern))
-	if maxBody < 0 {
-		maxBody = 0
-	}
+	maxBody = clampNonNegativeInt(maxBody)
 	a.onOwner(func() {
 		C.uwsgo_app_post_shared(a.ptr, cpattern, C.uint32_t(id), C.size_t(maxBody))
 	})
@@ -585,12 +665,12 @@ func runSharedHandler(handler AsyncHandler, ctxPtr uintptr) {
 // AsyncCtx and returns a Go-side requestSnapshot whose strings/bytes do not
 // alias ctx memory — so the snapshot stays valid after ctx is released.
 func newSnapshotFromCtx(ctxPtr uintptr) *requestSnapshot {
-	methodLen := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxMethodLenOff))
-	urlLen := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxURLLenOff))
-	queryLen := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxQueryLenOff))
-	ipLen := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxIPLenOff))
+	methodLen := boundedUint32Len(*(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxMethodLenOff)), shared.snapMethodCap)
+	urlLen := boundedUint32Len(*(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxURLLenOff)), shared.snapURLCap)
+	queryLen := boundedUint32Len(*(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxQueryLenOff)), shared.snapQueryCap)
+	ipLen := boundedUint32Len(*(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxIPLenOff)), shared.snapIPCap)
 	paramCount := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxParamCountOff))
-	headersLen := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxHeadersLenOff))
+	headersLen := boundedUint32Len(*(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxHeadersLenOff)), shared.snapHeadersCap)
 	truncated := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxTruncatedOff)) != 0
 
 	// Defense in depth: the C++ side caps paramCount at SNAP_PARAM_MAX
@@ -604,10 +684,10 @@ func newSnapshotFromCtx(ctxPtr uintptr) *requestSnapshot {
 	}
 
 	snap := &requestSnapshot{
-		method:    copyAt(ctxPtr+shared.ctxMethodOff, int(methodLen)),
-		url:       copyAt(ctxPtr+shared.ctxURLOff, int(urlLen)),
-		query:     copyAt(ctxPtr+shared.ctxQueryOff, int(queryLen)),
-		ip:        copyAt(ctxPtr+shared.ctxIPOff, int(ipLen)),
+		method:    copyAt(ctxPtr+shared.ctxMethodOff, methodLen),
+		url:       copyAt(ctxPtr+shared.ctxURLOff, urlLen),
+		query:     copyAt(ctxPtr+shared.ctxQueryOff, queryLen),
+		ip:        copyAt(ctxPtr+shared.ctxIPOff, ipLen),
 		truncated: truncated,
 	}
 
@@ -620,17 +700,14 @@ func newSnapshotFromCtx(ctxPtr uintptr) *requestSnapshot {
 			// Per-param length should also fit within snapParamCap;
 			// clamp so a corrupted length can't drive copyAt past
 			// the slot.
-			if uintptr(plen) > shared.snapParamCap {
-				plen = uint32(shared.snapParamCap)
-			}
-			params[i] = copyAt(paramsBase+uintptr(i)*shared.snapParamCap, int(plen))
+			params[i] = copyAt(paramsBase+uintptr(i)*shared.snapParamCap, boundedUint32Len(plen, shared.snapParamCap))
 		}
 		snap.params = params
 	}
 
 	if headersLen > 0 {
 		hdrs := make([]byte, headersLen)
-		copy(hdrs, unsafe.Slice((*byte)(unsafe.Pointer(ctxPtr+shared.ctxHeadersOff)), int(headersLen)))
+		copy(hdrs, unsafe.Slice((*byte)(unsafe.Pointer(ctxPtr+shared.ctxHeadersOff)), headersLen))
 		snap.headers = hdrs
 	}
 
@@ -642,12 +719,12 @@ func newSnapshotFromCtx(ctxPtr uintptr) *requestSnapshot {
 // release. GET routes leave body_len = 0 — the call is a single
 // compare-and-skip for that path.
 func readSharedReqBody(ctxPtr uintptr) []byte {
-	bodyLen := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxReqBodyLenOff))
+	bodyLen := boundedUint32Len(*(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxReqBodyLenOff)), shared.snapReqBodyCap)
 	if bodyLen == 0 {
 		return nil
 	}
 	out := make([]byte, bodyLen)
-	copy(out, unsafe.Slice((*byte)(unsafe.Pointer(ctxPtr+shared.ctxReqBodyOff)), int(bodyLen)))
+	copy(out, unsafe.Slice((*byte)(unsafe.Pointer(ctxPtr+shared.ctxReqBodyOff)), bodyLen))
 	return out
 }
 
@@ -740,18 +817,6 @@ func (a *appNative) websocket(pattern string, behavior WebSocketBehavior) {
 	handle := cgo.NewHandle(behavior)
 	a.handles = append(a.handles, handle)
 
-	maxPayload := behavior.MaxPayloadLength
-	if maxPayload <= 0 {
-		maxPayload = 16 << 20 // 16 MiB
-	}
-	idleSec := int(behavior.IdleTimeout / time.Second)
-	if idleSec <= 0 {
-		idleSec = 120
-	}
-	maxBp := behavior.MaxBackpressure
-	if maxBp <= 0 {
-		maxBp = 64 << 10 // 64 KiB
-	}
 	pings := 1
 	if behavior.DisablePings {
 		pings = 0
@@ -763,7 +828,9 @@ func (a *appNative) websocket(pattern string, behavior WebSocketBehavior) {
 
 	a.onOwner(func() {
 		C.uwsgo_app_ws(a.ptr, cpattern, C.uintptr_t(handle),
-			C.size_t(maxPayload), C.int(idleSec), C.size_t(maxBp), C.int(pings),
+			cUint32SizeFromPositive(behavior.MaxPayloadLength, 16<<20),
+			cUint16IntFromDurationSeconds(behavior.IdleTimeout, 120),
+			cUint32SizeFromPositive(behavior.MaxBackpressure, 64<<10), C.int(pings),
 			C.int(withUpgrade))
 	})
 }
@@ -776,13 +843,16 @@ func (a *appNative) prepareRoute(pattern string, handler Handler) (*C.char, cgo.
 }
 
 func (a *appNative) listen(host string, port int) bool {
+	if port < 0 || port > maxInt32 {
+		return false
+	}
 	var chost *C.char
 	if host != "" {
 		chost = C.CString(host)
 		defer C.free(unsafe.Pointer(chost))
 	}
 	return a.onOwnerBool(func() bool {
-		return C.uwsgo_app_listen(a.ptr, chost, C.int(port)) != 0
+		return C.uwsgo_app_listen(a.ptr, chost, cIntFromNonNegative(port)) != 0
 	})
 }
 
@@ -793,6 +863,7 @@ func (a *appNative) addChild(child appNative) bool {
 }
 
 func (a *appNative) setBodyLimit(limit int) {
+	limit = clampNonNegativeInt(limit)
 	a.onOwner(func() {
 		C.uwsgo_app_set_body_limit(a.ptr, C.size_t(limit))
 	})
@@ -1250,7 +1321,7 @@ func finishSharedSend(statePtr uintptr) {
 
 func (a *appNative) startSharedDrain(intervalUs int) {
 	a.onOwner(func() {
-		C.uwsgo_app_start_drain(a.ptr, C.int(intervalUs))
+		C.uwsgo_app_start_drain(a.ptr, cIntFromNonNegative(intervalUs))
 	})
 }
 
@@ -1262,7 +1333,10 @@ func (a *appNative) startSharedDrain(intervalUs int) {
 func asyncSendShared(ctxHandle uintptr, statusLine, contentType, body string) bool {
 	if !sharedReady || uintptr(len(statusLine)) > shared.statusCap ||
 		uintptr(len(contentType)) > shared.ctCap ||
-		uintptr(len(body)) > shared.bodyCap {
+		uintptr(len(body)) > shared.bodyCap ||
+		uint64(len(statusLine)) > maxUint32 ||
+		uint64(len(contentType)) > maxUint32 ||
+		uint64(len(body)) > maxUint32 {
 		return false
 	}
 	statePtr, ok := beginSharedSend(ctxHandle)
@@ -1381,6 +1455,9 @@ func (r requestNative) header(name string) string {
 }
 
 func (r requestNative) parameter(index int) string {
+	if index < 0 {
+		return ""
+	}
 	return readNativeString(func(buf *C.char, len C.size_t) C.size_t {
 		return C.uwsgo_req_parameter(r.ptr, C.ulong(index), buf, len)
 	})
@@ -1408,13 +1485,21 @@ func (r requestNative) headersAll() []byte {
 	if size == 0 {
 		return nil
 	}
-	buf := make([]byte, int(size))
+	n, ok := goIntFromCSize(size, "request headers")
+	if !ok {
+		return nil
+	}
+	buf := make([]byte, n)
 	written := C.uwsgo_req_headers_all(r.ptr, (*C.char)(unsafe.Pointer(&buf[0])), size)
 	if written == 0 {
 		return nil
 	}
 	if written < size {
-		return buf[:int(written)]
+		writtenN, ok := goIntFromCSize(written, "request headers written")
+		if !ok {
+			return nil
+		}
+		return buf[:writtenN]
 	}
 	return buf
 }
@@ -1425,6 +1510,10 @@ func (r requestNative) headersAll() []byte {
 // don't have to special-case the empty case.
 func goStringFromC(ptr unsafe.Pointer, n int) string {
 	if n <= 0 || ptr == nil {
+		return ""
+	}
+	if n > maxInt32 {
+		reportPanic(fmt.Errorf("gogo: native string length %d exceeds C.int max", n))
 		return ""
 	}
 	return C.GoStringN((*C.char)(ptr), C.int(n))
@@ -1448,9 +1537,39 @@ func readNativeString(read func(*C.char, C.size_t) C.size_t) string {
 		return ""
 	}
 
-	buf := make([]byte, int(size))
+	n, ok := goIntFromCSize(size, "native string")
+	if !ok {
+		return ""
+	}
+	buf := make([]byte, n)
 	read((*C.char)(unsafe.Pointer(&buf[0])), size)
 	return string(buf)
+}
+
+func goBytesFromC(ptr unsafe.Pointer, size C.size_t, label string) ([]byte, bool) {
+	if size == 0 {
+		return nil, true
+	}
+	if ptr == nil {
+		reportPanic(fmt.Errorf("gogo: %s has nil data pointer with length %d", label, uint64(size)))
+		return nil, false
+	}
+	n, ok := cgoCopyLen(size, label)
+	if !ok {
+		return nil, false
+	}
+	return C.GoBytes(ptr, n), true
+}
+
+func goStringFromCSize(ptr *C.char, size C.size_t, label string) string {
+	if size == 0 || ptr == nil {
+		return ""
+	}
+	n, ok := cgoCopyLen(size, label)
+	if !ok {
+		return ""
+	}
+	return C.GoStringN(ptr, n)
 }
 
 func unsafeStringData(s string) *C.char {
@@ -1470,15 +1589,15 @@ func unsafeByteData(b []byte) *C.char {
 }
 
 func (ws websocketNative) send(message []byte, opcode OpCode) bool {
-	return C.uwsgo_ws_send(ws.ptr, unsafeByteData(message), C.size_t(len(message)), C.int(opcode)) != 0
+	return C.uwsgo_ws_send(ws.ptr, unsafeByteData(message), C.size_t(len(message)), cIntFromInt(int(opcode))) != 0
 }
 
 func (ws websocketNative) sendString(message string, opcode OpCode) bool {
-	return C.uwsgo_ws_send(ws.ptr, unsafeStringData(message), C.size_t(len(message)), C.int(opcode)) != 0
+	return C.uwsgo_ws_send(ws.ptr, unsafeStringData(message), C.size_t(len(message)), cIntFromInt(int(opcode))) != 0
 }
 
 func (ws websocketNative) end(code int, message string) {
-	C.uwsgo_ws_end(ws.ptr, C.int(code), unsafeStringData(message), C.size_t(len(message)))
+	C.uwsgo_ws_end(ws.ptr, cIntFromInt(code), unsafeStringData(message), C.size_t(len(message)))
 }
 
 func (ws websocketNative) subscribe(topic string) bool {
@@ -1493,14 +1612,14 @@ func (ws websocketNative) publish(topic string, message []byte, opcode OpCode) b
 	return C.uwsgo_ws_publish(ws.ptr,
 		unsafeStringData(topic), C.size_t(len(topic)),
 		unsafeByteData(message), C.size_t(len(message)),
-		C.int(opcode)) != 0
+		cIntFromInt(int(opcode))) != 0
 }
 
 func (a *appNative) publish(topic string, message []byte, opcode OpCode) {
 	C.uwsgo_app_publish(a.ptr,
 		unsafeStringData(topic), C.size_t(len(topic)),
 		unsafeByteData(message), C.size_t(len(message)),
-		C.int(opcode))
+		cIntFromInt(int(opcode)))
 }
 
 // publishBatch packs N (topic, message, opcode) tuples into one
@@ -1515,7 +1634,18 @@ func (a *appNative) publishBatch(msgs []PublishMessage) {
 	}
 	var totalBytes int
 	for i := range msgs {
-		totalBytes += len(msgs[i].Topic) + len(msgs[i].Message)
+		topicLen := len(msgs[i].Topic)
+		messageLen := len(msgs[i].Message)
+		if topicLen > maxGoInt-messageLen {
+			reportPanic(fmt.Errorf("gogo: publish batch payload length overflows Go int"))
+			return
+		}
+		add := topicLen + messageLen
+		if totalBytes > maxGoInt-add {
+			reportPanic(fmt.Errorf("gogo: publish batch payload length overflows Go int"))
+			return
+		}
+		totalBytes += add
 	}
 	buf := make([]byte, totalBytes)
 	items := make([]C.uwsgo_batch_item_t, len(msgs))
@@ -1529,7 +1659,7 @@ func (a *appNative) publishBatch(msgs []PublishMessage) {
 		items[i].message_len = C.size_t(len(msgs[i].Message))
 		copy(buf[off:], msgs[i].Message)
 		off += len(msgs[i].Message)
-		items[i].opcode = C.int(msgs[i].OpCode)
+		items[i].opcode = cIntFromInt(int(msgs[i].OpCode))
 	}
 	var bufPtr *C.char
 	if totalBytes > 0 {
@@ -1554,6 +1684,15 @@ func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req
 	handle := cgo.Handle(handlerID)
 	handler := handle.Value().(Handler)
 
+	methodN, _ := goIntFromCSize(methodLen, "HTTP method")
+	urlN, _ := goIntFromCSize(urlLen, "HTTP URL")
+	queryN, _ := goIntFromCSize(queryLen, "HTTP query")
+	headersN, _ := goIntFromCSize(headersLen, "HTTP headers")
+	p0N, _ := goIntFromCSize(p0Len, "HTTP route parameter 0")
+	p1N, _ := goIntFromCSize(p1Len, "HTTP route parameter 1")
+	p2N, _ := goIntFromCSize(p2Len, "HTTP route parameter 2")
+	p3N, _ := goIntFromCSize(p3Len, "HTTP route parameter 3")
+
 	reqWrap := requestPool.Get().(*Request)
 	reqWrap.inner = requestNative{ptr: req}
 	// uWS already had method / URL / query / first 4 params parsed and
@@ -1563,22 +1702,22 @@ func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req
 	// trip. The pointers are valid for the lifetime of this callback
 	// (= the lifetime of reqWrap before it returns to the pool).
 	reqWrap.syncMethodPtr = unsafe.Pointer(methodPtr)
-	reqWrap.syncMethodLen = int(methodLen)
+	reqWrap.syncMethodLen = methodN
 	reqWrap.syncURLPtr = unsafe.Pointer(urlPtr)
-	reqWrap.syncURLLen = int(urlLen)
+	reqWrap.syncURLLen = urlN
 	reqWrap.syncQueryPtr = unsafe.Pointer(queryPtr)
-	reqWrap.syncQueryLen = int(queryLen)
+	reqWrap.syncQueryLen = queryN
 	reqWrap.syncHeadersPtr = unsafe.Pointer(headersBlobPtr)
-	reqWrap.syncHeadersLen = int(headersLen)
+	reqWrap.syncHeadersLen = headersN
 	reqWrap.syncHeadersComplete = headersComplete != 0
 	reqWrap.syncParamPtrs[0] = unsafe.Pointer(p0Ptr)
-	reqWrap.syncParamLens[0] = int(p0Len)
+	reqWrap.syncParamLens[0] = p0N
 	reqWrap.syncParamPtrs[1] = unsafe.Pointer(p1Ptr)
-	reqWrap.syncParamLens[1] = int(p1Len)
+	reqWrap.syncParamLens[1] = p1N
 	reqWrap.syncParamPtrs[2] = unsafe.Pointer(p2Ptr)
-	reqWrap.syncParamLens[2] = int(p2Len)
+	reqWrap.syncParamLens[2] = p2N
 	reqWrap.syncParamPtrs[3] = unsafe.Pointer(p3Ptr)
-	reqWrap.syncParamLens[3] = int(p3Len)
+	reqWrap.syncParamLens[3] = p3N
 	// Store the live response pointer so req.IP() can lazily fetch the
 	// peer address via cgo on demand.
 	reqWrap.syncResPtr = unsafe.Pointer(res)
@@ -1633,6 +1772,10 @@ func uwsgoHandleWSMessage(handlerID C.uintptr_t, ws *C.uwsgo_ws_t, message *C.ch
 	handle := cgo.Handle(handlerID)
 	behavior := handle.Value().(WebSocketBehavior)
 	if behavior.Message != nil {
+		msg, ok := goBytesFromC(unsafe.Pointer(message), messageLen, "WebSocket message")
+		if !ok {
+			return
+		}
 		wsWrap := &WebSocket{inner: websocketNative{ptr: ws}, app: behavior.app}
 		initWSHubSocket(wsWrap)
 		defer func() {
@@ -1642,7 +1785,7 @@ func uwsgoHandleWSMessage(handlerID C.uintptr_t, ws *C.uwsgo_ws_t, message *C.ch
 		}()
 		behavior.Message(
 			wsWrap,
-			C.GoBytes(unsafe.Pointer(message), C.int(messageLen)),
+			msg,
 			OpCode(opcode),
 		)
 	}
@@ -1659,6 +1802,10 @@ func uwsgoHandleWSClose(handlerID C.uintptr_t, ws *C.uwsgo_ws_t, code C.int, mes
 	// gone the held Go value can be garbage collected.
 	releaseUserDataOnClose(wsWrap)
 	if behavior.Close != nil {
+		msg, ok := goBytesFromC(unsafe.Pointer(message), messageLen, "WebSocket close message")
+		if !ok {
+			return
+		}
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				reportPanic(recovered)
@@ -1667,7 +1814,7 @@ func uwsgoHandleWSClose(handlerID C.uintptr_t, ws *C.uwsgo_ws_t, code C.int, mes
 		behavior.Close(
 			wsWrap,
 			int(code),
-			C.GoBytes(unsafe.Pointer(message), C.int(messageLen)),
+			msg,
 		)
 	}
 }
@@ -1684,16 +1831,19 @@ func uwsgoHandleWSUpgrade(handlerID C.uintptr_t,
 	handle := cgo.Handle(handlerID)
 	behavior := handle.Value().(WebSocketBehavior)
 
-	headerCopy := C.GoBytes(unsafe.Pointer(headersBlob), C.int(headersLen))
+	headerCopy, ok := goBytesFromC(unsafe.Pointer(headersBlob), headersLen, "WebSocket upgrade headers")
+	if !ok {
+		return
+	}
 	handleWSUpgradeFromCgo(
 		behavior,
 		uintptr(ctxPtr),
-		C.GoStringN(method, C.int(methodLen)),
-		C.GoStringN(url, C.int(urlLen)),
-		C.GoStringN(query, C.int(queryLen)),
-		C.GoStringN(ip, C.int(ipLen)),
+		goStringFromCSize(method, methodLen, "WebSocket upgrade method"),
+		goStringFromCSize(url, urlLen, "WebSocket upgrade URL"),
+		goStringFromCSize(query, queryLen, "WebSocket upgrade query"),
+		goStringFromCSize(ip, ipLen, "WebSocket upgrade IP"),
 		headerCopy,
-		C.GoStringN(secProtoOffered, C.int(secProtoLen)),
+		goStringFromCSize(secProtoOffered, secProtoLen, "WebSocket upgrade protocols"),
 	)
 }
 
@@ -1824,8 +1974,8 @@ func uwsgoHandleData(callbackID C.uintptr_t, data *C.char, size C.size_t, isLast
 	// explicitly because a silent truncation here would copy only part
 	// of the buffer into Go memory while the caller thinks all bytes
 	// arrived — defense-in-depth costs one branch on the cold path.
-	if size > C.size_t(maxInt32) {
-		reportPanic(fmt.Errorf("gogo: uwsgoHandleData chunk size %d exceeds int32 max — refusing to truncate", uint64(size)))
+	n, ok := cgoCopyLen(size, "request body chunk")
+	if !ok {
 		if isLast != 0 {
 			h.Delete()
 		}
@@ -1833,7 +1983,7 @@ func uwsgoHandleData(callbackID C.uintptr_t, data *C.char, size C.size_t, isLast
 	}
 	var chunk []byte
 	if size > 0 {
-		chunk = C.GoBytes(unsafe.Pointer(data), C.int(size))
+		chunk = C.GoBytes(unsafe.Pointer(data), n)
 	}
 	last := isLast != 0
 	if last {
