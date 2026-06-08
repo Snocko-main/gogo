@@ -70,6 +70,13 @@ func main() {
 			n = v
 		}
 	}
+	workers := 0
+	if env := os.Getenv("GOGO_WORKERS"); env != "" {
+		if v, err := strconv.Atoi(env); err == nil && v >= 0 {
+			workers = v
+		}
+	}
+	gogo.SetWorkerCount(workers)
 
 	setup := func(app *gogo.App) {
 		app.Get("/plain", func(res *gogo.Response, req *gogo.Request) {
@@ -80,6 +87,16 @@ func main() {
 		})
 		app.Get("/json", func(res *gogo.Response, req *gogo.Request) {
 			res.Send(200, "application/json", `{"message":"hello world","ok":true}`+"\n")
+		})
+		app.GetAsync("/async", func(res *gogo.Response, req *gogo.Request) {
+			var name, email, role string
+			err := dbConn.QueryRow("SELECT name, email, role FROM users WHERE id = ?", 42).Scan(&name, &email, &role)
+			if err != nil {
+				res.Send(500, "text/plain", err.Error())
+				return
+			}
+			res.Send(200, "application/json",
+				fmt.Sprintf(`{"id":42,"name":%q,"email":%q,"role":%q}`+"\n", name, email, role))
 		})
 		app.Get("/health", gogo.Reply{
 			Status:      200,
@@ -93,6 +110,17 @@ func main() {
 		app.GetAsync("/sleep", func(res *gogo.Response, req *gogo.Request) {
 			time.Sleep(2 * time.Millisecond)
 			res.Send(200, "text/plain; charset=utf-8", "slept\n")
+		})
+		app.Use("/middleware", func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				res.Header("X-Bench-Middleware", "gogo")
+				res.Header("X-Bench-Route", "middleware")
+				next(res, req)
+			}
+		})
+		app.Get("/middleware", func(res *gogo.Response, req *gogo.Request) {
+			res.Header("Content-Type", "text/plain; charset=utf-8")
+			res.Send(200, "", "hello world\n")
 		})
 		app.GetAsync("/file", func(res *gogo.Response, req *gogo.Request) {
 			data, err := os.ReadFile(filePath)

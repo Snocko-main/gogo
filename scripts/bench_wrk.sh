@@ -3,46 +3,84 @@
 # wrk benchmark matrix across gogo, fiber, nethttp, node+uWebSockets.js,
 # bun+elysia, and actix-web.
 #
-# Endpoints:   /hello, /hello/:name, /db (GET) + /echo (POST)
+# Route sets:
+#   BENCH_ROUTE_SET=legacy
+#     Six-framework comparison for the checked-in snapshot:
+#     /hello, /hello/:name, /db (GET) + /echo, /query (POST)
+#   BENCH_ROUTE_SET=v07-http
+#     Local HTTP baseline coverage for gogo/fiber/nethttp:
+#     /plain, /hello/:name, /json, /middleware, /async (GET)
 # Threads:     1, 2, 4, 8     (wrk -t)
 # Connections: 500            (wrk -c)
 # Modes:       single (1 worker) and multi (MULTI_WORKERS workers)
 #
-# /echo POSTs a fixed 50-byte JSON body via scripts/wrk_post.lua so each
-# server's body-collection path is exercised. Each server is started,
-# warmed, benchmarked, then killed before moving to the next. Per-run
-# stdout (request rate, latency) is appended to
+# POST endpoints use scripts/wrk_post*.lua so each selected server gets
+# the same body shape. Each server is started, warmed, benchmarked,
+# then killed before moving to the next. Per-run stdout (request rate,
+# latency) is appended to
 # benchmark/results/wrk-<framework>-<mode>.log.
 #
 # Env knobs:
+#   BENCH_ROUTE_SET legacy|v07-http route/framework defaults (default legacy)
 #   DURATION       seconds per wrk run                  (default 15)
 #   THREADS        space-separated thread counts        (default "1 2 4 8")
 #   CONN           connections                          (default 500)
-#   ENDPOINTS      GET endpoints to hit                 (default "/hello /hello/inon /db")
-#   POST_ENDPOINTS POST endpoints to hit                (default "/echo")
-#   FRAMEWORKS     subset to run                        (default "gogo fiber nethttp uwsjs bun actix")
+#   ENDPOINTS      GET endpoints to hit                 (route-set default)
+#   POST_ENDPOINTS POST endpoints to hit                (route-set default)
+#   FRAMEWORKS     subset to run                        (route-set default)
 #   MODES          subset to run                        (default "single multi")
 #   MULTI_WORKERS  server workers/processes for multi   (default min(NumCPU, 4))
+#   GOGO_WORKERS   shared-dispatch workers for gogo     (default 0 = NumCPU)
 #   WARMUP         seconds of warmup hits before timing (default 2)
 #   RESULTS_DIR    where to write logs                  (default benchmark/results)
 #
 # Prereqs: wrk, go, node (+ npm install in benchmark/node-uwebsockets),
 # bun (+ bun install in benchmark/bun-elysia), and the Actix release
 # binary (cargo build --release --manifest-path benchmark/actix/Cargo.toml).
+#
+# gogo cgo budget for the v0.7 hot HTTP baselines:
+#   - Static Reply/string routes: 0 per-request cgo callbacks/calls.
+#   - Dynamic sync routes such as /plain, /json, and /hello/:name:
+#     <=1 C++->Go handler callback + <=1 Go->C Send call.
+#   - Sync middleware route /middleware: <=1 C++->Go handler callback
+#     + <=3 Go->C response calls (status, batched headers, end). Adding
+#     more middleware headers must keep the batched header crossing.
+#   - Shared async route /async: 0 per-request cgo callbacks/calls while
+#     the route has no sync middleware and the response fits shared-send
+#     limits. The route's SQLite lookup may use cgo inside the benchmark
+#     handler; that is application work, not framework HTTP dispatch cost.
 
 set -eu
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
+BENCH_ROUTE_SET="${BENCH_ROUTE_SET:-legacy}"
+case "$BENCH_ROUTE_SET" in
+legacy)
+	DEFAULT_FRAMEWORKS="gogo fiber nethttp uwsjs bun actix"
+	DEFAULT_ENDPOINTS="/hello /hello/inon /db"
+	DEFAULT_POST_ENDPOINTS="/echo /query"
+	;;
+v07-http)
+	DEFAULT_FRAMEWORKS="gogo fiber nethttp"
+	DEFAULT_ENDPOINTS="/plain /hello/inon /json /middleware /async"
+	DEFAULT_POST_ENDPOINTS=""
+	;;
+*)
+	echo "unknown BENCH_ROUTE_SET: $BENCH_ROUTE_SET (want legacy or v07-http)" >&2
+	exit 1
+	;;
+esac
+
 DURATION="${DURATION:-15}"
 THREADS="${THREADS:-1 2 4 8}"
 CONN="${CONN:-500}"
-ENDPOINTS="${ENDPOINTS:-/hello /hello/inon /db}"
-POST_ENDPOINTS="${POST_ENDPOINTS:-/echo /query}"
+ENDPOINTS="${ENDPOINTS:-$DEFAULT_ENDPOINTS}"
+POST_ENDPOINTS="${POST_ENDPOINTS:-$DEFAULT_POST_ENDPOINTS}"
 POST_LUA="${POST_LUA:-$REPO_ROOT/scripts/wrk_post.lua}"
 POST_LUA_QUERY="${POST_LUA_QUERY:-$REPO_ROOT/scripts/wrk_post_db.lua}"
-FRAMEWORKS="${FRAMEWORKS:-gogo fiber nethttp uwsjs bun actix}"
+FRAMEWORKS="${FRAMEWORKS:-$DEFAULT_FRAMEWORKS}"
 MODES="${MODES:-single multi}"
 WARMUP="${WARMUP:-2}"
 RESULTS_DIR="${RESULTS_DIR:-benchmark/results}"
@@ -155,12 +193,12 @@ start_server() {
 	case "$fw:$mode" in
 	gogo:single)
 		build_go_binary gogo-bench gogo ./gogo
-		( GOGO_CORES=1 "$BENCH_BIN_DIR/gogo-bench" >/tmp/bench-gogo.log 2>&1 ) &
+		( GOGO_CORES=1 GOGO_WORKERS="${GOGO_WORKERS:-0}" "$BENCH_BIN_DIR/gogo-bench" >/tmp/bench-gogo.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	gogo:multi)
 		build_go_binary gogo-bench gogo ./gogo
-		( GOMAXPROCS="$MULTI_WORKERS" GOGO_CORES="$MULTI_WORKERS" "$BENCH_BIN_DIR/gogo-bench" >/tmp/bench-gogo.log 2>&1 ) &
+		( GOMAXPROCS="$MULTI_WORKERS" GOGO_CORES="$MULTI_WORKERS" GOGO_WORKERS="${GOGO_WORKERS:-0}" "$BENCH_BIN_DIR/gogo-bench" >/tmp/bench-gogo.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	fiber:single)
