@@ -119,6 +119,8 @@ func TestCORSRejectsAmbiguousWildcardOrigins(t *testing.T) {
 		{AllowOrigins: []string{"*", "https://app.example.com"}},
 		{AllowOrigins: []string{"https://app.example.com", "*"}},
 		{AllowOrigins: []string{"*"}, AllowCredentials: true},
+		{AllowOrigins: []string{" * "}, AllowCredentials: true},
+		{AllowOrigins: []string{" * ", "https://app.example.com"}},
 	}
 	for _, opt := range cases {
 		t.Run(strings.Join(opt.AllowOrigins, ","), func(t *testing.T) {
@@ -129,6 +131,41 @@ func TestCORSRejectsAmbiguousWildcardOrigins(t *testing.T) {
 			}()
 			_ = CORS(opt)
 		})
+	}
+}
+
+func TestCORSPreLowercasesConfiguredOriginsAtConstruction(t *testing.T) {
+	normalized := normalizeCORSOriginPatterns([]string{
+		" HTTPS://APP.Example.COM/ ",
+		"HTTPS://*.TRUSTED.Example/",
+		"null",
+	})
+	wantNormalized := []string{
+		"https://app.example.com",
+		"https://*.trusted.example",
+		"null",
+	}
+	if len(normalized) != len(wantNormalized) {
+		t.Fatalf("normalized origins length = %d, want %d", len(normalized), len(wantNormalized))
+	}
+	for i := range wantNormalized {
+		if normalized[i] != wantNormalized[i] {
+			t.Fatalf("normalized[%d] = %q, want %q", i, normalized[i], wantNormalized[i])
+		}
+	}
+
+	compiled := compileOrigins(normalized)
+	if got, want := compiled[0].full, "https://app.example.com"; got != want {
+		t.Fatalf("compiled exact full = %q, want %q", got, want)
+	}
+	if got, want := compiled[1].prefix, "https://"; got != want {
+		t.Fatalf("compiled wildcard prefix = %q, want %q", got, want)
+	}
+	if got, want := compiled[1].suffix, ".trusted.example"; got != want {
+		t.Fatalf("compiled wildcard suffix = %q, want %q", got, want)
+	}
+	if got, want := compiled[2].full, "null"; got != want {
+		t.Fatalf("compiled null full = %q, want %q", got, want)
 	}
 }
 
@@ -156,6 +193,31 @@ func TestCORSNormalizesConfiguredOrigins(t *testing.T) {
 	} {
 		if matchCompiledOrigin(compiled, origin) {
 			t.Fatalf("compiled origins matched invalid origin %q", origin)
+		}
+	}
+}
+
+func TestCORSWildcardOriginMatchesOnlySubdomains(t *testing.T) {
+	compiled := compileOrigins(normalizeCORSOriginPatterns([]string{
+		"HTTPS://*.Example.COM/",
+	}))
+	for _, origin := range []string{
+		"https://api.example.com",
+		"https://deep.api.example.com",
+		"HTTPS://API.EXAMPLE.COM/",
+	} {
+		if !matchCompiledOrigin(compiled, origin) {
+			t.Fatalf("compiled wildcard origin did not match %q", origin)
+		}
+	}
+	for _, origin := range []string{
+		"https://example.com",
+		"http://api.example.com",
+		"https://evil-example.com",
+		"https://api.example.com.evil.com",
+	} {
+		if matchCompiledOrigin(compiled, origin) {
+			t.Fatalf("compiled wildcard origin matched invalid origin %q", origin)
 		}
 	}
 }
