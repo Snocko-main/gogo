@@ -21,8 +21,9 @@ var (
 	// worker within the configured close timeout.
 	ErrWSHubCloseTimeout = errors.New("gogo: websocket hub close timeout")
 
-	// ErrWSHubAdapterQueueFull is returned by PublishFrom when the async
-	// adapter queue is full. Local subscribers have already been fanned out.
+	// ErrWSHubAdapterQueueFull is returned by hub publish calls when the
+	// async adapter queue is full. Local subscribers have already been fanned
+	// out.
 	ErrWSHubAdapterQueueFull = errors.New("gogo: websocket hub adapter queue is full")
 
 	// ErrWSHubUntrackedSocket is returned when PublishFrom cannot identify the
@@ -143,7 +144,9 @@ func WithWSHubNodeID(id string) WSHubOption {
 	}
 }
 
-// WithWSHubAdapter installs a distributed adapter, for example Redis.
+// WithWSHubAdapter installs a distributed adapter, for example Redis. The
+// adapter is started by Start or lazily by the first adapter publish or topic
+// reconciliation.
 func WithWSHubAdapter(adapter WSHubAdapter) WSHubOption {
 	return func(h *WSHub) {
 		h.adapter = adapter
@@ -151,8 +154,9 @@ func WithWSHubAdapter(adapter WSHubAdapter) WSHubOption {
 }
 
 // WithWSHubAdapterQueueSize sets the bounded async adapter queue used by
-// PublishFrom. Larger queues absorb Redis/network bursts without blocking the
-// WebSocket loop thread.
+// Publish, PublishBatch, and PublishFrom. Larger queues absorb Redis/network
+// bursts without blocking the WebSocket loop thread; a full queue returns
+// ErrWSHubAdapterQueueFull after local fan-out has already happened.
 func WithWSHubAdapterQueueSize(size int) WSHubOption {
 	return func(h *WSHub) {
 		if size > 0 {
@@ -161,9 +165,10 @@ func WithWSHubAdapterQueueSize(size int) WSHubOption {
 	}
 }
 
-// WithWSHubAdapterWorkers sets how many goroutines publish queued adapter
-// messages. The default is 1, which preserves queue order. Larger values can
-// improve Redis throughput when cross-process message ordering is not required.
+// WithWSHubAdapterWorkers sets how many goroutines call adapter.Publish for
+// queued messages. The default is 1, which preserves adapter publish call order
+// from the hub queue. Larger values can improve Redis throughput when
+// cross-process message ordering is not required.
 func WithWSHubAdapterWorkers(workers int) WSHubOption {
 	return func(h *WSHub) {
 		if workers > 0 {
@@ -173,7 +178,9 @@ func WithWSHubAdapterWorkers(workers int) WSHubOption {
 }
 
 // WithWSHubAdapterTopicWorkers sets how many goroutines reconcile adapter
-// topic subscriptions. The default is 1; raise it for high subscription churn.
+// topic subscriptions. The default is 1. Multiple workers may reconcile
+// different topics in parallel, but the same topic is never reconciled
+// concurrently.
 func WithWSHubAdapterTopicWorkers(workers int) WSHubOption {
 	return func(h *WSHub) {
 		if workers > 0 {
@@ -182,8 +189,9 @@ func WithWSHubAdapterTopicWorkers(workers int) WSHubOption {
 	}
 }
 
-// WithWSHubAdapterPublishTimeout bounds each adapter publish. This keeps
-// shutdown from waiting indefinitely on a slow or half-open Redis connection.
+// WithWSHubAdapterPublishTimeout bounds each adapter Publish, Subscribe, and
+// Unsubscribe operation. This keeps shutdown from waiting indefinitely on a
+// slow or half-open Redis connection.
 func WithWSHubAdapterPublishTimeout(timeout time.Duration) WSHubOption {
 	return func(h *WSHub) {
 		if timeout > 0 {
@@ -192,8 +200,9 @@ func WithWSHubAdapterPublishTimeout(timeout time.Duration) WSHubOption {
 	}
 }
 
-// WithWSHubCloseTimeout bounds how long Close waits for queued adapter
-// publishes to drain before aborting in-flight adapter work.
+// WithWSHubCloseTimeout bounds each Close wait phase for adapter workers. Close
+// first lets queued adapter work drain, then cancels the hub context and waits
+// again before returning ErrWSHubCloseTimeout.
 func WithWSHubCloseTimeout(timeout time.Duration) WSHubOption {
 	return func(h *WSHub) {
 		if timeout > 0 {
@@ -203,7 +212,8 @@ func WithWSHubCloseTimeout(timeout time.Duration) WSHubOption {
 }
 
 // WithWSHubAdapterErrorHandler receives asynchronous adapter errors from the
-// hub worker. The default reports rate-limited errors through SetPanicHandler.
+// hub worker, including Start, Publish, and topic reconciliation failures. The
+// default reports rate-limited errors through SetPanicHandler.
 func WithWSHubAdapterErrorHandler(fn func(error)) WSHubOption {
 	return func(h *WSHub) {
 		h.adapterErrFn = fn
@@ -447,7 +457,8 @@ func (h *WSHub) PublishFrom(ws *WebSocket, topic string, message []byte, opcode 
 	return h.queueAdapterPublish(msg)
 }
 
-// Close stops the adapter subscription. It does not close any attached App.
+// Close stops the adapter subscription and adapter workers. It is idempotent
+// and does not close any attached App.
 func (h *WSHub) Close() error {
 	if h == nil {
 		return nil
@@ -490,9 +501,10 @@ func (h *WSHub) Close() error {
 	return err
 }
 
-// Start starts the adapter subscription, if an adapter is configured. It can
-// be retried after transient adapter failures. Publish and PublishFrom also
-// start the adapter lazily.
+// Start starts the adapter subscription, if an adapter is configured. It is
+// idempotent after a successful start and can be retried after transient
+// adapter failures. Publish, PublishBatch, PublishFrom, and topic
+// reconciliation also start the adapter lazily.
 func (h *WSHub) Start() error {
 	return h.startAdapter(true, false)
 }
