@@ -347,10 +347,14 @@ func sharedWorker(stop <-chan struct{}) {
 		}
 
 		ctxPtr := *(*uintptr)(unsafe.Pointer(slotBase + shared.slotCtxOffset))
-		handlerID := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxHandlerIDOff))
 		// Mark slot empty for the next generation of producers (idx wraps in
 		// ringSize, so the next producer for this slot waits for idx+ringSize).
 		seqAddr.Store(idx + uint64(shared.ringMask) + 1)
+		if sharedCtxClosing(ctxPtr) {
+			asyncCtxRelease(ctxPtr)
+			continue
+		}
+		handlerID := *(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxHandlerIDOff))
 
 		// Read the handler from the atomic snapshot — append-only after
 		// registration, so no lock on the hot path.
@@ -794,18 +798,18 @@ func asyncDeferSendWithHeaders(loopPtr, ctxHandle uintptr, status, contentType, 
 // Each subsequent chunk goes through asyncDeferStreamWrite, and
 // asyncDeferStreamEnd closes the response. See res.Stream for the
 // caller-facing wrapper.
-func asyncDeferStreamStart(loopPtr, ctxHandle uintptr, status, contentType, headersBlob string) {
+func asyncDeferStreamStart(loopPtr, ctxHandle uintptr, status, contentType, headersBlob string) bool {
 	var headersPtr *C.char
 	if len(headersBlob) > 0 {
 		headersPtr = unsafeStringData(headersBlob)
 	}
-	C.uwsgo_res_defer_stream_start(
+	return C.uwsgo_res_defer_stream_start(
 		(*C.uwsgo_loop_t)(unsafe.Pointer(loopPtr)),
 		unsafe.Pointer(ctxHandle),
 		unsafeStringData(status), C.size_t(len(status)),
 		unsafeStringData(contentType), C.size_t(len(contentType)),
 		headersPtr, C.size_t(len(headersBlob)),
-	)
+	) != 0
 }
 
 // asyncDeferStreamWrite queues one chunk for the loop thread to
@@ -864,7 +868,10 @@ func asyncCtxAborted(ctxHandle uintptr) bool {
 		return true
 	}
 	if sharedReady {
-		return (*atomic.Int32)(unsafe.Pointer(ctxHandle+shared.ctxAbortedOff)).Load() != 0
+		if (*atomic.Int32)(unsafe.Pointer(ctxHandle+shared.ctxAbortedOff)).Load() != 0 {
+			return true
+		}
+		return sharedCtxClosing(ctxHandle)
 	}
 	return C.uwsgo_async_ctx_aborted(unsafe.Pointer(ctxHandle)) != 0
 }
@@ -882,29 +889,32 @@ func asyncCtxStreamPendingBytes(ctxHandle uintptr) uint64 {
 // reads ctx->pending_ring rather than using a global so multiple App
 // instances can coexist.
 type sharedLayout struct {
-	requestRing       uintptr
-	ctxPendingRingOff uintptr
-	ringMask          uint64
-	slotsOffset       uintptr
-	slotStride        uintptr
-	slotSeqOffset     uintptr
-	slotCtxOffset     uintptr
-	headOffset        uintptr
-	tailOffset        uintptr
-	wakePendingOffset uintptr
-	ctxStatusLenOff   uintptr
-	ctxCtLenOff       uintptr
-	ctxBodyLenOff     uintptr
-	ctxStatusOff      uintptr
-	ctxCtOff          uintptr
-	ctxBodyOff        uintptr
-	ctxHandlerIDOff   uintptr
-	ctxAbortedOff     uintptr
-	ctxResponseOff    uintptr
-	ctxLoopOff        uintptr
-	statusCap         uintptr
-	ctCap             uintptr
-	bodyCap           uintptr
+	requestRing         uintptr
+	ctxPendingRingOff   uintptr
+	ringMask            uint64
+	slotsOffset         uintptr
+	slotStride          uintptr
+	slotSeqOffset       uintptr
+	slotCtxOffset       uintptr
+	headOffset          uintptr
+	tailOffset          uintptr
+	wakePendingOffset   uintptr
+	ctxStatusLenOff     uintptr
+	ctxCtLenOff         uintptr
+	ctxBodyLenOff       uintptr
+	ctxStatusOff        uintptr
+	ctxCtOff            uintptr
+	ctxBodyOff          uintptr
+	ctxHandlerIDOff     uintptr
+	ctxAbortedOff       uintptr
+	ctxResponseOff      uintptr
+	ctxLoopOff          uintptr
+	ctxSharedStateOff   uintptr
+	stateClosingOff     uintptr
+	stateActiveSendsOff uintptr
+	statusCap           uintptr
+	ctCap               uintptr
+	bodyCap             uintptr
 	// Request snapshot offsets (populated by C++ before the ctx is enqueued).
 	ctxMethodLenOff  uintptr
 	ctxURLLenOff     uintptr
@@ -951,29 +961,32 @@ func initSharedLayoutOnce() {
 	var raw C.uwsgo_shared_layout_t
 	C.uwsgo_shared_layout(&raw)
 	shared = sharedLayout{
-		requestRing:       uintptr(raw.request_ring),
-		ctxPendingRingOff: uintptr(raw.ctx_pending_ring_offset),
-		ringMask:          uint64(raw.ring_mask),
-		slotsOffset:       uintptr(raw.ring_slots_offset),
-		slotStride:        uintptr(raw.ring_slot_stride),
-		slotSeqOffset:     uintptr(raw.ring_slot_seq_offset),
-		slotCtxOffset:     uintptr(raw.ring_slot_ctx_offset),
-		headOffset:        uintptr(raw.ring_head_offset),
-		tailOffset:        uintptr(raw.ring_tail_offset),
-		wakePendingOffset: uintptr(raw.ring_wake_pending_offset),
-		ctxStatusLenOff:   uintptr(raw.ctx_status_len_offset),
-		ctxCtLenOff:       uintptr(raw.ctx_ct_len_offset),
-		ctxBodyLenOff:     uintptr(raw.ctx_body_len_offset),
-		ctxStatusOff:      uintptr(raw.ctx_status_offset),
-		ctxCtOff:          uintptr(raw.ctx_ct_offset),
-		ctxBodyOff:        uintptr(raw.ctx_body_offset),
-		ctxHandlerIDOff:   uintptr(raw.ctx_handler_id_offset),
-		ctxAbortedOff:     uintptr(raw.ctx_aborted_offset),
-		ctxResponseOff:    uintptr(raw.ctx_response_offset),
-		ctxLoopOff:        uintptr(raw.ctx_loop_offset),
-		statusCap:         uintptr(raw.ctx_inline_status_cap),
-		ctCap:             uintptr(raw.ctx_inline_ct_cap),
-		bodyCap:           uintptr(raw.ctx_inline_body_cap),
+		requestRing:         uintptr(raw.request_ring),
+		ctxPendingRingOff:   uintptr(raw.ctx_pending_ring_offset),
+		ringMask:            uint64(raw.ring_mask),
+		slotsOffset:         uintptr(raw.ring_slots_offset),
+		slotStride:          uintptr(raw.ring_slot_stride),
+		slotSeqOffset:       uintptr(raw.ring_slot_seq_offset),
+		slotCtxOffset:       uintptr(raw.ring_slot_ctx_offset),
+		headOffset:          uintptr(raw.ring_head_offset),
+		tailOffset:          uintptr(raw.ring_tail_offset),
+		wakePendingOffset:   uintptr(raw.ring_wake_pending_offset),
+		ctxStatusLenOff:     uintptr(raw.ctx_status_len_offset),
+		ctxCtLenOff:         uintptr(raw.ctx_ct_len_offset),
+		ctxBodyLenOff:       uintptr(raw.ctx_body_len_offset),
+		ctxStatusOff:        uintptr(raw.ctx_status_offset),
+		ctxCtOff:            uintptr(raw.ctx_ct_offset),
+		ctxBodyOff:          uintptr(raw.ctx_body_offset),
+		ctxHandlerIDOff:     uintptr(raw.ctx_handler_id_offset),
+		ctxAbortedOff:       uintptr(raw.ctx_aborted_offset),
+		ctxResponseOff:      uintptr(raw.ctx_response_offset),
+		ctxLoopOff:          uintptr(raw.ctx_loop_offset),
+		ctxSharedStateOff:   uintptr(raw.ctx_shared_state_offset),
+		stateClosingOff:     uintptr(raw.state_closing_offset),
+		stateActiveSendsOff: uintptr(raw.state_active_sends_offset),
+		statusCap:           uintptr(raw.ctx_inline_status_cap),
+		ctCap:               uintptr(raw.ctx_inline_ct_cap),
+		bodyCap:             uintptr(raw.ctx_inline_body_cap),
 
 		ctxMethodLenOff:       uintptr(raw.ctx_method_len_offset),
 		ctxURLLenOff:          uintptr(raw.ctx_url_len_offset),
@@ -1004,6 +1017,45 @@ func initSharedLayoutOnce() {
 	sharedReady = true
 }
 
+func sharedCtxState(ctxHandle uintptr) uintptr {
+	if !sharedReady || ctxHandle == 0 {
+		return 0
+	}
+	return *(*uintptr)(unsafe.Pointer(ctxHandle + shared.ctxSharedStateOff))
+}
+
+func sharedStateClosing(statePtr uintptr) bool {
+	if statePtr == 0 {
+		return false
+	}
+	return (*atomic.Int32)(unsafe.Pointer(statePtr+shared.stateClosingOff)).Load() != 0
+}
+
+func sharedCtxClosing(ctxHandle uintptr) bool {
+	return sharedStateClosing(sharedCtxState(ctxHandle))
+}
+
+func beginSharedSend(ctxHandle uintptr) (uintptr, bool) {
+	statePtr := sharedCtxState(ctxHandle)
+	if statePtr == 0 || sharedStateClosing(statePtr) {
+		return 0, false
+	}
+	active := (*atomic.Int32)(unsafe.Pointer(statePtr + shared.stateActiveSendsOff))
+	active.Add(1)
+	if sharedStateClosing(statePtr) {
+		active.Add(-1)
+		return 0, false
+	}
+	return statePtr, true
+}
+
+func finishSharedSend(statePtr uintptr) {
+	if statePtr == 0 {
+		return
+	}
+	(*atomic.Int32)(unsafe.Pointer(statePtr + shared.stateActiveSendsOff)).Add(-1)
+}
+
 func (a appNative) startSharedDrain(intervalUs int) {
 	C.uwsgo_app_start_drain(a.ptr, C.int(intervalUs))
 }
@@ -1019,6 +1071,11 @@ func asyncSendShared(ctxHandle uintptr, statusLine, contentType, body string) bo
 		uintptr(len(body)) > shared.bodyCap {
 		return false
 	}
+	statePtr, ok := beginSharedSend(ctxHandle)
+	if !ok {
+		return false
+	}
+	defer finishSharedSend(statePtr)
 
 	// Write status/ct/body bytes into the ctx's inline buffers.
 	if n := len(statusLine); n > 0 {

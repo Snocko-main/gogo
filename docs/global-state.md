@@ -32,6 +32,11 @@ found there.
 | `SetWorkerCount(n)` | `0`, interpreted as `runtime.NumCPU()` when workers start | Native shared-dispatch worker pool used by shared async routes | Native builds only. Negative values are clamped to `0`. The value is read when a shared worker generation starts. Calls after workers are already running do not resize that generation; set it before the first shared async route is registered. |
 | `WaitForSharedWorkers(timeout)` | Not a setting | Native shared-dispatch worker generations | Observes worker drain state. It does not configure global state, but it is the public observation hook for the process-wide shared worker pool. Stub builds always return `true`. |
 
+`SetPanicHandler` is intentionally the supported panic-recovery configuration
+model for v1. There is no per-`App` `Config` hook: some recovery sites are
+owned by package-level workers or shared callback paths where no single `App`
+is available, so a process-wide handler keeps reporting behavior consistent.
+
 ## Package-Level Limits
 
 These exported variables remain assignable for compatibility, but the setter

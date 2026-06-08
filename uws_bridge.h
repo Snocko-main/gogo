@@ -220,11 +220,12 @@ void uwsgo_res_defer_send_with_headers(
 // the expected mode for these streaming helpers (don't set
 // Content-Length unless you know the total payload size in advance).
 //
-// Each of the stream_* functions retains the ctx before queuing the
-// loop defer, so the AsyncCtx outlives every pending write. Callers
-// must finish a stream with exactly one defer_stream_end; emitting
-// further chunks (or another end) afterwards is undefined behavior.
-void uwsgo_res_defer_stream_start(
+// Each accepted stream_* operation retains the ctx before queuing the
+// loop defer, so the AsyncCtx outlives every pending write. The caller
+// still owns the original async ctx ref and must release it when the
+// stream function returns. stream_start returns non-zero only when the
+// opening frame was accepted for queuing.
+int uwsgo_res_defer_stream_start(
     uwsgo_loop_t *loop,
     void *ctx,
     const char *status, size_t status_len,
@@ -292,6 +293,9 @@ typedef struct uwsgo_shared_layout_t {
     size_t ctx_aborted_offset;
     size_t ctx_response_offset;
     size_t ctx_loop_offset;
+    size_t ctx_shared_state_offset;
+    size_t state_closing_offset;
+    size_t state_active_sends_offset;
     // Per-App response ring pointer carried inline in each AsyncCtx so Go's
     // SendShared can push to the right App's ring when multiple Apps run
     // in the same process.

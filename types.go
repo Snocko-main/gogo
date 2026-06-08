@@ -423,6 +423,10 @@ const (
 // app creation and bind time. The struct is intentionally narrow — knobs
 // only get added here when they need a single, app-wide value.
 //
+// Panic recovery is intentionally not part of Config. The supported panic
+// hook is SetPanicHandler, which is process-wide because recovery sites include
+// package-level workers and callbacks that are not owned by a single App.
+//
 // # Connection-level timeouts and limits
 //
 // A few knobs that look like they belong here are deliberately not
@@ -586,6 +590,8 @@ type App struct {
 	stopping      atomic.Bool
 	closed        atomic.Bool
 	pendingTimers atomic.Int32
+	runDone       chan struct{}
+	runDoneOnce   sync.Once
 	// nativeMu serializes App.Close with cross-thread native calls that keep
 	// using the app pointer after leaving Go, such as WebSocket publishes.
 	nativeMu sync.RWMutex
@@ -667,7 +673,8 @@ func defaultConfig(c Config) Config {
 
 // NewApp creates a non-TLS uWebSockets app. With no Config the app uses safe
 // production defaults; pass at most one Config to override. The variadic shape
-// is retained only for backward compatibility with the old zero-arg signature.
+// is the compatibility contract: NewApp() remains valid, NewApp(Config{...})
+// applies overrides, and more than one Config returns an error.
 func NewApp(cfg ...Config) (*App, error) {
 	if len(cfg) > 1 {
 		return nil, fmt.Errorf("gogo: NewApp accepts at most one Config (got %d)", len(cfg))
@@ -691,7 +698,7 @@ func NewApp(cfg ...Config) (*App, error) {
 	initSharedLayout()
 	inner.setBodyLimit(c.BodyLimit)
 	inner.setCapturePeerIP(c.CapturePeerIP)
-	return &App{inner: inner, cfg: c, trustedProxyRanges: trustedProxyRanges}, nil
+	return &App{inner: inner, cfg: c, trustedProxyRanges: trustedProxyRanges, runDone: make(chan struct{})}, nil
 }
 
 func parseTrustedProxyRanges(values []string) ([]netip.Prefix, error) {
@@ -2408,11 +2415,12 @@ func (a *App) fireListenHooks(port int) {
 }
 
 // OnShutdown registers a callback that fires synchronously at the start
-// of Shutdown / ShutdownGracefully (before the C++ close is dispatched
-// to the loop). Use it to flush logs, close DB pools, etc. Hooks run in
-// registration order and run on whatever goroutine called Shutdown.
-// Hooks fire at most once per App lifecycle, even if Shutdown and
-// ShutdownGracefully are both called. Calling OnShutdown(nil) is a no-op.
+// of Shutdown, ShutdownGracefully, or ShutdownContext (before the C++
+// close is dispatched to the loop). Use it to flush logs, close DB
+// pools, etc. Hooks run in registration order and run on whatever
+// goroutine called the shutdown API. Hooks fire at most once per App
+// lifecycle, even if multiple shutdown APIs are called. Calling
+// OnShutdown(nil) is a no-op.
 func (a *App) OnShutdown(fn func()) {
 	if fn == nil {
 		return
@@ -2443,8 +2451,18 @@ func (a *App) fireShutdownHooks() {
 // the shared-memory drain timer on this loop so SendShared responses can be
 // flushed by the loop thread.
 func (a *App) Run() {
+	defer a.finishRun()
 	a.inner.startSharedDrain(200) // 200μs drain interval
 	a.inner.run()
+}
+
+func (a *App) finishRun() {
+	if a.runDone == nil {
+		return
+	}
+	a.runDoneOnce.Do(func() {
+		close(a.runDone)
+	})
 }
 
 // Shutdown stops the app immediately: the listen socket and every
@@ -2514,6 +2532,32 @@ func (a *App) ShutdownGracefully(timeout time.Duration) {
 	}()
 }
 
+// ShutdownContext starts a graceful shutdown and blocks until Run exits or
+// ctx is done. It closes the listen socket immediately, lets accepted
+// connections drain naturally, and returns nil when the loop exits.
+//
+// If ctx is done before the loop exits, ShutdownContext force-closes active
+// connections with Shutdown and returns ctx.Err(). Call Close after Run
+// returns to free native resources. Passing a nil context returns an error.
+func (a *App) ShutdownContext(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("gogo: ShutdownContext requires a non-nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		a.Shutdown()
+		return err
+	}
+
+	a.ShutdownGracefully(0)
+	select {
+	case <-a.runDone:
+		return nil
+	case <-ctx.Done():
+		a.Shutdown()
+		return ctx.Err()
+	}
+}
+
 // Close frees native resources. Call it only after Run has returned, or
 // before Run if the app was never started. Waits for any in-flight
 // ShutdownGracefully force-close goroutine to settle so a delayed
@@ -2538,6 +2582,7 @@ func (a *App) Close() {
 	a.nativeMu.Lock()
 	a.inner.close()
 	a.nativeMu.Unlock()
+	a.finishRun()
 	// Drop the worker pool reference exactly once per shared App.
 	// Multiple Close calls (defensive teardown, force-close timer
 	// overlap) must not over-decrement the global active-apps counter.
@@ -3290,20 +3335,31 @@ func (r *Response) Stream(status int, contentType string, fn func(w io.Writer) e
 	}
 	r.pendingHeaders = r.pendingHeaders[:0]
 
-	// Mark sent so the normal async release path treats this
-	// response as complete — Stream owns its lifecycle from here.
-	r.async.sent = true
+	ctxHandle := r.async.ctxHandle
+	loopPtr := r.async.loopPtr
+	if !asyncDeferStreamStart(loopPtr, ctxHandle, line, contentType, hb.String()) {
+		r.async.sent = true
+		asyncCtxRelease(ctxHandle)
+		return nil
+	}
 
-	asyncDeferStreamStart(r.async.loopPtr, r.async.ctxHandle, line, contentType, hb.String())
+	// Mark sent so the normal async release path treats this response as
+	// complete. Stream owns the original async ctx ref from here; every native
+	// stream operation retains/releases its own defer ref, and the defer below
+	// drops the original ref exactly once even if fn panics.
+	r.async.sent = true
+	defer func() {
+		if !asyncCtxAborted(ctxHandle) {
+			asyncDeferStreamEnd(loopPtr, ctxHandle)
+		}
+		asyncCtxRelease(ctxHandle)
+	}()
 
 	sw := &streamWriter{r: r}
 	fnErr := fn(sw)
-	// Always close — even on user error — so the response doesn't
-	// hang the connection. The user's error is propagated back to
-	// the caller for logging / metrics.
-	if !asyncCtxAborted(r.async.ctxHandle) {
-		asyncDeferStreamEnd(r.async.loopPtr, r.async.ctxHandle)
-	}
+	// The deferred close above runs even on user error so the response doesn't
+	// hang the connection. The user's error is propagated back to the caller for
+	// logging / metrics.
 	return fnErr
 }
 
@@ -3659,26 +3715,16 @@ func (r *Response) Redirect(location string, code int) {
 	r.statusCode = code
 	line := statusLine(code)
 	if r.async != nil && !r.async.sent {
+		if r.dropAsyncIfAborted() {
+			return
+		}
 		r.async.sent = true
-		inner := r.inner
-		// Cached pointer — see sendBytes for why we don't call res.Loop()
-		// from off-loop-thread.
-		loop := loopFromUintptr(r.async.loopPtr)
-		ctx := r.async.ctxHandle
-		loc := location
-		headers := captureResponseHeaders(r.pendingHeaders, nil)
+		headers := captureResponseHeaders(r.pendingHeaders, []responseHeader{{
+			name:  "Location",
+			value: location,
+		}})
 		r.pendingHeaders = r.pendingHeaders[:0]
-		loop.Defer(func() {
-			defer asyncCtxRelease(ctx)
-			inner.cork(func() {
-				inner.status(line)
-				for _, h := range headers {
-					inner.header(h.name, h.value)
-				}
-				inner.header("Location", loc)
-				inner.end("")
-			})
-		})
+		asyncDeferSendWithHeaders(r.async.loopPtr, r.async.ctxHandle, line, "", responseHeadersBlob(headers), "")
 		return
 	}
 	r.inner.status(line)
@@ -4036,24 +4082,15 @@ func (r *Response) sendBytes(code int, headers []responseHeader, body []byte) {
 	r.statusCode = code
 	line := statusLine(code)
 	if r.async != nil && !r.async.sent {
+		if r.dropAsyncIfAborted() {
+			runtime.KeepAlive(body)
+			return
+		}
 		r.async.sent = true
-		loop := loopFromUintptr(r.async.loopPtr)
-		inner := r.inner
-		ctx := r.async.ctxHandle
 		hs := captureResponseHeaders(r.pendingHeaders, headers)
 		r.pendingHeaders = r.pendingHeaders[:0]
-		bs := body
-		loop.Defer(func() {
-			defer asyncCtxRelease(ctx)
-			inner.cork(func() {
-				inner.status(line)
-				for _, h := range hs {
-					inner.header(h.name, h.value)
-				}
-				inner.end(bytesAsString(bs))
-			})
-			runtime.KeepAlive(bs)
-		})
+		asyncDeferSendWithHeaders(r.async.loopPtr, r.async.ctxHandle, line, "", responseHeadersBlob(hs), bytesAsString(body))
+		runtime.KeepAlive(body)
 		return
 	}
 	r.inner.status(line)
@@ -4073,6 +4110,21 @@ func captureResponseHeaders(pending, extra []responseHeader) []responseHeader {
 	out = append(out, pending...)
 	out = append(out, extra...)
 	return out
+}
+
+func responseHeadersBlob(headers []responseHeader) string {
+	if len(headers) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, h := range headers {
+		b.Grow(len(h.name) + len(h.value) + 2)
+		b.WriteString(h.name)
+		b.WriteByte(0)
+		b.WriteString(h.value)
+		b.WriteByte(0)
+	}
+	return b.String()
 }
 
 // bytesAsString aliases body as a Go string without copying. The string

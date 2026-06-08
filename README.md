@@ -71,6 +71,7 @@ body-parse + SQLite query paths.
   - [Global state audit](#global-state-audit)
   - [Test server helpers](#test-server-helpers)
   - [TrustProxy and client IPs](#trustproxy-and-client-ips)
+  - [CapturePeerIP and async routes](#capturepeerip-and-async-routes)
   - [net/http adapter body cap](#nethttp-adapter-body-cap)
   - [Redirect and open redirects](#redirect-and-open-redirects)
 - [Error Handling & Panic Recovery](#error-handling--panic-recovery)
@@ -1769,16 +1770,31 @@ app.OnShutdown(func() {
     db.Close()
 })
 
+runDone := make(chan struct{})
+go func() {
+    app.Run()
+    close(runDone)
+}()
+
 sigCh := make(chan os.Signal, 1)
 signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 <-sigCh
 
-app.ShutdownGracefully(30 * time.Second)   // wait for in-flight requests
-// Run() returns once the loop has drained.
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+if err := app.ShutdownContext(ctx); err != nil {
+    log.Printf("forced shutdown: %v", err)
+}
+<-runDone
+app.Close() // free native resources after Run returns
 ```
 
-`Shutdown` closes the listen socket and drains the loop; `Close` frees
-native resources. Both are safe from any goroutine.
+`ShutdownContext` starts a graceful drain and returns nil after `Run` exits. If
+the context expires first, it force-closes active connections and returns the
+context error; wait for `Run` to return before calling `Close`.
+`ShutdownGracefully` starts the same graceful drain without blocking. `Shutdown`
+closes the listen socket and active connections immediately; `Close` frees
+native resources. Shutdown APIs are safe from any goroutine.
 
 ## Configuration
 
@@ -1793,16 +1809,23 @@ app, _ := gogo.NewApp(gogo.Config{
 })
 ```
 
-| Field              | Default                   | Notes                                                    |
-| ------------------ | ------------------------- | -------------------------------------------------------- |
-| `BodyLimit`        | 4 MiB                     | Reject Content-Length > limit with 413 on the C++ side   |
-| `BodyReadTimeout`  | 30s                       | Deadline for `Response.Body` to finish reading the body  |
-| `BindAddr`         | `""`                      | Empty = all interfaces (`0.0.0.0`)                       |
-| `CapturePeerIP`    | `false`                   | Snapshot peer IP for async / shared-dispatch paths       |
+`NewApp` intentionally accepts either no argument or one `Config`: `NewApp()`
+uses safe defaults, and `NewApp(gogo.Config{...})` applies overrides. Passing
+multiple configs returns an error so configuration stays unambiguous.
+
+| Field              | Default                   | Notes                                                     |
+| ------------------ | ------------------------- | --------------------------------------------------------- |
+| `BodyLimit`        | 4 MiB                     | Reject Content-Length > limit with 413 on the C++ side    |
+| `BodyReadTimeout`  | 30s                       | Deadline for `Response.Body` to finish reading the body   |
+| `BindAddr`         | `""`                      | Empty = all interfaces (`0.0.0.0`)                        |
+| `CapturePeerIP`    | `false`                   | Snapshot peer IP for async / shared-dispatch paths        |
 | `TrustProxy`       | `false`                   | Compatibility shortcut: trust forwarded headers from any peer |
-| `TrustedProxies`   | empty                     | Trust forwarded headers only from listed IPs/CIDR ranges |
-| `JSONEncoder`      | `encoding/json.Marshal`   | Encoder for `Response.JSON` and `Response.JSONP`         |
-| `JSONDecoder`      | `encoding/json.Unmarshal` | Decoder for `Request.BodyParser` JSON bodies             |
+| `TrustedProxies`   | empty                     | Trust forwarded headers only from listed IPs/CIDR ranges  |
+| `JSONEncoder`      | `encoding/json.Marshal`   | Encoder for `Response.JSON` and `Response.JSONP`          |
+| `JSONDecoder`      | `encoding/json.Unmarshal` | Decoder for `Request.BodyParser` JSON bodies              |
+
+See [`docs/configuration.md`](docs/configuration.md) for local development,
+reverse proxy, and production configuration examples.
 
 `BodyReadTimeout` protects `Response.Body` users from slow body uploads that
 drip bytes forever without exceeding `BodyLimit`. Keep the 30s default for
@@ -1902,6 +1925,25 @@ Internet-facing servers that read X-Forwarded-For anyway (against
 recommendation) must call `req.Header("x-forwarded-for")` and parse it
 themselves, accepting that any client can forge the value.
 
+### CapturePeerIP and async routes
+
+`CapturePeerIP` is separate from `TrustProxy`. It controls whether gogo copies
+the immediate TCP peer IP into the request snapshot used by async route helpers.
+Leave it off unless an async handler needs `req.IP()` for logging, audit,
+rate-limiting, or auth decisions.
+
+| Route style | `CapturePeerIP=false` | `CapturePeerIP=true` |
+| --- | --- | --- |
+| Sync handlers | `req.IP()` lazily reads the live uWS response and works normally | Same behavior |
+| `GetAsync` / `Router.GetAsync` | `req.IP()` is `""` in the async snapshot | `req.IP()` is populated from the TCP peer |
+| Body-async routes (`PostAsync`, `PutAsync`, `PatchAsync`, `DeleteAsync`) | `req.IP()` is `""` in the async snapshot | `req.IP()` is populated from the TCP peer |
+
+`req.IPs()` reads `X-Forwarded-For` from request headers and is controlled by
+`TrustProxy` / `TrustedProxies`, not by `CapturePeerIP`. If an async route sits
+behind a trusted proxy and wants the original client, configure
+`TrustedProxies` and use `req.IPs()`.
+If it wants the proxy/socket peer, enable `CapturePeerIP` and use `req.IP()`.
+
 ### net/http adapter body cap
 
 `gogo.HTTPAdapter(h)` and `gogo.HTTPAdapterWithBody(h, body)` are migration
@@ -1959,7 +2001,8 @@ gogo.SetPanicHandler(func(recovered any) {
 
 The framework catches handler panics across HTTP, async, WebSocket, defer,
 and body callbacks. It emits a best-effort 500 where an HTTP response is
-still available and keeps the server alive.
+still available and keeps the server alive. `SetPanicHandler` is process-wide;
+install it during startup when a process hosts multiple `App` instances.
 
 Custom 404 / 405:
 
