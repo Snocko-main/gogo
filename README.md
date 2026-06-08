@@ -1618,6 +1618,13 @@ Keep the default one adapter worker when cross-process message order matters.
 If your workload can tolerate reordering, `gogo.WithWSHubAdapterWorkers(4)` can
 raise Redis publish throughput.
 
+The public adapter contract is documented in
+[`docs/websocket-hub-adapter.md`](docs/websocket-hub-adapter.md). In short,
+hub adapter fan-out is best-effort: the hub preserves adapter publish call
+order only with the default single worker, does not retry failed broker
+publishes after they leave the queue, and relies on `Close`/contexts to stop
+adapter receive loops and in-flight operations.
+
 `DynamicSubscriptions` uses gogo's Go-side `ws.Subscribe` / `ws.Unsubscribe`
 tracking rather than a uWS subscription callback, so it does not add an extra
 C-to-Go callback on the WebSocket hot path. HTTP `GetAsync` / `PostAsync`
