@@ -1,6 +1,9 @@
 package redis
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -105,6 +108,172 @@ func TestStaticSubscribeNoop(t *testing.T) {
 	}
 }
 
+func TestRedisWSHubIntegrationPublishesAcrossAdapters(t *testing.T) {
+	subClient := redisIntegrationClient(t)
+	defer subClient.Close()
+	pubClient := redisIntegrationClient(t)
+	defer pubClient.Close()
+
+	prefix := redisWSHubTestPrefix(t)
+	topic := "room.general"
+	sub := redisWSHubTestAdapter(t, subClient, Options{ChannelPrefix: prefix})
+	defer sub.Close()
+	pub := redisWSHubTestAdapter(t, pubClient, Options{ChannelPrefix: prefix})
+	defer pub.Close()
+
+	delivered := make(chan gogo.WSHubMessage, 8)
+	if err := sub.Start(t.Context(), recordRedisWSHubMessages(delivered)); err != nil {
+		t.Fatalf("subscriber Start: %v", err)
+	}
+
+	msg := gogo.WSHubMessage{
+		NodeID:  "node-a",
+		Topic:   topic,
+		Message: []byte("hello from node a"),
+		OpCode:  gogo.Text,
+	}
+	publishCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+	if err := pub.Publish(publishCtx, msg); err != nil {
+		cancel()
+		t.Fatalf("publisher Publish: %v", err)
+	}
+	cancel()
+
+	got := waitForRedisWSHubMessage(t, delivered, 2*time.Second)
+	assertRedisWSHubMessage(t, got, msg)
+}
+
+func TestRedisWSHubIntegrationDynamicSubscribeUnsubscribe(t *testing.T) {
+	subClient := redisIntegrationClient(t)
+	defer subClient.Close()
+	pubClient := redisIntegrationClient(t)
+	defer pubClient.Close()
+
+	prefix := redisWSHubTestPrefix(t)
+	topic := "room.dynamic"
+	channel := prefix + topic
+	sub := redisWSHubTestAdapter(t, subClient, Options{
+		ChannelPrefix:        prefix,
+		DynamicSubscriptions: true,
+	})
+	defer sub.Close()
+	pub := redisWSHubTestAdapter(t, pubClient, Options{ChannelPrefix: prefix})
+	defer pub.Close()
+
+	delivered := make(chan gogo.WSHubMessage, 8)
+	if err := sub.Start(t.Context(), recordRedisWSHubMessages(delivered)); err != nil {
+		t.Fatalf("subscriber Start: %v", err)
+	}
+
+	subCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+	if err := sub.Subscribe(subCtx, topic); err != nil {
+		cancel()
+		t.Fatalf("Subscribe: %v", err)
+	}
+	cancel()
+	waitForRedisSubscribers(t, pubClient, channel, 1)
+
+	first := gogo.WSHubMessage{
+		NodeID:  "node-a",
+		Topic:   topic,
+		Message: []byte("before unsubscribe"),
+		OpCode:  gogo.Text,
+	}
+	publishCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+	if err := pub.Publish(publishCtx, first); err != nil {
+		cancel()
+		t.Fatalf("Publish before unsubscribe: %v", err)
+	}
+	cancel()
+	got := waitForRedisWSHubMessage(t, delivered, 2*time.Second)
+	assertRedisWSHubMessage(t, got, first)
+
+	unsubCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+	if err := sub.Unsubscribe(unsubCtx, topic); err != nil {
+		cancel()
+		t.Fatalf("Unsubscribe: %v", err)
+	}
+	cancel()
+	waitForRedisSubscribers(t, pubClient, channel, 0)
+
+	after := gogo.WSHubMessage{
+		NodeID:  "node-a",
+		Topic:   topic,
+		Message: []byte("after unsubscribe"),
+		OpCode:  gogo.Text,
+	}
+	publishCtx, cancel = context.WithTimeout(t.Context(), time.Second)
+	if err := pub.Publish(publishCtx, after); err != nil {
+		cancel()
+		t.Fatalf("Publish after unsubscribe: %v", err)
+	}
+	cancel()
+	expectNoRedisWSHubMessage(t, delivered, 200*time.Millisecond)
+}
+
+func TestRedisWSHubIntegrationCloseStopsDynamicSubscription(t *testing.T) {
+	subClient := redisIntegrationClient(t)
+	defer subClient.Close()
+	pubClient := redisIntegrationClient(t)
+	defer pubClient.Close()
+
+	prefix := redisWSHubTestPrefix(t)
+	topic := "room.close"
+	channel := prefix + topic
+	sub := redisWSHubTestAdapter(t, subClient, Options{
+		ChannelPrefix:        prefix,
+		DynamicSubscriptions: true,
+	})
+	pub := redisWSHubTestAdapter(t, pubClient, Options{ChannelPrefix: prefix})
+	defer pub.Close()
+
+	delivered := make(chan gogo.WSHubMessage, 8)
+	if err := sub.Start(t.Context(), recordRedisWSHubMessages(delivered)); err != nil {
+		t.Fatalf("subscriber Start: %v", err)
+	}
+
+	subCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+	if err := sub.Subscribe(subCtx, topic); err != nil {
+		cancel()
+		t.Fatalf("Subscribe: %v", err)
+	}
+	cancel()
+	waitForRedisSubscribers(t, pubClient, channel, 1)
+
+	if err := sub.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	waitForRedisSubscribers(t, pubClient, channel, 0)
+
+	closedMsg := gogo.WSHubMessage{
+		NodeID:  "node-a",
+		Topic:   topic,
+		Message: []byte("closed"),
+		OpCode:  gogo.Text,
+	}
+	publishCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+	if err := sub.Publish(publishCtx, closedMsg); !errors.Is(err, errAdapterClosed) {
+		cancel()
+		t.Fatalf("closed adapter Publish error = %v, want %v", err, errAdapterClosed)
+	}
+	cancel()
+
+	subCtx, cancel = context.WithTimeout(t.Context(), time.Second)
+	if err := sub.Subscribe(subCtx, topic); !errors.Is(err, errAdapterClosed) {
+		cancel()
+		t.Fatalf("closed adapter Subscribe error = %v, want %v", err, errAdapterClosed)
+	}
+	cancel()
+
+	publishCtx, cancel = context.WithTimeout(t.Context(), time.Second)
+	if err := pub.Publish(publishCtx, closedMsg); err != nil {
+		cancel()
+		t.Fatalf("Publish after close: %v", err)
+	}
+	cancel()
+	expectNoRedisWSHubMessage(t, delivered, 200*time.Millisecond)
+}
+
 func TestDecodeRejectsOversizedMessage(t *testing.T) {
 	in := gogo.WSHubMessage{
 		NodeID:  "node-a",
@@ -147,5 +316,88 @@ func TestEncodeRejectsInvalidOpcode(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("encode succeeded for invalid opcode")
+	}
+}
+
+func redisWSHubTestPrefix(t *testing.T) string {
+	t.Helper()
+	return fmt.Sprintf("gogo:test:ws:%d:", time.Now().UnixNano())
+}
+
+func redisWSHubTestAdapter(t *testing.T, client goredis.UniversalClient, opt Options) *Adapter {
+	t.Helper()
+	adapter, err := NewClientOptions(client, opt)
+	if err != nil {
+		t.Fatalf("NewClientOptions: %v", err)
+	}
+	return adapter
+}
+
+func recordRedisWSHubMessages(ch chan<- gogo.WSHubMessage) func(gogo.WSHubMessage) {
+	return func(msg gogo.WSHubMessage) {
+		select {
+		case ch <- msg:
+		default:
+		}
+	}
+}
+
+func waitForRedisWSHubMessage(t *testing.T, ch <-chan gogo.WSHubMessage, timeout time.Duration) gogo.WSHubMessage {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case msg := <-ch:
+		return msg
+	case <-timer.C:
+		t.Fatalf("timed out waiting for Redis WSHub message after %v", timeout)
+	}
+	return gogo.WSHubMessage{}
+}
+
+func expectNoRedisWSHubMessage(t *testing.T, ch <-chan gogo.WSHubMessage, timeout time.Duration) {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case msg := <-ch:
+		t.Fatalf("unexpected Redis WSHub message after unsubscribe/close: %#v", msg)
+	case <-timer.C:
+	}
+}
+
+func assertRedisWSHubMessage(t *testing.T, got, want gogo.WSHubMessage) {
+	t.Helper()
+	if got.NodeID != want.NodeID || got.Topic != want.Topic || got.OpCode != want.OpCode {
+		t.Fatalf("message metadata = %#v, want %#v", got, want)
+	}
+	if string(got.Message) != string(want.Message) {
+		t.Fatalf("message payload = %q, want %q", got.Message, want.Message)
+	}
+}
+
+func waitForRedisSubscribers(t *testing.T, client goredis.UniversalClient, channel string, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var (
+		got     int64
+		lastErr error
+	)
+	for {
+		ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+		counts, err := client.PubSubNumSub(ctx, channel).Result()
+		cancel()
+		if err != nil {
+			lastErr = err
+		} else {
+			got = counts[channel]
+			if got == want {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Redis subscribers for %q = %d, want %d (last error: %v)", channel, got, want, lastErr)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
