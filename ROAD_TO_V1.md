@@ -146,16 +146,16 @@ files in the same PR unless one agent is explicitly assigned as integrator.
 - [x] Standardize middleware error behavior: fail-open, fail-closed, and
       `OnError` semantics.
 - [x] Add Redis or external store guidance for sessions.
-- [ ] Add Redis integration tests for the rate-limit adapter.
-- [ ] Prevent async rate limiting from using an empty or spoofable default IP
+- [x] Add Redis integration tests for the rate-limit adapter.
+- [x] Prevent async rate limiting from using an empty or spoofable default IP
       key when `CapturePeerIP` is disabled.
-- [ ] Add first-class JWT issuer, audience, and required-claim validation.
-- [ ] Recheck CORS wildcard and credentials behavior.
-- [ ] Recheck Session, CSRF, JWT, BasicAuth, and WebSocketAuth defaults.
-- [ ] Revisit middleware zero-value production defaults, especially CORS and
+- [x] Add first-class JWT issuer, audience, and required-claim validation.
+- [x] Recheck CORS wildcard and credentials behavior.
+- [x] Recheck Session, CSRF, JWT, BasicAuth, and WebSocketAuth defaults.
+- [x] Revisit middleware zero-value production defaults, especially CORS and
       Helmet/HSTS behavior.
 - [x] Document middleware ordering and async placement.
-- [ ] Add a production-ish auth stack example.
+- [x] Add a production-ish auth stack example.
 
 ## v0.5.0 - WebSocket Stabilization
 
