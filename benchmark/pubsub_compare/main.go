@@ -12,10 +12,11 @@
 //   - GET /stat         RSS + conn count as JSON
 //
 // A single Go load generator drives them over WebSocket + HTTP and
-// prints throughput, RSS, and per-connection memory:
+// prints throughput, RSS, and per-connection memory. For reproducible
+// v0.7 baseline runs, see README.md and run_baseline.sh:
 //
-//	go build -tags gogo -o gogo_server ./benchmark/pubsub_compare/
-//	go build           -o loadgen     ./benchmark/pubsub_compare/loadgen/
+//	(cd benchmark && go build -tags gogo -o gogo_server ./pubsub_compare)
+//	(cd benchmark && go build           -o loadgen     ./pubsub_compare/loadgen)
 //
 //	# uWS.js side
 //	mkdir -p /tmp/wsbench && cd /tmp/wsbench && npm init -y && \
@@ -34,32 +35,8 @@
 // several hours (SO_REUSEPORT means a fresh server binds OK but
 // requests still hit the old one).
 //
-// Reference numbers from one run on a 4-vCPU VM (ulimit -n = 4096,
-// 128-byte payload, 1000 subscribers, 5 s workload). Rerun on the
-// target hardware before quoting — these are indicative, not
-// authoritative:
-//
-//	Metric                           uWS.js v20.51   gogo
-//	Baseline RSS (no conns)              48 MB         7.5 MB
-//	RSS @ 1000 idle conns                48 MB         8.2 MB
-//	RSS @ 3000 idle conns                57 MB         9.3 MB
-//	Mem / conn idle (N=3000)            830 B          262 B
-//	Single publish, 1000 subs           659k msgs/s    715k msgs/s
-//	Batch=100, 1000 subs                280k msgs/s    5.1M msgs/s
-//	Batch HTTP-call rate (4 workers)      3 calls/s     51 calls/s
-//
-// Single-publish is within ~10 % (both bound by the same uWS
-// TopicTree fan-out). Batch is where PublishBatch dominates: gogo
-// defers the broadcast onto the loop and returns from the HTTP
-// handler immediately, so the next request isn't serialised behind
-// 100 publishes × 1000 frame writes. uWS.js's app.publish is
-// synchronous on the loop — the HTTP handler holds the response
-// until the broadcast queues up, and effective throughput collapses.
-//
-// Caveats: same-machine setup (no NIC latency, shared CPU), 4-vCPU,
-// fd-cap 4096 means ~3000 conn ceiling without raising ulimit. RSS
-// deltas at small N are page-granular (4 KiB) noise — trust the
-// per-conn figure at N=3000.
+// Reference numbers and caveats live in README.md. Rerun the baseline
+// on target hardware before quoting results.
 
 package main
 
@@ -135,8 +112,11 @@ func main() {
 		var rss int64
 		var ru syscall.Rusage
 		if syscall.Getrusage(syscall.RUSAGE_SELF, &ru) == nil {
-			// ru_maxrss on Linux is in KiB.
-			rss = ru.Maxrss * 1024
+			rss = ru.Maxrss
+			// ru_maxrss is bytes on Darwin and KiB on Linux.
+			if runtime.GOOS != "darwin" {
+				rss *= 1024
+			}
 		}
 		var ms runtime.MemStats
 		runtime.ReadMemStats(&ms)
