@@ -116,22 +116,21 @@ files in the same PR unless one agent is explicitly assigned as integrator.
 
 ## v0.3.0 - Config Behavior
 
-- [ ] Decide whether `NewApp(cfg ...Config)` stays variadic for v1.
+- [x] Keep `NewApp(cfg ...Config)` variadic for v1 compatibility: zero or one
+      config is supported, extra configs return an error.
 - [x] Validate config inputs before v1: extra configs, negative limits,
       disabled limits, timeout sentinels, and zero-value defaults.
-- [ ] Add `ShutdownContext(ctx)` or another blocking graceful-shutdown API if
-      the current non-blocking graceful shutdown is not enough.
+- [x] Add `ShutdownContext(ctx)` as the blocking graceful-shutdown API.
 - [x] Fix lifecycle hook contract: `OnListen` panic recovery, nil hooks, and
       repeated `Shutdown` / `ShutdownGracefully` hook behavior.
-- [ ] Add app-scoped panic handling in `Config`, or explicitly keep the global
-      handler as the supported model.
+- [x] Keep `SetPanicHandler` global as the supported panic-recovery model.
 - [x] Add `RunMultiCore` config/options support or explicitly document the
       current process-wide config limits.
 - [x] Add graceful multicore shutdown or document immediate shutdown only.
 - [ ] Replace or extend `TrustProxy bool` with trusted proxy CIDR/range support
       before v1, or document why the boolean API is final.
-- [ ] Document `CapturePeerIP` behavior for async and shared-dispatch routes.
-- [ ] Add config examples for local development, reverse proxy, and production.
+- [x] Document `CapturePeerIP` behavior for async and shared-dispatch routes.
+- [x] Add config examples for local development, reverse proxy, and production.
 - [x] Add tests that lock zero-value config defaults.
 - [ ] Define uWS loop and OS-thread ownership for single-app usage: own a
       locked native loop goroutine internally, or document/enforce same-thread

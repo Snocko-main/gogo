@@ -242,11 +242,25 @@
 //
 // # Graceful shutdown
 //
-//	app.Shutdown() // close listen socket + drain timer; returns immediately
-//	// when Run() returns, call:
-//	app.Close()    // free native resources
+//	runDone := make(chan struct{})
+//	go func() {
+//	    app.Run()
+//	    close(runDone)
+//	}()
 //
-// Shutdown is safe from any goroutine.
+//	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+//	defer cancel()
+//	if err := app.ShutdownContext(ctx); err != nil {
+//	    log.Printf("forced shutdown: %v", err)
+//	}
+//	<-runDone
+//	app.Close() // free native resources after Run returns
+//
+// ShutdownContext returns nil only after Run exits. If the context expires
+// first, it force-closes active connections and returns the context error;
+// wait for Run to return before calling Close.
+//
+// Shutdown, ShutdownGracefully, and ShutdownContext are safe from any goroutine.
 //
 // # Performance characteristics
 //
