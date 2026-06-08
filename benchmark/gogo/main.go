@@ -81,6 +81,9 @@ func main() {
 		app.Get("/json", func(res *gogo.Response, req *gogo.Request) {
 			res.Send(200, "application/json", `{"message":"hello world","ok":true}`+"\n")
 		})
+		app.GetAsync("/async", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain; charset=utf-8", "hello world\n")
+		})
 		app.Get("/health", gogo.Reply{
 			Status:      200,
 			ContentType: "application/json",
@@ -93,6 +96,17 @@ func main() {
 		app.GetAsync("/sleep", func(res *gogo.Response, req *gogo.Request) {
 			time.Sleep(2 * time.Millisecond)
 			res.Send(200, "text/plain; charset=utf-8", "slept\n")
+		})
+		app.Use("/middleware", func(next gogo.Handler) gogo.Handler {
+			return func(res *gogo.Response, req *gogo.Request) {
+				res.Header("X-Bench-Middleware", "gogo")
+				res.Header("X-Bench-Route", "middleware")
+				next(res, req)
+			}
+		})
+		app.Get("/middleware", func(res *gogo.Response, req *gogo.Request) {
+			res.Header("Content-Type", "text/plain; charset=utf-8")
+			res.Send(200, "", "hello world\n")
 		})
 		app.GetAsync("/file", func(res *gogo.Response, req *gogo.Request) {
 			data, err := os.ReadFile(filePath)

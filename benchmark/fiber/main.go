@@ -75,6 +75,11 @@ func main() {
 		return c.SendString(`{"message":"hello world","ok":true}` + "\n")
 	})
 
+	app.Get("/async", func(c *fiber.Ctx) error {
+		c.Set("Content-Type", "text/plain; charset=utf-8")
+		return c.SendString("hello world\n")
+	})
+
 	app.Get("/hello/:name", func(c *fiber.Ctx) error {
 		c.Set("Content-Type", "text/plain; charset=utf-8")
 		return c.SendString("hello " + c.Params("name") + "\n")
@@ -84,6 +89,16 @@ func main() {
 		time.Sleep(2 * time.Millisecond)
 		c.Set("Content-Type", "text/plain; charset=utf-8")
 		return c.SendString("slept\n")
+	})
+
+	app.Use("/middleware", func(c *fiber.Ctx) error {
+		c.Set("X-Bench-Middleware", "fiber")
+		c.Set("X-Bench-Route", "middleware")
+		return c.Next()
+	})
+	app.Get("/middleware", func(c *fiber.Ctx) error {
+		c.Set("Content-Type", "text/plain; charset=utf-8")
+		return c.SendString("hello world\n")
 	})
 
 	filePath := os.Getenv("BENCH_FILE")

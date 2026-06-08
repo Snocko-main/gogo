@@ -66,6 +66,11 @@ func main() {
 		w.Write([]byte(`{"message":"hello world","ok":true}` + "\n"))
 	})
 
+	mux.HandleFunc("GET /async", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Write([]byte("hello world\n"))
+	})
+
 	mux.HandleFunc("GET /hello/{name}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Write([]byte("hello " + r.PathValue("name") + "\n"))
@@ -76,6 +81,16 @@ func main() {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Write([]byte("slept\n"))
 	})
+
+	middlewareHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Write([]byte("hello world\n"))
+	})
+	mux.Handle("GET /middleware", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Bench-Middleware", "nethttp")
+		w.Header().Set("X-Bench-Route", "middleware")
+		middlewareHandler.ServeHTTP(w, r)
+	}))
 
 	dbPath := os.Getenv("BENCH_DB")
 	if dbPath == "" {
