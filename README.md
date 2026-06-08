@@ -71,6 +71,7 @@ body-parse + SQLite query paths.
   - [Global state audit](#global-state-audit)
   - [Test server helpers](#test-server-helpers)
   - [TrustProxy and client IPs](#trustproxy-and-client-ips)
+  - [CapturePeerIP and async routes](#capturepeerip-and-async-routes)
   - [net/http adapter body cap](#nethttp-adapter-body-cap)
   - [Redirect and open redirects](#redirect-and-open-redirects)
 - [Error Handling & Panic Recovery](#error-handling--panic-recovery)
@@ -1879,6 +1880,24 @@ app.Get("/whoami", func(res *gogo.Response, req *gogo.Request) {
 Internet-facing servers that read X-Forwarded-For anyway (against
 recommendation) must call `req.Header("x-forwarded-for")` and parse it
 themselves, accepting that any client can forge the value.
+
+### CapturePeerIP and async routes
+
+`CapturePeerIP` is separate from `TrustProxy`. It controls whether gogo copies
+the immediate TCP peer IP into the request snapshot used by async route helpers.
+Leave it off unless an async handler needs `req.IP()` for logging, audit,
+rate-limiting, or auth decisions.
+
+| Route style | `CapturePeerIP=false` | `CapturePeerIP=true` |
+| --- | --- | --- |
+| Sync handlers | `req.IP()` lazily reads the live uWS response and works normally | Same behavior |
+| `GetAsync` / `Router.GetAsync` | `req.IP()` is `""` in the async snapshot | `req.IP()` is populated from the TCP peer |
+| Body-async routes (`PostAsync`, `PutAsync`, `PatchAsync`, `DeleteAsync`) | `req.IP()` is `""` in the async snapshot | `req.IP()` is populated from the TCP peer |
+
+`req.IPs()` reads `X-Forwarded-For` from request headers and is controlled by
+`TrustProxy`, not by `CapturePeerIP`. If an async route sits behind a trusted
+proxy and wants the original client, enable `TrustProxy` and use `req.IPs()`.
+If it wants the proxy/socket peer, enable `CapturePeerIP` and use `req.IP()`.
 
 ### net/http adapter body cap
 
