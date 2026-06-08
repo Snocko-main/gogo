@@ -40,13 +40,37 @@ type TestServer struct {
 	client    *http.Client
 }
 
+// TestServerOptions configures NewTestServerWithOptions.
+//
+// The zero value is ready to use: the server binds to 127.0.0.1, startup waits
+// up to five seconds, and Client returns an http.Client with keep-alives
+// disabled and a ten-second request timeout.
+type TestServerOptions struct {
+	// Config is passed to NewApp after the helper fills BindAddr with
+	// 127.0.0.1. TestServer always binds loopback; leave BindAddr empty, or
+	// set it to 127.0.0.1 explicitly.
+	Config Config
+
+	// StartupTimeout bounds setup, Listen, and readiness checks. The zero value
+	// uses the default five-second timeout.
+	StartupTimeout time.Duration
+
+	// Client is used by Do, Get, and Post. Nil installs the helper's default
+	// client. Close calls Client.CloseIdleConnections before shutting down the
+	// server.
+	Client *http.Client
+}
+
 var testServerMu sync.Mutex
 
 // NewTestServer starts an App on a free port, runs the setup callback before
 // Listen, and waits for the listening socket to accept connections before
 // returning. Native builds own the uWS loop on an internal locked goroutine, so
-// tests do not need runtime.LockOSThread. The returned TestServer drives the
-// running App via its http.Client; Close shuts the App down cleanly.
+// tests do not need runtime.LockOSThread. NewTestServer serializes TestServer
+// lifetimes because the native binding has process-wide shared worker and ring
+// state; this keeps parallel tests from running multiple native Apps in the
+// same process at once. The returned TestServer drives the running App via its
+// http.Client; Close shuts the App down cleanly.
 //
 //	ts, err := gogo.NewTestServer(func(app *gogo.App) {
 //	    app.Get("/users/:id", showUser)
@@ -64,6 +88,35 @@ func NewTestServer(setup func(*App)) (*TestServer, error) {
 	if setup == nil {
 		return nil, fmt.Errorf("gogo: NewTestServer: setup callback is required")
 	}
+	return newTestServer("NewTestServer", TestServerOptions{}, func(app *App) error {
+		setup(app)
+		return nil
+	})
+}
+
+// NewTestServerWithOptions starts a TestServer using opts and a setup callback
+// that can fail without panicking. setup runs before Listen and is the place to
+// register routes, middleware, fallback handlers, named routes, lifecycle
+// hooks, and other startup-time App state.
+//
+//	ts, err := gogo.NewTestServerWithOptions(func(app *gogo.App) error {
+//	    if err := installRoutes(app); err != nil {
+//	        return err
+//	    }
+//	    return nil
+//	}, gogo.TestServerOptions{StartupTimeout: 10 * time.Second})
+func NewTestServerWithOptions(setup func(*App) error, opts TestServerOptions) (*TestServer, error) {
+	return newTestServer("NewTestServerWithOptions", opts, setup)
+}
+
+func newTestServer(op string, opts TestServerOptions, setup func(*App) error) (*TestServer, error) {
+	if setup == nil {
+		return nil, fmt.Errorf("gogo: %s: setup callback is required", op)
+	}
+	opts, err := normalizeTestServerOptions(op, opts)
+	if err != nil {
+		return nil, err
+	}
 	// The native binding has process-wide shared worker/ring state. Serialize
 	// public test servers so package tests that call t.Parallel don't create
 	// multiple native Apps in the same process at once.
@@ -77,7 +130,7 @@ func NewTestServer(setup func(*App)) (*TestServer, error) {
 
 	port, err := freeLocalPort()
 	if err != nil {
-		return nil, fmt.Errorf("gogo: NewTestServer: %w", err)
+		return nil, fmt.Errorf("gogo: %s: %w", op, err)
 	}
 
 	ready := make(chan *App, 1)
@@ -97,13 +150,18 @@ func NewTestServer(setup func(*App)) (*TestServer, error) {
 		}()
 
 		var err error
-		app, err = NewApp(Config{BindAddr: "127.0.0.1"})
+		app, err = NewApp(opts.Config)
 		if err != nil {
 			listenErr <- fmt.Errorf("NewApp: %w", err)
 			close(runDone)
 			return
 		}
-		setup(app)
+		if err := setup(app); err != nil {
+			listenErr <- fmt.Errorf("setup: %w", err)
+			app.Close()
+			close(runDone)
+			return
+		}
 		if !app.Listen(port) {
 			listenErr <- fmt.Errorf("Listen :%d failed", port)
 			app.Close()
@@ -120,18 +178,18 @@ func NewTestServer(setup func(*App)) (*TestServer, error) {
 	select {
 	case app = <-ready:
 	case err := <-listenErr:
-		return nil, err
-	case <-time.After(5 * time.Second):
-		return nil, fmt.Errorf("gogo: NewTestServer: setup timed out after 5s")
+		return nil, fmt.Errorf("gogo: %s: %w", op, err)
+	case <-time.After(opts.StartupTimeout):
+		return nil, fmt.Errorf("gogo: %s: setup timed out after %s", op, opts.StartupTimeout)
 	}
 
 	host := "127.0.0.1:" + strconv.Itoa(port)
-	if err := waitForPortAccept(host, 2*time.Second); err != nil {
+	if err := waitForPortAccept(host, opts.StartupTimeout); err != nil {
 		// Best-effort cleanup; the loop goroutine is still
 		// running so we have to ask it to stop before returning.
 		app.Shutdown()
 		<-runDone
-		return nil, fmt.Errorf("gogo: NewTestServer: %w", err)
+		return nil, fmt.Errorf("gogo: %s: %w", op, err)
 	}
 
 	ts := &TestServer{
@@ -142,15 +200,7 @@ func NewTestServer(setup func(*App)) (*TestServer, error) {
 		release: func() {
 			testServerMu.Unlock()
 		},
-		client: &http.Client{
-			// Disable keep-alive so Close doesn't have to wait
-			// for idle connections to drain. Tests typically
-			// fire a handful of requests against each server
-			// instance, so the extra TCP handshake per request
-			// isn't a concern.
-			Transport: &http.Transport{DisableKeepAlives: true},
-			Timeout:   10 * time.Second,
-		},
+		client: opts.Client,
 	}
 	locked = false
 	return ts, nil
@@ -178,6 +228,22 @@ func NewTestServerT(tb testing.TB, setup func(*App)) *TestServer {
 	return ts
 }
 
+// NewTestServerTWithOptions starts a TestServer with options and registers
+// Close with tb.Cleanup. It fails the test immediately when setup returns an
+// error, panics, Listen fails, or readiness checks fail.
+func NewTestServerTWithOptions(tb testing.TB, setup func(*App) error, opts TestServerOptions) *TestServer {
+	if tb == nil {
+		panic("gogo: NewTestServerTWithOptions: testing.TB is nil")
+	}
+	tb.Helper()
+	ts, err := NewTestServerWithOptions(setup, opts)
+	if err != nil {
+		tb.Fatalf("gogo: NewTestServerTWithOptions: %v", err)
+	}
+	tb.Cleanup(ts.Close)
+	return ts
+}
+
 // Port returns the loopback port the server is listening on.
 func (ts *TestServer) Port() int { return ts.port }
 
@@ -185,10 +251,11 @@ func (ts *TestServer) Port() int { return ts.port }
 // build URLs manually when you need control over the path.
 func (ts *TestServer) URL() string { return "http://" + ts.host }
 
-// App exposes the underlying *App for setup that the constructor
-// callback cannot handle — e.g. publishing to a topic from a Go
-// worker goroutine, or installing middleware after the server is
-// running.
+// App exposes the underlying *App for runtime interactions and inspection, such
+// as publishing to a topic, calling Shutdown, or reading registered route
+// metadata. Route and middleware registration belongs in the setup callback
+// before the helper calls Listen; registering routes or middleware through App
+// after the TestServer has started is outside the TestServer contract.
 func (ts *TestServer) App() *App { return ts.app }
 
 // Client returns the *http.Client wired to talk to this server.
@@ -237,6 +304,9 @@ func (ts *TestServer) Post(path, contentType string, body io.Reader) (*http.Resp
 // the first call does work; subsequent calls are no-ops.
 func (ts *TestServer) Close() {
 	ts.closeOnce.Do(func() {
+		if ts.client != nil {
+			ts.client.CloseIdleConnections()
+		}
 		ts.app.Shutdown()
 		select {
 		case <-ts.runDone:
@@ -249,6 +319,36 @@ func (ts *TestServer) Close() {
 			ts.release()
 		}
 	})
+}
+
+func normalizeTestServerOptions(op string, opts TestServerOptions) (TestServerOptions, error) {
+	if opts.StartupTimeout < 0 {
+		return opts, fmt.Errorf("gogo: %s: StartupTimeout must be non-negative", op)
+	}
+	if opts.StartupTimeout == 0 {
+		opts.StartupTimeout = 5 * time.Second
+	}
+	switch opts.Config.BindAddr {
+	case "", "127.0.0.1":
+		opts.Config.BindAddr = "127.0.0.1"
+	default:
+		return opts, fmt.Errorf("gogo: %s: TestServerOptions.Config.BindAddr must be empty or 127.0.0.1", op)
+	}
+	if opts.Client == nil {
+		opts.Client = defaultTestServerClient()
+	}
+	return opts, nil
+}
+
+func defaultTestServerClient() *http.Client {
+	return &http.Client{
+		// Disable keep-alive so Close doesn't have to wait for idle
+		// connections to drain. Tests typically fire a handful of requests
+		// against each server instance, so the extra TCP handshake per request
+		// isn't a concern.
+		Transport: &http.Transport{DisableKeepAlives: true},
+		Timeout:   10 * time.Second,
+	}
 }
 
 // freeLocalPort asks the kernel for a free TCP port on 127.0.0.1

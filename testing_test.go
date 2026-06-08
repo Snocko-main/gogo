@@ -4,6 +4,7 @@ package gogo_test
 
 import (
 	"encoding/json"
+	"errors"
 	"expvar"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	gogo "github.com/Snocko-main/gogo"
 	"github.com/Snocko-main/gogo/middleware"
@@ -67,6 +69,71 @@ func TestNewTestServerT(t *testing.T) {
 	}
 }
 
+func TestNewTestServerWithOptionsDefaults(t *testing.T) {
+	ts, err := gogo.NewTestServerWithOptions(func(app *gogo.App) error {
+		app.Get("/ping", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "pong")
+		})
+		return nil
+	}, gogo.TestServerOptions{})
+	if err != nil {
+		t.Fatalf("NewTestServerWithOptions: %v", err)
+	}
+	defer ts.Close()
+
+	if !strings.HasPrefix(ts.URL(), "http://127.0.0.1:") {
+		t.Fatalf("URL = %q, want loopback host", ts.URL())
+	}
+	if ts.Client().Timeout != 10*time.Second {
+		t.Fatalf("default client timeout = %s, want 10s", ts.Client().Timeout)
+	}
+
+	resp, err := ts.Get("/ping")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || string(body) != "pong" {
+		t.Fatalf("GET /ping: status=%d body=%q, want 200 pong", resp.StatusCode, string(body))
+	}
+}
+
+func TestNewTestServerTWithOptionsUsesCustomClient(t *testing.T) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	ts := gogo.NewTestServerTWithOptions(t, func(app *gogo.App) error {
+		app.Get("/ping", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "pong")
+		})
+		return nil
+	}, gogo.TestServerOptions{Client: client})
+
+	if ts.Client() != client {
+		t.Fatal("Client() did not return the configured client")
+	}
+	resp, err := ts.Get("/ping")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestNewTestServerWithOptionsSetupError(t *testing.T) {
+	sentinel := errors.New("setup failed")
+	ts, err := gogo.NewTestServerWithOptions(func(app *gogo.App) error {
+		return sentinel
+	}, gogo.TestServerOptions{})
+	if ts != nil {
+		ts.Close()
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("NewTestServerWithOptions error = %v, want setup sentinel", err)
+	}
+}
+
 func TestNewTestServerSetupPanicReturnsError(t *testing.T) {
 	ts, err := gogo.NewTestServer(func(app *gogo.App) {
 		panic("boom")
@@ -79,6 +146,33 @@ func TestNewTestServerSetupPanicReturnsError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "setup panic: boom") {
 		t.Fatalf("NewTestServer error = %q, want setup panic", err)
+	}
+}
+
+func TestNewTestServerWithOptionsSetupPanicReturnsError(t *testing.T) {
+	ts, err := gogo.NewTestServerWithOptions(func(app *gogo.App) error {
+		panic("boom")
+	}, gogo.TestServerOptions{})
+	if ts != nil {
+		ts.Close()
+	}
+	if err == nil {
+		t.Fatal("NewTestServerWithOptions returned nil error after setup panic")
+	}
+	if !strings.Contains(err.Error(), "setup panic: boom") {
+		t.Fatalf("NewTestServerWithOptions error = %q, want setup panic", err)
+	}
+}
+
+func TestNewTestServerWithOptionsRejectsNonLoopbackBindAddr(t *testing.T) {
+	_, err := gogo.NewTestServerWithOptions(func(app *gogo.App) error {
+		return nil
+	}, gogo.TestServerOptions{Config: gogo.Config{BindAddr: "0.0.0.0"}})
+	if err == nil {
+		t.Fatal("expected non-loopback BindAddr error")
+	}
+	if !strings.Contains(err.Error(), "BindAddr") {
+		t.Fatalf("error = %q, want BindAddr", err)
 	}
 }
 
@@ -129,9 +223,10 @@ func TestTestServerDo(t *testing.T) {
 	}
 }
 
-// TestTestServerExposesApp checks the App() accessor works for
-// post-setup configuration (e.g. publishing from a goroutine).
-func TestTestServerExposesApp(t *testing.T) {
+// TestTestServerAppIsRuntimeOnlyAccessor checks App() works for runtime
+// inspection. Route and middleware registration must stay in the setup
+// callback before TestServer starts the App.
+func TestTestServerAppIsRuntimeOnlyAccessor(t *testing.T) {
 	ts, err := gogo.NewTestServer(func(app *gogo.App) {
 		app.Get("/", func(res *gogo.Response, req *gogo.Request) {
 			res.Send(200, "text/plain", "ok")
@@ -143,6 +238,9 @@ func TestTestServerExposesApp(t *testing.T) {
 	defer ts.Close()
 	if ts.App() == nil {
 		t.Errorf("App() returned nil")
+	}
+	if allowed := ts.App().AllowedMethods("/"); len(allowed) != 1 || allowed[0] != "GET" {
+		t.Errorf("AllowedMethods(/) = %v, want [GET]", allowed)
 	}
 	if ts.URL() == "" || ts.Port() == 0 {
 		t.Errorf("URL/Port empty: url=%q port=%d", ts.URL(), ts.Port())
