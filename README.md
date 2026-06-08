@@ -1790,6 +1790,10 @@ app, _ := gogo.NewApp(gogo.Config{
 })
 ```
 
+`NewApp` intentionally accepts either no argument or one `Config`: `NewApp()`
+uses safe defaults, and `NewApp(gogo.Config{...})` applies overrides. Passing
+multiple configs returns an error so configuration stays unambiguous.
+
 | Field             | Default                   | Notes                                                   |
 | ----------------- | ------------------------- | ------------------------------------------------------- |
 | `BodyLimit`       | 4 MiB                     | Reject Content-Length > limit with 413 on the C++ side  |
@@ -1959,7 +1963,8 @@ gogo.SetPanicHandler(func(recovered any) {
 
 The framework catches handler panics across HTTP, async, WebSocket, defer,
 and body callbacks. It emits a best-effort 500 where an HTTP response is
-still available and keeps the server alive.
+still available and keeps the server alive. `SetPanicHandler` is process-wide;
+install it during startup when a process hosts multiple `App` instances.
 
 Custom 404 / 405:
 

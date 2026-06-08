@@ -3940,6 +3940,26 @@ func TestGroupPrefixRejectsWildcard(t *testing.T) {
 	}
 }
 
+func TestNewAppAllowsZeroOrOneConfig(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  []gogo.Config
+	}{
+		{name: "default"},
+		{name: "one config", cfg: []gogo.Config{{BindAddr: "127.0.0.1"}}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			app, err := gogo.NewApp(tc.cfg...)
+			if err != nil {
+				t.Fatalf("NewApp: %v", err)
+			}
+			app.Close()
+		})
+	}
+}
+
 // TestGroupGlobalUseStillWraps: a global App.Use ALWAYS wraps routes
 // registered via a Group, regardless of the group's prefix.
 func TestGroupGlobalUseStillWraps(t *testing.T) {
