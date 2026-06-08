@@ -4,7 +4,9 @@ package middleware_test
 
 import (
 	"fmt"
+	"net"
 	"net/http"
+	"runtime"
 	"strconv"
 	"sync"
 	"testing"
@@ -139,6 +141,102 @@ func TestRateLimitKeyFunc(t *testing.T) {
 	}
 }
 
+func TestRateLimitAsyncDefaultKeyRejectsUnavailablePeerIP(t *testing.T) {
+	store := &recordingRateLimitStore{}
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.RateLimit(middleware.RateLimitOptions{
+			Max:        10,
+			Window:     time.Minute,
+			AsyncStore: true,
+			Store:      store,
+		}))
+		app.GetAsync("/", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/", port), nil)
+	req.Header.Set("X-Forwarded-For", "203.0.113.99")
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 500 {
+		t.Fatalf("status = %d, want 500", resp.StatusCode)
+	}
+	if got := store.hitCount(); got != 0 {
+		t.Fatalf("store hit count = %d, want 0", got)
+	}
+}
+
+func TestRateLimitAsyncDefaultKeyUsesCapturedPeerIP(t *testing.T) {
+	store := &recordingRateLimitStore{}
+	port, teardown := startRateLimitAppCfg(t, gogo.Config{CapturePeerIP: true}, func(app *gogo.App) {
+		app.Use(middleware.RateLimit(middleware.RateLimitOptions{
+			Max:        10,
+			Window:     time.Minute,
+			AsyncStore: true,
+			Store:      store,
+		}))
+		app.GetAsync("/", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	resp, err := noKeepaliveClient.Get(fmt.Sprintf("http://127.0.0.1:%d/", port))
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	keys := store.keys()
+	if len(keys) != 1 {
+		t.Fatalf("store keys = %v, want one captured key", keys)
+	}
+	if keys[0] != "127.0.0.1" && keys[0] != "::1" {
+		t.Fatalf("store key = %q, want loopback peer IP", keys[0])
+	}
+}
+
+func TestRateLimitAsyncCustomKeyWorksWithoutPeerIPCapture(t *testing.T) {
+	store := &recordingRateLimitStore{}
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.RateLimit(middleware.RateLimitOptions{
+			Max:        10,
+			Window:     time.Minute,
+			AsyncStore: true,
+			Store:      store,
+			KeyFunc: func(req *gogo.Request) string {
+				return req.Header("x-tenant")
+			},
+		}))
+		app.GetAsync("/", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "ok")
+		})
+	})
+	defer teardown()
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/", port), nil)
+	req.Header.Set("X-Tenant", "tenant-a")
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	keys := store.keys()
+	if len(keys) != 1 || keys[0] != "tenant-a" {
+		t.Fatalf("store keys = %v, want [tenant-a]", keys)
+	}
+}
+
 func TestRateLimitMemoryStoreConcurrent(t *testing.T) {
 	store := middleware.NewMemoryRateLimitStore()
 	var wg sync.WaitGroup
@@ -157,6 +255,89 @@ func TestRateLimitMemoryStoreConcurrent(t *testing.T) {
 	if c != 5001 {
 		t.Errorf("count %d want 5001", c)
 	}
+}
+
+type recordingRateLimitStore struct {
+	mu       sync.Mutex
+	seenKeys []string
+	count    int
+}
+
+func (s *recordingRateLimitStore) Hit(key string, window time.Duration) (int, time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.seenKeys = append(s.seenKeys, key)
+	s.count++
+	return s.count, time.Now().Add(window)
+}
+
+func (s *recordingRateLimitStore) hitCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.count
+}
+
+func (s *recordingRateLimitStore) keys() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.seenKeys))
+	copy(out, s.seenKeys)
+	return out
+}
+
+func startRateLimitAppCfg(t *testing.T, cfg gogo.Config, configure func(app *gogo.App)) (port int, teardown func()) {
+	t.Helper()
+	port = freePort(t)
+	if cfg.BindAddr == "" {
+		cfg.BindAddr = "127.0.0.1"
+	}
+	ready := make(chan *gogo.App, 1)
+	listenErr := make(chan error, 1)
+	runDone := make(chan struct{})
+
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		app, err := gogo.NewApp(cfg)
+		if err != nil {
+			listenErr <- fmt.Errorf("NewApp: %w", err)
+			close(runDone)
+			return
+		}
+		configure(app)
+		if !app.Listen(port) {
+			listenErr <- fmt.Errorf("Listen :%d failed", port)
+			app.Close()
+			close(runDone)
+			return
+		}
+		ready <- app
+		app.Run()
+		app.Close()
+		close(runDone)
+	}()
+
+	var app *gogo.App
+	select {
+	case app = <-ready:
+	case err := <-listenErr:
+		t.Fatal(err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("setup timeout")
+	}
+	for i := 0; i < 50; i++ {
+		c, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err == nil {
+			c.Close()
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	teardown = func() {
+		app.Shutdown()
+		<-runDone
+	}
+	return port, teardown
 }
 
 // TestRateLimitMaxBucketsBounds asserts that the in-memory store's

@@ -25,7 +25,9 @@ type RateLimitOptions struct {
 	// is the immediate TCP peer. Behind trusted proxies, override this when you
 	// want end-client limits, for example by selecting from req.IPs(). For
 	// AsyncStore on async routes, req.IP() requires Config.CapturePeerIP unless
-	// Config.TrustedProxies auto-enabled it.
+	// Config.TrustedProxies auto-enabled it; when the default key cannot read a
+	// peer IP, the middleware rejects instead of using an empty or header-derived
+	// key.
 	KeyFunc func(*gogo.Request) string
 
 	// SkipFunc, when non-nil and returning true, bypasses the limit
@@ -112,7 +114,8 @@ func RateLimit(opt RateLimitOptions) mwhint.Hinted {
 	if opt.Window <= 0 {
 		panic("gogo/middleware: RateLimit Window must be positive")
 	}
-	if opt.KeyFunc == nil {
+	usingDefaultKey := opt.KeyFunc == nil
+	if usingDefaultKey {
 		opt.KeyFunc = func(req *gogo.Request) string { return req.IP() }
 	}
 	if opt.Store == nil {
@@ -140,6 +143,10 @@ func RateLimit(opt RateLimitOptions) mwhint.Hinted {
 				return
 			}
 			key := opt.KeyFunc(req)
+			if usingDefaultKey && key == "" {
+				res.Send(500, "text/plain; charset=utf-8", "Rate limit key unavailable\n")
+				return
+			}
 			count, resetAt := opt.Store.Hit(key, opt.Window)
 			remaining := opt.Max - count
 			if remaining < 0 {

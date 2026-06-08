@@ -1,8 +1,11 @@
 package redis
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"math"
+	"os"
 	"testing"
 	"time"
 
@@ -79,6 +82,70 @@ func TestRateLimitStoreClientDoesNotOwn(t *testing.T) {
 	}
 }
 
+func TestRateLimitStoreRedisIntegrationSharesCounters(t *testing.T) {
+	client := redisIntegrationClient(t)
+	defer client.Close()
+
+	prefix := fmt.Sprintf("gogo:test:rl:%d:", time.Now().UnixNano())
+	key := "shared-user"
+	defer deleteRedisKeys(client, prefix+key)
+
+	storeA, err := NewRateLimitStoreClientOptions(client, RateLimitOptions{
+		KeyPrefix: prefix,
+		Timeout:   time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewRateLimitStoreClientOptions A: %v", err)
+	}
+	storeB, err := NewRateLimitStoreClientOptions(client, RateLimitOptions{
+		KeyPrefix: prefix,
+		Timeout:   time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewRateLimitStoreClientOptions B: %v", err)
+	}
+
+	count, resetAt := storeA.Hit(key, time.Second)
+	if count != 1 {
+		t.Fatalf("first count = %d, want 1", count)
+	}
+	count, resetAt2 := storeB.Hit(key, time.Second)
+	if count != 2 {
+		t.Fatalf("second count = %d, want 2 shared through Redis", count)
+	}
+	if delta := resetAt2.Sub(resetAt); delta < -100*time.Millisecond || delta > 100*time.Millisecond {
+		t.Fatalf("resetAt delta = %v, want same fixed window", delta)
+	}
+}
+
+func TestRateLimitStoreRedisIntegrationExpiresWindow(t *testing.T) {
+	client := redisIntegrationClient(t)
+	defer client.Close()
+
+	prefix := fmt.Sprintf("gogo:test:rl:%d:", time.Now().UnixNano())
+	key := "expiring-user"
+	defer deleteRedisKeys(client, prefix+key)
+
+	store, err := NewRateLimitStoreClientOptions(client, RateLimitOptions{
+		KeyPrefix: prefix,
+		Timeout:   time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewRateLimitStoreClientOptions: %v", err)
+	}
+
+	if count, _ := store.Hit(key, 150*time.Millisecond); count != 1 {
+		t.Fatalf("first count = %d, want 1", count)
+	}
+	if count, _ := store.Hit(key, 150*time.Millisecond); count != 2 {
+		t.Fatalf("second count = %d, want 2", count)
+	}
+	time.Sleep(250 * time.Millisecond)
+	if count, _ := store.Hit(key, 150*time.Millisecond); count != 1 {
+		t.Fatalf("count after expiry = %d, want 1", count)
+	}
+}
+
 func TestRateLimitOnFailureFailOpen(t *testing.T) {
 	var seen error
 	store := &RateLimitStore{onError: func(err error) { seen = err }}
@@ -149,4 +216,38 @@ func TestToInt64(t *testing.T) {
 	if _, err := toInt64(3.14); err == nil {
 		t.Fatal("toInt64(float) succeeded, want error")
 	}
+}
+
+func redisIntegrationClient(t *testing.T) goredis.UniversalClient {
+	t.Helper()
+
+	var (
+		client goredis.UniversalClient
+		err    error
+	)
+	if url := os.Getenv("REDIS_URL"); url != "" {
+		client, err = newRedisClient(url, "", "", "", 0)
+		if err != nil {
+			t.Fatalf("parse REDIS_URL: %v", err)
+		}
+	} else {
+		client, err = newRedisClient("", "127.0.0.1:6379", "", "", 0)
+		if err != nil {
+			t.Fatalf("new Redis client: %v", err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer cancel()
+	if err := client.Ping(ctx).Err(); err != nil {
+		client.Close()
+		t.Skipf("Redis integration skipped; no reachable Redis at REDIS_URL or 127.0.0.1:6379: %v", err)
+	}
+	return client
+}
+
+func deleteRedisKeys(client goredis.UniversalClient, keys ...string) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_ = client.Del(ctx, keys...).Err()
 }
