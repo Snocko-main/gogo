@@ -53,6 +53,11 @@ func fetchStat(base string) (stat, error) {
 	return s, nil
 }
 
+func closeHTTPResponse(resp *http.Response) {
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+}
+
 const wsAcceptGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 func dialWS(addr, path string) (net.Conn, *bufio.Reader, error) {
@@ -262,7 +267,7 @@ func main() {
 			<-ticker.C
 			resp, err := httpClient.Get(publishURL)
 			if err == nil {
-				resp.Body.Close()
+				closeHTTPResponse(resp)
 				publishCalls.Add(1)
 			}
 		}
@@ -276,7 +281,7 @@ func main() {
 				for time.Now().Before(deadline) {
 					resp, err := httpClient.Get(publishURL)
 					if err == nil {
-						resp.Body.Close()
+						closeHTTPResponse(resp)
 						publishCalls.Add(1)
 					}
 				}
