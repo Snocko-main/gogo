@@ -4,10 +4,15 @@ package gogo_test
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"runtime"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -349,5 +354,139 @@ func TestSSEPanicsOnSyncRoute(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != 500 || string(body) != "caught" {
 		t.Errorf("sync SSE: status=%d body=%q, want 500/caught", resp.StatusCode, string(body))
+	}
+}
+
+// BenchmarkSSEBackpressureMemory measures the memory-facing side of
+// Response.SSE -> Response.Stream backpressure. Reproduce with:
+//
+//	go test -tags gogo -run '^$' -bench '^BenchmarkSSEBackpressureMemory$' -benchmem -benchtime=5x -count=1 .
+//
+// The benchmark uses a no-read client so the handler deterministically crosses
+// a BufferedAmount trigger, then calls AwaitDrain and closes the client. It
+// reports Go -benchmem plus peak_buffered_B, aborted/op, and drained/op.
+func BenchmarkSSEBackpressureMemory(b *testing.B) {
+	const (
+		payloadBytes    = 32 << 10
+		maxFrames       = 2048
+		triggerBytes    = 4 << 20
+		awaitDrainBelow = 0
+	)
+
+	savedBackpressure := gogo.GetStreamBackpressureBytes()
+	gogo.SetStreamBackpressureBytes(0)
+	defer gogo.SetStreamBackpressureBytes(savedBackpressure)
+
+	payload := strings.Repeat("x", payloadBytes)
+	var peakBuffered atomic.Uint64
+	var abortedCount atomic.Uint64
+	var drainedCount atomic.Uint64
+	parked := make(chan uint64, 1)
+	results := make(chan sseBackpressureResult, 1)
+
+	port, teardown := startApp(b, func(app *gogo.App) {
+		app.GetAsync("/events", func(res *gogo.Response, req *gogo.Request) {
+			_ = res.SSE(func(s *gogo.SSEStream) error {
+				var peak uint64
+				for i := 0; i < maxFrames; i++ {
+					if err := s.SendEvent(gogo.SSEEvent{
+						ID:    strconv.Itoa(i),
+						Event: "bench",
+						Data:  payload,
+					}); err != nil {
+						results <- sseBackpressureResult{frames: i, peak: peak, err: err}
+						return err
+					}
+					if i%8 == 7 {
+						runtime.Gosched()
+					}
+					buffered := res.BufferedAmount()
+					if buffered > peak {
+						peak = buffered
+					}
+					if buffered > triggerBytes {
+						parked <- buffered
+						err := res.AwaitDrain(awaitDrainBelow)
+						results <- sseBackpressureResult{frames: i + 1, peak: peak, err: err}
+						return err
+					}
+				}
+				err := fmt.Errorf("BufferedAmount never exceeded %d bytes after %d SSE frames", triggerBytes, maxFrames)
+				results <- sseBackpressureResult{frames: maxFrames, peak: peak, err: err}
+				return err
+			})
+		})
+	})
+	defer teardown()
+
+	runtime.GC()
+	var after runtime.MemStats
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 2*time.Second)
+		if err != nil {
+			b.Fatalf("dial /events: %v", err)
+		}
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			_ = tcp.SetReadBuffer(1)
+		}
+		if _, err := fmt.Fprintf(conn, "GET /events HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nConnection: close\r\n\r\n", port); err != nil {
+			conn.Close()
+			b.Fatalf("write request: %v", err)
+		}
+
+		select {
+		case peak := <-parked:
+			recordMaxUint64(&peakBuffered, peak)
+			conn.Close()
+		case result := <-results:
+			conn.Close()
+			b.Fatalf("stream ended before AwaitDrain parked: frames=%d peak=%d err=%v", result.frames, result.peak, result.err)
+		case <-time.After(5 * time.Second):
+			conn.Close()
+			b.Fatal("timed out waiting for SSE stream to hit backpressure")
+		}
+
+		select {
+		case result := <-results:
+			recordMaxUint64(&peakBuffered, result.peak)
+			if errors.Is(result.err, gogo.ErrStreamAborted) {
+				abortedCount.Add(1)
+				continue
+			}
+			if result.err != nil {
+				b.Fatalf("AwaitDrain error: frames=%d peak=%d err=%v", result.frames, result.peak, result.err)
+			}
+			drainedCount.Add(1)
+		case <-time.After(5 * time.Second):
+			b.Fatal("timed out waiting for AwaitDrain abort")
+		}
+	}
+	b.StopTimer()
+
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	b.ReportMetric(float64(peakBuffered.Load()), "peak_buffered_B")
+	b.ReportMetric(float64(triggerBytes), "trigger_B")
+	b.ReportMetric(float64(awaitDrainBelow), "await_below_B")
+	b.ReportMetric(float64(after.HeapAlloc), "heap_live_after_B")
+	b.ReportMetric(float64(abortedCount.Load())/float64(b.N), "aborted/op")
+	b.ReportMetric(float64(drainedCount.Load())/float64(b.N), "drained/op")
+}
+
+type sseBackpressureResult struct {
+	frames int
+	peak   uint64
+	err    error
+}
+
+func recordMaxUint64(max *atomic.Uint64, v uint64) {
+	for {
+		old := max.Load()
+		if v <= old || max.CompareAndSwap(old, v) {
+			return
+		}
 	}
 }
