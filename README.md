@@ -1685,9 +1685,12 @@ app.WebSocket("/ws", gogo.WebSocketBehavior{
 ```
 
 Defaults:
-- Empty `AllowedOrigins` + `AllowMissingOrigin=false` → reject every
-  request that arrives with an Origin header — i.e. all browsers.
-  Set `AllowedOrigins` explicitly before going to production.
+- Zero-value `WebSocketAuth` rejects every handshake until you opt into
+  browser origins or missing-Origin CLI/service clients.
+- Empty `AllowedOrigins` + `AllowMissingOrigin=false` → reject browser
+  handshakes because their Origin is not allow-listed, and reject
+  non-browser handshakes because the Origin header is missing. Set
+  `AllowedOrigins` explicitly before going to production.
 - `AllowMissingOrigin=true` → permit handshakes without an Origin
   (CLI tools like `websocat`). Safe IF you have no browser clients
   on this endpoint.

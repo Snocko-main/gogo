@@ -54,10 +54,10 @@ func wsHandshake(port int, path string, extra map[string]string) (*http.Response
 	return resp, nil
 }
 
-// TestWebSocketAuthRejectsMissingOrigin: with the zero-value options,
-// WebSocketAuth refuses a handshake that arrives without an Origin
-// header — browser-driven CSWSH attempts always carry an Origin so
-// this is the strict default.
+// TestWebSocketAuthRejectsMissingOrigin: by default, even with an
+// allow-list configured, WebSocketAuth refuses a handshake that arrives
+// without an Origin header. Opt into AllowMissingOrigin only for CLI or
+// service clients that really do omit Origin.
 func TestWebSocketAuthRejectsMissingOrigin(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.WebSocket("/ws", gogo.WebSocketBehavior{
@@ -74,6 +74,35 @@ func TestWebSocketAuthRejectsMissingOrigin(t *testing.T) {
 	}
 	if resp.StatusCode != 403 {
 		t.Errorf("missing Origin: got %d, want 403", resp.StatusCode)
+	}
+}
+
+func TestWebSocketAuthZeroValueRejectsAllHandshakes(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.WebSocket("/ws", gogo.WebSocketBehavior{
+			Upgrade: middleware.WebSocketAuth(middleware.WebSocketAuthOptions{}),
+		})
+	})
+	defer teardown()
+
+	cases := []struct {
+		name    string
+		headers map[string]string
+	}{
+		{name: "missing origin"},
+		{name: "browser origin", headers: map[string]string{"Origin": "https://app.example.com"}},
+		{name: "legacy origin", headers: map[string]string{"Sec-WebSocket-Origin": "https://app.example.com"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := wsHandshake(port, "/ws", tc.headers)
+			if err != nil {
+				t.Fatalf("handshake: %v", err)
+			}
+			if resp.StatusCode != 403 {
+				t.Fatalf("status = %d, want 403", resp.StatusCode)
+			}
+		})
 	}
 }
 
@@ -164,6 +193,33 @@ func TestWebSocketAuthAllowMissingOriginCLI(t *testing.T) {
 	}
 	if resp.StatusCode != 101 {
 		t.Errorf("allow-missing-origin: got %d, want 101", resp.StatusCode)
+	}
+}
+
+func TestWebSocketAuthAllowMissingOriginWithEmptyAllowListIsCLIOnly(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.WebSocket("/ws", gogo.WebSocketBehavior{
+			Upgrade: middleware.WebSocketAuth(middleware.WebSocketAuthOptions{
+				AllowMissingOrigin: true,
+			}),
+		})
+	})
+	defer teardown()
+
+	resp, err := wsHandshake(port, "/ws", nil)
+	if err != nil {
+		t.Fatalf("handshake (missing origin): %v", err)
+	}
+	if resp.StatusCode != 101 {
+		t.Fatalf("missing origin: got %d, want 101", resp.StatusCode)
+	}
+
+	resp, err = wsHandshake(port, "/ws", map[string]string{"Origin": "https://app.example.com"})
+	if err != nil {
+		t.Fatalf("handshake (browser origin): %v", err)
+	}
+	if resp.StatusCode != 403 {
+		t.Fatalf("browser origin: got %d, want 403", resp.StatusCode)
 	}
 }
 

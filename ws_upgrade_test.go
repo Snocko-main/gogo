@@ -439,6 +439,29 @@ func TestWSUpgradeNoCallbackRejectsBrowserOrigin(t *testing.T) {
 	}
 }
 
+func TestWSUpgradeNoCallbackRejectsLegacyBrowserOrigin(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.WebSocket("/ws", gogo.WebSocketBehavior{})
+	})
+	defer teardown()
+
+	resp, _, conn, err := dialWSWithHeaders(port, "/ws", map[string]string{
+		"Sec-WebSocket-Origin": "https://evil.example",
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 403 {
+		t.Fatalf("status = %d, want 403; body=%q", resp.StatusCode, string(body))
+	}
+	if !strings.Contains(string(body), "origin not allowed") {
+		t.Errorf("body = %q, want origin rejection", string(body))
+	}
+}
+
 func TestWSUpgradeUnsafeAutoUpgradeAllowsBrowserOrigin(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.WebSocket("/ws", gogo.WebSocketBehavior{

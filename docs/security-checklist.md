@@ -21,6 +21,28 @@ accepted as residual risk.
 
 ## WebSocket Origin And Auth
 
+### v0.5 Frozen API Decisions
+
+- `UnsafeAutoUpgrade` keeps its name and remains opt-in. The default when
+  `Upgrade` is nil is secure-by-default: accept non-browser handshakes that
+  omit both `Origin` and legacy `Sec-WebSocket-Origin`, reject browser-style
+  handshakes that include either header, and require an explicit `Upgrade`
+  callback for browser clients.
+- `middleware.WebSocketAuth` is the preferred browser-facing upgrade helper.
+  Its zero value rejects every handshake; browser clients must configure
+  `AllowedOrigins`, and `AllowMissingOrigin` is only for CLI or
+  service-to-service clients that genuinely omit Origin.
+- WebSocket backpressure visibility is limited to `MaxBackpressure` and the
+  `bool` returned by `WebSocket.Send` / `SendText`. There is no public
+  per-socket buffered-byte sampler, drain callback, or `AwaitDrain` API before
+  v1.
+- Ping/pong callbacks are not part of the public v0.5 API. Keep automatic
+  pings enabled unless the application implements its own heartbeat at the
+  message layer.
+- `WebSocket.Send`, `SendText`, and `End` are loop-thread APIs. Call them from
+  WebSocket callbacks on the owning loop; use `App.Publish`, `App.PublishBatch`,
+  or `WSHub` for cross-goroutine fan-out.
+
 - [ ] Every browser-capable WebSocket route installs an explicit
       `WebSocketBehavior.Upgrade` callback, preferably `middleware.WebSocketAuth`.
 - [ ] `UnsafeAutoUpgrade` is absent from authenticated or cookie-bearing
@@ -34,7 +56,7 @@ accepted as residual risk.
 - [ ] `MaxPayloadLength`, `IdleTimeout`, and `MaxBackpressure` are documented for
       production WebSocket routes and covered by tests for oversized, idle, and
       slow-consumer clients.
-- [ ] The nil `Upgrade` default, missing `Origin`, and legacy
+- [x] The nil `Upgrade` default, missing `Origin`, and legacy
       `Sec-WebSocket-Origin` behavior are frozen and documented for v1.
 
 ## CORS
