@@ -143,9 +143,9 @@ files in the same PR unless one agent is explicitly assigned as integrator.
 
 ## v0.4.0 - Middleware Production Pass
 
-- [ ] Standardize middleware error behavior: fail-open, fail-closed, and
+- [x] Standardize middleware error behavior: fail-open, fail-closed, and
       `OnError` semantics.
-- [ ] Add Redis or external store guidance for sessions.
+- [x] Add Redis or external store guidance for sessions.
 - [ ] Add Redis integration tests for the rate-limit adapter.
 - [ ] Prevent async rate limiting from using an empty or spoofable default IP
       key when `CapturePeerIP` is disabled.
@@ -154,7 +154,7 @@ files in the same PR unless one agent is explicitly assigned as integrator.
 - [ ] Recheck Session, CSRF, JWT, BasicAuth, and WebSocketAuth defaults.
 - [ ] Revisit middleware zero-value production defaults, especially CORS and
       Helmet/HSTS behavior.
-- [ ] Document middleware ordering and async placement.
+- [x] Document middleware ordering and async placement.
 - [ ] Add a production-ish auth stack example.
 
 ## v0.5.0 - WebSocket Stabilization
