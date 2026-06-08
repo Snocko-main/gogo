@@ -119,8 +119,7 @@ files in the same PR unless one agent is explicitly assigned as integrator.
 - [ ] Decide whether `NewApp(cfg ...Config)` stays variadic for v1.
 - [x] Validate config inputs before v1: extra configs, negative limits,
       disabled limits, timeout sentinels, and zero-value defaults.
-- [ ] Add `ShutdownContext(ctx)` or another blocking graceful-shutdown API if
-      the current non-blocking graceful shutdown is not enough.
+- [x] Add `ShutdownContext(ctx)` as the blocking graceful-shutdown API.
 - [x] Fix lifecycle hook contract: `OnListen` panic recovery, nil hooks, and
       repeated `Shutdown` / `ShutdownGracefully` hook behavior.
 - [ ] Add app-scoped panic handling in `Config`, or explicitly keep the global
