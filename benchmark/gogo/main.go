@@ -70,7 +70,7 @@ func main() {
 			n = v
 		}
 	}
-	workers := n
+	workers := 0
 	if env := os.Getenv("GOGO_WORKERS"); env != "" {
 		if v, err := strconv.Atoi(env); err == nil && v >= 0 {
 			workers = v
@@ -89,7 +89,14 @@ func main() {
 			res.Send(200, "application/json", `{"message":"hello world","ok":true}`+"\n")
 		})
 		app.GetAsync("/async", func(res *gogo.Response, req *gogo.Request) {
-			res.Send(200, "text/plain; charset=utf-8", "hello world\n")
+			var name, email, role string
+			err := dbConn.QueryRow("SELECT name, email, role FROM users WHERE id = ?", 42).Scan(&name, &email, &role)
+			if err != nil {
+				res.Send(500, "text/plain", err.Error())
+				return
+			}
+			res.Send(200, "application/json",
+				fmt.Sprintf(`{"id":42,"name":%q,"email":%q,"role":%q}`+"\n", name, email, role))
 		})
 		app.Get("/health", gogo.Reply{
 			Status:      200,

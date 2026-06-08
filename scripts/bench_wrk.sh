@@ -30,7 +30,7 @@
 #   FRAMEWORKS     subset to run                        (route-set default)
 #   MODES          subset to run                        (default "single multi")
 #   MULTI_WORKERS  server workers/processes for multi   (default min(NumCPU, 4))
-#   GOGO_WORKERS   shared-dispatch workers for gogo     (default: mode workers)
+#   GOGO_WORKERS   shared-dispatch workers for gogo     (default 0 = NumCPU)
 #   WARMUP         seconds of warmup hits before timing (default 2)
 #   RESULTS_DIR    where to write logs                  (default benchmark/results)
 #
@@ -47,7 +47,8 @@
 #     more middleware headers must keep the batched header crossing.
 #   - Shared async route /async: 0 per-request cgo callbacks/calls while
 #     the route has no sync middleware and the response fits shared-send
-#     limits with Content-Type as the only response header.
+#     limits. The route's SQLite lookup may use cgo inside the benchmark
+#     handler; that is application work, not framework HTTP dispatch cost.
 
 set -eu
 
@@ -192,12 +193,12 @@ start_server() {
 	case "$fw:$mode" in
 	gogo:single)
 		build_go_binary gogo-bench gogo ./gogo
-		( GOGO_CORES=1 GOGO_WORKERS="${GOGO_WORKERS:-1}" "$BENCH_BIN_DIR/gogo-bench" >/tmp/bench-gogo.log 2>&1 ) &
+		( GOGO_CORES=1 GOGO_WORKERS="${GOGO_WORKERS:-0}" "$BENCH_BIN_DIR/gogo-bench" >/tmp/bench-gogo.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	gogo:multi)
 		build_go_binary gogo-bench gogo ./gogo
-		( GOMAXPROCS="$MULTI_WORKERS" GOGO_CORES="$MULTI_WORKERS" GOGO_WORKERS="${GOGO_WORKERS:-$MULTI_WORKERS}" "$BENCH_BIN_DIR/gogo-bench" >/tmp/bench-gogo.log 2>&1 ) &
+		( GOMAXPROCS="$MULTI_WORKERS" GOGO_CORES="$MULTI_WORKERS" GOGO_WORKERS="${GOGO_WORKERS:-0}" "$BENCH_BIN_DIR/gogo-bench" >/tmp/bench-gogo.log 2>&1 ) &
 		SERVER_PID=$!
 		;;
 	fiber:single)

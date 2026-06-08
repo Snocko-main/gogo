@@ -67,8 +67,13 @@ func main() {
 	})
 
 	mux.HandleFunc("GET /async", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Write([]byte("hello world\n"))
+		var name, email, role string
+		if err := dbConn.QueryRow("SELECT name, email, role FROM users WHERE id = ?", 42).Scan(&name, &email, &role); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"id":42,"name":%q,"email":%q,"role":%q}`+"\n", name, email, role)
 	})
 
 	mux.HandleFunc("GET /hello/{name}", func(w http.ResponseWriter, r *http.Request) {

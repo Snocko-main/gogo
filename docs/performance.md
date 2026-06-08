@@ -23,10 +23,9 @@ The `v07-http` route set runs `gogo`, `fiber`, and `nethttp` only. That keeps
 the new middleware route comparable without changing the Node, Bun, or Actix
 benchmark servers.
 
-For gogo, the benchmark pins shared-dispatch workers to the server shape:
-`GOGO_WORKERS=1` in `single` mode and `GOGO_WORKERS=$MULTI_WORKERS` in `multi`
-mode. That keeps `GetAsync` measurements from depending on the host CPU count
-when the benchmark is intentionally running one uWS loop.
+For gogo, `GOGO_WORKERS` can override the shared-dispatch worker count. The
+default value `0` keeps gogo's runtime default (`runtime.NumCPU()`), which is
+the intended shape for blocking async work.
 
 Covered GET workloads:
 
@@ -36,7 +35,7 @@ Covered GET workloads:
 | `/hello/inon` | parameter extraction |
 | `/json` | fixed JSON response |
 | `/middleware` | cheap middleware that stamps benchmark headers |
-| `/async` | gogo `GetAsync` shared-dispatch route versus equivalent responses |
+| `/async` | deterministic SQLite lookup from an async-capable route |
 
 Raw `wrk` output is written to
 `$RESULTS_DIR/wrk-<framework>-<mode>.log`. Use a fresh `RESULTS_DIR` for every
@@ -66,7 +65,11 @@ The HTTP hot-path budget for gogo is:
 | static `Reply`, string, or byte routes without sync middleware | 0 callbacks/calls |
 | dynamic sync routes such as `/plain`, `/json`, and `/hello/:name` | at most 1 C++ to Go handler callback plus 1 Go to C `Send` call |
 | sync route with middleware-set headers such as `/middleware` | at most 1 C++ to Go handler callback plus 3 Go to C response calls: status, batched headers, end |
-| shared async route such as `/async` | 0 callbacks/calls while no sync middleware matches and the response fits shared-send limits with only `Content-Type` |
+| shared async route such as `/async` | 0 framework callbacks/calls while no sync middleware matches and the response fits shared-send limits |
+
+The `/async` workload intentionally runs a SQLite lookup inside the handler.
+That database driver may use cgo internally; the budget above describes gogo's
+HTTP dispatch/response path only, not application or driver work.
 
 If a benchmark route changes those budgets, record why in the script or PR and
 capture fresh raw results with the exact command used.

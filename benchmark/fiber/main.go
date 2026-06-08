@@ -76,8 +76,13 @@ func main() {
 	})
 
 	app.Get("/async", func(c *fiber.Ctx) error {
-		c.Set("Content-Type", "text/plain; charset=utf-8")
-		return c.SendString("hello world\n")
+		var name, email, role string
+		err := dbConn.QueryRow("SELECT name, email, role FROM users WHERE id = ?", 42).Scan(&name, &email, &role)
+		if err != nil {
+			return c.Status(500).SendString(err.Error())
+		}
+		c.Set("Content-Type", "application/json")
+		return c.SendString(fmt.Sprintf(`{"id":42,"name":%q,"email":%q,"role":%q}`+"\n", name, email, role))
 	})
 
 	app.Get("/hello/:name", func(c *fiber.Ctx) error {

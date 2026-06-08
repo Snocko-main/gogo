@@ -2195,7 +2195,7 @@ then POSTs against any selected POST endpoints and tears it down. The default
 `BENCH_ROUTE_SET=legacy` route set matches the checked-in README snapshot:
 `/hello`, `/hello/:name`, `/db`, `POST /echo`, and `POST /query`. Use
 `BENCH_ROUTE_SET=v07-http` for the local gogo/Fiber/net/http coverage of
-plain, parameterized, JSON, middleware, and async GET routes.
+plain, parameterized, JSON, middleware, and async SQLite GET routes.
 
 Go benchmark dependencies live in the nested `benchmark` module so importing
 gogo does not pull benchmark-only frameworks or database drivers into your
