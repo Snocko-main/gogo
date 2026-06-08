@@ -3201,20 +3201,31 @@ func (r *Response) Stream(status int, contentType string, fn func(w io.Writer) e
 	}
 	r.pendingHeaders = r.pendingHeaders[:0]
 
-	// Mark sent so the normal async release path treats this
-	// response as complete — Stream owns its lifecycle from here.
-	r.async.sent = true
+	ctxHandle := r.async.ctxHandle
+	loopPtr := r.async.loopPtr
+	if !asyncDeferStreamStart(loopPtr, ctxHandle, line, contentType, hb.String()) {
+		r.async.sent = true
+		asyncCtxRelease(ctxHandle)
+		return nil
+	}
 
-	asyncDeferStreamStart(r.async.loopPtr, r.async.ctxHandle, line, contentType, hb.String())
+	// Mark sent so the normal async release path treats this response as
+	// complete. Stream owns the original async ctx ref from here; every native
+	// stream operation retains/releases its own defer ref, and the defer below
+	// drops the original ref exactly once even if fn panics.
+	r.async.sent = true
+	defer func() {
+		if !asyncCtxAborted(ctxHandle) {
+			asyncDeferStreamEnd(loopPtr, ctxHandle)
+		}
+		asyncCtxRelease(ctxHandle)
+	}()
 
 	sw := &streamWriter{r: r}
 	fnErr := fn(sw)
-	// Always close — even on user error — so the response doesn't
-	// hang the connection. The user's error is propagated back to
-	// the caller for logging / metrics.
-	if !asyncCtxAborted(r.async.ctxHandle) {
-		asyncDeferStreamEnd(r.async.loopPtr, r.async.ctxHandle)
-	}
+	// The deferred close above runs even on user error so the response doesn't
+	// hang the connection. The user's error is propagated back to the caller for
+	// logging / metrics.
 	return fnErr
 }
 

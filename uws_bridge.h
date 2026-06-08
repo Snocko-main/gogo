@@ -220,11 +220,12 @@ void uwsgo_res_defer_send_with_headers(
 // the expected mode for these streaming helpers (don't set
 // Content-Length unless you know the total payload size in advance).
 //
-// Each of the stream_* functions retains the ctx before queuing the
-// loop defer, so the AsyncCtx outlives every pending write. Callers
-// must finish a stream with exactly one defer_stream_end; emitting
-// further chunks (or another end) afterwards is undefined behavior.
-void uwsgo_res_defer_stream_start(
+// Each accepted stream_* operation retains the ctx before queuing the
+// loop defer, so the AsyncCtx outlives every pending write. The caller
+// still owns the original async ctx ref and must release it when the
+// stream function returns. stream_start returns non-zero only when the
+// opening frame was accepted for queuing.
+int uwsgo_res_defer_stream_start(
     uwsgo_loop_t *loop,
     void *ctx,
     const char *status, size_t status_len,

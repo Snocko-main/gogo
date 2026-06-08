@@ -798,18 +798,18 @@ func asyncDeferSendWithHeaders(loopPtr, ctxHandle uintptr, status, contentType, 
 // Each subsequent chunk goes through asyncDeferStreamWrite, and
 // asyncDeferStreamEnd closes the response. See res.Stream for the
 // caller-facing wrapper.
-func asyncDeferStreamStart(loopPtr, ctxHandle uintptr, status, contentType, headersBlob string) {
+func asyncDeferStreamStart(loopPtr, ctxHandle uintptr, status, contentType, headersBlob string) bool {
 	var headersPtr *C.char
 	if len(headersBlob) > 0 {
 		headersPtr = unsafeStringData(headersBlob)
 	}
-	C.uwsgo_res_defer_stream_start(
+	return C.uwsgo_res_defer_stream_start(
 		(*C.uwsgo_loop_t)(unsafe.Pointer(loopPtr)),
 		unsafe.Pointer(ctxHandle),
 		unsafeStringData(status), C.size_t(len(status)),
 		unsafeStringData(contentType), C.size_t(len(contentType)),
 		headersPtr, C.size_t(len(headersBlob)),
-	)
+	) != 0
 }
 
 // asyncDeferStreamWrite queues one chunk for the loop thread to

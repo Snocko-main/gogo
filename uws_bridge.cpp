@@ -125,6 +125,10 @@ struct StaticResponse {
 // the heap in uwsgo_app_new.
 struct AsyncCtx;
 struct SharedAppState;
+struct uwsgo_app_t;
+
+static void release_shared_state(SharedAppState *state);
+static void close_drain_timer(uwsgo_app_t *app);
 
 constexpr uint64_t RING_SIZE = 4096;
 constexpr uint64_t RING_MASK = RING_SIZE - 1;
@@ -290,6 +294,16 @@ struct uwsgo_app_t {
     // request, which measures at ~2-3% on small-response routes.
     bool capture_peer_ip = false;
 };
+
+static void close_drain_timer(uwsgo_app_t *app) {
+    if (app == nullptr || app->drain_timer == nullptr) {
+        return;
+    }
+    auto *state = *reinterpret_cast<SharedAppState **>(us_timer_ext(app->drain_timer));
+    us_timer_close(app->drain_timer);
+    app->drain_timer = nullptr;
+    release_shared_state(state);
+}
 
 static size_t copy_string_view(std::string_view value, char *buffer, size_t buffer_len) {
     if (buffer != nullptr && buffer_len > 0) {
@@ -717,10 +731,7 @@ extern "C" void uwsgo_app_stop(uwsgo_app_t *app) {
             app->app->close();
             app->listen_socket = nullptr;
         }
-        if (app->drain_timer != nullptr) {
-            us_timer_close(app->drain_timer);
-            app->drain_timer = nullptr;
-        }
+        close_drain_timer(app);
     });
 }
 
@@ -743,10 +754,7 @@ extern "C" void uwsgo_app_close_listen(uwsgo_app_t *app) {
             us_listen_socket_close(0, app->listen_socket);
             app->listen_socket = nullptr;
         }
-        if (app->drain_timer != nullptr) {
-            us_timer_close(app->drain_timer);
-            app->drain_timer = nullptr;
-        }
+        close_drain_timer(app);
     });
 }
 
@@ -1090,6 +1098,12 @@ void SharedAppState::release() {
     }
 }
 
+static void release_shared_state(SharedAppState *state) {
+    if (state != nullptr) {
+        state->release();
+    }
+}
+
 static void discard_pending(PendingRing *ring) {
     if (ring == nullptr) return;
     ring->wake_pending.store(0, std::memory_order_release);
@@ -1144,6 +1158,51 @@ struct CtxHold {
     CtxHold &operator=(const CtxHold &) = delete;
     CtxHold &operator=(CtxHold &&) = delete;
     ~CtxHold() { if (ctx) ctx->release(); }
+};
+
+// BodyCollector owns the initial AsyncCtx ref while post_shared is still
+// collecting request body chunks. uWS may abandon a body before it ever emits a
+// final onData(isLast=true), so abort/destruction must also be able to release
+// that owner ref exactly once. On successful body completion, ownership is
+// transferred to enqueue_ctx and ultimately the Go shared worker.
+struct BodyCollector {
+    AsyncCtx *ctx;
+    std::atomic<int> done{0};  // 0 collecting, 1 released, 2 transferred
+
+    explicit BodyCollector(AsyncCtx *c) : ctx(c) {}
+    BodyCollector(const BodyCollector &) = delete;
+    BodyCollector &operator=(const BodyCollector &) = delete;
+
+    ~BodyCollector() {
+        abandon();
+    }
+
+    bool pending() const {
+        return done.load(std::memory_order_acquire) == 0;
+    }
+
+    bool release_owner(bool mark_aborted) {
+        int expected = 0;
+        if (!done.compare_exchange_strong(
+                expected, 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return false;
+        }
+        if (mark_aborted) {
+            ctx->aborted.store(1, std::memory_order_release);
+        }
+        ctx->release();
+        return true;
+    }
+
+    void abandon() {
+        release_owner(true);
+    }
+
+    bool transfer_to_enqueue() {
+        int expected = 0;
+        return done.compare_exchange_strong(
+            expected, 2, std::memory_order_acq_rel, std::memory_order_acquire);
+    }
 };
 
 // SendBuffer owns C-heap copies of status/content_type/body so the defer
@@ -1456,19 +1515,24 @@ extern "C" void uwsgo_app_post_shared(uwsgo_app_t *app, const char *pattern,
         }
 
         // Body collection runs after the lambda returns — uWS calls
-        // onData per chunk. We accumulate into ctx->body until
-        // isLast or overflow. ctx is captured by reference into the
-        // closure; the onAborted hook flips the aborted flag so a
-        // disconnected client mid-stream doesn't enqueue garbage.
-        res->onAborted([hold = CtxHold(ctx)]() {
-            hold.ctx->aborted.store(1, std::memory_order_release);
+        // onData per chunk. The collector owns ctx's initial ref until
+        // final body completion transfers it to enqueue_ctx. If the
+        // client aborts or the App starts closing before isLast, the
+        // collector releases that owner ref immediately.
+        auto collector = std::make_shared<BodyCollector>(ctx);
+        res->onAborted([collector]() {
+            collector->abandon();
         });
-        res->onData([ctx, res, max_body](std::string_view chunk, bool isLast) mutable {
+        res->onData([collector, res, max_body](std::string_view chunk, bool isLast) mutable {
+            if (!collector->pending()) {
+                return;
+            }
+            AsyncCtx *ctx = collector->ctx;
             if (ctx->closed_or_aborted()) {
-                // Client gone — drop the ctx, no enqueue. release()
-                // here mirrors the onAborted increment so refcount
-                // stays balanced.
-                if (isLast) ctx->release();
+                // Client gone or App closing — drop the ctx, no enqueue.
+                // Later onData calls see collector->done and return
+                // without touching a released ctx.
+                collector->abandon();
                 return;
             }
             if (!ctx->body_overflow) {
@@ -1489,10 +1553,11 @@ extern "C" void uwsgo_app_post_shared(uwsgo_app_t *app, const char *pattern,
             if (!isLast) return;
 
             if (ctx->body_overflow) {
-                ctx->release();
-                res->writeStatus("413 Payload Too Large");
-                res->writeHeader("Content-Type", "text/plain; charset=utf-8");
-                res->end("payload too large\n");
+                if (collector->release_owner(false)) {
+                    res->writeStatus("413 Payload Too Large");
+                    res->writeHeader("Content-Type", "text/plain; charset=utf-8");
+                    res->end("payload too large\n");
+                }
                 return;
             }
             // Body complete and within cap. Push to the ring so a
@@ -1500,7 +1565,9 @@ extern "C" void uwsgo_app_post_shared(uwsgo_app_t *app, const char *pattern,
             // enqueue_ctx helper also re-registers onAborted on
             // success — that's the canonical hook for the post-
             // enqueue abort signal, matching the GET path.
-            enqueue_ctx(ctx, res);
+            if (collector->transfer_to_enqueue()) {
+                enqueue_ctx(ctx, res);
+            }
         });
     });
 }
@@ -1571,16 +1638,26 @@ extern "C" void uwsgo_wake_drain(uwsgo_loop_t *loop, void *ring) {
 // this timer just catches anything that slips through.
 extern "C" void uwsgo_app_start_drain(uwsgo_app_t *app, int interval_us) {
     auto *loop = reinterpret_cast<struct us_loop_t *>(app->loop);
-    // Allocate ext_size = sizeof(PendingRing*) so we can stash the ring
-    // pointer inline with the timer; libuS gives us back the timer in the
-    // callback and us_timer_ext recovers the trailing user data.
-    app->drain_timer = us_create_timer(loop, 0, sizeof(PendingRing *));
+    SharedAppState *state = app->shared_state;
+    if (state != nullptr) {
+        state->retain();
+    }
+    // Allocate ext_size = sizeof(SharedAppState*) so the timer holds a
+    // refcounted owner instead of a raw PendingRing pointer. close_drain_timer
+    // releases this ref when the timer is closed on the loop thread.
+    app->drain_timer = us_create_timer(loop, 0, sizeof(SharedAppState *));
+    if (app->drain_timer == nullptr) {
+        release_shared_state(state);
+        return;
+    }
     int ms = interval_us / 1000;
     if (ms < 1) ms = 1;
-    *reinterpret_cast<PendingRing **>(us_timer_ext(app->drain_timer)) = app->pending_ring;
+    *reinterpret_cast<SharedAppState **>(us_timer_ext(app->drain_timer)) = state;
     us_timer_set(app->drain_timer, [](struct us_timer_t *t) {
-        auto *r = *reinterpret_cast<PendingRing **>(us_timer_ext(t));
-        drain_pending(r);
+        auto *state = *reinterpret_cast<SharedAppState **>(us_timer_ext(t));
+        if (state != nullptr) {
+            drain_pending(&state->pending_ring);
+        }
     }, ms, ms);
 }
 
@@ -1724,8 +1801,9 @@ extern "C" void uwsgo_res_defer_send_with_headers(
 // as a single TCP packet; the lambda intentionally does NOT call
 // end(), leaving the response open for follow-up stream_write
 // chunks. The ctx must outlive every pending defer — we retain
-// here so the close-out (stream_end) can release symmetrically.
-extern "C" void uwsgo_res_defer_stream_start(
+// here for this one queued operation. Go keeps the original async
+// ctx ref until Response.Stream returns.
+extern "C" int uwsgo_res_defer_stream_start(
     uwsgo_loop_t *loop,
     void *ctx_handle,
     const char *status, size_t status_len,
@@ -1734,7 +1812,7 @@ extern "C" void uwsgo_res_defer_stream_start(
     auto *l = reinterpret_cast<uWS::Loop *>(loop);
     auto *ctx = static_cast<AsyncCtx *>(ctx_handle);
     if (ctx == nullptr || ctx->closed_or_aborted()) {
-        return;
+        return 0;
     }
     ctx->retain();
 
@@ -1781,6 +1859,7 @@ extern "C" void uwsgo_res_defer_stream_start(
         });
         ctx->release();
     });
+    return 1;
 }
 
 // uwsgo_res_defer_stream_write queues a single body chunk. uWS's

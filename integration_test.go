@@ -699,6 +699,78 @@ func TestSharedDispatchCloseBeforeRedirect(t *testing.T) {
 	})
 }
 
+func TestSharedDispatchCloseBeforeStream(t *testing.T) {
+	testSharedDispatchCloseBeforeResponse(t, func(res *gogo.Response) {
+		if err := res.Stream(200, "text/plain", func(w io.Writer) error {
+			_, err := w.Write([]byte("late"))
+			return err
+		}); err != nil {
+			t.Errorf("Stream: %v", err)
+		}
+	})
+}
+
+func TestSharedDispatchCloseDuringPostBody(t *testing.T) {
+	var handlerRan atomic.Bool
+	port := freePort(t)
+	ready := make(chan *gogo.App, 1)
+	runDone := make(chan struct{})
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		app, err := gogo.NewApp(gogo.Config{BindAddr: "127.0.0.1"})
+		if err != nil {
+			t.Errorf("NewApp: %v", err)
+			close(runDone)
+			return
+		}
+		app.PostAsync("/upload", 1<<20, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			handlerRan.Store(true)
+			res.Send(200, "text/plain", fmt.Sprintf("got %d", len(body)))
+		})
+		if !app.Listen(port) {
+			t.Errorf("Listen :%d failed", port)
+			app.Close()
+			close(runDone)
+			return
+		}
+		ready <- app
+		app.Run()
+		app.Close()
+		close(runDone)
+	}()
+
+	var app *gogo.App
+	select {
+	case app = <-ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("app setup timed out")
+	}
+
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), time.Second)
+	if err != nil {
+		app.Shutdown()
+		t.Fatalf("dial: %v", err)
+	}
+	fmt.Fprintf(conn, "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 100000\r\nConnection: close\r\n\r\npartial")
+	time.Sleep(50 * time.Millisecond)
+
+	app.Shutdown()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		conn.Close()
+		t.Fatal("Run did not exit after Shutdown with partial PostAsync body")
+	}
+	conn.Close()
+	if handlerRan.Load() {
+		t.Fatal("partial PostAsync body reached shared handler after close")
+	}
+	if !gogo.WaitForSharedWorkers(5 * time.Second) {
+		t.Fatal("shared workers did not drain after close during PostAsync body")
+	}
+}
+
 func testSharedDispatchCloseBeforeResponse(t *testing.T, respond func(*gogo.Response)) {
 	t.Helper()
 
