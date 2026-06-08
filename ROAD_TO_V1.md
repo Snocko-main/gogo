@@ -136,8 +136,10 @@ files in the same PR unless one agent is explicitly assigned as integrator.
       locked native loop goroutine internally, or document/enforce same-thread
       `NewApp` / route registration / `Listen` / `Run` / `Close`.
 - [x] Define shared-dispatch quiescence before freeing native app memory.
-- [x] Decide shared handler registry lifetime: cleanup, generations/tombstones,
-      or documented process-lifetime retention.
+- [x] Decide shared handler registry lifetime: release handlers after
+      graceful/shared drain; process-lifetime retention is not the v1 contract.
+- [ ] Implement shared handler registry cleanup with tombstones or generations
+      so stale handler IDs cannot call removed handlers.
 
 ## v0.4.0 - Middleware Production Pass
 

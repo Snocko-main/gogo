@@ -1,8 +1,8 @@
 # Native Lifecycle Status for v0.3
 
 This note records the native lifecycle decisions that were reviewed during the
-v0.3 config pass. It separates decisions that are already implemented from the
-remaining v1 native-boundary follow-ups.
+v0.3 config pass. It separates behavior that is already implemented, accepted
+v1 direction, and the remaining native-boundary follow-ups.
 
 ## Closed Decisions
 
@@ -28,18 +28,26 @@ return when needed, then call `Close` to free native resources. `Close` is not a
 general cancellation primitive for arbitrary user goroutines; handlers that
 need to stop early should observe `Response.OnAborted` or `Request.Context`.
 
-### Shared handler registry lifetime
+## Accepted v1 Direction
 
-Shared async route registration appends handlers to a process-wide registry and
-publishes immutable snapshots for worker reads. The registry is intentionally
-process-lifetime state for v1. This matches the current route model: routes are
-registered at app setup time, and there is no public hot-unregister API.
+### Shared handler registry cleanup
 
-The public operational knobs remain:
+Shared async route registration currently appends handlers to a process-wide
+registry and publishes immutable snapshots for worker reads. That is safe for a
+single boot-defined app, but it must not become the v1 lifecycle contract: a
+process that repeatedly creates and closes apps would retain every shared
+handler closure until process exit.
 
-- `SetWorkerCount`, configured before shared workers start
-- `WaitForSharedWorkers`, for tests and supervisors that need to observe worker
-  generation drain
+The v1 direction is to release an app's shared handlers after graceful shutdown
+has drained that app's shared work. Cleanup must run after the app can no longer
+produce or consume shared callbacks, not at the beginning of
+`ShutdownGracefully`, because in-flight handlers and queued shared responses may
+still need the registered handler IDs while the drain is in progress.
+
+The likely implementation shape is tombstones or generations rather than
+shrinking the registry. Old numeric handler IDs must remain safe to observe
+after cleanup, while the handler closures themselves should be released so large
+captured objects can be garbage collected.
 
 ## Remaining Follow-Ups
 
@@ -58,6 +66,13 @@ Cross-thread methods should remain limited to the explicitly safe APIs that
 defer to the loop or use native synchronization, such as `Shutdown`,
 `ShutdownGracefully`, `ShutdownContext`, `Publish`, `PublishBatch`, and
 deferred async responses.
+
+### Shared handler registry cleanup
+
+Implement cleanup for shared handler slots after graceful/shared drain. Tests
+should cover repeated `NewApp` / route registration / `ShutdownGracefully` /
+`Close` cycles and verify that stale handler IDs cannot call a removed handler
+or a newly registered handler from another app generation.
 
 ### Native boundary audit
 
