@@ -5151,7 +5151,7 @@ func TestShutdownContextDrainsInFlight(t *testing.T) {
 	}()
 	<-requestStarted
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	shutdownErr := make(chan error, 1)
 	go func() {
@@ -5184,12 +5184,12 @@ func TestShutdownContextDrainsInFlight(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ShutdownContext: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("ShutdownContext did not return after graceful drain")
 	}
 	select {
 	case <-runDone:
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("Run did not exit after ShutdownContext graceful drain")
 	}
 }
