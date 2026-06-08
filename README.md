@@ -773,6 +773,13 @@ children under `/api/`; `/apiv2` does not match. `/`, `/*`, and `/**` mean
 global. The match uses the live request URL at request time, so parametric
 and wildcard routes cannot bypass a scoped guard.
 
+Middleware runs left-to-right: the first middleware passed to `Use` is the
+outermost wrapper and sees the request first. A middleware that rejects a
+request should write the response and return without calling `next`.
+Middleware that observes final status, persists state, or records audit data
+should register `res.OnFinish` and then call `next`; see the cleanup section
+below for the panic-safe form.
+
 ### Async middleware
 
 `AsyncMiddleware` wraps `GetAsync` and body-async handlers and runs on the
@@ -799,6 +806,18 @@ app.GetAsync("/api/me", func(res *gogo.Response, req *gogo.Request) {
     res.JSON(200, user)
 })
 ```
+
+Bundled middleware declares its placement:
+
+| Placement | Runs on | Use for |
+| --- | --- | --- |
+| Sync | uWS loop thread | cheap checks and headers: CORS preflight, BasicAuth, JWT verification, CSRF checks |
+| Async | worker goroutine | blocking stores or network calls: Redis rate limits, database/session stores |
+| Both | sync routes on the loop, async routes in the worker | cheap cross-cutting behavior that should apply everywhere: RequestID, Logger, Metrics, Helmet, Compress |
+
+`middleware.Async(mw)` forces a sync-shaped middleware into the async chain
+for `GetAsync` and body-async routes. Use it only when the middleware may
+block; sync routes will not see async-only middleware.
 
 ### Post-handler cleanup with `Response.OnFinish`
 
@@ -973,6 +992,30 @@ HMAC-backed middleware secrets (`JWT` with HS*, `CSRF`, and `NewSession`)
 must be at least 32 bytes. Generate them from a secret manager or a CSPRNG;
 short demo strings panic at startup instead of silently weakening token
 integrity.
+
+### Middleware failure policy
+
+Middleware failures fall into three buckets:
+
+| Failure | Default behavior | Operator hook |
+| --- | --- | --- |
+| Invalid configuration at startup | panic before serving traffic | fix config; tests should assert construction panics |
+| Request authentication or validation failure | fail closed with 401/403/429 or omit CORS allow headers | custom `OnLimit`, `SkipFunc`, WebSocket `Verify`, or explicit route logic |
+| Backend/store failure after startup | middleware-specific; network stores should document fail-open/fail-closed behavior | `OnError` where provided, plus metrics/logging around the store |
+
+Built-in auth middleware is fail-closed by default: `BasicAuth` and `JWT`
+return 401, `CSRF` returns 403, `WebSocketAuth` rejects the upgrade, and
+`RateLimit` returns 429 when a key exceeds its quota. `CORS` is different: it
+does not authenticate a request, so disallowed origins simply do not receive
+allow headers and browsers block the response.
+
+Store-backed middleware must make outage behavior explicit. The bundled Redis
+rate-limit adapter defaults to fail-open and reports failures through
+`OnError`; set `FailClosed` when protecting scarce or expensive resources.
+Session persistence errors are not sent to clients after the response has
+started, so production `SessionStore` implementations should log or measure
+their own save/delete failures and should be paired with `AsyncStore` when they
+can block.
 
 ### RequestID — 128-bit IDs
 
@@ -1166,8 +1209,19 @@ via `MaxEntries` if your workload legitimately keeps many concurrent
 sessions; `mw.NoSessionEntryLimit` disables the cap (not recommended outside
 tests).
 
-For multi-instance fleets, implement `SessionStore` (and `RateLimitStore`)
-on top of Redis / Memcache.
+For multi-instance fleets, implement `SessionStore` on top of Redis, Memcache,
+SQL, or another shared backend. A production store should:
+
+- apply the provided TTL on every `Save`
+- make `Load`, `Save`, and `Delete` safe for concurrent requests
+- copy maps at the boundary so request code cannot mutate shared store state
+- log or metric save/delete failures internally, because deferred persistence
+  may run after headers are already committed
+- run with `AsyncStore: true` if it performs network, disk, or database I/O
+
+Use the same rule for rate limiting: single-process memory stores are fine for
+one instance; Redis or another shared `RateLimitStore` is required when limits
+must be consistent across a fleet.
 
 ## Database Connection
 
