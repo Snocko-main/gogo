@@ -80,6 +80,20 @@ type JWTOptions struct {
 	// an HMAC secret if the verifier blindly used the alg header).
 	Algorithm JWTAlgorithm
 
+	// Issuer, when non-empty, requires the token's `iss` claim to
+	// exactly match this value. Default empty disables issuer validation.
+	Issuer string
+
+	// Audience, when non-empty, requires the token's `aud` claim to contain
+	// this value. The middleware accepts either a string `aud` claim or an
+	// array of string audiences. Default empty disables audience validation.
+	Audience string
+
+	// RequiredClaims lists claim names that must be present with non-null
+	// values. It does not otherwise validate custom claim value semantics.
+	// Default nil requires no additional claims.
+	RequiredClaims []string
+
 	// TokenFunc extracts the JWT string from the request. Default
 	// reads "Authorization: Bearer <token>". Override to source
 	// the token from a cookie, query parameter, etc.
@@ -172,6 +186,7 @@ func JWT(opt JWTOptions) mwhint.Hinted {
 		opt.MaxTokenBytes = defaultJWTMaxTokenBytes
 	}
 	expectedAlg := string(opt.Algorithm)
+	claimValidation := jwtClaimValidationFromOptions(opt)
 
 	return mwhint.Hinted{Place: mwhint.Sync, Mw: gogo.Middleware(func(next gogo.Handler) gogo.Handler {
 		return func(res *gogo.Response, req *gogo.Request) {
@@ -188,7 +203,7 @@ func JWT(opt JWTOptions) mwhint.Hinted {
 				jwtReject(res, "missing token")
 				return
 			}
-			claims, err := verifyJWT(tok, verifier, expectedAlg, opt.Leeway, opt.MaxTokenBytes)
+			claims, err := verifyJWT(tok, verifier, expectedAlg, opt.Leeway, opt.MaxTokenBytes, claimValidation)
 			if err != nil {
 				jwtReject(res, err.Error())
 				return
@@ -275,6 +290,26 @@ func jwtAlgInfoFor(alg JWTAlgorithm) (jwtAlgInfo, bool) {
 // just calls a single function per request.
 type jwtVerifier func(signingInput, signature []byte) error
 
+type jwtClaimValidation struct {
+	issuer         string
+	audience       string
+	requiredClaims []string
+}
+
+func jwtClaimValidationFromOptions(opt JWTOptions) jwtClaimValidation {
+	requiredClaims := append([]string(nil), opt.RequiredClaims...)
+	for _, claim := range requiredClaims {
+		if claim == "" {
+			panic("gogo/middleware: JWT required claim name must not be empty")
+		}
+	}
+	return jwtClaimValidation{
+		issuer:         opt.Issuer,
+		audience:       opt.Audience,
+		requiredClaims: requiredClaims,
+	}
+}
+
 func jwtBuildVerifier(info jwtAlgInfo, secret []byte, key crypto.PublicKey) (jwtVerifier, error) {
 	switch info.family {
 	case "HS":
@@ -347,9 +382,9 @@ func jwtBuildVerifier(info jwtAlgInfo, secret []byte, key crypto.PublicKey) (jwt
 // verifyJWT parses a token of the form header.payload.signature,
 // confirms the header `alg` matches expectedAlg, runs the per-family
 // verifier on the signing input, and decodes the payload into a
-// claims map. exp / nbf are checked against the wall clock with the
-// configured leeway.
-func verifyJWT(tok string, verify jwtVerifier, expectedAlg string, leeway time.Duration, maxTokenBytes int) (map[string]any, error) {
+// claims map. exp / nbf and the configured registered/custom claim
+// requirements are checked against the wall clock with the configured leeway.
+func verifyJWT(tok string, verify jwtVerifier, expectedAlg string, leeway time.Duration, maxTokenBytes int, claimValidation jwtClaimValidation) (map[string]any, error) {
 	if maxTokenBytes >= 0 && len(tok) > maxTokenBytes {
 		return nil, errors.New("token too large")
 	}
@@ -425,7 +460,76 @@ func verifyJWT(tok string, verify jwtVerifier, expectedAlg string, leeway time.D
 			return nil, errors.New("token not yet valid")
 		}
 	}
+	if err := validateJWTClaims(claims, claimValidation); err != nil {
+		return nil, err
+	}
 	return claims, nil
+}
+
+func validateJWTClaims(claims map[string]any, validation jwtClaimValidation) error {
+	if validation.issuer != "" {
+		issRaw, ok := claims["iss"]
+		if !ok || issRaw == nil {
+			return errors.New("missing iss claim")
+		}
+		iss, ok := issRaw.(string)
+		if !ok {
+			return errors.New("malformed iss claim")
+		}
+		if iss != validation.issuer {
+			return errors.New("invalid issuer")
+		}
+	}
+
+	if validation.audience != "" {
+		audRaw, ok := claims["aud"]
+		if !ok || audRaw == nil {
+			return errors.New("missing aud claim")
+		}
+		matches, err := jwtAudienceContains(audRaw, validation.audience)
+		if err != nil {
+			return err
+		}
+		if !matches {
+			return errors.New("invalid audience")
+		}
+	}
+
+	for _, claim := range validation.requiredClaims {
+		value, ok := claims[claim]
+		if !ok || value == nil {
+			return errors.New("missing required claim: " + claim)
+		}
+	}
+	return nil
+}
+
+func jwtAudienceContains(audRaw any, expected string) (bool, error) {
+	switch aud := audRaw.(type) {
+	case string:
+		return aud == expected, nil
+	case []any:
+		matches := false
+		for _, item := range aud {
+			audString, ok := item.(string)
+			if !ok {
+				return false, errors.New("malformed aud claim")
+			}
+			if audString == expected {
+				matches = true
+			}
+		}
+		return matches, nil
+	case []string:
+		for _, audString := range aud {
+			if audString == expected {
+				return true, nil
+			}
+		}
+		return false, nil
+	default:
+		return false, errors.New("malformed aud claim")
+	}
 }
 
 // SignJWT produces a compact JWT signed with the given algorithm

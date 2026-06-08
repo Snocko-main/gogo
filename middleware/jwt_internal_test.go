@@ -20,7 +20,7 @@ func TestJWTAuthParamEscapesChallengeValue(t *testing.T) {
 
 func TestVerifyJWTRejectsOverMaxTokenBytes(t *testing.T) {
 	verifier := func(signingInput, signature []byte) error { return nil }
-	_, err := verifyJWT(strings.Repeat("a", 32)+".b.c", verifier, "HS256", 0, 16)
+	_, err := verifyJWT(strings.Repeat("a", 32)+".b.c", verifier, "HS256", 0, 16, jwtClaimValidation{})
 	if err == nil || err.Error() != "token too large" {
 		t.Fatalf("verifyJWT error = %v, want token too large", err)
 	}
@@ -30,10 +30,176 @@ func TestVerifyJWTMaxTokenBytesCanBeDisabled(t *testing.T) {
 	verifier := func(signingInput, signature []byte) error {
 		return errors.New("verifier should not run before header decode")
 	}
-	_, err := verifyJWT(strings.Repeat("a", 32)+".b.c", verifier, "HS256", time.Second, NoJWTTokenLimit)
+	_, err := verifyJWT(strings.Repeat("a", 32)+".b.c", verifier, "HS256", time.Second, NoJWTTokenLimit, jwtClaimValidation{})
 	if err == nil || err.Error() == "token too large" {
 		t.Fatalf("verifyJWT error = %v, want non-size parse error", err)
 	}
+}
+
+func TestVerifyJWTPreservesValidTokenWithoutClaimValidation(t *testing.T) {
+	tok := signJWTForVerifyTest(t, map[string]any{
+		"sub": "user-42",
+	})
+
+	claims, err := verifySignedJWTForTest(t, tok, jwtClaimValidation{})
+	if err != nil {
+		t.Fatalf("verifyJWT: %v", err)
+	}
+	if claims["sub"] != "user-42" {
+		t.Fatalf("sub claim = %v, want user-42", claims["sub"])
+	}
+}
+
+func TestVerifyJWTAcceptsIssuerAudienceAndRequiredClaims(t *testing.T) {
+	tok := signJWTForVerifyTest(t, map[string]any{
+		"iss":   "https://issuer.example",
+		"aud":   "api",
+		"sub":   "user-42",
+		"scope": "read:things",
+	})
+
+	_, err := verifySignedJWTForTest(t, tok, jwtClaimValidation{
+		issuer:         "https://issuer.example",
+		audience:       "api",
+		requiredClaims: []string{"sub", "scope"},
+	})
+	if err != nil {
+		t.Fatalf("verifyJWT: %v", err)
+	}
+}
+
+func TestVerifyJWTAcceptsAudienceArray(t *testing.T) {
+	tok := signJWTForVerifyTest(t, map[string]any{
+		"aud": []string{"cli", "api"},
+	})
+
+	_, err := verifySignedJWTForTest(t, tok, jwtClaimValidation{audience: "api"})
+	if err != nil {
+		t.Fatalf("verifyJWT: %v", err)
+	}
+}
+
+func TestVerifyJWTRejectsInvalidIssuerClaims(t *testing.T) {
+	tests := []struct {
+		name    string
+		claims  map[string]any
+		wantErr string
+	}{
+		{
+			name:    "missing",
+			claims:  map[string]any{"sub": "user-42"},
+			wantErr: "missing iss claim",
+		},
+		{
+			name:    "non-string",
+			claims:  map[string]any{"iss": 42},
+			wantErr: "malformed iss claim",
+		},
+		{
+			name:    "mismatch",
+			claims:  map[string]any{"iss": "https://issuer.invalid"},
+			wantErr: "invalid issuer",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tok := signJWTForVerifyTest(t, tc.claims)
+			_, err := verifySignedJWTForTest(t, tok, jwtClaimValidation{
+				issuer: "https://issuer.example",
+			})
+			if err == nil || err.Error() != tc.wantErr {
+				t.Fatalf("verifyJWT error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestVerifyJWTRejectsInvalidAudienceClaims(t *testing.T) {
+	tests := []struct {
+		name    string
+		claims  map[string]any
+		wantErr string
+	}{
+		{
+			name:    "missing",
+			claims:  map[string]any{"sub": "user-42"},
+			wantErr: "missing aud claim",
+		},
+		{
+			name:    "non-string",
+			claims:  map[string]any{"aud": 42},
+			wantErr: "malformed aud claim",
+		},
+		{
+			name:    "array contains non-string",
+			claims:  map[string]any{"aud": []any{"api", 42}},
+			wantErr: "malformed aud claim",
+		},
+		{
+			name:    "mismatch",
+			claims:  map[string]any{"aud": []string{"cli", "worker"}},
+			wantErr: "invalid audience",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tok := signJWTForVerifyTest(t, tc.claims)
+			_, err := verifySignedJWTForTest(t, tok, jwtClaimValidation{
+				audience: "api",
+			})
+			if err == nil || err.Error() != tc.wantErr {
+				t.Fatalf("verifyJWT error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestVerifyJWTRejectsMissingRequiredClaims(t *testing.T) {
+	tests := []struct {
+		name           string
+		claims         map[string]any
+		requiredClaims []string
+		wantErr        string
+	}{
+		{
+			name:           "missing",
+			claims:         map[string]any{"sub": "user-42"},
+			requiredClaims: []string{"sub", "scope"},
+			wantErr:        "missing required claim: scope",
+		},
+		{
+			name:           "null",
+			claims:         map[string]any{"sub": nil},
+			requiredClaims: []string{"sub"},
+			wantErr:        "missing required claim: sub",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tok := signJWTForVerifyTest(t, tc.claims)
+			_, err := verifySignedJWTForTest(t, tok, jwtClaimValidation{
+				requiredClaims: tc.requiredClaims,
+			})
+			if err == nil || err.Error() != tc.wantErr {
+				t.Fatalf("verifyJWT error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestJWTRejectsEmptyRequiredClaimName(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("JWT accepted an empty required claim name")
+		}
+	}()
+	_ = JWT(JWTOptions{
+		Secret:         []byte("test-secret-with-enough-bytes-AAAA"),
+		RequiredClaims: []string{""},
+	})
 }
 
 func TestJWTRejectsECDSACurveMismatch(t *testing.T) {
@@ -77,4 +243,26 @@ func TestSignJWTRejectsECDSACurveMismatch(t *testing.T) {
 	if _, err := SignJWT(JWTES256, priv, map[string]any{"sub": "x"}); err == nil {
 		t.Fatal("SignJWT accepted ES256 with a P-384 key")
 	}
+}
+
+func signJWTForVerifyTest(t *testing.T, claims map[string]any) string {
+	t.Helper()
+	tok, err := SignJWT(JWTHS256, []byte("test-secret-with-enough-bytes-AAAA"), claims)
+	if err != nil {
+		t.Fatalf("SignJWT: %v", err)
+	}
+	return tok
+}
+
+func verifySignedJWTForTest(t *testing.T, tok string, validation jwtClaimValidation) (map[string]any, error) {
+	t.Helper()
+	info, ok := jwtAlgInfoFor(JWTHS256)
+	if !ok {
+		t.Fatal("missing HS256 algorithm info")
+	}
+	verifier, err := jwtBuildVerifier(info, []byte("test-secret-with-enough-bytes-AAAA"), nil)
+	if err != nil {
+		t.Fatalf("jwtBuildVerifier: %v", err)
+	}
+	return verifyJWT(tok, verifier, string(JWTHS256), 0, defaultJWTMaxTokenBytes, validation)
 }
