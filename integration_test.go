@@ -7583,6 +7583,173 @@ func (a *blockingWSHubAdapter) Publish(context.Context, gogo.WSHubMessage) error
 
 func (a *blockingWSHubAdapter) Close() error { return nil }
 
+type recordingTopicWSHubAdapter struct {
+	subs   chan string
+	unsubs chan string
+}
+
+func newRecordingTopicWSHubAdapter() *recordingTopicWSHubAdapter {
+	return &recordingTopicWSHubAdapter{
+		subs:   make(chan string, 4),
+		unsubs: make(chan string, 4),
+	}
+}
+
+func (a *recordingTopicWSHubAdapter) Start(context.Context, func(gogo.WSHubMessage)) error {
+	return nil
+}
+
+func (a *recordingTopicWSHubAdapter) Publish(context.Context, gogo.WSHubMessage) error {
+	return nil
+}
+
+func (a *recordingTopicWSHubAdapter) Close() error { return nil }
+
+func (a *recordingTopicWSHubAdapter) Subscribe(ctx context.Context, topic string) error {
+	select {
+	case a.subs <- topic:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (a *recordingTopicWSHubAdapter) Unsubscribe(ctx context.Context, topic string) error {
+	select {
+	case a.unsubs <- topic:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func waitForWSHubTopicOp(t *testing.T, ch <-chan string, want string) {
+	t.Helper()
+	select {
+	case got := <-ch:
+		if got != want {
+			t.Fatalf("topic op = %q, want %q", got, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for topic op %q", want)
+	}
+}
+
+func TestWSHubUnsubscribeStopsHubPublishAndQueuesAdapterUnsubscribe(t *testing.T) {
+	adapter := newRecordingTopicWSHubAdapter()
+	hub := gogo.NewWSHub(
+		gogo.WithWSHubNodeID("test-node"),
+		gogo.WithWSHubAdapter(adapter),
+	)
+	defer hub.Close()
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		hub.WebSocket(app, "/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				if !hub.Subscribe(ws, "room") {
+					t.Errorf("Subscribe returned false")
+				}
+				ws.SendText("ready")
+			},
+			Message: func(ws *gogo.WebSocket, msg []byte, op gogo.OpCode) {
+				switch string(msg) {
+				case "leave":
+					if !hub.Unsubscribe(ws, "room") {
+						t.Errorf("Unsubscribe returned false")
+					}
+					ws.SendText("left")
+				}
+			},
+		})
+	})
+	defer teardown()
+
+	client, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+	got, err := client.ReadText(2 * time.Second)
+	if err != nil {
+		t.Fatalf("read ready: %v", err)
+	}
+	if got != "ready" {
+		t.Fatalf("ready message = %q, want ready", got)
+	}
+	waitForWSHubTopicOp(t, adapter.subs, "room")
+
+	if err := hub.Publish("room", []byte("before-unsubscribe"), gogo.Text); err != nil {
+		t.Fatalf("Publish before unsubscribe: %v", err)
+	}
+	got, err = client.ReadText(2 * time.Second)
+	if err != nil {
+		t.Fatalf("read before unsubscribe: %v", err)
+	}
+	if got != "before-unsubscribe" {
+		t.Fatalf("message before unsubscribe = %q, want before-unsubscribe", got)
+	}
+
+	if err := client.SendText("leave"); err != nil {
+		t.Fatalf("send leave: %v", err)
+	}
+	got, err = client.ReadText(2 * time.Second)
+	if err != nil {
+		t.Fatalf("read leave ack: %v", err)
+	}
+	if got != "left" {
+		t.Fatalf("leave ack = %q, want left", got)
+	}
+	waitForWSHubTopicOp(t, adapter.unsubs, "room")
+
+	if err := hub.Publish("room", []byte("after-unsubscribe"), gogo.Text); err != nil {
+		t.Fatalf("Publish after unsubscribe: %v", err)
+	}
+	if err := client.expectNoMessage(200 * time.Millisecond); err != nil {
+		t.Fatalf("received hub publish after unsubscribe: %v", err)
+	}
+}
+
+func TestWSHubClientCloseQueuesAdapterUnsubscribe(t *testing.T) {
+	adapter := newRecordingTopicWSHubAdapter()
+	hub := gogo.NewWSHub(
+		gogo.WithWSHubNodeID("test-node"),
+		gogo.WithWSHubAdapter(adapter),
+	)
+	defer hub.Close()
+
+	port, teardown := startApp(t, func(app *gogo.App) {
+		hub.WebSocket(app, "/ws", gogo.WebSocketBehavior{
+			Open: func(ws *gogo.WebSocket) {
+				if !hub.Subscribe(ws, "room") {
+					t.Errorf("Subscribe returned false")
+				}
+				ws.SendText("ready")
+			},
+		})
+	})
+	defer teardown()
+
+	client, err := dialWebSocket(port, "/ws")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	got, err := client.ReadText(2 * time.Second)
+	if err != nil {
+		t.Fatalf("read ready: %v", err)
+	}
+	if got != "ready" {
+		t.Fatalf("ready message = %q, want ready", got)
+	}
+	waitForWSHubTopicOp(t, adapter.subs, "room")
+
+	client.Close()
+	waitForWSHubTopicOp(t, adapter.unsubs, "room")
+
+	if err := hub.Publish("room", []byte("after-close"), gogo.Text); err != nil {
+		t.Fatalf("Publish after client close: %v", err)
+	}
+}
+
 func TestWSHubPublishFromDoesNotBlockOnAdapter(t *testing.T) {
 	adapter := &blockingWSHubAdapter{
 		entered: make(chan struct{}, 1),
