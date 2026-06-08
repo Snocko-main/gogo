@@ -1749,6 +1749,12 @@ app.OnShutdown(func() {
     db.Close()
 })
 
+runDone := make(chan struct{})
+go func() {
+    app.Run()
+    close(runDone)
+}()
+
 sigCh := make(chan os.Signal, 1)
 signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 <-sigCh
@@ -1758,14 +1764,16 @@ defer cancel()
 if err := app.ShutdownContext(ctx); err != nil {
     log.Printf("forced shutdown: %v", err)
 }
-// Run() has returned; call Close to free native resources.
+<-runDone
+app.Close() // free native resources after Run returns
 ```
 
-`ShutdownContext` starts a graceful drain, blocks until `Run` exits, and
-force-closes active connections if the context expires. `ShutdownGracefully`
-starts the same graceful drain without blocking. `Shutdown` closes the listen
-socket and active connections immediately; `Close` frees native resources.
-Shutdown APIs are safe from any goroutine.
+`ShutdownContext` starts a graceful drain and returns nil after `Run` exits. If
+the context expires first, it force-closes active connections and returns the
+context error; wait for `Run` to return before calling `Close`.
+`ShutdownGracefully` starts the same graceful drain without blocking. `Shutdown`
+closes the listen socket and active connections immediately; `Close` frees
+native resources. Shutdown APIs are safe from any goroutine.
 
 ## Configuration
 

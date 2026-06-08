@@ -233,13 +233,19 @@
 //
 // # Graceful shutdown
 //
+//	runDone := make(chan struct{})
+//	go func() {
+//	    app.Run()
+//	    close(runDone)
+//	}()
+//
 //	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 //	defer cancel()
 //	if err := app.ShutdownContext(ctx); err != nil {
 //	    log.Printf("forced shutdown: %v", err)
 //	}
-//	// when Run() returns, call:
-//	app.Close() // free native resources
+//	<-runDone
+//	app.Close() // free native resources after Run returns
 //
 // Shutdown, ShutdownGracefully, and ShutdownContext are safe from any goroutine.
 //
