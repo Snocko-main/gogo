@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -313,6 +314,22 @@ static size_t copy_string_view(std::string_view value, char *buffer, size_t buff
     return value.size();
 }
 
+static unsigned int clamp_size_to_uint(size_t value, unsigned int fallback) {
+    if (value == 0) {
+        return fallback;
+    }
+    constexpr auto max = std::numeric_limits<unsigned int>::max();
+    return value > max ? max : static_cast<unsigned int>(value);
+}
+
+static unsigned short clamp_int_to_ushort(int value, unsigned short fallback) {
+    if (value <= 0) {
+        return fallback;
+    }
+    constexpr auto max = std::numeric_limits<unsigned short>::max();
+    return value > max ? max : static_cast<unsigned short>(value);
+}
+
 extern "C" uwsgo_app_t *uwsgo_app_new(void) {
     auto *a = new uwsgo_app_t{std::make_unique<uWS::App>()};
     // Capture the loop pointer at app creation time. uWS::App() binds to the
@@ -459,7 +476,12 @@ static bool body_limit_rejects(uwsgo_app_t *app, uWS::HttpResponse<false> *res, 
     unsigned long long n = 0;
     for (char c : cl) {
         if (c < '0' || c > '9') { n = ~0ULL; break; }
-        n = n * 10 + static_cast<unsigned long long>(c - '0');
+        unsigned long long digit = static_cast<unsigned long long>(c - '0');
+        if (n > (std::numeric_limits<unsigned long long>::max() - digit) / 10) {
+            n = ~0ULL;
+            break;
+        }
+        n = n * 10 + digit;
         if (n > app->body_limit) break;
     }
     if (n <= app->body_limit) return false;
@@ -530,9 +552,9 @@ extern "C" void uwsgo_app_ws(uwsgo_app_t *app, const char *pattern, uintptr_t ha
     app->has_websocket = true;
     uWS::App::WebSocketBehavior<uwsgo_ws_data_t> behavior = {};
 
-    behavior.maxPayloadLength = static_cast<unsigned int>(max_payload);
-    behavior.idleTimeout = static_cast<unsigned short>(idle_seconds);
-    behavior.maxBackpressure = static_cast<unsigned int>(max_backpressure);
+    behavior.maxPayloadLength = clamp_size_to_uint(max_payload, 16u << 20);
+    behavior.idleTimeout = clamp_int_to_ushort(idle_seconds, 120);
+    behavior.maxBackpressure = clamp_size_to_uint(max_backpressure, 64u << 10);
     behavior.sendPingsAutomatically = send_pings_automatically != 0;
 
     if (with_upgrade != 0) {
@@ -672,6 +694,9 @@ extern "C" void uwsgo_ws_set_user_data(uwsgo_ws_t *ws, uintptr_t user_data) {
 }
 
 extern "C" int uwsgo_app_listen(uwsgo_app_t *app, const char *host, int port) {
+    if (app == nullptr || app->app == nullptr || port < 0) {
+        return 0;
+    }
     bool ok = false;
     auto cb = [&ok, app](auto *listen_socket) {
         app->listen_socket = listen_socket;
@@ -775,6 +800,9 @@ extern "C" void uwsgo_res_write_header(uwsgo_res_t *res, const char *key, size_t
 // header parser.
 extern "C" void uwsgo_res_write_headers_batch(uwsgo_res_t *res,
     const char *headers_blob, size_t headers_len, size_t count) {
+    if (headers_blob == nullptr || headers_len == 0 || count == 0) {
+        return;
+    }
     auto *r = reinterpret_cast<uWS::HttpResponse<false> *>(res);
     const char *p = headers_blob;
     const char *end = headers_blob + headers_len;
@@ -1770,9 +1798,9 @@ extern "C" void uwsgo_res_defer_send_with_headers(
             // Walk the packed name\0value\0... blob and emit each pair as
             // a header. memchr keeps the scan bounded by headers_len even
             // if a malformed blob ever lacks a trailing NUL.
-            const char *p = sb.headers_blob;
-            const char *end = sb.headers_blob + sb.headers_len;
-            while (p < end) {
+            const char *p = sb.headers_len > 0 ? sb.headers_blob : nullptr;
+            const char *end = sb.headers_len > 0 ? sb.headers_blob + sb.headers_len : nullptr;
+            while (p != nullptr && p < end) {
                 const char *name_end = static_cast<const char *>(
                     std::memchr(p, 0, static_cast<size_t>(end - p)));
                 if (name_end == nullptr) break;
@@ -1834,9 +1862,9 @@ extern "C" int uwsgo_res_defer_stream_start(
         auto *r = ctx->response;
         r->cork([r, &sb]() {
             r->writeStatus(std::string_view(sb.status, sb.status_len));
-            const char *p = sb.headers_blob;
-            const char *end = sb.headers_blob + sb.headers_len;
-            while (p < end) {
+            const char *p = sb.headers_len > 0 ? sb.headers_blob : nullptr;
+            const char *end = sb.headers_len > 0 ? sb.headers_blob + sb.headers_len : nullptr;
+            while (p != nullptr && p < end) {
                 const char *name_end = static_cast<const char *>(
                     std::memchr(p, 0, static_cast<size_t>(end - p)));
                 if (name_end == nullptr) break;
@@ -2047,13 +2075,31 @@ extern "C" void uwsgo_app_publish_batch(
     if (count == 0) {
         return;
     }
+    if (items == nullptr || (bytes_len > 0 && bytes == nullptr)) {
+        return;
+    }
     // One alloc owns the items array + byte blob. The per-publish
     // overhead the single-message path pays (mutex, wakeup, lambda
     // heap-spill) gets amortized across `count` items, which is the
     // whole point of this entry point — the slab-vs-large-alloc
     // wash that pessimized the single-message rewrite doesn't apply
     // here because we're saving N-1 of EVERY other cost too.
+    constexpr size_t max_size = std::numeric_limits<size_t>::max();
+    if (count > max_size / sizeof(uwsgo_batch_item_t)) {
+        return;
+    }
     size_t items_bytes = count * sizeof(uwsgo_batch_item_t);
+    if (bytes_len > max_size - items_bytes) {
+        return;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (items[i].topic_off > bytes_len ||
+                items[i].topic_len > bytes_len - items[i].topic_off ||
+                items[i].message_off > bytes_len ||
+                items[i].message_len > bytes_len - items[i].message_off) {
+            return;
+        }
+    }
     size_t total = items_bytes + bytes_len;
     char *buf = static_cast<char *>(::operator new(total));
     memcpy(buf, items, items_bytes);
