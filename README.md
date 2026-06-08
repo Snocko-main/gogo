@@ -1946,6 +1946,8 @@ parameter registration, worker count settings, and package-level limits.
 `NewTestServer` starts a real loopback listener for integration-style tests.
 `NewTestServerT` is the `testing.TB`-friendly wrapper: it fails the test on
 startup errors and registers `Close` with `t.Cleanup`.
+See [`docs/testing.md`](docs/testing.md) for sync, async, body, middleware,
+WebSocket, graceful shutdown, and test-server serialization guidance.
 
 ```go
 func TestPing(t *testing.T) {
