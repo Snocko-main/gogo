@@ -1811,6 +1811,12 @@ context error; wait for `Run` to return before calling `Close`.
 closes the listen socket and active connections immediately; `Close` frees
 native resources. Shutdown APIs are safe from any goroutine.
 
+Native builds own the uWS loop on an internal locked goroutine. Application
+code does not need `runtime.LockOSThread` for the normal `NewApp` / route
+registration / `Listen` / `Run` / `Close` lifecycle. Register routes,
+middleware, and WebSocket behavior before `Listen` / `Run`; shutdown and
+publish APIs are the cross-goroutine entry points once the loop is running.
+
 `ShutdownGracefully` is an `App` API. `RunMultiCore` currently exposes only
 `MultiCoreHandle.Shutdown`, which stops every worker immediately and may drop
 in-flight responses.

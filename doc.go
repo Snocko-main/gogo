@@ -261,6 +261,10 @@
 // wait for Run to return before calling Close.
 //
 // Shutdown, ShutdownGracefully, and ShutdownContext are safe from any goroutine.
+// Native builds own the uWS loop on an internal locked goroutine, so normal
+// single-app code does not need runtime.LockOSThread. Register routes,
+// middleware, and WebSocket behavior before Listen / Run; shutdown and publish
+// APIs are the supported cross-goroutine entry points once the loop is running.
 //
 // # Performance characteristics
 //

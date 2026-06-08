@@ -11,7 +11,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -43,11 +42,11 @@ type TestServer struct {
 
 var testServerMu sync.Mutex
 
-// NewTestServer starts an App on a free port, runs the setup
-// callback on the loop's locked goroutine, and waits for the
-// listening socket to accept connections before returning. The
-// returned TestServer drives the running App via its http.Client;
-// Close shuts the App down cleanly.
+// NewTestServer starts an App on a free port, runs the setup callback before
+// Listen, and waits for the listening socket to accept connections before
+// returning. Native builds own the uWS loop on an internal locked goroutine, so
+// tests do not need runtime.LockOSThread. The returned TestServer drives the
+// running App via its http.Client; Close shuts the App down cleanly.
 //
 //	ts, err := gogo.NewTestServer(func(app *gogo.App) {
 //	    app.Get("/users/:id", showUser)
@@ -86,13 +85,6 @@ func NewTestServer(setup func(*App)) (*TestServer, error) {
 	runDone := make(chan struct{})
 
 	go func() {
-		// uWS pins each App to the OS thread that created it; the
-		// loop goroutine must own the thread for its entire
-		// lifetime or the framework's Listen / Run / Close calls
-		// will fault.
-		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
-
 		var app *App
 		defer func() {
 			if r := recover(); r != nil {

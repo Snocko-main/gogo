@@ -2666,12 +2666,6 @@ func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, erro
 		runWg.Add(1)
 		go func() {
 			defer runWg.Done()
-			// uWS::Loop is bound to the OS thread that created the App, so
-			// every API call against this App must happen on this thread.
-			// LockOSThread keeps us pinned for the lifetime of Run.
-			runtime.LockOSThread()
-			defer runtime.UnlockOSThread()
-
 			app, err := NewApp()
 			if err != nil {
 				starts <- startResult{idx: idx, err: err}

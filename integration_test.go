@@ -43,9 +43,10 @@ func freePort(t testing.TB) int {
 	return port
 }
 
-// startApp boots an app on a free port, runs the loop on a dedicated OS-locked
-// goroutine (uWS loop is thread-local), waits until the server accepts a
-// connection, and returns a teardown func.
+// startApp boots an app on a free port, waits until the server accepts a
+// connection, and returns a teardown func. Native builds own the uWS loop on an
+// internal locked goroutine, so tests using this helper do not need
+// runtime.LockOSThread.
 func startApp(t testing.TB, configure func(app *gogo.App)) (port int, teardown func()) {
 	t.Helper()
 
@@ -55,11 +56,6 @@ func startApp(t testing.TB, configure func(app *gogo.App)) (port int, teardown f
 	runDone := make(chan struct{})
 
 	go func() {
-		// Loop binding requires every uWS call for this app to happen on the
-		// same OS thread that called uwsgo_app_new.
-		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
-
 		app, err := gogo.NewApp(gogo.Config{BindAddr: "127.0.0.1"})
 		if err != nil {
 			listenErr <- fmt.Errorf("NewApp: %w", err)
@@ -108,6 +104,64 @@ func startApp(t testing.TB, configure func(app *gogo.App)) (port int, teardown f
 		}
 	}
 	return port, teardown
+}
+
+func TestSingleAppOwnsNativeLoopThreadInternally(t *testing.T) {
+	port := freePort(t)
+	app, err := gogo.NewApp(gogo.Config{BindAddr: "127.0.0.1"})
+	if err != nil {
+		t.Fatalf("NewApp: %v", err)
+	}
+	app.Get("/ok", func(res *gogo.Response, req *gogo.Request) {
+		res.Send(200, "text/plain", "ok")
+	})
+	if !app.Listen(port) {
+		app.Close()
+		t.Fatalf("Listen :%d failed", port)
+	}
+
+	runDone := make(chan struct{})
+	go func() {
+		app.Run()
+		close(runDone)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/ok", port))
+		if err == nil {
+			body, readErr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if readErr != nil {
+				app.Shutdown()
+				<-runDone
+				app.Close()
+				t.Fatalf("read body: %v", readErr)
+			}
+			if resp.StatusCode != 200 || string(body) != "ok" {
+				app.Shutdown()
+				<-runDone
+				app.Close()
+				t.Fatalf("response = %d %q, want 200 ok", resp.StatusCode, string(body))
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			app.Shutdown()
+			<-runDone
+			app.Close()
+			t.Fatalf("server did not accept requests: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	app.Shutdown()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not exit after Shutdown")
+	}
+	app.Close()
 }
 
 func TestRunMultiCoreDistributesAcceptedSockets(t *testing.T) {
