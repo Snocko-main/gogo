@@ -54,6 +54,50 @@ func TestJWTValidToken(t *testing.T) {
 	}
 }
 
+func TestJWTValidTokenWithClaimValidationOptions(t *testing.T) {
+	secret := []byte("test-secret-with-enough-bytes-AAAA")
+	tok, err := middleware.SignJWT(middleware.JWTHS256, secret, map[string]any{
+		"iss": "https://issuer.example",
+		"aud": []string{"cli", "api"},
+		"sub": "user-42",
+	})
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.JWT(middleware.JWTOptions{
+			Secret:         secret,
+			Issuer:         "https://issuer.example",
+			Audience:       "api",
+			RequiredClaims: []string{"sub"},
+		}))
+		app.Get("/me", func(res *gogo.Response, req *gogo.Request) {
+			claims, _ := req.Local(middleware.JWTLocalKey).(map[string]any)
+			res.JSON(200, claims)
+		})
+	})
+	defer teardown()
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/me", port), nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("got %d", resp.StatusCode)
+	}
+	var out map[string]any
+	body, _ := io.ReadAll(resp.Body)
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if out["sub"] != "user-42" {
+		t.Errorf("sub: %v", out["sub"])
+	}
+}
+
 func TestJWTMissingToken(t *testing.T) {
 	port, teardown := startApp(t, func(app *gogo.App) {
 		app.Use(middleware.JWT(middleware.JWTOptions{Secret: []byte("secret-secret-secret-secret-AAAA")}))
