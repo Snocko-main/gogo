@@ -124,7 +124,7 @@ accepted as residual risk.
 - [ ] Loop-thread ownership and allowed goroutine/thread usage are documented for
       route registration, `Listen`, `Run`, `Close`, WebSocket send/end, and
       deferred responses.
-- [ ] Shared-dispatch shutdown quiesces active work before native app memory is
+- [x] Shared-dispatch shutdown quiesces active work before native app memory is
       freed.
 - [ ] Native fuzz/stress coverage includes oversized headers, bodies, WebSocket
       frames, malformed subprotocols, aborted streams, and shutdown races.

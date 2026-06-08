@@ -2046,6 +2046,8 @@ app.MethodNotAllowed(func(res *gogo.Response, req *gogo.Request) {
   past the C-side lifetime.
 - Sync handlers run on the uWS loop thread — never block them. Use
   `GetAsync` / `PostAsync` for anything that does IO.
+- Native lifecycle decisions from the v0.3 config pass are recorded in
+  [`docs/native-lifecycle-v0.3.md`](docs/native-lifecycle-v0.3.md).
 - `net/http` middleware is not directly compatible (different signature).
   Adapt with a small wrapper or use the bundled `middleware` package.
 - WebSocket pub/sub topics are exact-match strings — no MQTT-style

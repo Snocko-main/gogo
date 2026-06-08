@@ -1,93 +1,75 @@
-# Native Lifecycle Findings for v0.3
+# Native Lifecycle Status for v0.3
 
-This report maps the current native lifecycle contracts for the v0.3.0 roadmap
-items around uWS loop ownership, shared-dispatch quiescence, and shared handler
-registry lifetime.
+This note records the native lifecycle decisions that were reviewed during the
+v0.3 config pass. It separates decisions that are already implemented from the
+remaining v1 native-boundary follow-ups.
 
-## Findings
+## Closed Decisions
 
-1. **Shared-dispatch app memory can be freed before shared workers are
-   quiescent.**
+### Shared-dispatch quiescence
 
-   `App.Close` frees native app memory through `a.inner.close()` before it
-   drops the app's shared-worker reference and signals workers to exit
-   (`types.go:2439`, `native_enabled.go:217`). Shared workers are intentionally
-   fire-and-forget and may still be running user handlers (`native_enabled.go:221`).
-   Those handlers still hold an `AsyncCtx` that can reference the per-app
-   pending response ring, ctx pool, uWS response pointer, and loop pointer
-   (`uws_bridge.cpp:940`, `uws_bridge.cpp:1332`). `uwsgo_app_free` then deletes
-   the ctx pool and pending ring immediately (`uws_bridge.cpp:1043`). A handler
-   that ignores cancellation and later calls `res.Send` can therefore route
-   through `asyncSendShared` and touch freed native memory
-   (`native_enabled.go:1016`).
+Shared-dispatch state now outlives `App.Close` safely. The native bridge keeps
+per-app shared state behind a ref-counted owner, marks that owner closing before
+free, waits for active shared-ring producers, discards queued response-ring
+entries, and avoids recycling contexts into a pool after close begins.
 
-   This is the release-blocking lifecycle decision. A small reorder is not
-   enough unless `Close` is allowed to block until all shared handlers return.
+This covers the request/response paths that can otherwise outlive the Go app:
 
-2. **Single-app loop ownership is same-thread by implementation but not fully
-   documented or enforced for the public `NewApp` path.**
+- inline shared responses
+- fallback defer-send responses
+- redirects
+- stream start/write/end ownership
+- `PostAsync` body collection when a client aborts before the final body chunk
+- wake-drain and drain-timer callbacks that need the app response ring
 
-   `uwsgo_app_new` captures `uWS::Loop::get()` when the app is created, so the
-   app is bound to the OS thread that called `NewApp` (`uws_bridge.cpp:276`).
-   `RunMultiCore` and `NewTestServer` honor that by locking an OS thread before
-   creating, registering, listening, and running the app (`types.go:2535`,
-   `testing.go:93`). The single-app public docs show `NewApp`, route
-   registration, `Listen`, and `Run` in one goroutine, but they do not explicitly
-   say that route registration / `Listen` / `Run` must stay on the creating
-   OS thread. `Shutdown`, `ShutdownGracefully`, `App.Publish`, and
-   `App.PublishBatch` already use cross-thread defers or native mutexes and are
-   documented as safe from any goroutine.
+The public close contract is still the same: call `Shutdown`,
+`ShutdownGracefully`, or `ShutdownContext` to stop the loop, wait for `Run` to
+return when needed, then call `Close` to free native resources. `Close` is not a
+general cancellation primitive for arbitrary user goroutines; handlers that
+need to stop early should observe `Response.OnAborted` or `Request.Context`.
 
-3. **Shared handler registry lifetime is already a documented process-lifetime
-   retention decision.**
+### Shared handler registry lifetime
 
-   Shared async route registration appends handlers to a process-wide registry
-   and publishes atomic snapshots for lock-free worker reads
-   (`native_enabled.go:64`). The v0.2 global-state audit documents those slots
-   as append-only for the process lifetime, with `SetWorkerCount` and
-   `WaitForSharedWorkers` as the public knobs (`docs/global-state.md:75`).
-   No tombstone or generation cleanup is currently needed for v0.3 unless the
-   project wants bounded handler retention for hosts that create many app
-   instances dynamically.
+Shared async route registration appends handlers to a process-wide registry and
+publishes immutable snapshots for worker reads. The registry is intentionally
+process-lifetime state for v1. This matches the current route model: routes are
+registered at app setup time, and there is no public hot-unregister API.
 
-## Recommended Decisions
+The public operational knobs remain:
 
-- **Loop ownership:** document and eventually enforce the current same-thread
-  single-app contract. Applications should create the app, register routes,
-  call `Listen`, call `Run`, and then call `Close` from the same locked OS
-  thread, or use `RunMultiCore` / `NewTestServer`, which do that internally.
-  Cross-thread operations should remain limited to documented safe methods:
-  `Shutdown`, `ShutdownGracefully`, `Publish`, `PublishBatch`, and loop-deferred
-  response helpers.
+- `SetWorkerCount`, configured before shared workers start
+- `WaitForSharedWorkers`, for tests and supervisors that need to observe worker
+  generation drain
 
-- **Shared handler registry:** keep documented process-lifetime retention for
-  v1 unless a real dynamic-app hosting use case appears. The current append-only
-  registry is simple and matches the no-hot-unregister route model.
+## Remaining Follow-Ups
 
-- **Shared-dispatch quiescence:** choose one explicit close contract before
-  changing runtime behavior:
-  - Blocking close: `Close` stops the last shared worker generation and waits
-    for all active shared handlers to return before freeing native per-app
-    memory. This is simple and safe, but can hang if a handler ignores
-    cancellation.
-  - Non-blocking close with deferred native free: native per-app shared state
-    gets a refcount/quiescer so `Close` can return while memory is freed only
-    after all `AsyncCtx` users release. This preserves fast close but is a
-    larger C++ ownership change.
-  - Documented process-lifetime native retention: shared apps never free the
-    pending ring / ctx pool. This avoids use-after-free but leaks per-app native
-    memory and should be chosen only if dynamic app teardown is out of scope.
+### Single-app loop ownership
 
-## Exact Blockers
+`uwsgo_app_new` captures the uWS loop for the OS thread that creates the app.
+`RunMultiCore` and `NewTestServer` already honor that by creating, registering,
+listening, running, and closing each app on a locked OS thread. The public
+single-app path still needs a v1 owner decision:
 
-- Should `App.Close` be allowed to block indefinitely waiting for shared async
-  handlers that ignored `req.Context()` cancellation?
-- If not, should v0.3 add a deferred-free/refcount design for per-app
-  `PendingRing` and `CtxPool`, or intentionally retain that memory for process
-  lifetime?
-- Should the public API grow a bounded close/shutdown API for this, or should
-  the existing `ShutdownContext(ctx)` roadmap item own the timeout contract?
+- document and enforce same-thread `NewApp` / route registration / `Listen` /
+  `Run` / `Close`, or
+- move single-app ownership behind an internal locked loop goroutine.
 
-## Validation Notes
+Cross-thread methods should remain limited to the explicitly safe APIs that
+defer to the loop or use native synchronization, such as `Shutdown`,
+`ShutdownGracefully`, `ShutdownContext`, `Publish`, `PublishBatch`, and
+deferred async responses.
 
-No runtime or native build behavior was changed by this report.
+### Native boundary audit
+
+The v1 security checklist still tracks broader native-boundary work:
+
+- string, length, and buffer conversion audit
+- snapshot cap documentation for method, URL, query, params, headers, peer IP,
+  and body
+- `cgo.Handle` release coverage
+- native fuzz/stress coverage for oversized inputs, aborted streams, malformed
+  WebSocket handshakes, and shutdown races
+- vendored native dependency and build-tool documentation
+
+Those items are larger than the v0.3 lifecycle decision and should remain
+tracked separately.
