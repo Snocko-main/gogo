@@ -3201,20 +3201,31 @@ func (r *Response) Stream(status int, contentType string, fn func(w io.Writer) e
 	}
 	r.pendingHeaders = r.pendingHeaders[:0]
 
-	// Mark sent so the normal async release path treats this
-	// response as complete — Stream owns its lifecycle from here.
-	r.async.sent = true
+	ctxHandle := r.async.ctxHandle
+	loopPtr := r.async.loopPtr
+	if !asyncDeferStreamStart(loopPtr, ctxHandle, line, contentType, hb.String()) {
+		r.async.sent = true
+		asyncCtxRelease(ctxHandle)
+		return nil
+	}
 
-	asyncDeferStreamStart(r.async.loopPtr, r.async.ctxHandle, line, contentType, hb.String())
+	// Mark sent so the normal async release path treats this response as
+	// complete. Stream owns the original async ctx ref from here; every native
+	// stream operation retains/releases its own defer ref, and the defer below
+	// drops the original ref exactly once even if fn panics.
+	r.async.sent = true
+	defer func() {
+		if !asyncCtxAborted(ctxHandle) {
+			asyncDeferStreamEnd(loopPtr, ctxHandle)
+		}
+		asyncCtxRelease(ctxHandle)
+	}()
 
 	sw := &streamWriter{r: r}
 	fnErr := fn(sw)
-	// Always close — even on user error — so the response doesn't
-	// hang the connection. The user's error is propagated back to
-	// the caller for logging / metrics.
-	if !asyncCtxAborted(r.async.ctxHandle) {
-		asyncDeferStreamEnd(r.async.loopPtr, r.async.ctxHandle)
-	}
+	// The deferred close above runs even on user error so the response doesn't
+	// hang the connection. The user's error is propagated back to the caller for
+	// logging / metrics.
 	return fnErr
 }
 
@@ -3570,26 +3581,16 @@ func (r *Response) Redirect(location string, code int) {
 	r.statusCode = code
 	line := statusLine(code)
 	if r.async != nil && !r.async.sent {
+		if r.dropAsyncIfAborted() {
+			return
+		}
 		r.async.sent = true
-		inner := r.inner
-		// Cached pointer — see sendBytes for why we don't call res.Loop()
-		// from off-loop-thread.
-		loop := loopFromUintptr(r.async.loopPtr)
-		ctx := r.async.ctxHandle
-		loc := location
-		headers := captureResponseHeaders(r.pendingHeaders, nil)
+		headers := captureResponseHeaders(r.pendingHeaders, []responseHeader{{
+			name:  "Location",
+			value: location,
+		}})
 		r.pendingHeaders = r.pendingHeaders[:0]
-		loop.Defer(func() {
-			defer asyncCtxRelease(ctx)
-			inner.cork(func() {
-				inner.status(line)
-				for _, h := range headers {
-					inner.header(h.name, h.value)
-				}
-				inner.header("Location", loc)
-				inner.end("")
-			})
-		})
+		asyncDeferSendWithHeaders(r.async.loopPtr, r.async.ctxHandle, line, "", responseHeadersBlob(headers), "")
 		return
 	}
 	r.inner.status(line)
@@ -3947,24 +3948,15 @@ func (r *Response) sendBytes(code int, headers []responseHeader, body []byte) {
 	r.statusCode = code
 	line := statusLine(code)
 	if r.async != nil && !r.async.sent {
+		if r.dropAsyncIfAborted() {
+			runtime.KeepAlive(body)
+			return
+		}
 		r.async.sent = true
-		loop := loopFromUintptr(r.async.loopPtr)
-		inner := r.inner
-		ctx := r.async.ctxHandle
 		hs := captureResponseHeaders(r.pendingHeaders, headers)
 		r.pendingHeaders = r.pendingHeaders[:0]
-		bs := body
-		loop.Defer(func() {
-			defer asyncCtxRelease(ctx)
-			inner.cork(func() {
-				inner.status(line)
-				for _, h := range hs {
-					inner.header(h.name, h.value)
-				}
-				inner.end(bytesAsString(bs))
-			})
-			runtime.KeepAlive(bs)
-		})
+		asyncDeferSendWithHeaders(r.async.loopPtr, r.async.ctxHandle, line, "", responseHeadersBlob(hs), bytesAsString(body))
+		runtime.KeepAlive(body)
 		return
 	}
 	r.inner.status(line)
@@ -3984,6 +3976,21 @@ func captureResponseHeaders(pending, extra []responseHeader) []responseHeader {
 	out = append(out, pending...)
 	out = append(out, extra...)
 	return out
+}
+
+func responseHeadersBlob(headers []responseHeader) string {
+	if len(headers) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, h := range headers {
+		b.Grow(len(h.name) + len(h.value) + 2)
+		b.WriteString(h.name)
+		b.WriteByte(0)
+		b.WriteString(h.value)
+		b.WriteByte(0)
+	}
+	return b.String()
 }
 
 // bytesAsString aliases body as a Go string without copying. The string
