@@ -292,6 +292,9 @@ typedef struct uwsgo_shared_layout_t {
     size_t ctx_aborted_offset;
     size_t ctx_response_offset;
     size_t ctx_loop_offset;
+    size_t ctx_shared_state_offset;
+    size_t state_closing_offset;
+    size_t state_active_sends_offset;
     // Per-App response ring pointer carried inline in each AsyncCtx so Go's
     // SendShared can push to the right App's ring when multiple Apps run
     // in the same process.

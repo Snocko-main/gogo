@@ -3570,26 +3570,16 @@ func (r *Response) Redirect(location string, code int) {
 	r.statusCode = code
 	line := statusLine(code)
 	if r.async != nil && !r.async.sent {
+		if r.dropAsyncIfAborted() {
+			return
+		}
 		r.async.sent = true
-		inner := r.inner
-		// Cached pointer — see sendBytes for why we don't call res.Loop()
-		// from off-loop-thread.
-		loop := loopFromUintptr(r.async.loopPtr)
-		ctx := r.async.ctxHandle
-		loc := location
-		headers := captureResponseHeaders(r.pendingHeaders, nil)
+		headers := captureResponseHeaders(r.pendingHeaders, []responseHeader{{
+			name:  "Location",
+			value: location,
+		}})
 		r.pendingHeaders = r.pendingHeaders[:0]
-		loop.Defer(func() {
-			defer asyncCtxRelease(ctx)
-			inner.cork(func() {
-				inner.status(line)
-				for _, h := range headers {
-					inner.header(h.name, h.value)
-				}
-				inner.header("Location", loc)
-				inner.end("")
-			})
-		})
+		asyncDeferSendWithHeaders(r.async.loopPtr, r.async.ctxHandle, line, "", responseHeadersBlob(headers), "")
 		return
 	}
 	r.inner.status(line)
@@ -3947,24 +3937,15 @@ func (r *Response) sendBytes(code int, headers []responseHeader, body []byte) {
 	r.statusCode = code
 	line := statusLine(code)
 	if r.async != nil && !r.async.sent {
+		if r.dropAsyncIfAborted() {
+			runtime.KeepAlive(body)
+			return
+		}
 		r.async.sent = true
-		loop := loopFromUintptr(r.async.loopPtr)
-		inner := r.inner
-		ctx := r.async.ctxHandle
 		hs := captureResponseHeaders(r.pendingHeaders, headers)
 		r.pendingHeaders = r.pendingHeaders[:0]
-		bs := body
-		loop.Defer(func() {
-			defer asyncCtxRelease(ctx)
-			inner.cork(func() {
-				inner.status(line)
-				for _, h := range hs {
-					inner.header(h.name, h.value)
-				}
-				inner.end(bytesAsString(bs))
-			})
-			runtime.KeepAlive(bs)
-		})
+		asyncDeferSendWithHeaders(r.async.loopPtr, r.async.ctxHandle, line, "", responseHeadersBlob(hs), bytesAsString(body))
+		runtime.KeepAlive(body)
 		return
 	}
 	r.inner.status(line)
@@ -3984,6 +3965,21 @@ func captureResponseHeaders(pending, extra []responseHeader) []responseHeader {
 	out = append(out, pending...)
 	out = append(out, extra...)
 	return out
+}
+
+func responseHeadersBlob(headers []responseHeader) string {
+	if len(headers) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, h := range headers {
+		b.Grow(len(h.name) + len(h.value) + 2)
+		b.WriteString(h.name)
+		b.WriteByte(0)
+		b.WriteString(h.value)
+		b.WriteByte(0)
+	}
+	return b.String()
 }
 
 // bytesAsString aliases body as a Go string without copying. The string

@@ -13,6 +13,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -123,6 +124,7 @@ struct StaticResponse {
 // so PendingSlot can reference it. Each App allocates one PendingRing on
 // the heap in uwsgo_app_new.
 struct AsyncCtx;
+struct SharedAppState;
 
 constexpr uint64_t RING_SIZE = 4096;
 constexpr uint64_t RING_MASK = RING_SIZE - 1;
@@ -143,6 +145,7 @@ struct PendingRing {
     // handler clears this back to 0 the moment it begins, so any newly
     // arrived ctx after that point will get a fresh wake.
     std::atomic<uint32_t> wake_pending;
+    SharedAppState *owner = nullptr;
 
     void init() {
         for (uint64_t i = 0; i < RING_SIZE; i++) {
@@ -152,6 +155,7 @@ struct PendingRing {
         head.store(0, std::memory_order_relaxed);
         tail.store(0, std::memory_order_relaxed);
         wake_pending.store(0, std::memory_order_relaxed);
+        owner = nullptr;
     }
 };
 
@@ -230,6 +234,27 @@ struct CtxPool {
     }
 };
 
+struct SharedAppState {
+    std::atomic<int> refcount{1};
+    std::atomic<int32_t> closing{0};
+    std::atomic<int32_t> active_sends{0};
+    PendingRing pending_ring;
+    CtxPool ctx_pool;
+
+    void init() {
+        pending_ring.init();
+        pending_ring.owner = this;
+        ctx_pool.init();
+    }
+
+    void retain() {
+        refcount.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void release();
+    ~SharedAppState();
+};
+
 struct uwsgo_app_t {
     std::unique_ptr<uWS::App> app;
     uWS::Loop *loop = nullptr;
@@ -244,6 +269,7 @@ struct uwsgo_app_t {
     // the drain timer on this App's loop can cork+send without crossing
     // threads. Allocated on the heap so multiple App instances within the
     // same process don't share state and don't contend on a global ring.
+    SharedAppState *shared_state = nullptr;
     PendingRing *pending_ring = nullptr;
     struct us_timer_t *drain_timer = nullptr;
 
@@ -279,14 +305,13 @@ extern "C" uwsgo_app_t *uwsgo_app_new(void) {
     // current thread's loop; later teardown calls from any thread defer through
     // this captured loop rather than asking for the *caller's* loop.
     a->loop = uWS::Loop::get();
-    // Allocate this App's response ring up front so multiple App instances
-    // in the same process don't share state and don't contend on a global.
-    a->pending_ring = new PendingRing;
-    a->pending_ring->init();
-    // Allocate the per-App AsyncCtx recycle pool. Empty at start; fills
-    // as requests complete and ctx::release pushes back into it.
-    a->ctx_pool = new CtxPool;
-    a->ctx_pool->init();
+    // Allocate shared-dispatch state separately from uwsgo_app_t so in-flight
+    // shared workers can finish or abort safely even after App.Close frees the
+    // uWS app wrapper.
+    a->shared_state = new SharedAppState;
+    a->shared_state->init();
+    a->pending_ring = &a->shared_state->pending_ring;
+    a->ctx_pool = &a->shared_state->ctx_pool;
     return a;
 }
 
@@ -954,8 +979,8 @@ struct AsyncCtx {
     std::atomic<size_t> stream_pending_bytes{0};
     uWS::HttpResponse<false> *response;
     uWS::Loop *loop = nullptr;  // The loop that owns this response (set at creation time)
+    SharedAppState *state = nullptr;  // Owning shared-dispatch state while this ctx is in flight
     PendingRing *pending_ring = nullptr;  // The response ring this ctx must be pushed onto
-    CtxPool *pool = nullptr;  // Per-App pool to push back into on release; null = always delete
     uint32_t handler_id = 0;  // Used by shared-dispatch path to pick which Go handler runs
 
     // Inline response slots populated by Go via shared-memory writes.
@@ -1007,6 +1032,7 @@ struct AsyncCtx {
         stream_pending_bytes.store(0, std::memory_order_relaxed);
         response = nullptr;
         loop = nullptr;
+        state = nullptr;
         pending_ring = nullptr;
         handler_id = 0;
         inline_status_len = 0;
@@ -1022,40 +1048,81 @@ struct AsyncCtx {
         body_len = 0;
         body_overflow = 0;
         for (uint32_t i = 0; i < SNAP_PARAM_MAX; i++) param_lens[i] = 0;
-        // pool field is sticky across recycles — it points at the same
-        // App's pool for the entire lifetime of this object.
+    }
+
+    bool closed_or_aborted() const {
+        if (aborted.load(std::memory_order_acquire)) {
+            return true;
+        }
+        SharedAppState *s = state;
+        return s != nullptr && s->closing.load(std::memory_order_acquire) != 0;
     }
 
     void release() {
         if (refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            CtxPool *p = pool;  // load before reset clobbers anything
-            if (p) {
+            SharedAppState *s = state;
+            if (s != nullptr && s->closing.load(std::memory_order_acquire) == 0) {
                 reset_for_pool();
-                if (p->push(this)) {
+                if (s->ctx_pool.push(this)) {
+                    s->release();
                     return;  // recycled into pool
                 }
             }
             delete this;
+            if (s != nullptr) {
+                s->release();
+            }
         }
     }
 };
 
-extern "C" void uwsgo_app_free(uwsgo_app_t *app) {
-    if (app->ctx_pool) {
-        // Drain whatever's left in the pool. Pop until empty and delete
-        // each ctx — at app teardown there are no producers, so no
-        // races. Bypass the recycle path (set pool=nullptr) so each
-        // delete really frees.
-        for (;;) {
-            AsyncCtx *ctx = app->ctx_pool->pop();
-            if (!ctx) break;
-            ctx->pool = nullptr;
-            delete ctx;
-        }
-        delete app->ctx_pool;
+SharedAppState::~SharedAppState() {
+    for (;;) {
+        AsyncCtx *ctx = ctx_pool.pop();
+        if (!ctx) break;
+        delete ctx;
     }
-    if (app->pending_ring) {
-        delete app->pending_ring;
+}
+
+void SharedAppState::release() {
+    if (refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        delete this;
+    }
+}
+
+static void discard_pending(PendingRing *ring) {
+    if (ring == nullptr) return;
+    ring->wake_pending.store(0, std::memory_order_release);
+    uint64_t h = ring->head.load(std::memory_order_relaxed);
+    while (true) {
+        PendingSlot *slot = &ring->slots[h & RING_MASK];
+        uint64_t seq = slot->sequence.load(std::memory_order_acquire);
+        if (seq != h + 1) break;
+
+        AsyncCtx *ctx = slot->ctx;
+        slot->ctx = nullptr;
+        slot->sequence.store(h + RING_SIZE, std::memory_order_release);
+        if (ctx != nullptr) {
+            ctx->aborted.store(1, std::memory_order_release);
+            ctx->release();
+        }
+        h++;
+    }
+    ring->head.store(h, std::memory_order_relaxed);
+}
+
+extern "C" void uwsgo_app_free(uwsgo_app_t *app) {
+    if (app->shared_state) {
+        SharedAppState *state = app->shared_state;
+        state->closing.store(1, std::memory_order_release);
+        while (state->active_sends.load(std::memory_order_acquire) > 0) {
+            std::this_thread::yield();
+        }
+        discard_pending(&state->pending_ring);
+        app->shared_state = nullptr;
+        app->pending_ring = nullptr;
+        app->ctx_pool = nullptr;
+        state->release();
     }
     delete app;
 }
@@ -1130,7 +1197,9 @@ extern "C" uwsgo_loop_t *uwsgo_res_begin_async(uwsgo_res_t *res, void **out_ctx)
 
 extern "C" void uwsgo_async_ctx_release(void *ctx_handle) {
     auto *ctx = static_cast<AsyncCtx *>(ctx_handle);
-    ctx->release();
+    if (ctx != nullptr) {
+        ctx->release();
+    }
 }
 
 extern "C" void uwsgo_async_ctx_retain(void *ctx_handle) {
@@ -1145,7 +1214,7 @@ extern "C" int uwsgo_async_ctx_aborted(void *ctx_handle) {
     if (ctx == nullptr) {
         return 1;
     }
-    return ctx->aborted.load(std::memory_order_acquire) ? 1 : 0;
+    return ctx->closed_or_aborted() ? 1 : 0;
 }
 
 extern "C" size_t uwsgo_async_ctx_stream_pending_bytes(void *ctx_handle) {
@@ -1184,6 +1253,9 @@ extern "C" void uwsgo_shared_layout(uwsgo_shared_layout_t *out) {
     out->ctx_aborted_offset = offsetof(AsyncCtx, aborted);
     out->ctx_response_offset = offsetof(AsyncCtx, response);
     out->ctx_loop_offset = offsetof(AsyncCtx, loop);
+    out->ctx_shared_state_offset = offsetof(AsyncCtx, state);
+    out->state_closing_offset = offsetof(SharedAppState, closing);
+    out->state_active_sends_offset = offsetof(SharedAppState, active_sends);
     out->ctx_pending_ring_offset = offsetof(AsyncCtx, pending_ring);
     out->ctx_inline_status_cap = INLINE_STATUS_CAP;
     out->ctx_inline_ct_cap = INLINE_CT_CAP;
@@ -1330,13 +1402,15 @@ static bool enqueue_ctx(AsyncCtx *ctx, uWS::HttpResponse<false> *res) {
 // dispatch handlers — keeps the pool / handler_id / loop wiring
 // in one place.
 static AsyncCtx *acquire_shared_ctx(uwsgo_app_t *app, uWS::HttpResponse<false> *res, uint32_t handler_id) {
+    SharedAppState *state = app->shared_state;
+    state->retain();
     AsyncCtx *ctx = app->ctx_pool ? app->ctx_pool->pop() : nullptr;
     if (!ctx) {
         ctx = new AsyncCtx;
-        ctx->pool = app->ctx_pool;
     }
     ctx->response = res;
     ctx->loop = uWS::Loop::get();
+    ctx->state = state;
     ctx->pending_ring = app->pending_ring;
     ctx->handler_id = handler_id;
     return ctx;
@@ -1390,7 +1464,7 @@ extern "C" void uwsgo_app_post_shared(uwsgo_app_t *app, const char *pattern,
             hold.ctx->aborted.store(1, std::memory_order_release);
         });
         res->onData([ctx, res, max_body](std::string_view chunk, bool isLast) mutable {
-            if (ctx->aborted.load(std::memory_order_acquire)) {
+            if (ctx->closed_or_aborted()) {
                 // Client gone — drop the ctx, no enqueue. release()
                 // here mirrors the onAborted increment so refcount
                 // stays balanced.
@@ -1451,7 +1525,7 @@ static void drain_pending(PendingRing *ring) {
         AsyncCtx *ctx = slot->ctx;
         slot->sequence.store(h + RING_SIZE, std::memory_order_release);
 
-        if (!ctx->aborted.load(std::memory_order_acquire)) {
+        if (!ctx->closed_or_aborted()) {
             auto *r = ctx->response;
             r->cork([r, ctx]() {
                 if (ctx->inline_status_len > 0) {
@@ -1478,7 +1552,18 @@ static void drain_pending(PendingRing *ring) {
 extern "C" void uwsgo_wake_drain(uwsgo_loop_t *loop, void *ring) {
     auto *l = reinterpret_cast<uWS::Loop *>(loop);
     auto *r = reinterpret_cast<PendingRing *>(ring);
-    l->defer([r]() { drain_pending(r); });
+    SharedAppState *state = r ? r->owner : nullptr;
+    if (state != nullptr) {
+        state->retain();
+    }
+    l->defer([state, r]() {
+        if (state != nullptr) {
+            drain_pending(&state->pending_ring);
+            state->release();
+            return;
+        }
+        drain_pending(r);
+    });
 }
 
 // uwsgo_app_start_drain installs a periodic safety-net drain timer on this
@@ -1516,9 +1601,14 @@ extern "C" void uwsgo_res_defer_send(
     buf.body = dup_to_c_heap(body, body_len);
     buf.body_len = body_len;
 
+    if (ctx == nullptr || ctx->closed_or_aborted()) {
+        if (ctx != nullptr) ctx->release();
+        return;
+    }
+
     // The defer lambda takes ownership of Go's ctx ref (no extra retain).
     l->defer([ctx, sb = std::move(buf)]() mutable {
-        if (ctx->aborted.load(std::memory_order_acquire)) {
+        if (ctx->closed_or_aborted()) {
             ctx->release();
             return;
         }
@@ -1587,8 +1677,13 @@ extern "C" void uwsgo_res_defer_send_with_headers(
     buf.body = dup_to_c_heap(body, body_len);
     buf.body_len = body_len;
 
+    if (ctx == nullptr || ctx->closed_or_aborted()) {
+        if (ctx != nullptr) ctx->release();
+        return;
+    }
+
     l->defer([ctx, sb = std::move(buf)]() mutable {
-        if (ctx->aborted.load(std::memory_order_acquire)) {
+        if (ctx->closed_or_aborted()) {
             ctx->release();
             return;
         }
@@ -1638,6 +1733,9 @@ extern "C" void uwsgo_res_defer_stream_start(
     const char *headers_blob, size_t headers_len) {
     auto *l = reinterpret_cast<uWS::Loop *>(loop);
     auto *ctx = static_cast<AsyncCtx *>(ctx_handle);
+    if (ctx == nullptr || ctx->closed_or_aborted()) {
+        return;
+    }
     ctx->retain();
 
     SendBufferWithHeaders buf;
@@ -1651,7 +1749,7 @@ extern "C" void uwsgo_res_defer_stream_start(
     buf.body_len = 0;
 
     l->defer([ctx, sb = std::move(buf)]() mutable {
-        if (ctx->aborted.load(std::memory_order_acquire)) {
+        if (ctx->closed_or_aborted()) {
             ctx->release();
             return;
         }
@@ -1695,6 +1793,9 @@ extern "C" void uwsgo_res_defer_stream_write(
     const char *chunk, size_t chunk_len) {
     auto *l = reinterpret_cast<uWS::Loop *>(loop);
     auto *ctx = static_cast<AsyncCtx *>(ctx_handle);
+    if (ctx == nullptr || ctx->closed_or_aborted()) {
+        return;
+    }
     ctx->retain();
     ctx->stream_pending_bytes.fetch_add(chunk_len, std::memory_order_acq_rel);
 
@@ -1702,7 +1803,7 @@ extern "C" void uwsgo_res_defer_stream_write(
     size_t copy_len = chunk_len;
 
     l->defer([ctx, chunk_copy, copy_len]() mutable {
-        if (ctx->aborted.load(std::memory_order_acquire)) {
+        if (ctx->closed_or_aborted()) {
             if (chunk_copy) std::free(chunk_copy);
             ctx->stream_pending_bytes.fetch_sub(copy_len, std::memory_order_acq_rel);
             ctx->release();
@@ -1725,10 +1826,13 @@ extern "C" void uwsgo_res_defer_stream_end(
     void *ctx_handle) {
     auto *l = reinterpret_cast<uWS::Loop *>(loop);
     auto *ctx = static_cast<AsyncCtx *>(ctx_handle);
+    if (ctx == nullptr || ctx->closed_or_aborted()) {
+        return;
+    }
     ctx->retain();
 
     l->defer([ctx]() mutable {
-        if (ctx->aborted.load(std::memory_order_acquire)) {
+        if (ctx->closed_or_aborted()) {
             ctx->release();
             return;
         }
