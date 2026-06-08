@@ -8,9 +8,10 @@ import (
 )
 
 // WebSocketAuthOptions configures the WebSocketAuth helper. Every
-// field is optional; the zero value still installs a baseline
-// Origin-allow-list check, which is the minimum defense against
-// Cross-Site WebSocket Hijacking (CSWSH).
+// field is optional; the zero value rejects every handshake until the
+// application opts into either explicit browser origins or missing-Origin
+// CLI/service clients. That fail-closed default is the minimum defense
+// against Cross-Site WebSocket Hijacking (CSWSH).
 //
 // CSWSH is the WebSocket equivalent of CSRF: a third-party page the
 // user has open can open ws://yoursite/... from the browser and ride
@@ -26,10 +27,11 @@ import (
 // while still benefiting from the standard Origin gate.
 type WebSocketAuthOptions struct {
 	// AllowedOrigins is the exact-match list of permitted Origin
-	// header values. Empty means "no Origin header AND no Sec-
-	// WebSocket-Origin header" is required — i.e. CLI clients only,
-	// no browser. To allow browser clients from a specific site,
-	// list it explicitly: []string{"https://app.example.com"}.
+	// header values. Empty means no browser Origin is allowed. A
+	// handshake with neither Origin nor legacy Sec-WebSocket-Origin
+	// is still rejected unless AllowMissingOrigin is true. To allow
+	// browser clients from a specific site, list it explicitly:
+	// []string{"https://app.example.com"}.
 	//
 	// Matching is case-insensitive. Trailing slashes are ignored.
 	// The literal "*" is treated as "allow any origin" and is
@@ -78,7 +80,10 @@ type WebSocketAuthOptions struct {
 
 // WebSocketAuth returns an Upgrade callback that gates incoming
 // WebSocket handshakes against an Origin allow-list and an optional
-// app-supplied Verify check. Attach it to WebSocketBehavior.Upgrade:
+// app-supplied Verify check. With zero-value options it rejects every
+// handshake; configure AllowedOrigins for browsers and set
+// AllowMissingOrigin only for non-browser clients that omit Origin.
+// Attach it to WebSocketBehavior.Upgrade:
 //
 //	app.WebSocket("/ws", gogo.WebSocketBehavior{
 //	    Upgrade: middleware.WebSocketAuth(middleware.WebSocketAuthOptions{

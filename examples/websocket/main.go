@@ -1,8 +1,9 @@
 // websocket demonstrates a browser-friendly WebSocket route:
 //
 //   - GET / serves a tiny HTML client.
-//   - WebSocket /ws upgrades only allowed origins.
-//   - Upgrade stashes per-connection state with SetUserData.
+//   - WebSocket /ws uses middleware.WebSocketAuth for origin, token, and
+//     subprotocol checks.
+//   - Upgrade verification returns per-connection state as UserData.
 //   - Open subscribes each connection to a room.
 //   - Message publishes text frames to the other subscribers.
 //
@@ -14,7 +15,7 @@
 //
 // Or connect from the CLI:
 //
-//	websocat 'ws://localhost:3004/ws?name=cli&room=general'
+//	websocat -H='Origin: http://localhost:3004' -H='Sec-WebSocket-Protocol: chat.v1' 'ws://localhost:3004/ws?name=cli&room=general&token=demo-local-token'
 package main
 
 import (
@@ -23,6 +24,13 @@ import (
 	"time"
 
 	gogo "github.com/Snocko-main/gogo"
+	"github.com/Snocko-main/gogo/middleware"
+)
+
+const (
+	allowedOrigin = "http://localhost:3004"
+	demoToken     = "demo-local-token"
+	subprotocol   = "chat.v1"
 )
 
 const indexHTML = `<!doctype html>
@@ -41,7 +49,8 @@ const msg = document.getElementById('msg');
 const form = document.getElementById('form');
 const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
 const name = 'browser-' + Math.random().toString(16).slice(2, 6);
-const ws = new WebSocket(scheme + '://' + location.host + '/ws?name=' + name + '&room=general');
+const params = new URLSearchParams({ name, room: 'general', token: 'demo-local-token' });
+const ws = new WebSocket(scheme + '://' + location.host + '/ws?' + params, 'chat.v1');
 
 function line(text) {
     const li = document.createElement('li');
@@ -83,35 +92,48 @@ func main() {
 	defer hub.Close()
 
 	hub.WebSocket(app, "/ws", gogo.WebSocketBehavior{
-		Upgrade: func(ctx *gogo.UpgradeContext) {
-			origin := ctx.Header("origin")
-			if origin != "" && origin != "http://localhost:3004" {
-				ctx.Reject(403, "bad origin")
-				return
-			}
+		Upgrade: middleware.WebSocketAuth(middleware.WebSocketAuthOptions{
+			AllowedOrigins:      []string{allowedOrigin},
+			AllowedSubprotocols: []string{subprotocol},
+			Verify: func(ctx *gogo.UpgradeContext) (any, bool, int, string) {
+				if ctx.QueryParam("token") != demoToken {
+					return nil, false, 401, "bad token"
+				}
 
-			name := strings.TrimSpace(ctx.QueryParam("name"))
-			if name == "" {
-				name = "guest"
-			}
-			room := strings.TrimSpace(ctx.QueryParam("room"))
-			if room == "" {
-				room = "general"
-			}
-			ctx.SetUserData(&clientInfo{Name: name, Room: room})
-			ctx.Accept("")
-		},
+				// This demo uses a static query token so it can run without
+				// a login system. Browser production apps usually issue a
+				// short-lived signed cookie or one-time WebSocket ticket.
+				name := strings.TrimSpace(ctx.QueryParam("name"))
+				if name == "" {
+					name = "guest"
+				}
+				room := strings.TrimSpace(ctx.QueryParam("room"))
+				if room == "" {
+					room = "general"
+				}
+				return &clientInfo{Name: name, Room: room}, true, 0, ""
+			},
+		}),
 		Open: func(ws *gogo.WebSocket) {
 			info := ws.UserData().(*clientInfo)
 			topic := "room." + info.Room
-			hub.Subscribe(ws, topic)
+			if !hub.Subscribe(ws, topic) {
+				log.Printf("subscribe failed for %s to %s", info.Name, topic)
+				ws.End(1011, "subscribe failed")
+				return
+			}
 			log.Printf("%s connected to %s", info.Name, topic)
-			ws.SendText("welcome, " + info.Name + " (" + topic + ")\n")
+			if !ws.SendText("welcome, " + info.Name + " (" + topic + ")\n") {
+				log.Printf("welcome send rejected for %s", info.Name)
+				ws.End(1013, "backpressure")
+			}
 		},
 		Message: func(ws *gogo.WebSocket, msg []byte, op gogo.OpCode) {
 			info := ws.UserData().(*clientInfo)
 			if op != gogo.Text {
-				ws.SendText("binary frames are not handled by this demo\n")
+				if !ws.SendText("binary frames are not handled by this demo\n") {
+					log.Printf("binary warning send rejected for %s", info.Name)
+				}
 				return
 			}
 			text := strings.TrimSpace(string(msg))
@@ -119,7 +141,10 @@ func main() {
 				return
 			}
 			topic := "room." + info.Room
-			ws.SendText("you: " + text + "\n")
+			if !ws.SendText("you: " + text + "\n") {
+				log.Printf("echo send rejected for %s", info.Name)
+				return
+			}
 			if err := hub.PublishFrom(ws, topic, []byte(info.Name+": "+text+"\n"), gogo.Text); err != nil {
 				log.Printf("publish: %v", err)
 			}

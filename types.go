@@ -272,13 +272,20 @@ const (
 )
 
 // WebSocketBehavior contains callbacks and per-route limits for a
-// WebSocket endpoint. Limit fields default to safe production values
-// when zero — pick explicit numbers when you need different limits, do
-// not leave them at zero hoping for "unlimited".
+// WebSocket endpoint. Callbacks run on the owning uWS loop thread and
+// must not block. Limit fields default to safe production values when
+// zero; pick explicit numbers when you need different limits, do not
+// leave them at zero hoping for "unlimited".
 type WebSocketBehavior struct {
-	Open    func(*WebSocket)
+	// Open runs after the handshake succeeds.
+	Open func(*WebSocket)
+
+	// Message runs for incoming text and binary messages.
 	Message func(*WebSocket, []byte, OpCode)
-	Close   func(*WebSocket, int, []byte)
+
+	// Close runs after the connection closes. Use it for cleanup only;
+	// the socket is no longer a live send target.
+	Close func(*WebSocket, int, []byte)
 
 	app *App
 
@@ -294,13 +301,16 @@ type WebSocketBehavior struct {
 	// MaxBackpressure is the bytes uWS will queue per-socket for a
 	// slow consumer before closing the connection. Protects the
 	// loop from being held hostage by a single non-draining client.
-	// Default 64 KiB.
+	// Default 64 KiB. The public WebSocket API exposes this cap and
+	// the bool returned by Send / SendText; it does not expose a
+	// per-socket BufferedAmount, AwaitDrain, or drain callback.
 	MaxBackpressure int
 
 	// DisablePings turns off uWS's built-in ping/pong keepalive.
 	// Default (zero) leaves automatic pings ON so an idle connection
 	// doesn't get reaped by NAT boxes; set true only if your client
-	// drives its own ping protocol.
+	// drives its own heartbeat. Ping/pong callbacks are not part of
+	// the public API; use Message for application-level heartbeats.
 	DisablePings bool
 
 	// UnsafeAutoUpgrade restores uWS's legacy default of accepting every
@@ -6126,24 +6136,32 @@ func parseSingleQueryParam(q, name string) string {
 	return ""
 }
 
-// WebSocket wraps a uWebSockets WebSocket connection.
+// WebSocket wraps a uWebSockets WebSocket connection. Its methods touch
+// uWS loop-thread-local state; use them only from WebSocket callbacks on
+// the owning loop. Do not retain a WebSocket and call Send / SendText /
+// End from worker goroutines. For cross-goroutine fan-out use App.Publish,
+// App.PublishBatch, or WSHub.
 type WebSocket struct {
 	inner    websocketNative
 	app      *App
 	hubToken atomic.Uint64
 }
 
-// Send sends a WebSocket message.
+// Send sends a WebSocket message from the owning uWS loop thread. It
+// returns false when uWS did not queue the message, for example because
+// the socket is closing or already above its backpressure limit.
 func (ws *WebSocket) Send(message []byte, opcode OpCode) bool {
 	return ws.inner.send(message, opcode)
 }
 
-// SendText sends a text WebSocket message.
+// SendText sends a text WebSocket message from the owning uWS loop thread.
+// It returns false under the same conditions as Send.
 func (ws *WebSocket) SendText(message string) bool {
 	return ws.inner.sendString(message, Text)
 }
 
-// End closes the WebSocket connection.
+// End closes the WebSocket connection from the owning uWS loop thread.
+// Calling End from a worker goroutine is not supported.
 func (ws *WebSocket) End(code int, message string) {
 	ws.inner.end(code, message)
 }
