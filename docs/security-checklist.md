@@ -32,9 +32,9 @@ need to choose their own values, origins, secrets, proxy ranges, and limits.
 - [x] `TrustProxy` defaults off, and `TrustedProxies` provides an IP/CIDR
       allow-list for deployments where only specific immediate peers may supply
       forwarded headers.
-- [x] `req.Protocol()`, `req.Secure()`, and `req.IPs()` ignore forwarded
-      headers unless the immediate peer is trusted by `TrustProxy` or
-      `TrustedProxies`.
+- [x] `req.Protocol()`, `req.Secure()`, and `req.IPs()` honor forwarded
+      headers only when the immediate peer is trusted by `TrustProxy` or
+      `TrustedProxies`; `req.IP()` always reports the immediate TCP peer.
 - [x] `TrustedProxies` automatically enables peer-IP capture so async and
       shared-dispatch routes can decide whether forwarded headers are trusted.
 - [x] README and `docs/configuration.md` document that the trusted edge must
@@ -46,6 +46,19 @@ need to choose their own values, origins, secrets, proxy ranges, and limits.
       Caddy, Cloudflare, and load balancers, or link to accepted residual risk.
 
 ## WebSocket Origin And Auth
+
+### v0.5 Frozen API Decisions
+
+- WebSocket backpressure visibility remains limited to `MaxBackpressure` and
+  the `bool` returned by `WebSocket.Send` / `SendText`. There is no public
+  per-socket buffered-byte sampler, drain callback, or `AwaitDrain` API before
+  v1.
+- Ping/pong callbacks are not part of the public v0.5 API. Keep automatic
+  pings enabled unless the application implements its own heartbeat at the
+  message layer.
+- `WebSocket.Send`, `SendText`, and `End` are loop-thread APIs. Call them from
+  WebSocket callbacks on the owning loop; use `App.Publish`, `App.PublishBatch`,
+  or `WSHub` for cross-goroutine fan-out.
 
 - [x] The nil `Upgrade` default accepts non-browser clients that omit `Origin`
       and rejects browser-style handshakes that include `Origin` unless an
@@ -59,6 +72,8 @@ need to choose their own values, origins, secrets, proxy ranges, and limits.
       upgrade path and calls out CSWSH risk.
 - [ ] Every browser-capable WebSocket route installs an explicit `Upgrade`
       callback, preferably `middleware.WebSocketAuth`.
+- [ ] `UnsafeAutoUpgrade` is absent from authenticated or cookie-bearing
+      endpoints; any use is documented as public and intentionally cross-origin.
 - [ ] Browser WebSocket origins are allow-listed exactly. `AllowedOrigins` set
       to `[]string{"*"}` appears only on public endpoints that do not rely on
       cookies, bearer headers, or other ambient credentials.
@@ -113,6 +128,8 @@ need to choose their own values, origins, secrets, proxy ranges, and limits.
       `SetCookieSigned`/`SignCookieValue` or map to server-side session state.
 - [ ] Cookie, session, and CSRF secrets have a rotation procedure that accepts
       old keys only for the necessary expiry window.
+- [ ] Cookie-authenticated unsafe methods use CSRF protection or document why
+      they are not reachable from browsers.
 - [ ] Horizontally scaled deployments use Redis, SQL, or another shared
       `SessionStore`; in-memory sessions are limited to single-process apps or
       accepted residual risk.
