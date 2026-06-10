@@ -2187,7 +2187,8 @@ app.MethodNotAllowed(func(res *gogo.Response, req *gogo.Request) {
 - [`examples/upload`](examples/upload) — POST body collection with 413 + streaming OnData
 - [`examples/sse`](examples/sse) — Server-Sent Events with reconnect resume
 - [`examples/websocket`](examples/websocket) — browser WebSocket + upgrade gate + pub/sub
-- [`examples/multicore`](examples/multicore) — `RunMultiCore` + `/metrics` + graceful shutdown
+- [`examples/multicore`](examples/multicore) — `RunMultiCore` + `/metrics` + immediate group shutdown
+- [`examples/graceful`](examples/graceful) — OS signals + single-app graceful drain
 - [`examples/httpadapter`](examples/httpadapter) — stdlib expvar + pprof through `HTTPAdapter`
 
 ## Why There Is a C++ Bridge
