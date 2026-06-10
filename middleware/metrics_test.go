@@ -3,9 +3,7 @@
 package middleware_test
 
 import (
-	"fmt"
 	"io"
-	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -181,15 +179,23 @@ func TestMetricsHistogramBuckets(t *testing.T) {
 // TestMetricsObservationHook fires the OnObservation callback for
 // every instrumented request — the hook is the OTel wiring point.
 func TestMetricsObservationHook(t *testing.T) {
+	type observation struct {
+		method string
+		status string
+		dur    time.Duration
+	}
 	var (
-		mu          sync.Mutex
-		observations []string
+		mu           sync.Mutex
+		observations []observation
 	)
 	m := middleware.NewMetrics(middleware.MetricsOptions{
 		OnObservation: func(method, status string, dur time.Duration) {
 			mu.Lock()
-			observations = append(observations, fmt.Sprintf("%s %s %dms",
-				method, status, dur.Milliseconds()))
+			observations = append(observations, observation{
+				method: method,
+				status: status,
+				dur:    dur,
+			})
 			mu.Unlock()
 		},
 	})
@@ -211,12 +217,15 @@ func TestMetricsObservationHook(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(observations) < 3 {
-		t.Errorf("OnObservation fired %d times, want >= 3: %v", len(observations), observations)
+	if len(observations) != 3 {
+		t.Errorf("OnObservation fired %d times, want 3: %v", len(observations), observations)
 	}
-	for _, line := range observations {
-		if !strings.HasPrefix(line, "get 200") {
-			t.Errorf("observation %q doesn't start with 'get 200'", line)
+	for _, obs := range observations {
+		if obs.method != "GET" || obs.status != "200" {
+			t.Errorf("observation labels = %s/%s, want GET/200", obs.method, obs.status)
+		}
+		if obs.dur < 0 {
+			t.Errorf("observation duration = %v, want non-negative", obs.dur)
 		}
 	}
 }
@@ -270,6 +279,3 @@ func TestMetricsObserveBytes(t *testing.T) {
 		t.Errorf("BytesIn = %d, want 50", snap.BytesIn)
 	}
 }
-
-// keep http import live in case future tests reach for it.
-var _ = http.StatusOK

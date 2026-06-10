@@ -1007,6 +1007,9 @@ app.Use(metrics.Middleware())
 app.Get("/metrics", metrics.Handler())
 ```
 
+See [Metrics And OpenTelemetry](docs/metrics.md) for the stable metric names,
+labels, bucket contract, and OpenTelemetry integration guidance.
+
 Use `AllowOrigins: []string{"*"}` only by itself for public APIs. gogo
 panics at startup if `"*"` is mixed with explicit origins, or combined with
 `AllowCredentials`, so ambiguous CORS policy fails before serving traffic.

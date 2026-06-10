@@ -1,6 +1,7 @@
-// Built-in observability — Prometheus-format metrics + an OTel hook
-// that fires per request so callers can wire any tracer they
-// already use without forcing the OTel dependency on gogo.
+// Built-in observability — Prometheus-format metrics plus a small
+// observation hook that fires per request so callers can wire any
+// tracer they already use without forcing an OpenTelemetry dependency
+// on gogo.
 //
 // The exposed surface is intentionally narrow:
 //
@@ -12,8 +13,9 @@
 // per-route tagging by default — the per-URL cardinality of a
 // real-world router would blow up Prometheus storage). Status
 // codes are tagged because the set is bounded; method tagging
-// likewise. Users who need per-route metrics can extend OnObservation
-// in MetricsOptions.
+// likewise. Users who need per-route metrics or OpenTelemetry spans
+// can extend OnObservation in MetricsOptions or add their own
+// middleware where route templates are available.
 
 package middleware
 
@@ -21,6 +23,7 @@ import (
 	"fmt"
 	"math"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -63,8 +66,10 @@ type MetricsOptions struct {
 	Subsystem string
 
 	// OnObservation fires after every request the middleware
-	// instruments. Hook callers wire this to their tracer of
-	// choice (OpenTelemetry, Datadog, etc.) without dragging the
+	// instruments. It receives the same bounded method/status label
+	// values used by the Prometheus output and never receives path or
+	// route labels by default. Hook callers wire this to their tracer
+	// of choice (OpenTelemetry, Datadog, etc.) without dragging the
 	// SDK into gogo's dependency tree. The callback runs inline on
 	// the handler goroutine — keep it non-blocking; spawn a
 	// goroutine yourself if the export crosses the network.
@@ -91,10 +96,10 @@ type Metrics struct {
 	startedAt time.Time
 
 	// statusCounts and methodCounts are tagged counters. Use
-	// sync.Map because the universe of (method, status) values is
-	// effectively bounded — Map's amortized read cost matches a
-	// plain map under low write churn (allocation only on first
-	// observation of each tag).
+	// sync.Map because the universe of normalized (method, status)
+	// values is bounded — Map's amortized read cost matches a plain
+	// map under low write churn (allocation only on first observation
+	// of each tag).
 	statusCounts sync.Map // string → *atomic.Int64
 	methodCounts sync.Map // string → *atomic.Int64
 }
@@ -242,23 +247,31 @@ func (m *Metrics) observe(method string, status int, dur time.Duration) {
 	// +Inf bucket always increments.
 	m.bucketCounts[len(m.bucketLE)].Add(1)
 
-	statusStr := strconv.Itoa(status)
-	bumpTagged(&m.statusCounts, statusStr)
-	bumpTagged(&m.methodCounts, metricsMethodLabel(method))
+	statusLabel := metricsStatusLabel(status)
+	methodLabel := metricsMethodLabel(method)
+	bumpTagged(&m.statusCounts, statusLabel)
+	bumpTagged(&m.methodCounts, methodLabel)
 
 	if m.opts.OnObservation != nil {
-		m.opts.OnObservation(method, statusStr, dur)
+		m.opts.OnObservation(methodLabel, statusLabel, dur)
 	}
 }
 
 func metricsMethodLabel(method string) string {
 	upper := strings.ToUpper(method)
 	switch upper {
-	case "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "CONNECT", "TRACE":
+	case "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "CONNECT", "TRACE", "QUERY":
 		return upper
 	default:
 		return "OTHER"
 	}
+}
+
+func metricsStatusLabel(status int) string {
+	if status < 100 || status > 999 {
+		return "OTHER"
+	}
+	return strconv.Itoa(status)
 }
 
 // bumpTagged increments the counter for tag, creating it on first
@@ -271,6 +284,26 @@ func bumpTagged(m *sync.Map, tag string) {
 		v, _ = m.LoadOrStore(tag, &counter)
 	}
 	v.(*atomic.Int64).Add(1)
+}
+
+type metricTagCount struct {
+	tag   string
+	count int64
+}
+
+func sortedTaggedCounts(m *sync.Map) []metricTagCount {
+	var counts []metricTagCount
+	m.Range(func(k, v any) bool {
+		counts = append(counts, metricTagCount{
+			tag:   k.(string),
+			count: v.(*atomic.Int64).Load(),
+		})
+		return true
+	})
+	sort.Slice(counts, func(i, j int) bool {
+		return counts[i].tag < counts[j].tag
+	})
+	return counts
 }
 
 // ObserveBytesOut records bytes written for the current request.
@@ -356,18 +389,16 @@ func (m *Metrics) render() string {
 	statusName := prefix + "requests_total"
 	b.WriteString("# HELP " + statusName + " Total HTTP requests grouped by status.\n")
 	b.WriteString("# TYPE " + statusName + " counter\n")
-	m.statusCounts.Range(func(k, v any) bool {
-		fmt.Fprintf(&b, "%s{status=%q} %d\n", statusName, k.(string), v.(*atomic.Int64).Load())
-		return true
-	})
+	for _, tc := range sortedTaggedCounts(&m.statusCounts) {
+		fmt.Fprintf(&b, "%s{status=%q} %d\n", statusName, tc.tag, tc.count)
+	}
 
 	methodName := prefix + "requests_method_total"
 	b.WriteString("# HELP " + methodName + " Total HTTP requests grouped by method.\n")
 	b.WriteString("# TYPE " + methodName + " counter\n")
-	m.methodCounts.Range(func(k, v any) bool {
-		fmt.Fprintf(&b, "%s{method=%q} %d\n", methodName, k.(string), v.(*atomic.Int64).Load())
-		return true
-	})
+	for _, tc := range sortedTaggedCounts(&m.methodCounts) {
+		fmt.Fprintf(&b, "%s{method=%q} %d\n", methodName, tc.tag, tc.count)
+	}
 
 	// request_duration_seconds — histogram + sum + count
 	durName := prefix + "request_duration_seconds"
