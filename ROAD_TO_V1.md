@@ -222,13 +222,13 @@ files in the same PR unless one agent is explicitly assigned as integrator.
 
 ## v0.9.0 - v1 Release Candidate
 
-- [ ] Freeze public API list.
-- [ ] Audit every exported symbol for naming, behavior, and compatibility.
-- [ ] Audit README, `doc.go`, examples, and generated package docs.
-- [ ] Run stress and race suites.
-- [ ] Run downstream smoke tests from a clean module.
-- [ ] Tag `v1.0.0-rc.1`.
-- [ ] Accept only blocker fixes or explicitly approved v1-readiness changes.
+- [x] Freeze public API list.
+- [x] Audit every exported symbol for naming, behavior, and compatibility.
+- [x] Audit README, `doc.go`, examples, and generated package docs.
+- [x] Run stress and race suites.
+- [x] Run downstream smoke tests from a clean module.
+- [x] Tag `v1.0.0-rc.1`.
+- [x] Accept only blocker fixes or explicitly approved v1-readiness changes.
 
 ## v1.0.0 Criteria
 
