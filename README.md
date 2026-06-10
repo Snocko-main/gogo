@@ -120,6 +120,10 @@ sudo dnf install -y gcc gcc-c++ zlib-devel
 sudo apk add build-base zlib-dev
 ```
 
+On macOS, Command Line Tools is the smallest supported setup; full Xcode also
+works. Homebrew LLVM/zlib can be used for a custom toolchain, but the Apple SDK
+and linker still need to come from Command Line Tools or Xcode.
+
 Add gogo to your app:
 
 ```sh

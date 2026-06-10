@@ -48,6 +48,11 @@ sudo dnf install -y gcc gcc-c++ zlib-devel
 sudo apk add build-base zlib-dev
 ```
 
+On macOS, Apple Command Line Tools is the smallest supported setup because it
+provides the SDK and linker that cgo expects. Full Xcode also works.
+Homebrew-provided `llvm` or `zlib` can be used for a custom toolchain, but the
+Apple SDK/linker still needs to come from Command Line Tools or Xcode.
+
 Native builds are intended for macOS and Linux. Without `-tags gogo`, the
 package still compiles a stub so normal Go tooling can inspect packages, but
 `NewApp` returns a setup error instead of starting uWebSockets.
