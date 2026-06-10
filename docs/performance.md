@@ -7,8 +7,8 @@ README.
 
 For the v1 reproducibility gate, see
 [`docs/v1-benchmark-baseline.md`](v1-benchmark-baseline.md). That page records
-the exact baseline and smoke commands, the environment notes, the inline smoke
-summary from 2026-06-10, and how to capture fresh raw logs.
+the exact baseline and smoke commands, environment notes, pass/fail smoke
+evidence from 2026-06-10, and how to capture fresh raw logs.
 
 ## v0.7 HTTP Baseline
 

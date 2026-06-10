@@ -2,13 +2,14 @@
 
 This page is the v1 evidence target for the roadmap criterion "Benchmark
 baseline is reproducible." It documents the benchmark commands, environment
-notes, result locations, and a short local smoke run that proves the HTTP
+notes, result locations, and short local smoke commands that prove the HTTP
 baseline harness can be rerun from a clean checkout.
 
-Treat the numbers below as reproducibility evidence, not capacity guidance.
-The smoke run used one-second `wrk` windows on a developer laptop, so the
-absolute throughput is intentionally noisy. For performance claims, rerun the
-full command in a quiet release environment and keep the raw logs.
+The short smoke commands below are pass/fail checks for the benchmark harness.
+They intentionally do not publish requests/sec values because one-second
+developer-laptop output is noisy enough to invert framework ordering. For
+performance claims, rerun the full command in a quiet release environment and
+keep the raw logs.
 
 ## Baseline Command
 
@@ -105,29 +106,10 @@ benchmark/results/v1-baseline-smoke-20260610T112700Z/wrk-fiber-single.log
 benchmark/results/v1-baseline-smoke-20260610T112700Z/wrk-nethttp-single.log
 ```
 
-Those local smoke logs are not committed because the checked-in evidence below
-is enough to show the command path and because future release runs should use a
-fresh timestamped directory.
-
-Inline summary from the smoke run:
-
-| framework | mode | route | requests/sec |
-|---|---|---|---:|
-| gogo | single | `/plain` | 221800.16 |
-| gogo | single | `/hello/inon` | 246930.06 |
-| gogo | single | `/json` | 249783.60 |
-| gogo | single | `/middleware` | 223383.59 |
-| gogo | single | `/async` | 97647.25 |
-| fiber | single | `/plain` | 223354.09 |
-| fiber | single | `/hello/inon` | 226254.01 |
-| fiber | single | `/json` | 209064.80 |
-| fiber | single | `/middleware` | 226493.91 |
-| fiber | single | `/async` | 101782.23 |
-| net/http | single | `/plain` | 132519.93 |
-| net/http | single | `/hello/inon` | 70981.77 |
-| net/http | single | `/json` | 124647.44 |
-| net/http | single | `/middleware` | 138168.60 |
-| net/http | single | `/async` | 77881.66 |
+The smoke passed for gogo, Fiber, and net/http. The local logs are not
+committed, and their requests/sec values are intentionally omitted because a
+one-second smoke run is not a valid relative-performance comparison. Future
+release runs should use a fresh timestamped directory.
 
 ## Rerun Check
 
@@ -153,19 +135,9 @@ During this run, raw logs were written locally to:
 benchmark/results/v1-baseline-smoke-rerun-20260610T112900Z/wrk-gogo-single.log
 ```
 
-Inline rerun summary:
-
-| framework | mode | route | requests/sec |
-|---|---|---|---:|
-| gogo | single | `/plain` | 145297.64 |
-| gogo | single | `/hello/inon` | 132225.49 |
-| gogo | single | `/json` | 122369.41 |
-| gogo | single | `/middleware` | 121797.68 |
-| gogo | single | `/async` | 65942.57 |
-
-The rerun intentionally stays small. The lower one-second numbers show that
-developer-laptop load and warmup effects can dominate tiny benchmark windows.
-Use the full baseline command for comparisons.
+The rerun passed. It intentionally stays small and omits throughput numbers for
+the same reason: developer-laptop load and warmup effects can dominate tiny
+benchmark windows. Use the full baseline command for comparisons.
 
 ## How To Refresh The Evidence
 
@@ -174,14 +146,15 @@ Use the full baseline command for comparisons.
    `uname -a`, CPU count, and memory.
 3. Run the full baseline command with a fresh `RESULTS_DIR`.
 4. Keep the raw `wrk` logs in that result directory for review.
-5. Summarize requests/sec and tail latency in this page or in the release PR.
+5. For full baseline runs only, summarize requests/sec and tail latency in this
+   page or in the release PR.
 6. Compare future performance work against a separate before/after result
    directory created with the same command and environment.
 
 ## Current Limitations
 
-- The committed smoke data is a reproducibility check, not a release-capacity
-  baseline.
+- The committed smoke evidence is a pass/fail reproducibility check, not a
+  release-capacity baseline or a framework ranking.
 - The 2026-06-10 smoke ran on a laptop that was not isolated from background
   work.
 - Only the single-worker Go-local matrix was smoked. The full command still
