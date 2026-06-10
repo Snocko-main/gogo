@@ -2,6 +2,12 @@
 
 Use this checklist before cutting any public tag.
 
+## Current Release Candidate
+
+`v0.9.0` and `v1.0.0-rc.1` are annotated tags cut on 2026-06-10 from commit
+`8c36f0b21ac22569879072200184839c1bb30adf`. Re-run this checklist before
+`v1.0.0` or any later release candidate.
+
 ## Before Tagging
 
 - Confirm `ROAD_TO_V1.md` reflects the intended release scope.
