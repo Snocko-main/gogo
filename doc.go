@@ -15,6 +15,8 @@
 // Without the gogo build tag the package compiles a stub that returns an
 // error from NewApp — useful for tools that import the package but won't
 // actually run a server.
+// See docs/install-build.md for OS package prerequisites and downstream smoke
+// build validation.
 //
 // # Hello world
 //
@@ -239,6 +241,7 @@
 //
 // See examples/multicore for a full setup with signal handling
 // + a /metrics endpoint formatted as Prometheus text exposition.
+// See docs/production-examples.md for the v1 production example coverage map.
 //
 // # Graceful shutdown
 //

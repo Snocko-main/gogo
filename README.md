@@ -93,6 +93,9 @@ Consumers do not need a `third_party` checkout or a prebuilt `uSockets.a`;
 `go get github.com/Snocko-main/gogo` fetches the native source that cgo
 compiles with the package.
 
+The release install/build checklist is kept in
+[`docs/install-build.md`](docs/install-build.md).
+
 To run a real gogo server, the machine building your app needs:
 
 - Go 1.24 or newer
@@ -116,6 +119,10 @@ sudo dnf install -y gcc gcc-c++ zlib-devel
 # Alpine
 sudo apk add build-base zlib-dev
 ```
+
+On macOS, Command Line Tools is the smallest supported setup; full Xcode also
+works. Homebrew LLVM/zlib can be used for a custom toolchain, but the Apple SDK
+and linker still need to come from Command Line Tools or Xcode.
 
 Add gogo to your app:
 
@@ -2186,6 +2193,10 @@ app.MethodNotAllowed(func(res *gogo.Response, req *gogo.Request) {
   [Post-handler cleanup](#post-handler-cleanup-with-responseonfinish).
 
 ## Examples
+
+For a v1 production coverage map across HTTP, middleware, WebSocket, graceful
+shutdown, multicore operations, and install/build validation, see
+[`docs/production-examples.md`](docs/production-examples.md).
 
 - [`examples/hello`](examples/hello) — static reply + sync + async handler
 - [`examples/restapi`](examples/restapi) — in-memory CRUD with JSON + query filter
