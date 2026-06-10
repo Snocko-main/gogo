@@ -24,8 +24,7 @@ need to choose their own values, origins, secrets, proxy ranges, and limits.
   `MultipartOptions`, `DefaultMultipartPartLimit`, `MaxTokenBytes` options,
   and the `No*Limit` sentinels.
 - File serving/uploads: `Response.SendFile`, `Response.Download`, multipart
-  save paths, and `docs/file-serving.md` when PR #101 or equivalent guidance
-  is merged.
+  save paths, and `docs/file-serving.md`.
 
 ## Proxy Trust
 
@@ -42,7 +41,7 @@ need to choose their own values, origins, secrets, proxy ranges, and limits.
       `X-Real-IP` headers.
 - [ ] v1 production examples use `TrustedProxies` instead of `TrustProxy: true`
       unless the surrounding network guarantees every immediate peer is trusted.
-- [ ] Reverse-proxy deployment docs confirm header overwrite behavior for nginx,
+- [x] Reverse-proxy deployment docs confirm header overwrite behavior for nginx,
       Caddy, Cloudflare, and load balancers, or link to accepted residual risk.
 
 ## WebSocket Origin And Auth
@@ -194,11 +193,11 @@ need to choose their own values, origins, secrets, proxy ranges, and limits.
 
 ## File Serving And Uploads
 
-- [ ] `docs/file-serving.md` from PR #101, or equivalent merged guidance, is
-      available as the file-serving evidence target before v1.
+- [x] `docs/file-serving.md` is available as the file-serving evidence target
+      before v1.
 - [ ] `SendFile` and `Download` callers never pass raw request paths directly to
       the filesystem; paths are rooted, cleaned, authorized, and allow-listed.
-- [ ] v1 either ships a rooted file-serving helper or merged documentation
+- [x] v1 either ships a rooted file-serving helper or merged documentation
       covers safe patterns for `SendFile`, `Download`, and multipart saves.
 - [ ] `MaxSendFileBytes`, `SendFileChunkBytes`, and
       `SendFileBackpressureBytes` have production guidance and tests for large
