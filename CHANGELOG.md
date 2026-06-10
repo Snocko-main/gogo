@@ -7,12 +7,13 @@ minor releases may include breaking API changes when they move the project
 toward a stable API. Breaking changes should be called out in the release
 notes for the release that introduces them.
 
-## Unreleased - v1.0.0-rc.1
+## v1.0.0-rc.1 - 2026-06-10
 
-This section prepares the release notes for the `v1.0.0-rc.1` tag. The tag has
-not been cut yet. These notes summarize notable changes since the `v0.1.x`
-public preview, using the completed roadmap items and merged release history as
-the source of truth.
+Annotated tag `v1.0.0-rc.1` was cut from commit
+`8c36f0b21ac22569879072200184839c1bb30adf`, the same commit as `v0.9.0`.
+These notes summarize notable changes since the `v0.1.x` public preview,
+using the completed roadmap items and merged release history as the source of
+truth.
 
 ### Routing and Public API
 
@@ -96,6 +97,13 @@ the source of truth.
   protection expectations, and release checklist steps.
 - Release candidate freeze policy is documented in
   `docs/release-candidate.md`.
+
+## v0.9.0 - 2026-06-10
+
+Annotated tag `v0.9.0` marks completion of the v0.9 release-candidate
+readiness work at commit `8c36f0b21ac22569879072200184839c1bb30adf`. It points
+to the same tree as `v1.0.0-rc.1`; the release notes above describe the final
+RC state.
 
 ## v0.1.1 - 2026-06-05
 

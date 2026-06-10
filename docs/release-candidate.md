@@ -1,23 +1,22 @@
-# v1 Release Candidate Runbook
+# v1 Release Candidate Notes
 
-Use this runbook with `ROAD_TO_V1.md` and `docs/release-checklist.md` when
-preparing `v1.0.0-rc.1`. It does not create the tag.
+Use these notes with `ROAD_TO_V1.md` and `docs/release-checklist.md` when
+tracking the `v1.0.0-rc.1` state and deciding whether a later RC is needed.
 
-## When to Tag rc.1
+## Tagged rc.1
 
-Tag `v1.0.0-rc.1` from `origin/main` only after the v0.9 PRs for the public API
-freeze, exported-symbol audit, docs/package audit, stress and race validation,
-downstream smoke testing, changelog, and release notes have merged or been
-explicitly marked non-blocking by a maintainer.
+`v0.9.0` and `v1.0.0-rc.1` were cut as annotated tags on 2026-06-10 from
+`origin/main` commit `8c36f0b21ac22569879072200184839c1bb30adf` after the v0.9
+release-candidate work merged.
 
-Before tagging, confirm:
+This release-note update records:
 
-- `origin/main` contains all accepted v0.9 release-candidate work.
-- `CHANGELOG.md` has a dated `v1.0.0-rc.1` entry with any breaking or
-  compatibility-sensitive changes called out.
-- The required checks in `docs/release-checklist.md` have passed locally or in
-  the matching CI run.
-- The downstream smoke test has passed from a clean temporary module.
+- Public API freeze, exported-symbol audit, and docs/package audit before the
+  tags.
+- Stress and race validation plus downstream smoke testing before the tags.
+- Dated `CHANGELOG.md` entries for `v0.9.0` and `v1.0.0-rc.1` after the tags
+  were created.
+- Release checklist coverage for required checks and post-tag verification.
 
 ## Freeze After rc.1
 
