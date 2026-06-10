@@ -7,7 +7,7 @@
 //     so per-worker initialization stays cheap
 //   - Per-worker request counters aggregated through a /metrics
 //     endpoint formatted as Prometheus text exposition
-//   - Signal-driven immediate shutdown via SIGINT / SIGTERM
+//   - Signal-driven immediate group shutdown via SIGINT / SIGTERM
 //
 // Run with:
 //
@@ -39,6 +39,11 @@
 // configurable through this helper; use process-wide knobs before
 // RunMultiCore and per-route/per-middleware options inside setup.
 //
+// Shutdown behavior — MultiCoreHandle.Shutdown calls each worker's
+// immediate Shutdown. It stops the group quickly, but it is not the
+// same as App.ShutdownContext's single-app graceful drain. See
+// examples/graceful when in-flight requests must finish before exit.
+//
 // Pinning to CPUs — gogo doesn't pin loops to specific cores
 // today. With a `RunMultiCore(N=NumCPU)` config the kernel typically
 // keeps each loop on its initial CPU; if you need stricter pinning
@@ -50,7 +55,6 @@ package main
 import (
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
@@ -162,8 +166,3 @@ gogo_uptime_seconds %.3f
 		res.Send(200, "text/plain; version=0.0.4", body)
 	})
 }
-
-// keep imports balanced — net/http would only come in if the user
-// chooses to embed a stdlib mux for additional routes; left here as
-// documentation of where to bolt that on.
-var _ = http.StatusOK
