@@ -22,6 +22,30 @@ Use this checklist before cutting any public tag.
 - `govulncheck ./...`
 - `govulncheck -tags gogo ./...`
 
+## Stress and Race Validation
+
+Run the v0.9 validation script before cutting a release candidate:
+
+```sh
+scripts/v09_release_validation.sh
+```
+
+The script runs the baseline suites plus targeted race and stress/count checks:
+
+```sh
+go test ./...
+CGO_ENABLED=1 go test -tags gogo ./...
+go test -race ./middleware -run '^(TestFastRequestIDGeneratorConcurrentPure)$' -count 1 -timeout 10m
+CGO_ENABLED=1 go test -race -tags gogo . -run '^(TestConcurrentLoad|TestWebSocketPublishRaceWithClose|TestWebSocketPublishConcurrent)$' -count 1 -timeout 10m
+CGO_ENABLED=1 go test -tags gogo . -run '^(TestStressShortBursts|TestConcurrentLoad|TestWebSocketPublishRaceWithClose|TestWebSocketPublishConcurrent)$' -count 3 -timeout 10m
+```
+
+Raise `GOGO_V09_RACE_COUNT`, `GOGO_V09_STRESS_COUNT`,
+`GOGO_V09_RACE_TIMEOUT`, or `GOGO_V09_STRESS_TIMEOUT` in CI or on a release
+host when deeper soak coverage is needed. If a platform cannot run native race
+tests, record the toolchain error in the release notes and run the pure Go race
+command plus the tagged native stress/count command as the supported fallback.
+
 `CGO_ENABLED=1 go vet -tags gogo ./...` is not a release gate yet. It is a
 known native baseline because `native_enabled.go` uses pointer arithmetic and
 cgo shared-memory layouts that `go vet` reports as possible unsafe pointer
