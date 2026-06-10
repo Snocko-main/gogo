@@ -417,6 +417,23 @@ type asyncMiddlewareEntry struct {
 	alsoSync bool
 }
 
+type groupMiddlewareEntry struct {
+	mw Middleware
+	// alsoAsync mirrors middlewareEntry.alsoAsync for Router-scoped
+	// middleware: PlaceBoth entries have an async twin, so async GET
+	// routes can keep the shared fast path when no sync-only group
+	// middleware is present.
+	alsoAsync bool
+}
+
+type groupAsyncMiddlewareEntry struct {
+	mw AsyncMiddleware
+	// alsoSync mirrors asyncMiddlewareEntry.alsoSync. Slow async routes
+	// run the sync twin before snapshotting, so the async chain skips
+	// this entry to avoid double execution.
+	alsoSync bool
+}
+
 const (
 	// NoBodyLimit disables Config.BodyLimit. Use only behind an external
 	// body-size limit, such as a trusted reverse proxy.
@@ -860,19 +877,7 @@ func (a *App) Use(args ...any) {
 // insertions. The middleware is type-asserted back to gogo.Middleware
 // (mwhint stores it as `any` to avoid an import cycle).
 func (a *App) registerHinted(prefix string, h mwhint.Hinted) {
-	syncMw, ok := h.Mw.(Middleware)
-	if !ok {
-		// Allow the underlying func type too; values declared with
-		// the raw signature satisfy the assertion via a conversion.
-		if fn, fok := h.Mw.(func(next Handler) Handler); fok {
-			syncMw = Middleware(fn)
-		} else {
-			panic(fmt.Sprintf("gogo: registerHinted: unsupported Mw type %T", h.Mw))
-		}
-	}
-	asyncMw := AsyncMiddleware(func(next AsyncHandler) AsyncHandler {
-		return AsyncHandler(syncMw(Handler(next)))
-	})
+	syncMw, asyncMw := middlewareFromHint("registerHinted", h)
 	switch h.Place {
 	case mwhint.Sync:
 		a.middlewares = append(a.middlewares, middlewareEntry{prefix: prefix, mw: syncMw})
@@ -884,6 +889,23 @@ func (a *App) registerHinted(prefix string, h mwhint.Hinted) {
 	default:
 		panic(fmt.Sprintf("gogo: invalid Placement %d", h.Place))
 	}
+}
+
+func middlewareFromHint(caller string, h mwhint.Hinted) (Middleware, AsyncMiddleware) {
+	syncMw, ok := h.Mw.(Middleware)
+	if !ok {
+		// Allow the underlying func type too; values declared with
+		// the raw signature satisfy the assertion via a conversion.
+		if fn, fok := h.Mw.(func(next Handler) Handler); fok {
+			syncMw = Middleware(fn)
+		} else {
+			panic(fmt.Sprintf("gogo: %s: unsupported Mw type %T", caller, h.Mw))
+		}
+	}
+	asyncMw := AsyncMiddleware(func(next AsyncHandler) AsyncHandler {
+		return AsyncHandler(syncMw(Handler(next)))
+	})
+	return syncMw, asyncMw
 }
 
 // normalizeMWPrefix turns a user-facing Use pattern into the stored prefix
@@ -1312,10 +1334,12 @@ func (a *App) GetAsync(pattern string, handler AsyncHandler) {
 	wrappedAsync := a.wrapAsyncFiltered(uwsPattern, handler, true)
 	a.inner.get(uwsPattern, a.applyMeta(meta, a.wrap(uwsPattern, func(res *Response, req *Request) {
 		snap := req.snapshotFromSync(a.cfg.CapturePeerIP)
+		locals := req.cloneLocals()
 		trustProxy := req.trustProxy
 		res.Async(func() {
 			snapReq := requestPool.Get().(*Request)
 			snapReq.snap = snap
+			snapReq.locals = locals
 			snapReq.res = res
 			snapReq.trustProxy = trustProxy
 			wrappedAsync(res, snapReq)
@@ -1419,6 +1443,7 @@ func (a *App) bodyAsync(method, pattern string, maxBodyBytes int, handler BodyAs
 		// happens via onData callbacks fired after we return, by which time
 		// req would be invalid; the snapshot survives.
 		snap := req.snapshotFromSync(a.cfg.CapturePeerIP)
+		locals := req.cloneLocals()
 		trustProxy := req.trustProxy
 		res.Body(maxBodyBytes, func(body []byte, err error) {
 			if handleBodyCollectionError(res, err) {
@@ -1430,6 +1455,7 @@ func (a *App) bodyAsync(method, pattern string, maxBodyBytes int, handler BodyAs
 				snapReq := requestPool.Get().(*Request)
 				snapReq.snap = snap
 				snapReq.body = body
+				snapReq.locals = locals
 				snapReq.res = res
 				snapReq.trustProxy = trustProxy
 				wrappedAsync(res, snapReq)
@@ -1683,45 +1709,85 @@ func (a *App) publishBatchLocal(msgs []PublishMessage) {
 type Router struct {
 	app     *App
 	prefix  string
-	syncMW  []Middleware
-	asyncMW []AsyncMiddleware
+	syncMW  []groupMiddlewareEntry
+	asyncMW []groupAsyncMiddlewareEntry
 }
 
 // Group returns a Router scoped to prefix with mws applied to every route
 // subsequently registered through it. Prefix must start with '/' and contain
 // no wildcards; trailing slash is stripped so Group("/api") and Group("/api/")
 // behave identically. Group("/") is equivalent to no prefix.
-func (a *App) Group(prefix string, mws ...Middleware) *Router {
-	return &Router{
+func (a *App) Group(prefix string, mws ...any) *Router {
+	r := &Router{
 		app:    a,
 		prefix: normalizeGroupPrefix(prefix),
-		syncMW: append([]Middleware(nil), mws...),
 	}
+	r.Use(mws...)
+	return r
 }
 
 // Group creates a nested Router. The child prefix is appended to the parent's
 // prefix and middleware is inherited then extended — mws here run inside the
 // parent group's middleware.
-func (r *Router) Group(prefix string, mws ...Middleware) *Router {
-	return &Router{
+func (r *Router) Group(prefix string, mws ...any) *Router {
+	child := &Router{
 		app:     r.app,
 		prefix:  r.prefix + normalizeGroupPrefix(prefix),
-		syncMW:  append(append([]Middleware(nil), r.syncMW...), mws...),
-		asyncMW: append([]AsyncMiddleware(nil), r.asyncMW...),
+		syncMW:  append([]groupMiddlewareEntry(nil), r.syncMW...),
+		asyncMW: append([]groupAsyncMiddlewareEntry(nil), r.asyncMW...),
 	}
+	child.Use(mws...)
+	return child
 }
 
-// Use appends sync middleware to this Router. Applies to every route
-// subsequently registered through this Router (or any child Group created
-// after this call).
-func (r *Router) Use(mws ...Middleware) {
-	r.syncMW = append(r.syncMW, mws...)
+// Use appends middleware to this Router. Applies to every route subsequently
+// registered through this Router (or any child Group created after this call).
+// Bundled middleware uses its placement hint the same way it does with
+// App.Use: sync-only middleware runs on the sync route path, async-only
+// middleware runs only on async routes, and PlaceBoth middleware runs once in
+// the right chain for each route type.
+func (r *Router) Use(args ...any) {
+	for i, arg := range args {
+		switch v := arg.(type) {
+		case mwhint.Hinted:
+			r.registerHinted(v)
+		case Middleware:
+			r.registerHinted(mwhint.Hinted{Mw: v, Place: mwhint.Both})
+		case func(next Handler) Handler:
+			r.registerHinted(mwhint.Hinted{Mw: Middleware(v), Place: mwhint.Both})
+		case AsyncMiddleware:
+			r.asyncMW = append(r.asyncMW, groupAsyncMiddlewareEntry{mw: v})
+		case func(next AsyncHandler) AsyncHandler:
+			r.asyncMW = append(r.asyncMW, groupAsyncMiddlewareEntry{mw: AsyncMiddleware(v)})
+		case string:
+			panic("gogo: Router.Use: path patterns are not supported; scope with App.Group or App.Use")
+		default:
+			panic(fmt.Sprintf("gogo: Router.Use: unsupported argument type %T at index %d", v, i))
+		}
+	}
 }
 
 // UseAsync appends async middleware to this Router. Applies only to GetAsync
 // and body-async routes registered through this Router.
 func (r *Router) UseAsync(mws ...AsyncMiddleware) {
-	r.asyncMW = append(r.asyncMW, mws...)
+	for _, mw := range mws {
+		r.asyncMW = append(r.asyncMW, groupAsyncMiddlewareEntry{mw: mw})
+	}
+}
+
+func (r *Router) registerHinted(h mwhint.Hinted) {
+	syncMw, asyncMw := middlewareFromHint("Router.Use", h)
+	switch h.Place {
+	case mwhint.Sync:
+		r.syncMW = append(r.syncMW, groupMiddlewareEntry{mw: syncMw})
+	case mwhint.Async:
+		r.asyncMW = append(r.asyncMW, groupAsyncMiddlewareEntry{mw: asyncMw})
+	case mwhint.Both:
+		r.syncMW = append(r.syncMW, groupMiddlewareEntry{mw: syncMw, alsoAsync: true})
+		r.asyncMW = append(r.asyncMW, groupAsyncMiddlewareEntry{mw: asyncMw, alsoSync: true})
+	default:
+		panic(fmt.Sprintf("gogo: invalid Placement %d", h.Place))
+	}
 }
 
 // normalizeGroupPrefix validates a Group prefix and trims trailing slashes.
@@ -1744,14 +1810,22 @@ func normalizeGroupPrefix(p string) string {
 
 func (r *Router) wrapGroupSync(h Handler) Handler {
 	for i := len(r.syncMW) - 1; i >= 0; i-- {
-		h = r.syncMW[i](h)
+		h = r.syncMW[i].mw(h)
 	}
 	return h
 }
 
 func (r *Router) wrapGroupAsync(h AsyncHandler) AsyncHandler {
+	return r.wrapGroupAsyncFiltered(h, false)
+}
+
+func (r *Router) wrapGroupAsyncFiltered(h AsyncHandler, skipAlsoSync bool) AsyncHandler {
 	for i := len(r.asyncMW) - 1; i >= 0; i-- {
-		h = r.asyncMW[i](h)
+		e := r.asyncMW[i]
+		if skipAlsoSync && e.alsoSync {
+			continue
+		}
+		h = e.mw(h)
 	}
 	return h
 }
@@ -1763,6 +1837,15 @@ func (r *Router) wrapGroupAsync(h AsyncHandler) AsyncHandler {
 // can intercept.
 func (r *Router) hasGroupOrAppMW(fullPattern string) bool {
 	return len(r.syncMW) > 0 || r.app.hasSyncMiddleware(fullPattern)
+}
+
+func (r *Router) hasMatchingGroupMiddleware() bool {
+	for _, e := range r.syncMW {
+		if !e.alsoAsync {
+			return true
+		}
+	}
+	return false
 }
 
 // needsDynamicStatic reports whether a static target needs the dynamic path
@@ -1893,12 +1976,12 @@ func (r *Router) Head(pattern string, handler Handler) {
 }
 
 // GetAsync registers a GET route under this Router that runs on a goroutine.
-// Uses the zero-cgo shared-memory dispatch path only when no sync middleware
-// (group or app) touches this route.
+// Uses the zero-cgo shared-memory dispatch path only when no sync-only
+// middleware (group or app) touches this route.
 func (r *Router) GetAsync(pattern string, handler AsyncHandler) {
 	full, meta := r.preRoute("get", pattern)
 
-	if len(r.syncMW) == 0 && !r.app.hasMatchingMiddleware(full) {
+	if !r.hasMatchingGroupMiddleware() && !r.app.hasMatchingMiddleware(full) {
 		// Fast path — no sync wrapper fires, async chain owns all
 		// middleware. applyMetaAsync sets snap.paramNames and runs
 		// typed validation inside the worker; applyAppRefAsync sets
@@ -1914,13 +1997,15 @@ func (r *Router) GetAsync(pattern string, handler AsyncHandler) {
 	// sync side's applyMeta sets req.paramNames + runs typed
 	// validation before snapshotFromSync carries names into the
 	// worker.
-	wrappedAsync := r.app.wrapAsyncFiltered(full, r.wrapGroupAsync(handler), true)
+	wrappedAsync := r.app.wrapAsyncFiltered(full, r.wrapGroupAsyncFiltered(handler, true), true)
 	syncEntry := func(res *Response, req *Request) {
 		snap := req.snapshotFromSync(r.app.cfg.CapturePeerIP)
+		locals := req.cloneLocals()
 		trustProxy := req.trustProxy
 		res.Async(func() {
 			snapReq := requestPool.Get().(*Request)
 			snapReq.snap = snap
+			snapReq.locals = locals
 			snapReq.res = res
 			snapReq.trustProxy = trustProxy
 			wrappedAsync(res, snapReq)
@@ -1973,10 +2058,11 @@ func (r *Router) bodyAsync(method, pattern string, maxBodyBytes int, handler Bod
 	// Body async methods wrap with the sync chain first, so skip
 	// PlaceBoth twins in the async chain to avoid double-firing the
 	// same middleware.
-	wrappedAsync := r.app.wrapAsyncFiltered(full, r.wrapGroupAsync(finalAsync), true)
+	wrappedAsync := r.app.wrapAsyncFiltered(full, r.wrapGroupAsyncFiltered(finalAsync, true), true)
 
 	syncEntry := func(res *Response, req *Request) {
 		snap := req.snapshotFromSync(r.app.cfg.CapturePeerIP)
+		locals := req.cloneLocals()
 		trustProxy := req.trustProxy
 		res.Body(maxBodyBytes, func(body []byte, err error) {
 			if handleBodyCollectionError(res, err) {
@@ -1986,6 +2072,7 @@ func (r *Router) bodyAsync(method, pattern string, maxBodyBytes int, handler Bod
 				snapReq := requestPool.Get().(*Request)
 				snapReq.snap = snap
 				snapReq.body = body
+				snapReq.locals = locals
 				snapReq.res = res
 				snapReq.trustProxy = trustProxy
 				wrappedAsync(res, snapReq)
@@ -5109,6 +5196,17 @@ func (r *Request) Local(key string) any {
 		return nil
 	}
 	return r.locals[key]
+}
+
+func (r *Request) cloneLocals() map[string]any {
+	if len(r.locals) == 0 {
+		return nil
+	}
+	locals := make(map[string]any, len(r.locals))
+	for k, v := range r.locals {
+		locals[k] = v
+	}
+	return locals
 }
 
 // Body returns the fully collected request body for body-async routes such as
