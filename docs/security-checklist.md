@@ -23,6 +23,9 @@ need to choose their own values, origins, secrets, proxy ranges, and limits.
 - Body/header limits: `Config.BodyLimit`, `Config.BodyReadTimeout`,
   `MultipartOptions`, `DefaultMultipartPartLimit`, `MaxTokenBytes` options,
   and the `No*Limit` sentinels.
+- File serving/uploads: `Response.SendFile`, `Response.Download`, multipart
+  save paths, and `docs/file-serving.md` when PR #101 or equivalent guidance
+  is merged.
 
 ## Proxy Trust
 
@@ -171,3 +174,60 @@ need to choose their own values, origins, secrets, proxy ranges, and limits.
       JWT/CSRF/BasicAuth middleware, CORS preflights, and WebSocket upgrades.
 - [ ] Release notes call out any remaining header-limit risk, especially when a
       deployment disables token/credential caps with `No*Limit` sentinels.
+
+## File Serving And Uploads
+
+- [ ] `docs/file-serving.md` from PR #101, or equivalent merged guidance, is
+      available as the file-serving evidence target before v1.
+- [ ] `SendFile` and `Download` callers never pass raw request paths directly to
+      the filesystem; paths are rooted, cleaned, authorized, and allow-listed.
+- [ ] v1 either ships a rooted file-serving helper or merged documentation
+      covers safe patterns for `SendFile`, `Download`, and multipart saves.
+- [ ] `MaxSendFileBytes`, `SendFileChunkBytes`, and
+      `SendFileBackpressureBytes` have production guidance and tests for large
+      files and slow consumers.
+- [ ] `NoSendFileLimit` is used only for trusted, authorized file routes with an
+      external size boundary.
+- [ ] Multipart uploads that save files validate filenames, extension/content
+      type, overwrite behavior, file permissions, and storage location.
+- [ ] Download filenames and response headers cannot be influenced by unchecked
+      CR/LF, path separators, or control characters.
+
+## Native Boundary
+
+- [ ] Every Go-to-C/C-to-Go string, length, and buffer conversion is checked for
+      truncation, overflow, and lifetime safety.
+- [ ] Native request snapshots have documented caps for method, URL, query,
+      params, headers, peer IP, and body, including fallback behavior when caps
+      are exceeded.
+- [ ] `cgo.Handle` values attached to WebSockets or callbacks are released on
+      every close, reject, panic, and shutdown path.
+- [ ] Loop-thread ownership and allowed goroutine/thread usage are documented for
+      route registration, `Listen`, `Run`, `Close`, WebSocket send/end, and
+      deferred responses.
+- [x] Shared-dispatch shutdown quiesces active work before native app memory is
+      freed.
+- [x] Shared handler registry cleanup releases per-app handler closures after
+      graceful/shared drain without reusing stale handler IDs unsafely.
+- [ ] Native fuzz/stress coverage includes oversized headers, bodies, WebSocket
+      frames, malformed subprotocols, aborted streams, and shutdown races.
+- [ ] Vendored native dependencies, patches, licenses, and required build tools
+      are documented for Linux and macOS release builds.
+
+## Required Release Checks
+
+- [ ] `go test ./...`
+- [ ] `CGO_ENABLED=1 go test -tags gogo ./...`
+- [ ] `govulncheck ./...`
+- [ ] `govulncheck -tags gogo ./...`
+- [ ] Race and stress suites for HTTP, middleware, WebSocket, async/shared
+      dispatch, file serving, and native shutdown paths.
+- [ ] Downstream smoke test from a clean module:
+      `go get github.com/Snocko-main/gogo@<sha>` and
+      `CGO_ENABLED=1 go build -tags gogo .`
+- [ ] Release-tag smoke test repeats the downstream build for `@vX.Y.Z` and
+      `@latest`.
+- [ ] CI matrix covers supported Linux/macOS targets, C++20, zlib, Go 1.24, and
+      the current stable Go version.
+- [ ] Release notes list all accepted residual security risks and confirm that no
+      security blocker remains open.
