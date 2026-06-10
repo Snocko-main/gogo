@@ -14,10 +14,16 @@ Builds a clean downstream module that imports $MODULE with:
   CGO_ENABLED=1 $GO build -tags "$TAGS" .
 
 Release-prep examples:
-  $0 \$(git rev-parse HEAD) v0.1.0 latest
-  GOGO_SMOKE_REFS="\$(git rev-parse HEAD) v0.1.0 latest" $0
+  $0 \$(git rev-parse HEAD) v0.8.0 latest
+  GOGO_SMOKE_REFS="\$(git rev-parse HEAD) v0.8.0 latest" $0
 
 Use --local PATH in pull-request CI to smoke-build the checked-out workspace.
+
+Environment:
+  GOGO_SMOKE_MODULE   module path to import; defaults to $MODULE
+  GOGO_SMOKE_TAGS     build tags; defaults to "$TAGS"
+  GOGO_SMOKE_REFS     space-separated refs used when no REF args are given
+  KEEP_TMP=1          keep the temporary downstream module for inspection
 EOF
 }
 
@@ -108,6 +114,9 @@ start_smoke() {
 }
 
 finish_smoke() {
+	printf 'resolved module: '
+	"$GO" list -m "$MODULE"
+	echo "build command: CGO_ENABLED=1 $GO build -tags \"$TAGS\" ."
 	CGO_ENABLED=1 "$GO" build -tags "$TAGS" .
 }
 
