@@ -178,33 +178,33 @@ files in the same PR unless one agent is explicitly assigned as integrator.
 
 ## v0.6.0 - Testing Helpers and Migration
 
-- [ ] Add `TestServerOptions`.
-- [ ] Add a setup variant that can return an error.
-- [ ] Document why `NewTestServer` serializes native tests.
-- [ ] Decide whether `TestServer.App()` permits route or middleware
+- [x] Add `TestServerOptions`.
+- [x] Add a setup variant that can return an error.
+- [x] Document why `NewTestServer` serializes native tests.
+- [x] Decide whether `TestServer.App()` permits route or middleware
       registration after the server has started; test or document the contract.
-- [ ] Decide whether to expose a public WebSocket test client.
-- [ ] Decide whether `HTTPAdapter` is a migration API, a testing helper, or
+- [x] Decide whether to expose a public WebSocket test client.
+- [x] Decide whether `HTTPAdapter` is a migration API, a testing helper, or
       both.
-- [ ] Add pprof and expvar examples through `HTTPAdapter`.
-- [ ] Add testing docs for sync, async, body, middleware, WebSocket, and
+- [x] Add pprof and expvar examples through `HTTPAdapter`.
+- [x] Add testing docs for sync, async, body, middleware, WebSocket, and
       graceful shutdown paths.
 
 ## v0.7.0 - Performance and Native Polish
 
-- [ ] Add reproducible benchmarks for plain, params, JSON, middleware, async,
+- [x] Add reproducible benchmarks for plain, params, JSON, middleware, async,
       and WebSocket routes.
-- [ ] Define a cgo crossing budget for hot request paths.
-- [ ] Add shared async close-safety benchmarks or stress tests.
-- [ ] Add stream/SSE backpressure memory benchmarks.
-- [ ] Add WebSocket publish-batch baselines.
-- [ ] Pre-lowercase CORS origins at construction.
-- [ ] Pre-grow pending header buffers.
-- [ ] Clamp and validate all native length, size, and config-width conversions
+- [x] Define a cgo crossing budget for hot request paths.
+- [x] Add shared async close-safety benchmarks or stress tests.
+- [x] Add stream/SSE backpressure memory benchmarks.
+- [x] Add WebSocket publish-batch baselines.
+- [x] Pre-lowercase CORS origins at construction.
+- [x] Pre-grow pending header buffers.
+- [x] Clamp and validate all native length, size, and config-width conversions
       across the cgo boundary.
-- [ ] Measure every perf PR before and after.
-- [ ] Consider C++-side prefetch for method, query, and common headers.
-- [ ] Keep performance docs tied to reproducible commands and raw results.
+- [x] Measure every perf PR before and after.
+- [x] Consider C++-side prefetch for method, query, and common headers.
+- [x] Keep performance docs tied to reproducible commands and raw results.
 
 ## v0.8.0 - Observability and Ops
 
