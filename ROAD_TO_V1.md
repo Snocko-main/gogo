@@ -208,16 +208,16 @@ files in the same PR unless one agent is explicitly assigned as integrator.
 
 ## v0.8.0 - Observability and Ops
 
-- [ ] Stabilize `middleware.Metrics` labels, buckets, and output format.
-- [ ] Decide the OpenTelemetry story: built-in hooks or documented middleware.
-- [ ] Add `RunMultiCore` production example.
-- [ ] Add graceful shutdown example with OS signal handling.
-- [ ] Add reverse proxy docs for nginx, Caddy, Cloudflare, and load balancers.
-- [ ] Add deployment notes for `ulimit`, `GOMAXPROCS`, and DB pools.
-- [ ] Add panic/error logging docs.
-- [ ] Add safe file-serving guidance or a rooted helper for `SendFile`,
+- [x] Stabilize `middleware.Metrics` labels, buckets, and output format.
+- [x] Decide the OpenTelemetry story: built-in hooks or documented middleware.
+- [x] Add `RunMultiCore` production example.
+- [x] Add graceful shutdown example with OS signal handling.
+- [x] Add reverse proxy docs for nginx, Caddy, Cloudflare, and load balancers.
+- [x] Add deployment notes for `ulimit`, `GOMAXPROCS`, and DB pools.
+- [x] Add panic/error logging docs.
+- [x] Add safe file-serving guidance or a rooted helper for `SendFile`,
       `Download`, and multipart saves.
-- [ ] Add a v1 security checklist covering proxy trust, WebSocket origin/auth,
+- [x] Add a v1 security checklist covering proxy trust, WebSocket origin/auth,
       CORS, cookies, JWT, body limits, and header limits.
 
 ## v0.9.0 - v1 Release Candidate
