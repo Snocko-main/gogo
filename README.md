@@ -1936,7 +1936,8 @@ multiple configs returns an error so configuration stays unambiguous.
 | `JSONDecoder`      | `encoding/json.Unmarshal` | Decoder for `Request.BodyParser` JSON bodies              |
 
 See [`docs/configuration.md`](docs/configuration.md) for local development,
-reverse proxy, and production configuration examples.
+reverse proxy, and production configuration examples, and [`docs/ops.md`](docs/ops.md)
+for proxy, deployment, and logging guidance.
 
 `BodyReadTimeout` protects `Response.Body` users from slow body uploads that
 drip bytes forever without exceeding `BodyLimit`. Keep the 30s default for
