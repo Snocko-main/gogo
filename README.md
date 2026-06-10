@@ -606,6 +606,9 @@ serving requests. Use `gogo.NoSendFileLimit` only for trusted file-serving
 routes where path allow-listing, authorization, or an external layer already
 bounds what may be served.
 
+See [`docs/file-serving.md`](docs/file-serving.md) for rooted path, symlink,
+download filename, and multipart upload safety guidance.
+
 ### Streaming
 
 `Response.Stream` writes a chunked-encoded response. Available from async
