@@ -121,8 +121,10 @@ client IP to gogo. Keep the gogo process unreachable from the public internet.
 
 ## Caddy
 
-Caddy's `reverse_proxy` handles WebSocket upgrades automatically. The important
-parts for gogo are body-size alignment and explicit forwarded-header policy:
+Caddy's `reverse_proxy` handles WebSocket upgrades automatically. On Caddy
+v2.10+, `request_body` can align edge and app body limits; on older releases,
+enforce the same cap at another edge layer. The important parts for gogo are
+body-size alignment and explicit forwarded-header policy:
 
 ```caddyfile
 api.example.com {
@@ -399,11 +401,11 @@ app.Get("/report", func(res *gogo.Response, req *gogo.Request) {
 ```
 
 Middleware and adapters may expose their own error hooks. For example, the
-Redis rate-limit adapter reports store failures through `RateLimitOptions.OnError`,
-and WebSocket hub adapter errors can be routed with
-`gogo.WithWSHubAdapterErrorHandler`. These failures are not all panics, so wire
-the relevant hooks into the same logging or metrics pipeline as your panic
-handler.
+Redis rate-limit adapter reports store failures through
+`redisadapter.RateLimitOptions.OnError`, and WebSocket hub adapter errors can
+be routed with `gogo.WithWSHubAdapterErrorHandler`. These failures are not all
+panics, so wire the relevant hooks into the same logging or metrics pipeline as
+your panic handler.
 
 ## Ops Checklist
 
@@ -415,5 +417,5 @@ handler.
 - `GOMAXPROCS`, `RunMultiCore`, and `SetWorkerCount` are sized intentionally.
 - DB pool limits are multiplied across all replicas before comparing to the DB
   server limit.
-- `SetPanicHandler`, request logging, middleware `OnError` hooks, and abort
-  handling are installed before production traffic.
+- `SetPanicHandler`, request logging, adapter error hooks, and abort handling
+  are installed before production traffic.
