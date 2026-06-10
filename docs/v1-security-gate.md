@@ -1,8 +1,8 @@
 # v1 Security Gate Evidence
 
-Status: draft release-gate evidence. No framework code blocker was found in the
-reviewed areas, but the v1 gate is blocked until vulnerability validation is
-rerun with a patched Go toolchain.
+Status: release-gate evidence. No framework code blocker was found in the
+reviewed areas. Vulnerability validation passes when run with a patched Go
+toolchain (`go1.26.4` or newer on the Go 1.26 line).
 
 Review date: 2026-06-10
 Base: `origin/main` at `8c36f0b`
@@ -18,9 +18,9 @@ scans report reachable Go standard-library vulnerabilities fixed in
 - [GO-2026-5037](https://pkg.go.dev/vuln/GO-2026-5037) in `crypto/x509`;
   traces reach multipart stream draining and route registration error paths.
 
-Remediation: rerun release validation with Go `1.26.4` or newer, or the current
-patched supported release line selected by release engineering. Keep this PR
-draft until both govulncheck scans pass.
+Remediation: release validation was rerun with Go `1.26.4`, and both
+govulncheck scans passed. Keep future v1 validation on Go `1.26.4` or newer,
+or the current patched supported release line selected by release engineering.
 
 ## Evidence Summary
 
@@ -33,13 +33,14 @@ draft until both govulncheck scans pass.
 | JWT validation | JWT middleware locks verification to the configured algorithm, rejects algorithm mismatch, requires strong HMAC secrets or matching asymmetric key families, validates `exp`/`nbf`, supports `Issuer`, `Audience`, `RequiredClaims`, and caps compact tokens at 16 KiB by default. See [`middleware/jwt.go`](../middleware/jwt.go#L31-L124), [`middleware/jwt.go`](../middleware/jwt.go#L167-L214), and [`middleware/jwt.go`](../middleware/jwt.go#L382-L533). | Pass for built-in validation. Production apps must configure issuer/audience/required identity claims and own key rotation or JWKS dispatch. |
 | Body limits | `Config.BodyLimit` defaults to 4 MiB, `BodyReadTimeout` defaults to 30 seconds, `Response.Body` clamps route reads to the app cap, and multipart parsing defaults to an 8 MiB per-part cap unless an explicit option or external total-size cap is used. See [`types.go`](../types.go#L437-L521), [`types.go`](../types.go#L677-L728), [`types.go`](../types.go#L4950-L5024), and [`multipart.go`](../multipart.go#L17-L51). | Pass for app-level body controls. Production upload routes should choose explicit per-route limits. |
 | Header limits | Header-derived auth values have parser-level caps: BasicAuth credentials default to 8 KiB, JWT compact tokens default to 16 KiB, and CSRF tokens default to 256 bytes. The public checklist still records total request-header size policy as residual risk. See [`middleware/basicauth.go`](../middleware/basicauth.go#L50-L60), [`middleware/jwt.go`](../middleware/jwt.go#L121-L130), [`middleware/csrf.go`](../middleware/csrf.go#L62-L81), and [`docs/security-checklist.md`](security-checklist.md#L177-L192). | Residual risk. Until a framework-wide header cap is exposed or documented from native/uWS behavior, production deployments must enforce reverse-proxy header limits and release notes must call this out. |
-| Dependency vulnerability status | `govulncheck ./...` and `govulncheck -tags gogo ./...` both report the same two reachable Go standard-library vulnerabilities with `go1.26.3`; no vulnerable required module call path was reported. | Blocked by toolchain vulnerability status, not by a third-party module in `go.mod`. |
+| Dependency vulnerability status | `govulncheck ./...` and `govulncheck -tags gogo ./...` both pass with `go1.26.4`. The earlier `go1.26.3` run reported GO-2026-5039 and GO-2026-5037 in the Go standard library; no vulnerable required module call path was reported. | Pass with patched toolchain. |
 
 ## Validation
 
 Tooling:
 
-- `go version`: `go1.26.3 darwin/arm64`
+- Initial `go version`: `go1.26.3 darwin/arm64`
+- Patched rerun: `GOTOOLCHAIN=go1.26.4`, `go version go1.26.4 darwin/arm64`
 - `govulncheck -version`: `govulncheck@v1.3.0`, DB updated
   `2026-06-02 21:39:47 +0000 UTC`
 
@@ -49,8 +50,11 @@ Commands run:
 | --- | --- |
 | `go test ./...` | Pass |
 | `CGO_ENABLED=1 go test -tags gogo ./...` | Pass |
-| `govulncheck ./...` | Fail: affected by GO-2026-5039 and GO-2026-5037 in Go standard library packages from `go1.26.3`; fixed in `go1.26.4`. |
-| `govulncheck -tags gogo ./...` | Fail: same GO-2026-5039 and GO-2026-5037 findings. |
+| `govulncheck ./...` with `go1.26.3` | Fail: affected by GO-2026-5039 and GO-2026-5037 in Go standard library packages from `go1.26.3`; fixed in `go1.26.4`. |
+| `govulncheck -tags gogo ./...` with `go1.26.3` | Fail: same GO-2026-5039 and GO-2026-5037 findings. |
+| `GOTOOLCHAIN=go1.26.4 go run golang.org/x/vuln/cmd/govulncheck@latest ./...` | Pass: no vulnerabilities found. |
+| `CGO_ENABLED=1 GOTOOLCHAIN=go1.26.4 go run golang.org/x/vuln/cmd/govulncheck@latest -tags gogo ./...` | Pass: no vulnerabilities found. |
+| GitHub Release Hygiene checks on PR #115 | Pass, including the `govulncheck` and native `govulncheck` release-check jobs. |
 
 ## Residual Risk
 
