@@ -20,23 +20,18 @@ Generated inventory was checked on 2026-06-10 from `origin/main` at
 
 ## Findings
 
-One v1 public API blocker was found. The audited exported symbols below are
-otherwise freeze-ready for v1 unless a later v0.9 blocker PR proves another
+No v1 public API blockers remain in this audit. One blocker was found during
+the initial inventory and resolved in this PR; the audited exported symbols
+below are freeze-ready for v1 unless a later v0.9 blocker PR proves another
 concrete compatibility or correctness problem.
 
-Open questions or blockers:
+Resolved blocker:
 
-- B1: Bundled middleware factories return `internal/mwhint.Hinted`, which
-  `App.Use(args ...any)` accepts, but `App.Group(prefix string, mws ...Middleware)`,
-  `Router.Group(prefix string, mws ...Middleware)`, and
-  `Router.Use(mws ...Middleware)` do not. A downstream compile check confirmed
-  `app.Use("/api/*", middleware.JWT(opts))` compiles, while
-  `api.Use(middleware.JWT(opts))` and `app.Group("/api", middleware.JWT(opts))`
-  fail with `mwhint.Hinted` not assignable to `gogo.Middleware`. This needs a
-  v1 decision before the middleware/group API is frozen: either accept hinted
-  middleware in router/group APIs, or explicitly freeze scoped bundled
-  middleware as an `App.Use(prefix, ...)`-only contract and fix stale comments
-  that show `api.Use(middleware.JWT(opts))`.
+- B1: Bundled middleware factories return `internal/mwhint.Hinted`. `App.Use`,
+  `App.Group`, `Router.Group`, and `Router.Use` now accept the same middleware
+  registration values, so docs and examples can use scoped bundled middleware
+  naturally (`api.Use(middleware.JWT(opts))`, `app.Group("/api",
+  middleware.RequestID())`) without falling back to prefix-scoped `App.Use`.
 
 Notes frozen by this audit:
 
@@ -49,8 +44,8 @@ Notes frozen by this audit:
   prefer `Use` plus `middleware.Async` and `BodyAsyncHandler`, but keeping the
   aliases avoids unnecessary churn.
 - Bundled middleware constructors return the internal marker type
-  `mwhint.Hinted`. That return type is accepted by `App.Use`, but not by the
-  typed router/group middleware APIs. See B1.
+  `mwhint.Hinted`. That return type is accepted by `App.Use`, `App.Group`,
+  `Router.Group`, and `Router.Use`; users do not construct it directly.
 - `SetWorkerCount` is a native-build-only exported tuning hook. It appears in
   source under `native_enabled.go` and in the global-state docs; callers that
   use it must build with `CGO_ENABLED=1 -tags gogo`. `WaitForSharedWorkers`
@@ -95,10 +90,8 @@ Freeze notes:
 
 ## Routing
 
-Status: stable except B1. The public routing API keeps the existing compact
-method set, route naming API, flexible `Get` targets, and group/mount scoping,
-but the group/router middleware parameter types need a v1 decision before they
-can be frozen.
+Status: stable. The public routing API keeps the existing compact method set,
+route naming API, flexible `Get` targets, and group/mount scoping.
 
 Root package types and functions:
 
@@ -122,6 +115,8 @@ Freeze notes:
   `Name(name, pattern)` remains the naming surface.
 - `Group` and `Mount` remain the preferred typed scoping APIs. Prefix-scoped
   `Use` is retained and documented, but group identity gives clearer behavior.
+- `Group` and `Router.Use` accept the same registration values as `App.Use`,
+  including bundled middleware and `middleware.Async(...)` hints.
 
 ## Request And Response
 
@@ -176,11 +171,9 @@ Freeze notes:
 
 ## Middleware
 
-Status: stable except B1. Middleware factories, option structs, local keys,
-stores, and metrics are ready to freeze, but the `mwhint.Hinted` return type
-does not compose with every public router/group middleware entry point.
-Constructor panics for invalid security-sensitive configuration are part of the
-current contract.
+Status: stable. Middleware factories, option structs, local keys, stores, and
+metrics are ready to freeze. Constructor panics for invalid security-sensitive
+configuration are part of the current contract.
 
 Top-level middleware constructors and helpers:
 
@@ -250,8 +243,7 @@ Freeze notes:
 
 - Middleware constructors returning `mwhint.Hinted` remain registration values,
   not a public extension API. Custom middleware should use `gogo.Middleware`,
-  `gogo.AsyncMiddleware`, or `middleware.Async`. Whether router/group APIs
-  should also accept these registration values is the B1 blocker.
+  `gogo.AsyncMiddleware`, or `middleware.Async`.
 - `NewSession` keeps the `New` prefix to avoid colliding conceptually with the
   per-request `Session` handle.
 
@@ -393,7 +385,8 @@ The following were intentionally excluded from the public API freeze:
 
 ## Residual Risk
 
-This is a documentation and inventory PR. It does not add behavioral tests.
-The compatibility conclusion relies on the existing API docs, route tests,
-global-state docs, middleware tests, WebSocket hub tests, and testing-helper
-docs already present in the repository.
+This PR adds targeted behavioral coverage for the resolved router/group
+middleware-registration blocker. The broader compatibility conclusion still
+relies on the existing API docs, route tests, global-state docs, middleware
+tests, WebSocket hub tests, and testing-helper docs already present in the
+repository.

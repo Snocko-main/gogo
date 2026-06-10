@@ -3723,6 +3723,132 @@ func TestRouterUseAddsMW(t *testing.T) {
 	}
 }
 
+func TestGroupAcceptsHintedMiddleware(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		api := app.Group("/api", middleware.RequestID(middleware.RequestIDOptions{
+			Generator: func() string { return "group-id" },
+		}))
+		api.Get("/id", func(res *gogo.Response, req *gogo.Request) {
+			id, _ := req.Local(middleware.RequestIDLocalKey).(string)
+			res.Send(200, "text/plain", id)
+		})
+	})
+	defer teardown()
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/api/id", port), nil)
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /api/id: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || string(body) != "group-id" {
+		t.Fatalf("GET /api/id: got %d %q, want 200 group-id", resp.StatusCode, string(body))
+	}
+	if got := resp.Header.Get("X-Request-ID"); got != "group-id" {
+		t.Fatalf("X-Request-ID = %q, want group-id", got)
+	}
+}
+
+func TestRouterUseAcceptsHintedMiddleware(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		api := app.Group("/api")
+		api.Use(middleware.RequestID(middleware.RequestIDOptions{
+			Generator: func() string { return "router-id" },
+		}))
+		api.Get("/id", func(res *gogo.Response, req *gogo.Request) {
+			id, _ := req.Local(middleware.RequestIDLocalKey).(string)
+			res.Send(200, "text/plain", id)
+		})
+	})
+	defer teardown()
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/api/id", port), nil)
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /api/id: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || string(body) != "router-id" {
+		t.Fatalf("GET /api/id: got %d %q, want 200 router-id", resp.StatusCode, string(body))
+	}
+	if got := resp.Header.Get("X-Request-ID"); got != "router-id" {
+		t.Fatalf("X-Request-ID = %q, want router-id", got)
+	}
+}
+
+func TestGroupHintedMiddlewareOnGetAsyncFastPath(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		api := app.Group("/api", middleware.RequestID(middleware.RequestIDOptions{
+			Generator: func() string { return "async-group-id" },
+		}))
+		api.GetAsync("/id", func(res *gogo.Response, req *gogo.Request) {
+			id, _ := req.Local(middleware.RequestIDLocalKey).(string)
+			res.Send(200, "text/plain", id)
+		})
+	})
+	defer teardown()
+
+	req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/api/id", port), nil)
+	resp, err := noKeepaliveClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /api/id: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || string(body) != "async-group-id" {
+		t.Fatalf("GET /api/id: got %d %q, want 200 async-group-id", resp.StatusCode, string(body))
+	}
+	if got := resp.Header.Get("X-Request-ID"); got != "async-group-id" {
+		t.Fatalf("X-Request-ID = %q, want async-group-id", got)
+	}
+}
+
+func TestHintedMiddlewareLocalsSurviveBodyAsyncSlowPath(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.RequestID(middleware.RequestIDOptions{
+			Generator: func() string { return "app-body-id" },
+		}))
+		app.PutAsync("/app", 64, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			id, _ := req.Local(middleware.RequestIDLocalKey).(string)
+			res.Send(200, "text/plain", id+"|"+string(body))
+		})
+
+		api := app.Group("/api", middleware.RequestID(middleware.RequestIDOptions{
+			Generator: func() string { return "group-body-id" },
+		}))
+		api.PutAsync("/id", 64, func(res *gogo.Response, req *gogo.Request, body []byte) {
+			id, _ := req.Local(middleware.RequestIDLocalKey).(string)
+			res.Send(200, "text/plain", id+"|"+string(body))
+		})
+	})
+	defer teardown()
+
+	status, body, header := httpBody(t, port, "PUT", "/app", "text/plain", []byte("hello"))
+	if status != 200 || body != "app-body-id|hello" {
+		t.Fatalf("PUT /app: got %d %q, want 200 app-body-id|hello", status, body)
+	}
+	if got := header.Get("X-Request-ID"); got != "app-body-id" {
+		t.Fatalf("PUT /app X-Request-ID = %q, want app-body-id", got)
+	}
+
+	status, body, header = httpBody(t, port, "PUT", "/api/id", "text/plain", []byte("world"))
+	if status != 200 || body != "group-body-id|world" {
+		t.Fatalf("PUT /api/id: got %d %q, want 200 group-body-id|world", status, body)
+	}
+	foundGroupID := false
+	for _, value := range header.Values("X-Request-ID") {
+		if value == "group-body-id" {
+			foundGroupID = true
+			break
+		}
+	}
+	if !foundGroupID {
+		t.Fatalf("PUT /api/id X-Request-ID values = %v, want one group-body-id", header.Values("X-Request-ID"))
+	}
+}
+
 // TestGroupUseAsyncOnGetAsync: Router.UseAsync wraps GetAsync handlers
 // registered through the router and passes Locals from middleware to handler.
 func TestGroupUseAsyncOnGetAsync(t *testing.T) {
