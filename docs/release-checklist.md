@@ -67,6 +67,8 @@ suppressed with a narrow, documented pattern.
 
 - Confirm GitHub release notes match `CHANGELOG.md`.
 - Confirm no security checklist item became a release blocker.
-- Confirm install docs still describe the required Go version, cgo build tag,
-  C/C++ toolchain, C++20, and zlib requirements.
+- Confirm `docs/install-build.md` still describes the required Go version, cgo
+  build tag, C/C++ toolchain, C++20, and zlib requirements.
+- Confirm `docs/production-examples.md` still maps the runnable examples to
+  HTTP, middleware, WebSocket, graceful shutdown, and install/build coverage.
 - If the release changes public APIs, add migration notes or examples.
