@@ -76,6 +76,8 @@ body-parse + SQLite query paths.
   - [Redirect and open redirects](#redirect-and-open-redirects)
 - [Error Handling & Panic Recovery](#error-handling--panic-recovery)
 - [Caveats](#caveats)
+- [Examples](#examples)
+- [Why There Is a C++ Bridge](#why-there-is-a-c-bridge)
 - [Benchmarking](#benchmarking)
 
 ## Requirements and Native Build
@@ -2187,7 +2189,7 @@ app.MethodNotAllowed(func(res *gogo.Response, req *gogo.Request) {
 
 - [`examples/hello`](examples/hello) — static reply + sync + async handler
 - [`examples/restapi`](examples/restapi) — in-memory CRUD with JSON + query filter
-- [`examples/authmw`](examples/authmw) — logger + bearer auth (sync & async middleware)
+- [`examples/authmw`](examples/authmw) — production-ish Helmet, CORS, session/CSRF, BasicAuth, JWT, and WebSocketAuth stack
 - [`examples/upload`](examples/upload) — POST body collection with 413 + streaming OnData
 - [`examples/sse`](examples/sse) — Server-Sent Events with reconnect resume
 - [`examples/websocket`](examples/websocket) — browser WebSocket + upgrade gate + pub/sub
