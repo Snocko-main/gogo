@@ -559,7 +559,7 @@ app.Get("/download/:name", func(res *gogo.Response, req *gogo.Request) {
         res.Send(404, "text/plain; charset=utf-8", "not found\n")
         return
     }
-    _ = res.Download(req, path, req.Param("name"))
+    _ = res.Download(req, path, safeDownloadName(req.Param("name")))
 })
 
 // JSONP — same as JSON but wrapped in a callback for legacy clients.
@@ -595,6 +595,25 @@ func safePublicPath(root, name string) (string, error) {
     }
     return cleanPath, nil
 }
+
+func safeDownloadName(name string) string {
+    name = filepath.Base(name)
+    name = strings.Map(func(r rune) rune {
+        switch {
+        case r < 0x20 || r == 0x7f:
+            return -1
+        case r == '/' || r == '\\' || r == ':':
+            return '_'
+        default:
+            return r
+        }
+    }, name)
+    name = strings.TrimSpace(name)
+    if name == "" || name == "." || name == ".." {
+        return "download"
+    }
+    return name
+}
 ```
 
 `SendFile` intentionally opens the path you pass it; path allow-listing belongs
@@ -605,6 +624,9 @@ for startup-time configuration, but prefer the setters if the server may be
 serving requests. Use `gogo.NoSendFileLimit` only for trusted file-serving
 routes where path allow-listing, authorization, or an external layer already
 bounds what may be served.
+
+See [`docs/file-serving.md`](docs/file-serving.md) for rooted path, symlink,
+download filename, and multipart upload safety guidance.
 
 ### Streaming
 
