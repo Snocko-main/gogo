@@ -60,6 +60,22 @@ suppressed with a narrow, documented pattern.
 
 ## Tagging
 
+The GitHub Actions `Release` workflow runs automatically after a PR is merged
+to `main`.
+
+- `fix/*` branches create the next patch tag, for example `v1.0.1` to
+  `v1.0.2`.
+- `feat/*` and `feature/*` branches create the next minor tag, for example
+  `v1.0.1` to `v1.1.0`.
+- `doc/*`, `chore/*`, direct pushes, and other branch prefixes do not create a
+  release.
+
+Before tagging, the workflow runs the release gates, creates an annotated tag,
+publishes a GitHub release, and smoke-builds the published tag and `latest`.
+
+Use the manual commands below only as a fallback when GitHub Actions cannot be
+used or when a one-off prerelease tag is needed.
+
 1. Update `CHANGELOG.md` with the release date and any breaking changes.
 2. Run the required checks locally or confirm the matching CI run is green.
 3. Tag with an annotated tag:
