@@ -5192,12 +5192,13 @@ type requestSnapshot struct {
 	// path stays allocation-light when headers aren't read.
 	headers []byte
 	// headersSrc/headersSrcLen describe the same blob still sitting in
-	// AsyncCtx memory (shared-dispatch path only). The worker pins the ctx
-	// for the request wrapper's whole lifetime, so reads go straight to ctx
-	// memory and only matched values are copied — the blob itself never is.
-	// headers above takes precedence when non-nil (sync-fallback snapshots
-	// and tests populate it directly).
-	headersSrc    uintptr
+	// AsyncCtx memory (shared-dispatch path only; points into the C heap,
+	// so the GC ignores it). The worker pins the ctx for the request
+	// wrapper's whole lifetime, so reads go straight to ctx memory and only
+	// matched values are copied — the blob itself never is. headers above
+	// takes precedence when non-nil (sync-fallback snapshots and tests
+	// populate it directly).
+	headersSrc    unsafe.Pointer
 	headersSrcLen int
 	// paramsArr backs params on the shared-dispatch path so the typical
 	// request (paramCount <= snapParamArrayMax, mirroring SNAP_PARAM_MAX)
@@ -5213,7 +5214,7 @@ func (s *requestSnapshot) headerBlobView() []byte {
 	if s.headers != nil || s.headersSrcLen == 0 {
 		return s.headers
 	}
-	return unsafe.Slice((*byte)(unsafe.Pointer(s.headersSrc)), s.headersSrcLen)
+	return unsafe.Slice((*byte)(s.headersSrc), s.headersSrcLen)
 }
 
 // snapParamArrayMax mirrors the C++ SNAP_PARAM_MAX so requestSnapshot can

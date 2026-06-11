@@ -755,7 +755,7 @@ func newSnapshotFromCtx(ctxPtr uintptr) *requestSnapshot {
 
 	snap := &requestSnapshot{truncated: truncated}
 	if headersLen > 0 {
-		snap.headersSrc = ctxPtr + shared.ctxHeadersOff
+		snap.headersSrc = unsafe.Pointer(ctxPtr + shared.ctxHeadersOff)
 		snap.headersSrcLen = headersLen
 	}
 
