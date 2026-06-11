@@ -537,7 +537,23 @@ func WaitForSharedWorkers(timeout time.Duration) bool {
 // closed channel makes the non-blocking select fall through to the
 // exit path). Hot-path requests are never delayed by the check.
 func sharedWorker(stop <-chan struct{}) {
-	const spinLimit = 256
+	// Miss back-off, in order: spinTight pure re-polls (no scheduler
+	// involvement at all), then Gosched yields until spinLimit, then the
+	// progressive sleep below.
+	//
+	// The tight phase is what keeps the hot path off the Go scheduler. A
+	// miss here usually means "another worker just claimed the slot" or
+	// "the producer is mid-publish" — both resolve within nanoseconds,
+	// and at six-figure RPS the gap to the next request is only a few
+	// microseconds. The previous code called runtime.Gosched() on every
+	// one of those misses; with several workers racing one head pointer
+	// that meant hundreds of thousands of scheduler round-trips per
+	// second, and profiles under load showed 60%+ of worker CPU inside
+	// runtime.lock2/schedule/findRunnable instead of in handlers.
+	const (
+		spinTight = 128
+		spinLimit = spinTight + 256
+	)
 
 	headAddr := (*atomic.Uint64)(unsafe.Pointer(shared.requestRing + shared.headOffset))
 	idleSleep := time.Duration(0)
@@ -553,6 +569,9 @@ func sharedWorker(stop <-chan struct{}) {
 			// Back off without burning the CPU; the next iteration re-reads
 			// head, which will reflect the consumer that just claimed the slot.
 			spins++
+			if spins <= spinTight {
+				continue
+			}
 			if spins > spinLimit {
 				// Check for shutdown only here, on the idle path —
 				// hot requests never pay for the select.
