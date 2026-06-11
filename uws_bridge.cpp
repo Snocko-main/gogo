@@ -141,15 +141,19 @@ struct PendingSlot {
 
 struct PendingRing {
     PendingSlot slots[RING_SIZE];
-    std::atomic<uint64_t> head;  // consumer index (loop thread only)
-    std::atomic<uint64_t> tail;  // producer index (any thread)
+    // head, tail, and wake_pending each get their own cache line
+    // (matching CtxPool): the loop thread advances head while producer
+    // goroutines CAS tail on every publish, so sharing a line would
+    // bounce it between cores for the whole drain/publish hot path.
+    alignas(64) std::atomic<uint64_t> head;  // consumer index (loop thread only)
+    alignas(64) std::atomic<uint64_t> tail;  // producer index (any thread)
     // wake_pending is 0 when no Go producer has yet called wake_drain
     // since the last loop-thread drain pass began. Producers CAS(0,1)
     // to claim the right to call wake_drain — the CAS loser knows the
     // drain is already scheduled and skips the cgo crossing. The drain
     // handler clears this back to 0 the moment it begins, so any newly
     // arrived ctx after that point will get a fresh wake.
-    std::atomic<uint32_t> wake_pending;
+    alignas(64) std::atomic<uint32_t> wake_pending;
     SharedAppState *owner = nullptr;
 
     void init() {
