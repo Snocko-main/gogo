@@ -552,7 +552,7 @@ func sharedWorker(stop <-chan struct{}) {
 	// runtime.lock2/schedule/findRunnable instead of in handlers.
 	const (
 		spinTight = 128
-		spinLimit = spinTight + 256
+		spinLimit = spinTight + 8
 	)
 
 	headAddr := (*atomic.Uint64)(unsafe.Pointer(shared.requestRing + shared.headOffset))
