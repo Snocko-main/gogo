@@ -12,6 +12,7 @@ permissions:
 concurrency:
   group: release-main
   cancel-in-progress: false
+  queue: max
 
 env:
   GO_STABLE_VERSION: 1.26.x

@@ -72,6 +72,9 @@ to `main`.
 
 Before tagging, the workflow runs the release gates, creates an annotated tag,
 publishes a GitHub release, and smoke-builds the published tag and `latest`.
+Release runs share one concurrency group with a `queue: max` policy, so a burst
+of merges is processed one release at a time instead of replacing older pending
+release runs.
 
 Use the manual commands below only as a fallback when GitHub Actions cannot be
 used or when a one-off prerelease tag is needed.
