@@ -298,6 +298,40 @@ struct uwsgo_app_t {
     // a string_view format + ~50-byte memcpy per shared-dispatch
     // request, which measures at ~2-3% on small-response routes.
     bool capture_peer_ip = false;
+
+    // refcount keeps this struct alive while deferred lambdas queued on
+    // the loop still reference it. uWS loops are thread-local and outlive
+    // any single App: a lambda deferred by stop/close_listen/publish can
+    // sit in the loop's queue past uwsgo_app_free and only run (or be
+    // destroyed) during a LATER App's run() on the same OS thread.
+    // Without the ref, that stale lambda would lock app_mu on a freed
+    // struct — a destroyed mutex aborts with
+    // "mutex lock failed: Invalid argument". The Go side's initial ref
+    // is dropped by uwsgo_app_free; each queued lambda holds its own via
+    // AppHold, so destruction happens after the last reference is gone
+    // no matter which side finishes first.
+    std::atomic<int> refcount{1};
+
+    void retain() { refcount.fetch_add(1, std::memory_order_relaxed); }
+    void release() {
+        if (refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            delete this;
+        }
+    }
+};
+
+// AppHold retains/releases uwsgo_app_t across a deferred lambda's
+// lifetime (same shape as CtxHold below). The destructor runs both when
+// the lambda executes and when the loop drops its defer queue without
+// running it, so the ref can't leak either way.
+struct AppHold {
+    uwsgo_app_t *app;
+    explicit AppHold(uwsgo_app_t *a) : app(a) { a->retain(); }
+    AppHold(const AppHold &o) : app(o.app) { app->retain(); }
+    AppHold(AppHold &&o) noexcept : app(o.app) { o.app = nullptr; }
+    AppHold &operator=(const AppHold &) = delete;
+    AppHold &operator=(AppHold &&) = delete;
+    ~AppHold() { if (app) app->release(); }
 };
 
 static void close_drain_timer(uwsgo_app_t *app) {
@@ -733,14 +767,16 @@ extern "C" void uwsgo_app_run(uwsgo_app_t *app) {
     // pre/post handlers in the App destructor via Loop::get(). That must run
     // on the loop thread; deleting the App later from Go's caller goroutine can
     // leave dangling TopicTree handlers on this loop and crash the next run.
+    //
+    // The loop itself is NOT freed here (websocket apps used to free it at
+    // this point): a shared-mode worker holding an active_sends pin may be
+    // inside uwsgo_wake_drain with this loop pointer right now. The loop is
+    // freed in uwsgo_app_free, which runs on this same OS thread after
+    // closing is published and the active_sends drain completes.
     std::lock_guard<std::mutex> lock(app->app_mu);
     if (app->app != nullptr) {
         app->app.reset();
         app->listen_socket = nullptr;
-    }
-    if (app->has_websocket && app->loop != nullptr) {
-        app->loop->free();
-        app->loop = nullptr;
     }
 }
 
@@ -750,11 +786,21 @@ extern "C" void uwsgo_app_run(uwsgo_app_t *app) {
 // are dispatched via Loop::defer because they mutate loop state and must run
 // on the loop thread. Safe to call from any goroutine. Idempotent.
 extern "C" void uwsgo_app_stop(uwsgo_app_t *app) {
-    if (app == nullptr || app->loop == nullptr) {
+    if (app == nullptr) {
         return;
     }
     app->accepting_work.store(false, std::memory_order_release);
-    app->loop->defer([app]() {
+    // app_mu pins app->loop against the run()-tail teardown (websocket
+    // apps free the loop and null the pointer under this same lock), so
+    // the defer below never targets a freed loop. The lambda holds its
+    // own app ref via AppHold — see the refcount field doc for why a
+    // queued lambda can outlive uwsgo_app_free.
+    std::lock_guard<std::mutex> lock(app->app_mu);
+    if (app->loop == nullptr) {
+        return;
+    }
+    app->loop->defer([hold = AppHold(app)]() {
+        uwsgo_app_t *app = hold.app;
         std::lock_guard<std::mutex> lock(app->app_mu);
         if (app->app != nullptr) {
             app->app->close();
@@ -770,11 +816,17 @@ extern "C" void uwsgo_app_stop(uwsgo_app_t *app) {
 // point the uWS loop's fd count drops to zero and run() returns. Calling
 // uwsgo_app_stop afterwards force-closes any remaining stragglers.
 extern "C" void uwsgo_app_close_listen(uwsgo_app_t *app) {
-    if (app == nullptr || app->loop == nullptr) {
+    if (app == nullptr) {
         return;
     }
     app->accepting_work.store(false, std::memory_order_release);
-    app->loop->defer([app]() {
+    // Same locking + AppHold rationale as uwsgo_app_stop above.
+    std::lock_guard<std::mutex> lock(app->app_mu);
+    if (app->loop == nullptr) {
+        return;
+    }
+    app->loop->defer([hold = AppHold(app)]() {
+        uwsgo_app_t *app = hold.app;
         std::lock_guard<std::mutex> lock(app->app_mu);
         if (app->app == nullptr) {
             return;
@@ -1170,7 +1222,29 @@ extern "C" void uwsgo_app_free(uwsgo_app_t *app) {
         app->ctx_pool = nullptr;
         state->release();
     }
-    delete app;
+    {
+        // This runs on the native owner thread — the same OS thread the
+        // loop ran on — so freeing the loop here is thread-correct. It
+        // must happen after the active_sends drain above: a shared-mode
+        // worker that passed its closing check may still be inside
+        // uwsgo_wake_drain with this loop pointer until its pin drops.
+        // Resetting app->app first mirrors the run()-tail ordering for
+        // apps that were never run.
+        std::lock_guard<std::mutex> lock(app->app_mu);
+        if (app->app != nullptr) {
+            app->app.reset();
+            app->listen_socket = nullptr;
+        }
+        if (app->has_websocket && app->loop != nullptr) {
+            app->loop->free();
+            app->loop = nullptr;
+        }
+    }
+    // Drop the Go side's initial ref. Deferred lambdas queued on the
+    // loop hold their own refs (AppHold), so the struct — and crucially
+    // its app_mu — stays alive until the last of them runs or is
+    // destroyed with the loop's defer queue.
+    app->release();
 }
 
 // RequestRing is shared across all App instances: C++ enqueues incoming
@@ -2087,7 +2161,8 @@ extern "C" void uwsgo_app_publish(uwsgo_app_t *app, const char *topic, size_t to
             !app->accepting_work.load(std::memory_order_acquire)) {
         return;
     }
-    app->loop->defer([app, t = std::move(topic_copy), m = std::move(message_copy), op]() {
+    app->loop->defer([hold = AppHold(app), t = std::move(topic_copy), m = std::move(message_copy), op]() {
+        uwsgo_app_t *app = hold.app;
         std::lock_guard<std::mutex> lock(app->app_mu);
         if (app->app != nullptr && app->accepting_work.load(std::memory_order_acquire)) {
             app->app->publish(t, m, op);
@@ -2131,19 +2206,23 @@ extern "C" void uwsgo_app_publish_batch(
         }
     }
     size_t total = items_bytes + bytes_len;
-    char *buf = static_cast<char *>(::operator new(total));
-    memcpy(buf, items, items_bytes);
+    // unique_ptr ownership (instead of a raw operator-new buffer with a
+    // manual delete inside the lambda) frees the blob even when the loop
+    // drops its defer queue without ever running the callback.
+    std::unique_ptr<char[]> bufp(new char[total]);
+    memcpy(bufp.get(), items, items_bytes);
     if (bytes_len > 0) {
-        memcpy(buf + items_bytes, bytes, bytes_len);
+        memcpy(bufp.get() + items_bytes, bytes, bytes_len);
     }
 
     std::lock_guard<std::mutex> lock(app->app_mu);
     if (app->app == nullptr || app->loop == nullptr ||
             !app->accepting_work.load(std::memory_order_acquire)) {
-        ::operator delete(buf);
         return;
     }
-    app->loop->defer([app, buf, count]() {
+    app->loop->defer([hold = AppHold(app), b = std::move(bufp), count]() {
+        uwsgo_app_t *app = hold.app;
+        const char *buf = b.get();
         const auto *items = reinterpret_cast<const uwsgo_batch_item_t *>(buf);
         const char *bytes = buf + count * sizeof(uwsgo_batch_item_t);
         std::lock_guard<std::mutex> lock(app->app_mu);
@@ -2155,6 +2234,5 @@ extern "C" void uwsgo_app_publish_batch(
                     static_cast<uWS::OpCode>(items[i].opcode));
             }
         }
-        ::operator delete(buf);
     });
 }
