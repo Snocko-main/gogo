@@ -1380,6 +1380,18 @@ func asyncSendShared(ctxHandle uintptr, statusLine, contentType, body string) bo
 	// MPSC enqueue: claim a ready slot with CAS. If the response ring is full
 	// or heavily contended, return false so the caller can fall back to
 	// Loop::defer instead of spinning unbounded on a worker goroutine.
+	//
+	// Backoff shape: CAS retries against other producers normally resolve
+	// within a handful of iterations, so the first enqueueSpinYield laps
+	// run tight. Past that the P yields every lap so co-scheduled workers
+	// make progress, and at enqueueSpinBudget the producer stops fighting:
+	// the cgo defer fallback costs about a microsecond, which is far
+	// cheaper than the tens of milliseconds of burned CPU the previous
+	// 100k-spin limit allowed under heavy producer contention.
+	const (
+		enqueueSpinYield  = 64
+		enqueueSpinBudget = 512
+	)
 	tailAddr := (*atomic.Uint64)(unsafe.Pointer(ringPtr + shared.tailOffset))
 	tail := tailAddr.Load()
 	var (
@@ -1402,10 +1414,10 @@ func asyncSendShared(ctxHandle uintptr, statusLine, contentType, body string) bo
 		default:
 			tail = tailAddr.Load()
 		}
-		if spin > 100000 {
+		if spin >= enqueueSpinBudget {
 			return false
 		}
-		if spin%256 == 0 {
+		if spin >= enqueueSpinYield {
 			runtime.Gosched()
 		}
 	}
