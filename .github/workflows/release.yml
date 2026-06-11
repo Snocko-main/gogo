@@ -1,0 +1,263 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+env:
+  GO_STABLE_VERSION: 1.26.x
+
+jobs:
+  plan:
+    name: Plan release
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.plan.outputs.should_release }}
+      bump: ${{ steps.plan.outputs.bump }}
+      version: ${{ steps.plan.outputs.version }}
+      latest_tag: ${{ steps.plan.outputs.latest_tag }}
+      pr_number: ${{ steps.plan.outputs.pr_number }}
+      pr_title: ${{ steps.plan.outputs.pr_title }}
+      head_ref: ${{ steps.plan.outputs.head_ref }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine release plan
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          git fetch --tags origin
+
+          prs="$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls")"
+          pr_count="$(printf '%s' "$prs" | jq 'length')"
+
+          if [ "$pr_count" -eq 0 ]; then
+            {
+              echo "should_release=false"
+              echo "reason=no associated pull request"
+            } >> "$GITHUB_OUTPUT"
+            echo "No release: pushed commit has no associated pull request." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          pr_number="$(printf '%s' "$prs" | jq -r '.[0].number')"
+          pr_title="$(printf '%s' "$prs" | jq -r '.[0].title')"
+          head_ref="$(printf '%s' "$prs" | jq -r '.[0].head.ref')"
+
+          case "$head_ref" in
+            fix/*)
+              bump=patch
+              ;;
+            feat/*|feature/*)
+              bump=minor
+              ;;
+            *)
+              {
+                echo "should_release=false"
+                echo "reason=branch prefix does not request release"
+                echo "pr_number=$pr_number"
+                echo "head_ref=$head_ref"
+              } >> "$GITHUB_OUTPUT"
+              {
+                echo "No release for PR #$pr_number."
+                echo
+                echo "Branch \`$head_ref\` is not \`fix/*\`, \`feat/*\`, or \`feature/*\`."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+              ;;
+          esac
+
+          latest_tag="$(
+            git tag --list 'v*' |
+              grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
+              sort -V |
+              tail -n 1
+          )"
+          version="$(scripts/next_release_version.sh "$bump" "$latest_tag")"
+
+          if git rev-parse -q --verify "refs/tags/$version" >/dev/null; then
+            echo "planned tag already exists: $version" >&2
+            exit 1
+          fi
+
+          {
+            echo "should_release=true"
+            echo "bump=$bump"
+            echo "version=$version"
+            echo "latest_tag=$latest_tag"
+            echo "pr_number=$pr_number"
+            echo "head_ref=$head_ref"
+            echo "pr_title<<EOF"
+            echo "$pr_title"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "Release planned: \`$version\`"
+            echo
+            echo "- PR: #$pr_number"
+            echo "- Branch: \`$head_ref\`"
+            echo "- Bump: \`$bump\` from \`$latest_tag\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: Validate, tag, and publish
+    needs: plan
+    if: needs.plan.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out release commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_STABLE_VERSION }}
+          cache: true
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential zlib1g-dev
+
+      - name: Recheck release version
+        env:
+          BUMP: ${{ needs.plan.outputs.bump }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -eu
+          git fetch --tags origin
+          if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
+            echo "tag already exists: $VERSION" >&2
+            exit 1
+          fi
+
+          current_next="$(scripts/next_release_version.sh "$BUMP")"
+          if [ "$current_next" != "$VERSION" ]; then
+            echo "planned version is stale; expected $current_next, got $VERSION" >&2
+            exit 1
+          fi
+
+      - name: Check shell scripts
+        run: |
+          sh -n \
+            scripts/check_tracked_native_sources.sh \
+            scripts/downstream_smoke_build.sh \
+            scripts/check_readme_examples.sh \
+            scripts/next_release_version.sh
+
+      - name: Verify C++20 and zlib toolchain
+        run: |
+          c++ --version
+          printf '#include <version>\nint main() { return 0; }\n' | c++ -std=c++20 -x c++ - -o /tmp/gogo-cxx20-check
+          printf '#include <zlib.h>\nint main() { return 0; }\n' | cc -x c - -lz -o /tmp/gogo-zlib-check
+
+      - name: Run Go tests
+        run: go test ./...
+
+      - name: Run native Go tests
+        run: CGO_ENABLED=1 go test -tags gogo ./...
+
+      - name: Check tracked native sources
+        run: scripts/check_tracked_native_sources.sh
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run downstream smoke build from checkout
+        run: scripts/downstream_smoke_build.sh --local "$GITHUB_WORKSPACE"
+
+      - name: Check README examples
+        run: scripts/check_readme_examples.sh
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Run govulncheck
+        run: |
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+      - name: Run native govulncheck
+        run: |
+          CGO_ENABLED=1 "$(go env GOPATH)/bin/govulncheck" -tags gogo ./...
+
+      - name: Create and push annotated tag
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -eu
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "$VERSION"
+          git push origin "refs/tags/$VERSION"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          LATEST_TAG: ${{ needs.plan.outputs.latest_tag }}
+          BUMP: ${{ needs.plan.outputs.bump }}
+          PR_NUMBER: ${{ needs.plan.outputs.pr_number }}
+          PR_TITLE: ${{ needs.plan.outputs.pr_title }}
+          HEAD_REF: ${{ needs.plan.outputs.head_ref }}
+        run: |
+          set -eu
+          cat > /tmp/gogo-release-notes.md <<EOF
+          Automated release from PR #$PR_NUMBER: $PR_TITLE
+
+          - Branch: \`$HEAD_REF\`
+          - Bump: \`$BUMP\`
+          - Previous release: \`$LATEST_TAG\`
+          - Commit: \`$GITHUB_SHA\`
+          EOF
+
+          notes="$(cat /tmp/gogo-release-notes.md)"
+          gh release create "$VERSION" \
+            --verify-tag \
+            --title "$VERSION" \
+            --generate-notes \
+            --notes-start-tag "$LATEST_TAG" \
+            --notes "$notes" \
+            --fail-on-no-commits
+
+      - name: Run downstream smoke build from published tag
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          GOPROXY: direct
+          GOSUMDB: off
+        run: scripts/downstream_smoke_build.sh "$VERSION" latest
+
+      - name: Write release summary
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          BUMP: ${{ needs.plan.outputs.bump }}
+          PR_NUMBER: ${{ needs.plan.outputs.pr_number }}
+        run: |
+          {
+            echo "## Released $VERSION"
+            echo
+            echo "- Source PR: #$PR_NUMBER"
+            echo "- Version bump: \`$BUMP\`"
+            echo "- Created annotated tag: \`$VERSION\`"
+            echo "- Published GitHub release"
+            echo "- Verified downstream builds for \`@$VERSION\` and \`@latest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
