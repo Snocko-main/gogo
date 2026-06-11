@@ -7,6 +7,15 @@ minor releases may include breaking API changes when they move the project
 toward a stable API. Breaking changes should be called out in the release
 notes for the release that introduces them.
 
+## Unreleased
+
+### Fixed
+
+- Fixed Linux native builds under strict C11 cgo flags by enabling the glibc
+  feature macro needed for the `syscall(SYS_gettid)` declaration used by native
+  loop owner-thread checks. Downstream users should not need custom bootstrap
+  `CGO_CFLAGS` for this path.
+
 ## v1.0.0-rc.1 - 2026-06-10
 
 Annotated tag `v1.0.0-rc.1` was cut from commit
