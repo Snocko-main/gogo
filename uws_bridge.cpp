@@ -1260,10 +1260,19 @@ struct SendBuffer {
     }
 };
 
-inline char *dup_to_c_heap(const char *src, size_t n) {
+// dup_to_c_heap returns nullptr both when n == 0 and when malloc
+// fails; *oom is set in the failure case so callers can drop the
+// whole operation. Without that signal a caller would pair the null
+// pointer with the original non-zero length and build a string_view
+// over it, which uWS would then read out of bounds.
+inline char *dup_to_c_heap(const char *src, size_t n, bool *oom) {
     if (n == 0) return nullptr;
     char *p = static_cast<char *>(std::malloc(n));
-    if (p != nullptr) std::memcpy(p, src, n);
+    if (p == nullptr) {
+        *oom = true;
+        return nullptr;
+    }
+    std::memcpy(p, src, n);
     return p;
 }
 
@@ -1699,14 +1708,15 @@ extern "C" void uwsgo_res_defer_send(
     auto *ctx = static_cast<AsyncCtx *>(ctx_handle);
 
     SendBuffer buf;
-    buf.status = dup_to_c_heap(status, status_len);
+    bool oom = false;
+    buf.status = dup_to_c_heap(status, status_len, &oom);
     buf.status_len = status_len;
-    buf.content_type = dup_to_c_heap(content_type, content_type_len);
+    buf.content_type = dup_to_c_heap(content_type, content_type_len, &oom);
     buf.content_type_len = content_type_len;
-    buf.body = dup_to_c_heap(body, body_len);
+    buf.body = dup_to_c_heap(body, body_len, &oom);
     buf.body_len = body_len;
 
-    if (ctx == nullptr || ctx->closed_or_aborted()) {
+    if (ctx == nullptr || oom || ctx->closed_or_aborted()) {
         if (ctx != nullptr) ctx->release();
         return;
     }
@@ -1773,16 +1783,17 @@ extern "C" void uwsgo_res_defer_send_with_headers(
     auto *ctx = static_cast<AsyncCtx *>(ctx_handle);
 
     SendBufferWithHeaders buf;
-    buf.status = dup_to_c_heap(status, status_len);
+    bool oom = false;
+    buf.status = dup_to_c_heap(status, status_len, &oom);
     buf.status_len = status_len;
-    buf.content_type = dup_to_c_heap(content_type, content_type_len);
+    buf.content_type = dup_to_c_heap(content_type, content_type_len, &oom);
     buf.content_type_len = content_type_len;
-    buf.headers_blob = dup_to_c_heap(headers_blob, headers_len);
+    buf.headers_blob = dup_to_c_heap(headers_blob, headers_len, &oom);
     buf.headers_len = headers_len;
-    buf.body = dup_to_c_heap(body, body_len);
+    buf.body = dup_to_c_heap(body, body_len, &oom);
     buf.body_len = body_len;
 
-    if (ctx == nullptr || ctx->closed_or_aborted()) {
+    if (ctx == nullptr || oom || ctx->closed_or_aborted()) {
         if (ctx != nullptr) ctx->release();
         return;
     }
@@ -1845,14 +1856,22 @@ extern "C" int uwsgo_res_defer_stream_start(
     ctx->retain();
 
     SendBufferWithHeaders buf;
-    buf.status = dup_to_c_heap(status, status_len);
+    bool oom = false;
+    buf.status = dup_to_c_heap(status, status_len, &oom);
     buf.status_len = status_len;
-    buf.content_type = dup_to_c_heap(content_type, content_type_len);
+    buf.content_type = dup_to_c_heap(content_type, content_type_len, &oom);
     buf.content_type_len = content_type_len;
-    buf.headers_blob = dup_to_c_heap(headers_blob, headers_len);
+    buf.headers_blob = dup_to_c_heap(headers_blob, headers_len, &oom);
     buf.headers_len = headers_len;
     buf.body = nullptr;
     buf.body_len = 0;
+    if (oom) {
+        // Report failure to Go before any header bytes go out; the
+        // caller can surface an error instead of leaving the response
+        // half-started.
+        ctx->release();
+        return 0;
+    }
 
     l->defer([ctx, sb = std::move(buf)]() mutable {
         if (ctx->closed_or_aborted()) {
@@ -1903,10 +1922,17 @@ extern "C" void uwsgo_res_defer_stream_write(
     if (ctx == nullptr || ctx->closed_or_aborted()) {
         return;
     }
+    // Copy before retain/fetch_add so an allocation failure needs no
+    // unwinding. Dropping the chunk on OOM truncates the stream body,
+    // but the alternative was pairing a null pointer with a non-zero
+    // length in the write below.
+    bool oom = false;
+    char *chunk_copy = dup_to_c_heap(chunk, chunk_len, &oom);
+    if (oom) {
+        return;
+    }
     ctx->retain();
     ctx->stream_pending_bytes.fetch_add(chunk_len, std::memory_order_acq_rel);
-
-    char *chunk_copy = dup_to_c_heap(chunk, chunk_len);
     size_t copy_len = chunk_len;
 
     l->defer([ctx, chunk_copy, copy_len]() mutable {
