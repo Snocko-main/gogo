@@ -127,6 +127,44 @@ func TestBasicAuthBadPassword(t *testing.T) {
 	}
 }
 
+func TestBasicAuthMultipleUsersNoCrossMatch(t *testing.T) {
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.Use(middleware.BasicAuth(middleware.BasicAuthOptions{
+			Users: map[string]string{"alice": "wonderland", "bob": "builder"},
+		}))
+		app.Get("/", func(res *gogo.Response, req *gogo.Request) {
+			user, _ := req.Local(middleware.BasicAuthLocalKey).(string)
+			res.Send(200, "text/plain", "hello "+user)
+		})
+	})
+	defer teardown()
+
+	cases := []struct {
+		user, pass string
+		want       int
+	}{
+		{"alice", "wonderland", 200},
+		{"bob", "builder", 200},
+		// A valid password paired with the wrong username must not
+		// satisfy the entry-by-entry scan.
+		{"alice", "builder", 401},
+		{"bob", "wonderland", 401},
+		{"mallory", "wonderland", 401},
+	}
+	for _, tc := range cases {
+		req, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/", port), nil)
+		req.SetBasicAuth(tc.user, tc.pass)
+		resp, err := noKeepaliveClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s:%s get: %v", tc.user, tc.pass, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != tc.want {
+			t.Errorf("%s:%s got %d want %d", tc.user, tc.pass, resp.StatusCode, tc.want)
+		}
+	}
+}
+
 func TestBasicAuthValidatorCallback(t *testing.T) {
 	var calls atomic.Int32
 	port, teardown := startApp(t, func(app *gogo.App) {
