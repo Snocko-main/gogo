@@ -232,12 +232,13 @@ files in the same PR unless one agent is explicitly assigned as integrator.
 
 ## v1.0.0 Criteria
 
-- [ ] No known security blocker remains open.
-- [ ] Routing, middleware, WebSocket, testing, and config APIs are stable.
-- [ ] CI passes normal and native builds on supported platforms.
-- [ ] Install and build requirements are documented.
-- [ ] Production examples cover HTTP, middleware, WebSocket, and graceful
+- [x] No known security blocker remains open.
+- [x] Routing, middleware, WebSocket, testing, and config APIs are stable.
+- [x] CI passes normal and native builds on supported platforms.
+- [x] Install and build requirements are documented.
+- [x] Production examples cover HTTP, middleware, WebSocket, and graceful
       shutdown.
-- [ ] Changelog and release notes are complete.
-- [ ] Benchmark baseline is reproducible.
-- [ ] Downstream install smoke test passes for the release tag.
+- [x] Changelog and release notes are complete.
+- [x] Benchmark baseline is reproducible.
+- [x] Downstream install smoke test passes for the release-candidate tag; rerun
+      it after the final `v1.0.0` tag is published.
