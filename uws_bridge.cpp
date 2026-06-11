@@ -1501,6 +1501,7 @@ extern "C" void uwsgo_shared_layout(uwsgo_shared_layout_t *out) {
     out->ctx_body_offset = offsetof(AsyncCtx, inline_body);
     out->ctx_handler_id_offset = offsetof(AsyncCtx, handler_id);
     out->ctx_aborted_offset = offsetof(AsyncCtx, aborted);
+    out->ctx_refcount_offset = offsetof(AsyncCtx, refcount);
     out->ctx_response_offset = offsetof(AsyncCtx, response);
     out->ctx_loop_offset = offsetof(AsyncCtx, loop);
     out->ctx_shared_state_offset = offsetof(AsyncCtx, state);

@@ -291,6 +291,11 @@ typedef struct uwsgo_shared_layout_t {
     size_t ctx_body_offset;
     size_t ctx_handler_id_offset;
     size_t ctx_aborted_offset;
+    // Offset of the AsyncCtx refcount (std::atomic<int>). Go workers pin
+    // the ctx for the lifetime of the request wrapper by incrementing this
+    // directly through shared memory — no cgo on the hot path — and drop
+    // the pin with uwsgo_async_ctx_release afterwards.
+    size_t ctx_refcount_offset;
     size_t ctx_response_offset;
     size_t ctx_loop_offset;
     size_t ctx_shared_state_offset;

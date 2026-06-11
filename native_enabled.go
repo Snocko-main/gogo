@@ -648,14 +648,22 @@ func runSharedHandler(handler AsyncHandler, ctxPtr uintptr) {
 	a.sent = false
 	resWrap.async = a
 
+	// Pin the ctx for the lifetime of this request wrapper. The worker owns
+	// the ring ref it popped, but sending the response transfers that ref to
+	// the loop-thread consumer, which may recycle the ctx immediately — and
+	// the headers snapshot below is a zero-copy view into ctx memory. The
+	// pin is a direct atomic increment on the C++ refcount through shared
+	// memory (no cgo); the matching release is the cgo call in the defer.
+	sharedCtxRetain(ctxPtr)
+
 	// Build the request snapshot from ctx memory. C++ has already copied the
-	// fields it could into AsyncCtx; we copy out to Go-owned strings/bytes so
-	// the snapshot survives past ctx release.
+	// fields it could into AsyncCtx; small fields are copied out to Go-owned
+	// strings, while the headers blob stays a view into pinned ctx memory.
 	reqWrap := requestPool.Get().(*Request)
 	reqWrap.snap = newSnapshotFromCtx(ctxPtr)
 	// post_shared routes leave the collected body in ctx memory;
 	// readSharedReqBody copies it out into a Go slice so the
-	// handler can read it via req.Body() after ctx release.
+	// handler can keep the bytes past the request's lifetime.
 	reqWrap.body = readSharedReqBody(ctxPtr)
 	// Back-pointer for req.Context() so a client abort propagates
 	// cancellation into downstream context-aware calls.
@@ -676,21 +684,38 @@ func runSharedHandler(handler AsyncHandler, ctxPtr uintptr) {
 		reqWrap.resetForPool()
 		requestPool.Put(reqWrap)
 		resWrap.finishAsync(a)
+		// Drop the lifetime pin taken before the snapshot was built. This
+		// must be the last ctx access on the worker: the release can recycle
+		// the ctx (or free it during app teardown), and every snapshot view
+		// into ctx memory is unreachable once reqWrap was reset above.
+		asyncCtxRelease(ctxPtr)
 	}()
 
 	handler(resWrap, reqWrap)
 }
 
+// sharedCtxRetain bumps the AsyncCtx refcount directly through shared
+// memory — the C++ side declares it std::atomic<int>, which is layout- and
+// semantics-compatible with atomic.Int32 on every supported platform (the
+// same contract the aborted/closing flags already rely on).
+func sharedCtxRetain(ctxPtr uintptr) {
+	(*atomic.Int32)(unsafe.Pointer(ctxPtr + shared.ctxRefcountOff)).Add(1)
+}
+
 // newSnapshotFromCtx reads the request-snapshot fields C++ wrote into the
-// AsyncCtx and returns a Go-side requestSnapshot whose strings/bytes do not
-// alias ctx memory — so the snapshot stays valid after ctx is released.
+// AsyncCtx and returns a Go-side requestSnapshot. Small fields (method, url,
+// query, ip, params) are copied into ONE arena allocation with the
+// snapshot's strings as views into it. The headers blob — the dominant byte
+// count, 1-2 KiB from real browsers — is NOT copied: the snapshot records a
+// raw view (headersSrc/headersSrcLen) into ctx memory, which runSharedHandler
+// pins for the request wrapper's whole lifetime. Header reads copy only the
+// matched value, exactly as before; the wholesale blob copy is gone.
 //
-// All variable-length fields are copied into ONE arena allocation and the
-// snapshot's strings/byte-slices are views into it. Per request this costs
-// two allocations (snapshot struct + arena) instead of one per field; under
-// saturation the per-field version showed mallocgc at ~25% of worker CPU.
-// The arena is never pooled or reused, so a handler retaining any snapshot
-// string simply keeps the (small) arena alive — same safety as before.
+// Per request this costs two allocations (snapshot struct + arena); under
+// saturation the previous per-field version showed mallocgc at ~25% of
+// worker CPU. The arena is never pooled or reused, so a handler retaining
+// any snapshot string simply keeps the (small) arena alive — same safety as
+// before.
 func newSnapshotFromCtx(ctxPtr uintptr) *requestSnapshot {
 	methodLen := boundedUint32Len(*(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxMethodLenOff)), shared.snapMethodCap)
 	urlLen := boundedUint32Len(*(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxURLLenOff)), shared.snapURLCap)
@@ -729,11 +754,16 @@ func newSnapshotFromCtx(ctxPtr uintptr) *requestSnapshot {
 	}
 
 	snap := &requestSnapshot{truncated: truncated}
+	if headersLen > 0 {
+		snap.headersSrc = ctxPtr + shared.ctxHeadersOff
+		snap.headersSrcLen = headersLen
+	}
 
-	// One arena holds every variable-length field. It is sized exactly and
-	// filled with append — the capacity must never be exceeded, or the
-	// realloc would leave earlier unsafe.String views dangling.
-	arena := make([]byte, 0, methodLen+urlLen+queryLen+ipLen+headersLen+paramBytes)
+	// One arena holds every variable-length field except headers (see the
+	// doc comment). It is sized exactly and filled with append — the
+	// capacity must never be exceeded, or the realloc would leave earlier
+	// unsafe.String views dangling.
+	arena := make([]byte, 0, methodLen+urlLen+queryLen+ipLen+paramBytes)
 	take := func(base uintptr, n int) string {
 		if n <= 0 {
 			return ""
@@ -747,12 +777,6 @@ func newSnapshotFromCtx(ctxPtr uintptr) *requestSnapshot {
 	snap.url = take(ctxPtr+shared.ctxURLOff, urlLen)
 	snap.query = take(ctxPtr+shared.ctxQueryOff, queryLen)
 	snap.ip = take(ctxPtr+shared.ctxIPOff, ipLen)
-
-	if headersLen > 0 {
-		off := len(arena)
-		arena = append(arena, unsafe.Slice((*byte)(unsafe.Pointer(ctxPtr+shared.ctxHeadersOff)), headersLen)...)
-		snap.headers = arena[off : off+headersLen : off+headersLen]
-	}
 
 	if paramCount > 0 {
 		if fixedParams {
@@ -1233,6 +1257,7 @@ type sharedLayout struct {
 	ctxBodyOff          uintptr
 	ctxHandlerIDOff     uintptr
 	ctxAbortedOff       uintptr
+	ctxRefcountOff      uintptr
 	ctxResponseOff      uintptr
 	ctxLoopOff          uintptr
 	ctxSharedStateOff   uintptr
@@ -1305,6 +1330,7 @@ func initSharedLayoutOnce() {
 		ctxBodyOff:          uintptr(raw.ctx_body_offset),
 		ctxHandlerIDOff:     uintptr(raw.ctx_handler_id_offset),
 		ctxAbortedOff:       uintptr(raw.ctx_aborted_offset),
+		ctxRefcountOff:      uintptr(raw.ctx_refcount_offset),
 		ctxResponseOff:      uintptr(raw.ctx_response_offset),
 		ctxLoopOff:          uintptr(raw.ctx_loop_offset),
 		ctxSharedStateOff:   uintptr(raw.ctx_shared_state_offset),

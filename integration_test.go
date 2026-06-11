@@ -706,6 +706,51 @@ func TestSharedDispatch(t *testing.T) {
 	}
 }
 
+// TestSharedDispatchHeaderAfterSend covers the lazy-header lifetime: the
+// shared-path snapshot keeps the header blob as a view into pinned AsyncCtx
+// memory, and the pin must keep that memory valid even after the response
+// has been sent and the ctx ownership transferred to the loop-thread
+// consumer. A handler that reads headers only AFTER res.Send must still see
+// the request's own values — a recycled ctx here would surface as another
+// request's headers (or garbage).
+func TestSharedDispatchHeaderAfterSend(t *testing.T) {
+	type seen struct {
+		before, after, custom string
+	}
+	results := make(chan seen, 1)
+	port, teardown := startApp(t, func(app *gogo.App) {
+		app.GetAsync("/h", func(res *gogo.Response, req *gogo.Request) {
+			before := req.Header("x-probe")
+			res.Send(200, "text/plain; charset=utf-8", "ok")
+			// Reads after the send: the loop thread may already have
+			// written the response and released its ctx ref.
+			after := req.Header("x-probe")
+			custom := req.Header("x-custom-token")
+			results <- seen{before: before, after: after, custom: custom}
+		})
+	})
+	defer teardown()
+
+	httpReq, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/h", port), nil)
+	httpReq.Header.Set("X-Probe", "probe-value-123")
+	httpReq.Header.Set("X-Custom-Token", "tok_abcdef")
+	resp, err := noKeepaliveClient.Do(httpReq)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	got := <-results
+	if got.before != "probe-value-123" || got.after != "probe-value-123" {
+		t.Fatalf("x-probe before/after send = %q / %q, want both probe-value-123", got.before, got.after)
+	}
+	if got.custom != "tok_abcdef" {
+		t.Fatalf("x-custom-token = %q, want tok_abcdef", got.custom)
+	}
+}
+
 // TestSharedWorkersDrainOnAppClose verifies the shared-dispatch
 // worker pool exits cleanly once the last App that referenced it is
 // closed. Without the drain, every test that uses a shared route
