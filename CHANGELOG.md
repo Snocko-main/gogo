@@ -7,7 +7,7 @@ minor releases may include breaking API changes when they move the project
 toward a stable API. Breaking changes should be called out in the release
 notes for the release that introduces them.
 
-## Unreleased
+## v1.0.1 - 2026-06-11
 
 ### Fixed
 
@@ -15,6 +15,13 @@ notes for the release that introduces them.
   feature macro needed for the `syscall(SYS_gettid)` declaration used by native
   loop owner-thread checks. Downstream users should not need custom bootstrap
   `CGO_CFLAGS` for this path.
+
+## v1.0.0 - 2026-06-11
+
+First stable release of gogo. The public v1 surface for routing, middleware,
+WebSocket, testing helpers, configuration, lifecycle, native build behavior,
+release hygiene, and documentation is stable. The GitHub release records the
+post-tag downstream smoke validation for `v1.0.0` and `latest`.
 
 ## v1.0.0-rc.1 - 2026-06-10
 
