@@ -3967,6 +3967,20 @@ func GetSendFileBackpressureBytes() uint64 {
 // Response.Async so the uWS loop thread isn't blocked on disk I/O;
 // the function returns nil immediately after the open/stat/range
 // prep, and the body streams from a goroutine.
+//
+// SECURITY: path is opened exactly as given — the framework performs
+// no sanitization, so a path built from request input (route params,
+// query strings, form fields) lets clients traverse outside the
+// intended directory with ".." segments or absolute paths. Never
+// pass untrusted input directly; resolve it against a fixed base
+// directory first and verify the result stays inside it:
+//
+//	p := filepath.Join(base, filepath.Clean("/"+req.Param("name")))
+//
+// Cleaning rooted at "/" strips every ".." before the join, so p
+// cannot escape base. Symlinks under base are still followed; keep
+// the tree free of links pointing outside it. See
+// docs/file-serving.md for the full rooted-path and symlink guidance.
 func (r *Response) SendFile(req *Request, path string) error {
 	return r.sendFile(req, path, "", false)
 }
@@ -3978,6 +3992,10 @@ func (r *Response) SendFile(req *Request, path string) error {
 // quoted-string form with quote / backslash escaped per RFC 6266;
 // non-ASCII filenames receive an RFC 5987 filename* parameter so
 // non-Latin-1 names survive transport.
+//
+// SECURITY: path handling matches SendFile — no sanitization is
+// performed, so never build path from untrusted request input; see
+// the SendFile doc for the safe base-directory pattern.
 func (r *Response) Download(req *Request, path, filename string) error {
 	if filename == "" {
 		filename = filepath.Base(path)
