@@ -20,10 +20,11 @@ const BasicAuthLocalKey = "gogo.basicauth.user"
 // BasicAuthOptions configures BasicAuth. Provide either Users or
 // Validator (Validator wins if both are set).
 type BasicAuthOptions struct {
-	// Users is a static {username: password} map. Lookups use
-	// constant-time comparison so timing leaks of valid usernames
-	// are kept negligible. Intended for small fleets and CI;
-	// production credentials should live in Validator backed by a
+	// Users is a static {username: password} map. Verification
+	// scans every entry with constant-time comparisons, so timing
+	// reveals neither whether a username exists nor which entry
+	// matched. Intended for small fleets and CI; production
+	// credentials should live in Validator backed by a
 	// hashed-password store.
 	Users map[string]string
 
@@ -95,22 +96,34 @@ func BasicAuth(opt BasicAuthOptions) mwhint.Hinted {
 
 	verify := opt.Validator
 	if verify == nil {
-		users := make(map[string][sha256.Size]byte, len(opt.Users))
-		for user, pass := range opt.Users {
-			users[user] = sha256.Sum256([]byte(pass))
+		// Hash both halves of every credential up front and scan the
+		// full list on each attempt, folding the results together with
+		// constant-time operations. A map lookup keyed on the username
+		// would exit early for unknown users, leaking valid usernames
+		// through response timing; the linear scan costs the same
+		// whether or not the username exists. Users maps are small by
+		// contract (see the field doc), so O(n) per attempt is fine.
+		type credential struct {
+			user [sha256.Size]byte
+			pass [sha256.Size]byte
 		}
-		dummy := sha256.Sum256(nil)
+		creds := make([]credential, 0, len(opt.Users))
+		for user, pass := range opt.Users {
+			creds = append(creds, credential{
+				user: sha256.Sum256([]byte(user)),
+				pass: sha256.Sum256([]byte(pass)),
+			})
+		}
 		verify = func(u, p string) bool {
-			supplied := sha256.Sum256([]byte(p))
-			expected, ok := users[u]
-			if !ok {
-				// Run the compare anyway to keep the timing
-				// roughly constant across known vs. unknown
-				// usernames.
-				subtle.ConstantTimeCompare(supplied[:], dummy[:])
-				return false
+			suppliedUser := sha256.Sum256([]byte(u))
+			suppliedPass := sha256.Sum256([]byte(p))
+			match := 0
+			for i := range creds {
+				userEq := subtle.ConstantTimeCompare(suppliedUser[:], creds[i].user[:])
+				passEq := subtle.ConstantTimeCompare(suppliedPass[:], creds[i].pass[:])
+				match |= userEq & passEq
 			}
-			return subtle.ConstantTimeCompare(supplied[:], expected[:]) == 1
+			return match == 1
 		}
 	}
 
