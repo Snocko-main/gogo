@@ -5,6 +5,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -242,6 +243,54 @@ func TestSignJWTRejectsECDSACurveMismatch(t *testing.T) {
 
 	if _, err := SignJWT(JWTES256, priv, map[string]any{"sub": "x"}); err == nil {
 		t.Fatal("SignJWT accepted ES256 with a P-384 key")
+	}
+}
+
+func TestVerifyJWTRejectsOutOfRangeTimeClaims(t *testing.T) {
+	tests := []struct {
+		name    string
+		claims  map[string]any
+		wantErr string
+	}{
+		{
+			name:    "negative exp",
+			claims:  map[string]any{"exp": -1},
+			wantErr: "malformed exp claim",
+		},
+		{
+			name:    "huge exp",
+			claims:  map[string]any{"exp": 1e300},
+			wantErr: "malformed exp claim",
+		},
+		{
+			name:    "negative nbf",
+			claims:  map[string]any{"nbf": -1e300},
+			wantErr: "malformed nbf claim",
+		},
+		{
+			name:    "huge nbf",
+			claims:  map[string]any{"nbf": 1e300},
+			wantErr: "malformed nbf claim",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tok := signJWTForVerifyTest(t, tc.claims)
+			_, err := verifySignedJWTForTest(t, tok, jwtClaimValidation{})
+			if err == nil || err.Error() != tc.wantErr {
+				t.Fatalf("verifyJWT error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestJWTNumericDateRejectsNaN(t *testing.T) {
+	if _, ok := jwtNumericDate(math.NaN()); ok {
+		t.Fatal("jwtNumericDate(NaN) accepted, want rejection")
+	}
+	if _, ok := jwtNumericDate(0); !ok {
+		t.Fatal("jwtNumericDate(0) rejected, want acceptance")
 	}
 }
 

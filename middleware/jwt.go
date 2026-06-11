@@ -16,6 +16,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"hash"
+	"math"
 	"math/big"
 	"strings"
 	"time"
@@ -445,7 +446,10 @@ func verifyJWT(tok string, verify jwtVerifier, expectedAlg string, leeway time.D
 		if !ok {
 			return nil, errors.New("malformed exp claim")
 		}
-		expT := time.Unix(int64(expF), 0)
+		expT, ok := jwtNumericDate(expF)
+		if !ok {
+			return nil, errors.New("malformed exp claim")
+		}
 		if now.After(expT.Add(leeway)) {
 			return nil, errors.New("token expired")
 		}
@@ -455,7 +459,10 @@ func verifyJWT(tok string, verify jwtVerifier, expectedAlg string, leeway time.D
 		if !ok {
 			return nil, errors.New("malformed nbf claim")
 		}
-		nbfT := time.Unix(int64(nbfF), 0)
+		nbfT, ok := jwtNumericDate(nbfF)
+		if !ok {
+			return nil, errors.New("malformed nbf claim")
+		}
 		if now.Add(leeway).Before(nbfT) {
 			return nil, errors.New("token not yet valid")
 		}
@@ -464,6 +471,24 @@ func verifyJWT(tok string, verify jwtVerifier, expectedAlg string, leeway time.D
 		return nil, err
 	}
 	return claims, nil
+}
+
+// maxJWTUnixSeconds bounds accepted NumericDate values to float64's
+// exact-integer range (2^53 seconds ≈ year 285 million). Beyond it the
+// float64 → int64 conversion loses precision, and a value past int64
+// range converts to an implementation-defined result — saturating to
+// MaxInt64 on some architectures, which would turn an absurd exp into
+// "never expires".
+const maxJWTUnixSeconds = float64(1 << 53)
+
+// jwtNumericDate converts an RFC 7519 NumericDate to a time.Time,
+// rejecting NaN, negative, and out-of-range values instead of letting
+// the int64 conversion produce an arbitrary timestamp.
+func jwtNumericDate(f float64) (time.Time, bool) {
+	if math.IsNaN(f) || f < 0 || f > maxJWTUnixSeconds {
+		return time.Time{}, false
+	}
+	return time.Unix(int64(f), 0), true
 }
 
 func validateJWTClaims(claims map[string]any, validation jwtClaimValidation) error {
