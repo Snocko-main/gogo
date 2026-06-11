@@ -756,11 +756,21 @@ extern "C" int uwsgo_app_add_child(uwsgo_app_t *parent, uwsgo_app_t *child) {
     return 1;
 }
 
+// tl_run_state points at the SharedAppState of the App whose loop is
+// currently running on this thread (each App runs on its own native
+// owner thread, so there is at most one). uwsgo_res_begin_async reads
+// it to stamp cgo-async ctxs with their owning state — the sync
+// handler that calls Response.Async always executes on the loop
+// thread, inside this run() call.
+static thread_local SharedAppState *tl_run_state = nullptr;
+
 extern "C" void uwsgo_app_run(uwsgo_app_t *app) {
     if (app == nullptr || app->app == nullptr) {
         return;
     }
+    tl_run_state = app->shared_state;
     app->app->run();
+    tl_run_state = nullptr;
     app->accepting_work.store(false, std::memory_order_release);
     us_internal_free_closed_sockets(reinterpret_cast<us_loop_t *>(app->loop));
     // uWS::App owns the WebSocket TopicTree and unregisters its loop
@@ -1266,6 +1276,55 @@ struct CtxHold {
     ~CtxHold() { if (ctx) ctx->release(); }
 };
 
+// CtxAdopt is CtxHold minus the retain: it takes ownership of a ref the
+// caller already holds and drops it when destroyed. Deferred lambdas
+// capture their ctx through this so the ref is released even when the
+// loop discards its defer queue without ever running the lambda
+// (previously those refs — and the ~13 KiB ctx blocks — leaked).
+struct CtxAdopt {
+    AsyncCtx *ctx;
+    explicit CtxAdopt(AsyncCtx *c) : ctx(c) {}
+    CtxAdopt(const CtxAdopt &) = delete;
+    CtxAdopt(CtxAdopt &&o) noexcept : ctx(o.ctx) { o.ctx = nullptr; }
+    CtxAdopt &operator=(const CtxAdopt &) = delete;
+    CtxAdopt &operator=(CtxAdopt &&) = delete;
+    ~CtxAdopt() { if (ctx) ctx->release(); }
+};
+
+// ActiveSendPin mirrors the Go-side beginSharedSend protocol for the
+// cgo defer paths: bump active_sends, then re-check closing — if the
+// App started tearing down in between, back off (ok = false) and let
+// the caller drop the send. While a pin is held, uwsgo_app_free is
+// still spinning on the active_sends drain, so the loop pointer the
+// caller is about to defer onto cannot be freed. Ctxs without a state
+// (Response.Async called outside a running loop) pin nothing and keep
+// the pre-existing behavior.
+struct ActiveSendPin {
+    SharedAppState *state = nullptr;
+    bool ok = true;
+
+    explicit ActiveSendPin(AsyncCtx *ctx) {
+        SharedAppState *s = ctx != nullptr ? ctx->state : nullptr;
+        if (s == nullptr) {
+            return;
+        }
+        s->active_sends.fetch_add(1, std::memory_order_acq_rel);
+        if (s->closing.load(std::memory_order_acquire) != 0) {
+            s->active_sends.fetch_sub(1, std::memory_order_acq_rel);
+            ok = false;
+            return;
+        }
+        state = s;
+    }
+    ActiveSendPin(const ActiveSendPin &) = delete;
+    ActiveSendPin &operator=(const ActiveSendPin &) = delete;
+    ~ActiveSendPin() {
+        if (state != nullptr) {
+            state->active_sends.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    }
+};
+
 // BodyCollector owns the initial AsyncCtx ref while post_shared is still
 // collecting request body chunks. uWS may abandon a body before it ever emits a
 // final onData(isLast=true), so abort/destruction must also be able to release
@@ -1338,6 +1397,13 @@ struct SendBuffer {
     }
 };
 
+// FreeDeleter pairs std::free with unique_ptr for buffers from
+// dup_to_c_heap, so a deferred lambda's chunk is reclaimed even when
+// the loop discards its defer queue without running the lambda.
+struct FreeDeleter {
+    void operator()(char *p) const { std::free(p); }
+};
+
 // dup_to_c_heap returns nullptr both when n == 0 and when malloc
 // fails; *oom is set in the failure case so callers can drop the
 // whole operation. Without that signal a caller would pair the null
@@ -1360,6 +1426,16 @@ extern "C" uwsgo_loop_t *uwsgo_res_begin_async(uwsgo_res_t *res, void **out_ctx)
     auto *ctx = new AsyncCtx;
     ctx->response = r;
     ctx->loop = loop;
+    // Stamp the running App's shared state (with a ref, matching the
+    // acquire_shared_ctx convention: one state ref per live ctx).
+    // This lets the defer-send paths pin active_sends so teardown
+    // can't free the loop out from under an in-flight send, and lets
+    // closed_or_aborted observe app closing for cgo-async ctxs the
+    // same way it already does for shared-dispatch ctxs.
+    if (SharedAppState *state = tl_run_state; state != nullptr) {
+        state->retain();
+        ctx->state = state;
+    }
 
     r->onAborted([hold = CtxHold(ctx)]() {
         hold.ctx->aborted.store(1, std::memory_order_release);
@@ -1798,11 +1874,19 @@ extern "C" void uwsgo_res_defer_send(
         if (ctx != nullptr) ctx->release();
         return;
     }
+    // Pin active_sends across the defer enqueue so app teardown can't
+    // free the loop while we're using it; back off if closing started.
+    ActiveSendPin pin(ctx);
+    if (!pin.ok) {
+        ctx->release();
+        return;
+    }
 
-    // The defer lambda takes ownership of Go's ctx ref (no extra retain).
-    l->defer([ctx, sb = std::move(buf)]() mutable {
+    // The defer lambda adopts Go's ctx ref (no extra retain); CtxAdopt
+    // drops it even if the loop discards the queue without running us.
+    l->defer([c = CtxAdopt(ctx), sb = std::move(buf)]() mutable {
+        AsyncCtx *ctx = c.ctx;
         if (ctx->closed_or_aborted()) {
-            ctx->release();
             return;
         }
         auto *r = ctx->response;
@@ -1814,7 +1898,6 @@ extern "C" void uwsgo_res_defer_send(
             }
             r->end(std::string_view(sb.body, sb.body_len));
         });
-        ctx->release();
     });
 }
 
@@ -1875,10 +1958,15 @@ extern "C" void uwsgo_res_defer_send_with_headers(
         if (ctx != nullptr) ctx->release();
         return;
     }
+    ActiveSendPin pin(ctx);
+    if (!pin.ok) {
+        ctx->release();
+        return;
+    }
 
-    l->defer([ctx, sb = std::move(buf)]() mutable {
+    l->defer([c = CtxAdopt(ctx), sb = std::move(buf)]() mutable {
+        AsyncCtx *ctx = c.ctx;
         if (ctx->closed_or_aborted()) {
-            ctx->release();
             return;
         }
         auto *r = ctx->response;
@@ -1909,7 +1997,6 @@ extern "C" void uwsgo_res_defer_send_with_headers(
             }
             r->end(std::string_view(sb.body, sb.body_len));
         });
-        ctx->release();
     });
 }
 
@@ -1950,10 +2037,15 @@ extern "C" int uwsgo_res_defer_stream_start(
         ctx->release();
         return 0;
     }
+    ActiveSendPin pin(ctx);
+    if (!pin.ok) {
+        ctx->release();
+        return 0;
+    }
 
-    l->defer([ctx, sb = std::move(buf)]() mutable {
+    l->defer([c = CtxAdopt(ctx), sb = std::move(buf)]() mutable {
+        AsyncCtx *ctx = c.ctx;
         if (ctx->closed_or_aborted()) {
-            ctx->release();
             return;
         }
         auto *r = ctx->response;
@@ -1982,7 +2074,6 @@ extern "C" int uwsgo_res_defer_stream_start(
             // Intentionally NO r->end(): defer_stream_end closes
             // the response after all chunks have been written.
         });
-        ctx->release();
     });
     return 1;
 }
@@ -2000,6 +2091,10 @@ extern "C" void uwsgo_res_defer_stream_write(
     if (ctx == nullptr || ctx->closed_or_aborted()) {
         return;
     }
+    ActiveSendPin pin(ctx);
+    if (!pin.ok) {
+        return;
+    }
     // Copy before retain/fetch_add so an allocation failure needs no
     // unwinding. Dropping the chunk on OOM truncates the stream body,
     // but the alternative was pairing a null pointer with a non-zero
@@ -2013,18 +2108,15 @@ extern "C" void uwsgo_res_defer_stream_write(
     ctx->stream_pending_bytes.fetch_add(chunk_len, std::memory_order_acq_rel);
     size_t copy_len = chunk_len;
 
-    l->defer([ctx, chunk_copy, copy_len]() mutable {
+    l->defer([c = CtxAdopt(ctx), buf = std::unique_ptr<char, FreeDeleter>(chunk_copy), copy_len]() mutable {
+        AsyncCtx *ctx = c.ctx;
         if (ctx->closed_or_aborted()) {
-            if (chunk_copy) std::free(chunk_copy);
             ctx->stream_pending_bytes.fetch_sub(copy_len, std::memory_order_acq_rel);
-            ctx->release();
             return;
         }
         auto *r = ctx->response;
-        r->write(std::string_view(chunk_copy ? chunk_copy : "", copy_len));
-        if (chunk_copy) std::free(chunk_copy);
+        r->write(std::string_view(buf ? buf.get() : "", copy_len));
         ctx->stream_pending_bytes.fetch_sub(copy_len, std::memory_order_acq_rel);
-        ctx->release();
     });
 }
 
@@ -2040,16 +2132,19 @@ extern "C" void uwsgo_res_defer_stream_end(
     if (ctx == nullptr || ctx->closed_or_aborted()) {
         return;
     }
+    ActiveSendPin pin(ctx);
+    if (!pin.ok) {
+        return;
+    }
     ctx->retain();
 
-    l->defer([ctx]() mutable {
+    l->defer([c = CtxAdopt(ctx)]() mutable {
+        AsyncCtx *ctx = c.ctx;
         if (ctx->closed_or_aborted()) {
-            ctx->release();
             return;
         }
         auto *r = ctx->response;
         r->end(std::string_view());
-        ctx->release();
     });
 }
 
