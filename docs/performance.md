@@ -1,9 +1,14 @@
 # Performance Benchmarks
 
-`ROAD_TO_V1.md` tracks v0.7 performance work. This page keeps the HTTP
-benchmark commands, route coverage, raw result location, and cgo hot-path
-budget in one place so benchmark numbers can be reproduced before they are
-summarized in the README.
+`ROAD_TO_V1.md` tracks performance work. This page keeps the HTTP benchmark
+commands, route coverage, raw result location, and cgo hot-path budget in one
+place so benchmark numbers can be reproduced before they are summarized in the
+README.
+
+For the v1 reproducibility gate, see
+[`docs/v1-benchmark-baseline.md`](v1-benchmark-baseline.md). That page records
+the exact baseline and smoke commands, environment notes, pass/fail smoke
+evidence from 2026-06-10, and how to capture fresh raw logs.
 
 ## v0.7 HTTP Baseline
 
