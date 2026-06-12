@@ -684,6 +684,13 @@ func runSharedHandler(handler AsyncHandler, ctxPtr uintptr) {
 // newSnapshotFromCtx reads the request-snapshot fields C++ wrote into the
 // AsyncCtx and returns a Go-side requestSnapshot whose strings/bytes do not
 // alias ctx memory — so the snapshot stays valid after ctx is released.
+//
+// All variable-length fields are copied into ONE arena allocation and the
+// snapshot's strings/byte-slices are views into it. Per request this costs
+// two allocations (snapshot struct + arena) instead of one per field; under
+// saturation the per-field version showed mallocgc at ~25% of worker CPU.
+// The arena is never pooled or reused, so a handler retaining any snapshot
+// string simply keeps the (small) arena alive — same safety as before.
 func newSnapshotFromCtx(ctxPtr uintptr) *requestSnapshot {
 	methodLen := boundedUint32Len(*(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxMethodLenOff)), shared.snapMethodCap)
 	urlLen := boundedUint32Len(*(*uint32)(unsafe.Pointer(ctxPtr + shared.ctxURLLenOff)), shared.snapURLCap)
@@ -703,32 +710,68 @@ func newSnapshotFromCtx(ctxPtr uintptr) *requestSnapshot {
 		paramCount = uint32(shared.snapParamMax)
 	}
 
-	snap := &requestSnapshot{
-		method:    copyAt(ctxPtr+shared.ctxMethodOff, methodLen),
-		url:       copyAt(ctxPtr+shared.ctxURLOff, urlLen),
-		query:     copyAt(ctxPtr+shared.ctxQueryOff, queryLen),
-		ip:        copyAt(ctxPtr+shared.ctxIPOff, ipLen),
-		truncated: truncated,
-	}
-
-	if paramCount > 0 {
-		paramsBase := ctxPtr + shared.ctxParamsOff
-		paramLensBase := ctxPtr + shared.ctxParamLensOff
-		params := make([]string, paramCount)
+	// First pass: clamp the per-param lengths and size the arena.
+	paramsBase := ctxPtr + shared.ctxParamsOff
+	paramLensBase := ctxPtr + shared.ctxParamLensOff
+	var paramLens [snapParamArrayMax]int
+	paramBytes := 0
+	fixedParams := paramCount <= snapParamArrayMax
+	if fixedParams {
 		for i := uint32(0); i < paramCount; i++ {
 			plen := *(*uint32)(unsafe.Pointer(paramLensBase + uintptr(i)*unsafe.Sizeof(uint32(0))))
 			// Per-param length should also fit within snapParamCap;
-			// clamp so a corrupted length can't drive copyAt past
+			// clamp so a corrupted length can't drive the copy past
 			// the slot.
-			params[i] = copyAt(paramsBase+uintptr(i)*shared.snapParamCap, boundedUint32Len(plen, shared.snapParamCap))
+			n := boundedUint32Len(plen, shared.snapParamCap)
+			paramLens[i] = n
+			paramBytes += n
 		}
-		snap.params = params
 	}
 
+	snap := &requestSnapshot{truncated: truncated}
+
+	// One arena holds every variable-length field. It is sized exactly and
+	// filled with append — the capacity must never be exceeded, or the
+	// realloc would leave earlier unsafe.String views dangling.
+	arena := make([]byte, 0, methodLen+urlLen+queryLen+ipLen+headersLen+paramBytes)
+	take := func(base uintptr, n int) string {
+		if n <= 0 {
+			return ""
+		}
+		off := len(arena)
+		arena = append(arena, unsafe.Slice((*byte)(unsafe.Pointer(base)), n)...)
+		return unsafe.String(&arena[off], n)
+	}
+
+	snap.method = take(ctxPtr+shared.ctxMethodOff, methodLen)
+	snap.url = take(ctxPtr+shared.ctxURLOff, urlLen)
+	snap.query = take(ctxPtr+shared.ctxQueryOff, queryLen)
+	snap.ip = take(ctxPtr+shared.ctxIPOff, ipLen)
+
 	if headersLen > 0 {
-		hdrs := make([]byte, headersLen)
-		copy(hdrs, unsafe.Slice((*byte)(unsafe.Pointer(ctxPtr+shared.ctxHeadersOff)), headersLen))
-		snap.headers = hdrs
+		off := len(arena)
+		arena = append(arena, unsafe.Slice((*byte)(unsafe.Pointer(ctxPtr+shared.ctxHeadersOff)), headersLen)...)
+		snap.headers = arena[off : off+headersLen : off+headersLen]
+	}
+
+	if paramCount > 0 {
+		if fixedParams {
+			for i := uint32(0); i < paramCount; i++ {
+				snap.paramsArr[i] = take(paramsBase+uintptr(i)*shared.snapParamCap, paramLens[i])
+			}
+			snap.params = snap.paramsArr[:paramCount]
+		} else {
+			// The bridge reported more params than the fixed array
+			// holds — only possible if SNAP_PARAM_MAX grows without
+			// snapParamArrayMax following. Stay correct on the old
+			// per-slice path.
+			params := make([]string, paramCount)
+			for i := uint32(0); i < paramCount; i++ {
+				plen := *(*uint32)(unsafe.Pointer(paramLensBase + uintptr(i)*unsafe.Sizeof(uint32(0))))
+				params[i] = copyAt(paramsBase+uintptr(i)*shared.snapParamCap, boundedUint32Len(plen, shared.snapParamCap))
+			}
+			snap.params = params
+		}
 	}
 
 	return snap

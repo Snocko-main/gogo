@@ -5191,7 +5191,17 @@ type requestSnapshot struct {
 	// C++; we parse on access rather than building a map up front so the hot
 	// path stays allocation-light when headers aren't read.
 	headers []byte
+	// paramsArr backs params on the shared-dispatch path so the typical
+	// request (paramCount <= snapParamArrayMax, mirroring SNAP_PARAM_MAX)
+	// needs no separate slice allocation; params points into this array.
+	paramsArr [snapParamArrayMax]string
 }
+
+// snapParamArrayMax mirrors the C++ SNAP_PARAM_MAX so requestSnapshot can
+// carry its params in a fixed array instead of a per-request slice
+// allocation. The shared-dispatch reader guards at use: if the bridge ever
+// reports a larger max, it falls back to an allocated slice.
+const snapParamArrayMax = 8
 
 // SetLocal stores a request-scoped value under key. Intended for passing
 // state from middleware down to the handler (e.g. an authenticated user
@@ -5975,7 +5985,11 @@ func (r *Request) snapshotFromSync(capturePeerIP bool) *requestSnapshot {
 	if capturePeerIP {
 		snap.ip = remoteAddrFromPtr(r.syncResPtr)
 	}
-	for i := 0; i < 8; i++ {
+	// Build params inside the snapshot's fixed array: the loop reads at
+	// most snapParamArrayMax entries, so the appends never outgrow the
+	// array and the slice allocation is avoided.
+	snap.params = snap.paramsArr[:0]
+	for i := 0; i < snapParamArrayMax; i++ {
 		p := r.inner.parameter(i)
 		if p == "" {
 			break
