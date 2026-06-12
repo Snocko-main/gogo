@@ -1076,7 +1076,11 @@ constexpr size_t SNAP_BODY_CAP = 8192;
 // pending ring without any cgo call. The uWS loop drains the ring on every
 // timer tick and serves the response from these buffers.
 struct AsyncCtx {
-    std::atomic<int> refcount{1};
+    // int32_t (not int) because Go pins the ctx by incrementing this
+    // through shared memory as an atomic.Int32 (ctx_refcount_offset);
+    // the explicit width keeps the two sides in lockstep by type, not
+    // by the platform's int size. Same convention as aborted below.
+    std::atomic<int32_t> refcount{1};
     std::atomic<int32_t> aborted{0};
     std::atomic<size_t> stream_pending_bytes{0};
     uWS::HttpResponse<false> *response;
@@ -1177,6 +1181,14 @@ struct AsyncCtx {
         }
     }
 };
+
+// Go manipulates these fields directly through shared memory using
+// atomic.Int32 at the exported offsets; pin the representation so a
+// future type change can't silently desynchronize the two sides.
+static_assert(sizeof(std::atomic<int32_t>) == sizeof(int32_t),
+    "std::atomic<int32_t> must be a bare int32 for Go shared-memory access");
+static_assert(std::atomic<int32_t>::is_always_lock_free,
+    "Go-side atomic ops assume lock-free int32 atomics");
 
 SharedAppState::~SharedAppState() {
     for (;;) {
@@ -1501,6 +1513,7 @@ extern "C" void uwsgo_shared_layout(uwsgo_shared_layout_t *out) {
     out->ctx_body_offset = offsetof(AsyncCtx, inline_body);
     out->ctx_handler_id_offset = offsetof(AsyncCtx, handler_id);
     out->ctx_aborted_offset = offsetof(AsyncCtx, aborted);
+    out->ctx_refcount_offset = offsetof(AsyncCtx, refcount);
     out->ctx_response_offset = offsetof(AsyncCtx, response);
     out->ctx_loop_offset = offsetof(AsyncCtx, loop);
     out->ctx_shared_state_offset = offsetof(AsyncCtx, state);

@@ -5191,10 +5191,30 @@ type requestSnapshot struct {
 	// C++; we parse on access rather than building a map up front so the hot
 	// path stays allocation-light when headers aren't read.
 	headers []byte
+	// headersSrc/headersSrcLen describe the same blob still sitting in
+	// AsyncCtx memory (shared-dispatch path only; points into the C heap,
+	// so the GC ignores it). The worker pins the ctx for the request
+	// wrapper's whole lifetime, so reads go straight to ctx memory and only
+	// matched values are copied — the blob itself never is. headers above
+	// takes precedence when non-nil (sync-fallback snapshots and tests
+	// populate it directly).
+	headersSrc    unsafe.Pointer
+	headersSrcLen int
 	// paramsArr backs params on the shared-dispatch path so the typical
 	// request (paramCount <= snapParamArrayMax, mirroring SNAP_PARAM_MAX)
 	// needs no separate slice allocation; params points into this array.
 	paramsArr [snapParamArrayMax]string
+}
+
+// headerBlobView returns the raw header blob: the Go-owned copy when one
+// exists, else a zero-copy view into pinned AsyncCtx memory. Callers must
+// not retain the returned slice beyond the current call — they copy out the
+// name/value bytes they need (both existing readers already do).
+func (s *requestSnapshot) headerBlobView() []byte {
+	if s.headers != nil || s.headersSrcLen == 0 {
+		return s.headers
+	}
+	return unsafe.Slice((*byte)(s.headersSrc), s.headersSrcLen)
 }
 
 // snapParamArrayMax mirrors the C++ SNAP_PARAM_MAX so requestSnapshot can
@@ -5538,7 +5558,7 @@ func (r *Request) Headers(fn func(name, value string) bool) int {
 func (r *Request) headersBlobForIteration(fullDump func() []byte) []byte {
 	switch {
 	case r.snap != nil:
-		return r.snap.headers
+		return r.snap.headerBlobView()
 	case r.syncHeadersPtr != nil:
 		if r.syncHeadersComplete {
 			return unsafe.Slice((*byte)(r.syncHeadersPtr), r.syncHeadersLen)
@@ -5919,12 +5939,12 @@ func (r *Request) ParameterInt64(index int, def int64) int64 {
 // lookupHeader scans the raw "name\0value\0..." buffer for a matching key.
 // Header names are case-insensitive (uWS lower-cases on parse).
 func (s *requestSnapshot) lookupHeader(name string) string {
-	if len(s.headers) == 0 {
+	buf := s.headerBlobView()
+	if len(buf) == 0 {
 		return ""
 	}
 	// Match against the lower-cased name so callers don't have to.
 	needle := strings.ToLower(name)
-	buf := s.headers
 	for len(buf) > 0 {
 		i := indexOfZero(buf)
 		if i < 0 {
