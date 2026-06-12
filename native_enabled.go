@@ -541,17 +541,33 @@ func sharedWorker(stop <-chan struct{}) {
 	// involvement at all), then Gosched yields until spinLimit, then the
 	// progressive sleep below.
 	//
-	// The tight phase is what keeps the hot path off the Go scheduler. A
-	// miss here usually means "another worker just claimed the slot" or
-	// "the producer is mid-publish" — both resolve within nanoseconds,
-	// and at six-figure RPS the gap to the next request is only a few
-	// microseconds. The previous code called runtime.Gosched() on every
-	// one of those misses; with several workers racing one head pointer
-	// that meant hundreds of thousands of scheduler round-trips per
-	// second, and profiles under load showed 60%+ of worker CPU inside
-	// runtime.lock2/schedule/findRunnable instead of in handlers.
+	// The tight phase serves two roles. Under saturation it keeps the hot
+	// path off the Go scheduler: a miss usually means "another worker
+	// just claimed the slot" or "the producer is mid-publish", both of
+	// which resolve within nanoseconds (the pre-v1.1 code answered every
+	// such miss with runtime.Gosched(), and profiles under load showed
+	// 60%+ of worker CPU inside runtime.lock2/schedule/findRunnable).
+	//
+	// Under LIGHT load it is the worker's awake window: requests arrive
+	// tens of microseconds apart, and a worker that dozes off between
+	// them adds up to a full idleSleep period (500µs at the cap) to every
+	// response — time.Sleep on Linux also overshoots its first 10-40µs
+	// tiers to 60-90µs of wall time, so any arrival that lands in the
+	// sleep phase pays dearly. spinTight is therefore sized to cover
+	// realistic light-load inter-arrival gaps with read-only polls of a
+	// shared (read-mostly, so not bouncing) cache line that cost no
+	// scheduler traffic at all.
+	//
+	// The value is a measured balance, sensitive in BOTH directions. 128
+	// regressed light-load p50 from ~110µs to ~500µs (throughput -4x at
+	// c=8, -36% at c=64) because workers spent almost their whole duty
+	// cycle asleep. 32768 won light load back but cost ~18% at full
+	// saturation: when the ring runs momentarily dry, every worker
+	// polling hard steals exactly the CPU the loop threads need to
+	// refill it. 16384 measured best-or-par across c=8/64/512 with idle
+	// CPU at roughly half of the old 256-Gosched phase it replaces.
 	const (
-		spinTight = 128
+		spinTight = 16384
 		spinLimit = spinTight + 8
 	)
 
