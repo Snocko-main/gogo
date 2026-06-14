@@ -224,6 +224,63 @@ func TestRunMultiCoreBalancedDistributesAcceptedSockets(t *testing.T) {
 	}
 }
 
+func TestRunMultiCoreLoopRequestCounts(t *testing.T) {
+	const workers = 4
+	const perWorker = 8
+
+	oldProcs := runtime.GOMAXPROCS(workers)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	port := freePort(t)
+	// Balanced mode forces an even spread, so the per-loop counts are
+	// deterministic enough to assert every loop served some traffic and the
+	// totals add up. (Reuseport mode reports the same totals but the kernel
+	// decides the per-loop split.)
+	handle, err := gogo.RunMultiCoreWithOptions(workers, port, func(app *gogo.App) {
+		app.Get("/ping", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain", "ok")
+		})
+	}, gogo.RunMultiCoreOptions{Mode: gogo.MultiCoreBalanced})
+	if err != nil {
+		t.Fatalf("RunMultiCoreWithOptions: %v", err)
+	}
+	defer func() {
+		handle.Shutdown()
+		handle.Wait()
+	}()
+
+	client := &http.Client{
+		Transport: &http.Transport{DisableKeepAlives: true},
+		Timeout:   2 * time.Second,
+	}
+	const total = workers * perWorker
+	for i := 0; i < total; i++ {
+		resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/ping", port))
+		if err != nil {
+			t.Fatalf("GET /ping: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+	}
+
+	counts := handle.LoopRequestCounts()
+	if len(counts) != workers {
+		t.Fatalf("LoopRequestCounts len = %d, want %d", len(counts), workers)
+	}
+	var sum uint64
+	for i, c := range counts {
+		if c == 0 {
+			t.Errorf("loop %d served 0 requests; counts=%v", i, counts)
+		}
+		sum += c
+	}
+	if sum != total {
+		t.Fatalf("sum of LoopRequestCounts = %d, want %d (counts=%v)", sum, total, counts)
+	}
+}
+
 func TestRunMultiCoreRejectsUnknownMode(t *testing.T) {
 	handle, err := gogo.RunMultiCoreWithOptions(1, freePort(t), func(app *gogo.App) {
 		app.Get("/", "ok")

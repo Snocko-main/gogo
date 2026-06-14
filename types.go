@@ -1684,6 +1684,20 @@ func (a *App) publishLocal(topic string, message []byte, opcode OpCode) {
 	a.inner.publish(topic, message, opcode)
 }
 
+// RequestCount returns how many requests this App's loop has dispatched
+// since start. With RunMultiCore (one App per loop) comparing this across
+// the group's apps shows how evenly SO_REUSEPORT distributed work. Returns 0
+// for native-disabled (stub) builds and after the App is closed. Safe to
+// call concurrently with serving.
+func (a *App) RequestCount() uint64 {
+	a.nativeMu.RLock()
+	defer a.nativeMu.RUnlock()
+	if a.closed.Load() {
+		return 0
+	}
+	return a.inner.requestCount()
+}
+
 func (a *App) publishPeersExcept(skip *App, topic string, message []byte, opcode OpCode) {
 	for _, peer := range a.pubsubPeers {
 		if peer != skip {
@@ -2777,6 +2791,19 @@ func (h *MultiCoreHandle) Shutdown() {
 // freed native resources. Returns immediately once all loops have finished.
 func (h *MultiCoreHandle) Wait() {
 	<-h.done
+}
+
+// LoopRequestCounts returns the per-loop request totals, one entry per App in
+// the group in the order they were created. It's a distribution diagnostic:
+// with MultiCoreReusePort the kernel hashes connections across loops, so an
+// uneven spread here under load points at connection-placement skew. Sum the
+// entries for the group total.
+func (h *MultiCoreHandle) LoopRequestCounts() []uint64 {
+	counts := make([]uint64, len(h.apps))
+	for i, a := range h.apps {
+		counts[i] = a.RequestCount()
+	}
+	return counts
 }
 
 // MultiCoreMode selects how RunMultiCoreWithOptions spreads accepted

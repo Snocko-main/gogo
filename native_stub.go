@@ -71,6 +71,7 @@ func (appNative) listen(string, int) bool                  { return false }
 func (appNative) addChild(appNative) bool                  { return false }
 func (appNative) setBodyLimit(int)                         {}
 func (appNative) setCapturePeerIP(bool)                    {}
+func (appNative) requestCount() uint64                     { return 0 }
 func (appNative) run()                                     {}
 func (appNative) stop()                                    {}
 func (appNative) closeListen()                             {}
