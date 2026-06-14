@@ -243,6 +243,45 @@ func TestRunMultiCoreRejectsUnknownMode(t *testing.T) {
 	}
 }
 
+func TestRunMultiCoreRejectsInvalidWorkerHintLoops(t *testing.T) {
+	cases := []struct {
+		name string
+		opts gogo.RunMultiCoreOptions
+		want string
+	}{
+		{
+			name: "negative",
+			opts: gogo.RunMultiCoreOptions{WorkerHintLoops: -1},
+			want: "WorkerHintLoops must be >= 0",
+		},
+		{
+			name: "greater than n",
+			opts: gogo.RunMultiCoreOptions{WorkerHintLoops: 2},
+			want: "WorkerHintLoops must be <= n (1)",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handle, err := gogo.RunMultiCoreWithOptions(1, freePort(t), func(app *gogo.App) {
+				app.Get("/", "ok")
+			}, tc.opts)
+			if err == nil {
+				if handle != nil {
+					handle.Shutdown()
+					handle.Wait()
+				}
+				t.Fatal("RunMultiCoreWithOptions returned nil error for invalid WorkerHintLoops")
+			}
+			if handle != nil {
+				t.Fatal("RunMultiCoreWithOptions returned handle for invalid WorkerHintLoops")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %q, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestRunMultiCoreSetupPanicReturnsError(t *testing.T) {
 	port := freePort(t)
 	handle, err := gogo.RunMultiCore(2, port, func(app *gogo.App) {

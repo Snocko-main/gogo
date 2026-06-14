@@ -180,6 +180,28 @@ func TestRunMultiCoreBalancedPublishesLoopWorkerHint(t *testing.T) {
 	handle.Wait()
 }
 
+func TestRunMultiCoreWorkerHintLoopsOverridesModeDefault(t *testing.T) {
+	savedHint := sharedCoreHint.Load()
+	t.Cleanup(func() { sharedCoreHint.Store(savedHint) })
+	sharedCoreHint.Store(0)
+
+	handle, err := RunMultiCoreWithOptions(3, workerHintFreePort(t), func(app *App) {
+		app.Get("/sync", func(res *Response, req *Request) {
+			res.Send(200, "text/plain; charset=utf-8", "ok")
+		})
+	}, RunMultiCoreOptions{Mode: MultiCoreReusePort, WorkerHintLoops: 3})
+	if err != nil {
+		t.Fatalf("RunMultiCoreWithOptions: %v", err)
+	}
+	if got := sharedCoreHintLoops(); got != 3 {
+		handle.Shutdown()
+		handle.Wait()
+		t.Fatalf("sharedCoreHint loops after explicit WorkerHintLoops = %d, want 3", got)
+	}
+	handle.Shutdown()
+	handle.Wait()
+}
+
 // TestRunMultiCoreSetupPanicResetsSharedCoreHint covers the early error path:
 // setup can fail before any shared route acquires a worker-pool ref.
 func TestRunMultiCoreSetupPanicResetsSharedCoreHint(t *testing.T) {
