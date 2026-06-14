@@ -24,10 +24,10 @@
 // scheduling cycles, pinning below it starves loops.
 //
 // SetWorkerCount — controls the GetAsync worker-goroutine pool size.
-// Defaults to NumCPU. With RunMultiCore each loop already saturates
-// one core; the GetAsync workers compete for the same CPUs, so
-// either set this to a smaller number (NumCPU / 2) or trust the
-// default and accept the contention on short async handlers.
+// Defaults to ceil(1.5 × loop count): it scales with the number of
+// loops, not NumCPU, so it doesn't over-subscribe the loop threads.
+// Trust the default for short async handlers; raise it for IO-bound
+// handlers that keep many requests blocked at once.
 //
 // Per-worker resources — wrap shared resources in plain Go state
 // captured into setup. The example below uses an atomic.Int64 for

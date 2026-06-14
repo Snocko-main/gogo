@@ -1868,8 +1868,10 @@ Tuning knobs that actually matter:
 
 - `GOMAXPROCS` — pin to the same N you passed to `RunMultiCore`.
 - `gogo.SetWorkerCount(n)` — controls the `GetAsync` worker pool. Default
-  is `NumCPU`; with `RunMultiCore` consider halving this since each loop
-  already owns one core.
+  is `ceil(1.5 × loop count)` (so a single `App` gets 2, `RunMultiCore(8)`
+  gets 12) — it scales with loops, not `NumCPU`, to avoid over-subscribing
+  the loop threads. Raise it for IO-bound handlers that keep many requests
+  blocked at once.
 - Pin shared resources (DB pools, caches) to one allocation outside
   `setup`.
 - For strict CPU pinning, run under `taskset -c 0-(N-1)`.
