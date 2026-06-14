@@ -107,6 +107,15 @@ func main() {
 		app.Get("/hello/:name", func(res *gogo.Response, req *gogo.Request) {
 			res.Send(200, "text/plain; charset=utf-8", "hello "+req.Parameter(0)+"\n")
 		})
+		// Twin routes: identical handler work, one sync one async, so an
+		// A/B between them on the same running process isolates exactly the
+		// shared-dispatch (worker-handoff) overhead with zero other diff.
+		app.Get("/twinsync/:name", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain; charset=utf-8", "hello "+req.Parameter(0)+"\n")
+		})
+		app.GetAsync("/twinasync/:name", func(res *gogo.Response, req *gogo.Request) {
+			res.Send(200, "text/plain; charset=utf-8", "hello "+req.Parameter(0)+"\n")
+		})
 		app.GetAsync("/sleep", func(res *gogo.Response, req *gogo.Request) {
 			time.Sleep(2 * time.Millisecond)
 			res.Send(200, "text/plain; charset=utf-8", "slept\n")
