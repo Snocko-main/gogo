@@ -980,6 +980,19 @@ func (a *App) applyMeta(meta *routeMeta, h Handler) Handler {
 // friends would see res.app == nil on every async-route request.
 func (a *App) applyAppRefAsync(h AsyncHandler) AsyncHandler {
 	app := a
+	if len(app.trustedProxyRanges) == 0 {
+		if !app.cfg.TrustProxy {
+			return func(res *Response, req *Request) {
+				res.app = app
+				h(res, req)
+			}
+		}
+		return func(res *Response, req *Request) {
+			res.app = app
+			req.trustProxy = true
+			h(res, req)
+		}
+	}
 	return func(res *Response, req *Request) {
 		res.app = app
 		req.trustProxy = app.trustsProxyPeer(req)
@@ -1013,12 +1026,27 @@ func (a *App) applyMetaAsync(meta *routeMeta, h AsyncHandler) AsyncHandler {
 }
 
 func (a *App) wrap(routePattern string, h Handler) Handler {
+	trustedProxyRanges := a.trustedProxyRanges
+	trustProxy := a.cfg.TrustProxy
 	if len(a.middlewares) == 0 {
 		// No middleware: still wrap so res.app gets the back-pointer
 		// (Response.Render and friends need it). One extra function
 		// frame per request is cheaper than a wider invariant ("only
 		// some handlers see res.app").
 		inner := h
+		if len(trustedProxyRanges) == 0 {
+			if !trustProxy {
+				return func(res *Response, req *Request) {
+					res.app = a
+					inner(res, req)
+				}
+			}
+			return func(res *Response, req *Request) {
+				res.app = a
+				req.trustProxy = true
+				inner(res, req)
+			}
+		}
 		return func(res *Response, req *Request) {
 			res.app = a
 			req.trustProxy = a.trustsProxyPeer(req)
@@ -1037,6 +1065,19 @@ func (a *App) wrap(routePattern string, h Handler) Handler {
 			h = a.middlewares[i].mw(h)
 		}
 		inner := h
+		if len(trustedProxyRanges) == 0 {
+			if !trustProxy {
+				return func(res *Response, req *Request) {
+					res.app = a
+					inner(res, req)
+				}
+			}
+			return func(res *Response, req *Request) {
+				res.app = a
+				req.trustProxy = true
+				inner(res, req)
+			}
+		}
 		return func(res *Response, req *Request) {
 			res.app = a
 			req.trustProxy = a.trustsProxyPeer(req)
@@ -1046,6 +1087,35 @@ func (a *App) wrap(routePattern string, h Handler) Handler {
 	entries := make([]middlewareEntry, len(a.middlewares))
 	copy(entries, a.middlewares)
 	inner := h
+	if len(trustedProxyRanges) == 0 {
+		if !trustProxy {
+			return func(res *Response, req *Request) {
+				res.app = a
+				url := req.URL()
+				chain := inner
+				for i := len(entries) - 1; i >= 0; i-- {
+					e := entries[i]
+					if e.prefix == "" || urlUnderPrefix(url, e.prefix) {
+						chain = e.mw(chain)
+					}
+				}
+				chain(res, req)
+			}
+		}
+		return func(res *Response, req *Request) {
+			res.app = a
+			req.trustProxy = true
+			url := req.URL()
+			chain := inner
+			for i := len(entries) - 1; i >= 0; i-- {
+				e := entries[i]
+				if e.prefix == "" || urlUnderPrefix(url, e.prefix) {
+					chain = e.mw(chain)
+				}
+			}
+			chain(res, req)
+		}
+	}
 	return func(res *Response, req *Request) {
 		res.app = a
 		req.trustProxy = a.trustsProxyPeer(req)

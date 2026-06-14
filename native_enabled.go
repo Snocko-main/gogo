@@ -38,6 +38,7 @@ import (
 	"fmt"
 	"runtime"
 	"runtime/cgo"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -169,6 +170,14 @@ func goIntFromCSize(size C.size_t, label string) (int, bool) {
 		return 0, false
 	}
 	return int(size), true
+}
+
+func goIntFromCSizeHot(size C.size_t) int {
+	if strconv.IntSize == 32 && size > C.size_t(maxGoInt) {
+		reportPanic(fmt.Errorf("gogo: HTTP callback length %d exceeds Go int max", uint64(size)))
+		return 0
+	}
+	return int(size)
 }
 
 func cgoCopyLen(size C.size_t, label string) (C.int, bool) {
@@ -1438,17 +1447,13 @@ func (a *appNative) startSharedDrain(intervalUs int) {
 func asyncSendShared(ctxHandle uintptr, statusLine, contentType, body string) bool {
 	if !sharedReady || uintptr(len(statusLine)) > shared.statusCap ||
 		uintptr(len(contentType)) > shared.ctCap ||
-		uintptr(len(body)) > shared.bodyCap ||
-		uint64(len(statusLine)) > maxUint32 ||
-		uint64(len(contentType)) > maxUint32 ||
-		uint64(len(body)) > maxUint32 {
+		uintptr(len(body)) > shared.bodyCap {
 		return false
 	}
 	statePtr, ok := beginSharedSend(ctxHandle)
 	if !ok {
 		return false
 	}
-	defer finishSharedSend(statePtr)
 
 	// Write status/ct/body bytes into the ctx's inline buffers.
 	if n := len(statusLine); n > 0 {
@@ -1477,6 +1482,7 @@ func asyncSendShared(ctxHandle uintptr, statusLine, contentType, body string) bo
 	// publish is a use-after-free hazard.
 	ringPtr := *(*uintptr)(unsafe.Pointer(ctxHandle + shared.ctxPendingRingOff))
 	if ringPtr == 0 {
+		finishSharedSend(statePtr)
 		return false
 	}
 	loopPtr := *(*uintptr)(unsafe.Pointer(ctxHandle + shared.ctxLoopOff))
@@ -1514,11 +1520,13 @@ func asyncSendShared(ctxHandle uintptr, statusLine, contentType, body string) bo
 			}
 			tail = tailAddr.Load()
 		case diff < 0:
+			finishSharedSend(statePtr)
 			return false
 		default:
 			tail = tailAddr.Load()
 		}
 		if spin >= enqueueSpinBudget {
+			finishSharedSend(statePtr)
 			return false
 		}
 		if spin >= enqueueSpinYield {
@@ -1550,6 +1558,7 @@ claimed:
 			)
 		}
 	}
+	finishSharedSend(statePtr)
 	return true
 }
 
@@ -1801,15 +1810,6 @@ func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req
 	handle := cgo.Handle(handlerID)
 	handler := handle.Value().(Handler)
 
-	methodN, _ := goIntFromCSize(methodLen, "HTTP method")
-	urlN, _ := goIntFromCSize(urlLen, "HTTP URL")
-	queryN, _ := goIntFromCSize(queryLen, "HTTP query")
-	headersN, _ := goIntFromCSize(headersLen, "HTTP headers")
-	p0N, _ := goIntFromCSize(p0Len, "HTTP route parameter 0")
-	p1N, _ := goIntFromCSize(p1Len, "HTTP route parameter 1")
-	p2N, _ := goIntFromCSize(p2Len, "HTTP route parameter 2")
-	p3N, _ := goIntFromCSize(p3Len, "HTTP route parameter 3")
-
 	reqWrap := requestPool.Get().(*Request)
 	reqWrap.inner = requestNative{ptr: req}
 	// uWS already had method / URL / query / first 4 params parsed and
@@ -1819,22 +1819,22 @@ func uwsgoHandleHTTP(handlerID C.uintptr_t, res *C.uwsgo_res_t, req *C.uwsgo_req
 	// trip. The pointers are valid for the lifetime of this callback
 	// (= the lifetime of reqWrap before it returns to the pool).
 	reqWrap.syncMethodPtr = unsafe.Pointer(methodPtr)
-	reqWrap.syncMethodLen = methodN
+	reqWrap.syncMethodLen = goIntFromCSizeHot(methodLen)
 	reqWrap.syncURLPtr = unsafe.Pointer(urlPtr)
-	reqWrap.syncURLLen = urlN
+	reqWrap.syncURLLen = goIntFromCSizeHot(urlLen)
 	reqWrap.syncQueryPtr = unsafe.Pointer(queryPtr)
-	reqWrap.syncQueryLen = queryN
+	reqWrap.syncQueryLen = goIntFromCSizeHot(queryLen)
 	reqWrap.syncHeadersPtr = unsafe.Pointer(headersBlobPtr)
-	reqWrap.syncHeadersLen = headersN
+	reqWrap.syncHeadersLen = goIntFromCSizeHot(headersLen)
 	reqWrap.syncHeadersComplete = headersComplete != 0
 	reqWrap.syncParamPtrs[0] = unsafe.Pointer(p0Ptr)
-	reqWrap.syncParamLens[0] = p0N
+	reqWrap.syncParamLens[0] = goIntFromCSizeHot(p0Len)
 	reqWrap.syncParamPtrs[1] = unsafe.Pointer(p1Ptr)
-	reqWrap.syncParamLens[1] = p1N
+	reqWrap.syncParamLens[1] = goIntFromCSizeHot(p1Len)
 	reqWrap.syncParamPtrs[2] = unsafe.Pointer(p2Ptr)
-	reqWrap.syncParamLens[2] = p2N
+	reqWrap.syncParamLens[2] = goIntFromCSizeHot(p2Len)
 	reqWrap.syncParamPtrs[3] = unsafe.Pointer(p3Ptr)
-	reqWrap.syncParamLens[3] = p3N
+	reqWrap.syncParamLens[3] = goIntFromCSizeHot(p3Len)
 	// Store the live response pointer so req.IP() can lazily fetch the
 	// peer address via cgo on demand.
 	reqWrap.syncResPtr = unsafe.Pointer(res)
