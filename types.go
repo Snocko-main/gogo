@@ -2779,12 +2779,65 @@ func (h *MultiCoreHandle) Wait() {
 	<-h.done
 }
 
+// MultiCoreMode selects how RunMultiCoreWithOptions spreads accepted
+// connections across worker loops.
+type MultiCoreMode int
+
+const (
+	// MultiCoreAuto keeps the default RunMultiCore behavior. Today it maps to
+	// MultiCoreReusePort because that avoids the cross-loop socket adoption
+	// overhead of balanced mode.
+	MultiCoreAuto MultiCoreMode = iota
+	// MultiCoreReusePort lets every App bind the same port with uSockets'
+	// default SO_REUSEPORT behavior. It is the lowest-overhead mode, but the
+	// kernel decides connection placement and may not use every loop evenly for
+	// short loopback benchmarks or low-cardinality client address sets.
+	MultiCoreReusePort
+	// MultiCoreBalanced round-robins accepted sockets across every App loop via
+	// uWebSockets child Apps. It gives predictable per-loop connection
+	// placement, at the cost of extra native handoff work on accepted sockets.
+	MultiCoreBalanced
+)
+
+func (mode MultiCoreMode) String() string {
+	switch mode {
+	case MultiCoreAuto:
+		return "auto"
+	case MultiCoreReusePort:
+		return "reuseport"
+	case MultiCoreBalanced:
+		return "balanced"
+	default:
+		return fmt.Sprintf("unknown(%d)", mode)
+	}
+}
+
+// RunMultiCoreOptions configures RunMultiCoreWithOptions.
+type RunMultiCoreOptions struct {
+	// Mode controls accepted-socket distribution. Zero selects
+	// MultiCoreAuto.
+	Mode MultiCoreMode
+}
+
+func (opts RunMultiCoreOptions) normalizedMode() (MultiCoreMode, error) {
+	switch opts.Mode {
+	case MultiCoreAuto:
+		return MultiCoreReusePort, nil
+	case MultiCoreReusePort, MultiCoreBalanced:
+		return opts.Mode, nil
+	default:
+		return MultiCoreAuto, fmt.Errorf("gogo: unknown RunMultiCore mode %d", opts.Mode)
+	}
+}
+
 // RunMultiCore spawns n independent App instances on dedicated OS threads.
-// Each instance binds to the given port, then every listener round-robins
-// accepted sockets across every App. This keeps scaling predictable even on
-// kernels or loopback paths where SO_REUSEPORT hashes connections to only one
-// listening socket. setup is called once per App, on the thread that instance
-// will run on, to register routes / middleware / etc.
+// Each instance binds to the given port using SO_REUSEPORT and lets the kernel
+// distribute accepted sockets across worker loops. This is the low-overhead
+// default; use RunMultiCoreWithOptions and MultiCoreBalanced when predictable
+// per-loop connection placement matters more than raw accept-path overhead.
+//
+// setup is called once per App, on the thread that instance will run on, to
+// register routes / middleware / etc.
 //
 // setup MUST register the same routes on every App for consistent behavior;
 // the framework just calls setup(app) and trusts user code to be
@@ -2797,18 +2850,34 @@ func (h *MultiCoreHandle) Wait() {
 // any App fails to start; in that case already-started Apps are shut down
 // before returning.
 func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, error) {
+	return RunMultiCoreWithOptions(n, port, setup, RunMultiCoreOptions{})
+}
+
+// RunMultiCoreWithOptions is RunMultiCore with explicit listener distribution
+// controls.
+func RunMultiCoreWithOptions(n int, port int, setup func(app *App), opts RunMultiCoreOptions) (*MultiCoreHandle, error) {
 	if n <= 0 {
 		return nil, fmt.Errorf("gogo: RunMultiCore needs n>0, got %d", n)
 	}
 	if setup == nil {
 		return nil, fmt.Errorf("gogo: RunMultiCore requires a setup function")
 	}
+	mode, err := opts.normalizedMode()
+	if err != nil {
+		return nil, err
+	}
 
-	// Publish the loop count before any app runs setup() — and therefore
-	// before the first GetAsync spins up the shared worker pool — so the
-	// default worker count scales with loops. A user SetWorkerCount call
-	// still wins (the hint only feeds the zero/default branch).
-	coreHintToken := setSharedCoreHint(n)
+	// Publish the loop count hint before any app runs setup() — and therefore
+	// before the first GetAsync spins up the shared worker pool. Balanced mode
+	// forces traffic across all loops, so its default worker budget scales with
+	// n. ReusePort mode leaves placement to the kernel; short loopback runs and
+	// low-cardinality client sets can land mostly on one loop, so default to the
+	// one-loop worker budget unless the user has called SetWorkerCount.
+	workerHintLoops := 1
+	if mode == MultiCoreBalanced {
+		workerHintLoops = n
+	}
+	coreHintToken := setSharedCoreHint(workerHintLoops)
 	resetCoreHint := func() {
 		resetSharedCoreHintIfCurrent(coreHintToken)
 	}
@@ -2869,7 +2938,7 @@ func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, erro
 				return
 			}
 
-			if n > 1 {
+			if n > 1 && mode == MultiCoreBalanced {
 				for childIdx, child := range apps {
 					// Keep the accepting App in the child set. This mirrors uWS's
 					// LocalCluster pattern and gives every listener the same complete

@@ -61,9 +61,9 @@ func main() {
 		filePath = "data/sample.json"
 	}
 
-	// GOGO_CORES=N enables multi-core mode (N independent App instances
-	// with accepted sockets round-robined across loops). Defaults to
-	// single-core for parity with old runs.
+	// GOGO_CORES=N enables multi-core mode (N independent App instances).
+	// Defaults to single-core for parity with old runs. GOGO_MULTICORE_MODE
+	// accepts "reuseport" (default) or "balanced".
 	n := 1
 	if env := os.Getenv("GOGO_CORES"); env != "" {
 		if v, err := strconv.Atoi(env); err == nil && v > 0 {
@@ -77,6 +77,15 @@ func main() {
 		}
 	}
 	gogo.SetWorkerCount(workers)
+	mode := gogo.MultiCoreReusePort
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GOGO_MULTICORE_MODE"))) {
+	case "", "auto", "reuseport", "reuse-port", "fast":
+		mode = gogo.MultiCoreReusePort
+	case "balanced", "balance":
+		mode = gogo.MultiCoreBalanced
+	default:
+		log.Fatalf("unknown GOGO_MULTICORE_MODE %q", os.Getenv("GOGO_MULTICORE_MODE"))
+	}
 
 	setup := func(app *gogo.App) {
 		app.Get("/plain", func(res *gogo.Response, req *gogo.Request) {
@@ -199,10 +208,10 @@ func main() {
 		return
 	}
 
-	handle, err := gogo.RunMultiCore(n, 3002, setup)
+	handle, err := gogo.RunMultiCoreWithOptions(n, 3002, setup, gogo.RunMultiCoreOptions{Mode: mode})
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("gogo~ listening on http://localhost:3002 (%d cores)", n)
+	log.Printf("gogo~ listening on http://localhost:3002 (%d cores, %v mode)", n, mode)
 	handle.Wait()
 }

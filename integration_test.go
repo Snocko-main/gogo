@@ -164,7 +164,7 @@ func TestSingleAppOwnsNativeLoopThreadInternally(t *testing.T) {
 	app.Close()
 }
 
-func TestRunMultiCoreDistributesAcceptedSockets(t *testing.T) {
+func TestRunMultiCoreBalancedDistributesAcceptedSockets(t *testing.T) {
 	const workers = 4
 
 	oldProcs := runtime.GOMAXPROCS(workers)
@@ -174,15 +174,15 @@ func TestRunMultiCoreDistributesAcceptedSockets(t *testing.T) {
 	var next atomic.Int32
 	var counts [workers]atomic.Int64
 
-	handle, err := gogo.RunMultiCore(workers, port, func(app *gogo.App) {
+	handle, err := gogo.RunMultiCoreWithOptions(workers, port, func(app *gogo.App) {
 		id := int(next.Add(1)) - 1
 		app.Get("/id", func(res *gogo.Response, req *gogo.Request) {
 			counts[id].Add(1)
 			res.Send(200, "text/plain", strconv.Itoa(id))
 		})
-	})
+	}, gogo.RunMultiCoreOptions{Mode: gogo.MultiCoreBalanced})
 	if err != nil {
-		t.Fatalf("RunMultiCore: %v", err)
+		t.Fatalf("RunMultiCoreWithOptions: %v", err)
 	}
 	defer func() {
 		handle.Shutdown()
@@ -221,6 +221,25 @@ func TestRunMultiCoreDistributesAcceptedSockets(t *testing.T) {
 			got[i] = counts[i].Load()
 		}
 		t.Fatalf("requests reached %d/%d workers; counts=%v", len(seen), workers, got)
+	}
+}
+
+func TestRunMultiCoreRejectsUnknownMode(t *testing.T) {
+	handle, err := gogo.RunMultiCoreWithOptions(1, freePort(t), func(app *gogo.App) {
+		app.Get("/", "ok")
+	}, gogo.RunMultiCoreOptions{Mode: gogo.MultiCoreMode(99)})
+	if err == nil {
+		if handle != nil {
+			handle.Shutdown()
+			handle.Wait()
+		}
+		t.Fatal("RunMultiCoreWithOptions returned nil error for unknown mode")
+	}
+	if handle != nil {
+		t.Fatal("RunMultiCoreWithOptions returned handle for unknown mode")
+	}
+	if !strings.Contains(err.Error(), "unknown RunMultiCore mode 99") {
+		t.Fatalf("error = %q, want unknown mode context", err)
 	}
 }
 

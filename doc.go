@@ -182,7 +182,7 @@
 //
 // Single-loop mode (NewApp + Run) caps throughput at one OS thread —
 // uWebSockets is event-loop driven, not goroutine-per-request. To
-// saturate every vCPU, use RunMultiCore:
+// run multiple event loops, use RunMultiCore:
 //
 //	handle, err := gogo.RunMultiCore(runtime.NumCPU(), 3000, func(app *gogo.App) {
 //	    app.Get("/plain", plainHandler)
@@ -195,14 +195,17 @@
 //	handle.Wait()
 //
 // RunMultiCore spawns N independent App instances, each bound to the
-// same port. Accepted sockets are round-robined across the App loops,
-// so scaling does not depend on the kernel's SO_REUSEPORT hash
-// distributing connections evenly. setup runs once per instance on
-// the OS thread that instance will own. setup has no error return; do
-// fallible shared initialization before RunMultiCore. A setup panic is
-// recovered, converted to an error, and any created Apps are closed.
+// same port. The default mode lets the kernel distribute accepted
+// sockets with SO_REUSEPORT, which avoids cross-loop socket handoff
+// overhead. If you need predictable per-loop connection placement,
+// use RunMultiCoreWithOptions with MultiCoreBalanced; that mode
+// round-robins accepted sockets across App loops at extra accept-path
+// cost. setup runs once per instance on the OS thread that instance
+// will own. setup has no error return; do fallible shared
+// initialization before RunMultiCore. A setup panic is recovered,
+// converted to an error, and any created Apps are closed.
 // RunMultiCore currently creates each worker with the zero-value Config; there
-// is no Config/options parameter for app-scoped settings such as BodyLimit,
+// is no Config parameter for app-scoped settings such as BodyLimit,
 // BodyReadTimeout, BindAddr, CapturePeerIP, TrustProxy, or custom JSON codecs.
 // Use process-wide knobs before RunMultiCore and per-route/per-middleware
 // options inside setup.
@@ -217,10 +220,11 @@
 //     scheduler then has exactly one P per loop; oversubscribing
 //     wastes context-switch budget, undersubscribing starves loops.
 //   - SetWorkerCount — controls the GetAsync worker-goroutine pool.
-//     Default = ceil(1.5 × loop count): one worker per loop plus a
-//     half-worker of slack, so it scales with loops rather than NumCPU
-//     and does not over-subscribe the loop threads on a low-loop /
-//     many-core box. Raise it for IO-bound handlers that keep many
+//     Default = ceil(1.5 × worker-hint loops). A single App and
+//     default RunMultiCore reuseport mode use the one-loop default so
+//     async workers do not steal CPU when the kernel places many
+//     connections on one listener. MultiCoreBalanced uses the full
+//     loop count. Raise it for IO-bound handlers that keep many
 //     requests blocked at once.
 //   - Shared resources (DB pools, caches) — create ONCE outside
 //     RunMultiCore and capture the pointers into the handler
