@@ -291,9 +291,10 @@ var (
 )
 
 type sharedWorkerGeneration struct {
-	stop    chan struct{}
-	drained chan struct{}
-	live    atomic.Int32
+	stop          chan struct{}
+	drained       chan struct{}
+	coreHintToken uint64
+	live          atomic.Int32
 }
 
 func init() {
@@ -403,16 +404,41 @@ var workerCount atomic.Int32
 // RunMultiCore publishes its loop count here before any route registers;
 // the plain single-App path leaves it 0, which defaultWorkerCount treats as
 // one loop. User-supplied SetWorkerCount overrides the hint entirely.
-var sharedCoreHint atomic.Int32
+//
+// The high 32 bits are a generation counter and the low 32 bits are the loop
+// count. Reset paths compare the full token so an older RunMultiCore lifecycle
+// cannot clear a newer hint that happens to use the same loop count.
+var sharedCoreHint atomic.Uint64
 
 // setSharedCoreHint is called by RunMultiCore before setup() runs (and thus
 // before the first GetAsync triggers ensureSharedWorkers) so the worker
 // default reflects the real loop count.
-func setSharedCoreHint(loops int) {
+func setSharedCoreHint(loops int) uint64 {
 	if loops < 1 {
 		loops = 1
 	}
-	sharedCoreHint.Store(int32(loops))
+	for {
+		old := sharedCoreHint.Load()
+		gen := old>>32 + 1
+		if gen == 0 {
+			gen = 1
+		}
+		next := gen<<32 | uint64(uint32(loops))
+		if sharedCoreHint.CompareAndSwap(old, next) {
+			return next
+		}
+	}
+}
+
+// resetSharedCoreHintIfCurrent clears a RunMultiCore-published hint only if
+// another RunMultiCore call has not replaced it.
+// This covers sync-only / setup-failure RunMultiCore lifecycles that never
+// acquire a shared worker ref, while stopSharedWorkersIfIdle covers the
+// shared-route path when the worker pool itself goes idle.
+func resetSharedCoreHintIfCurrent(token uint64) {
+	if token != 0 {
+		sharedCoreHint.CompareAndSwap(token, 0)
+	}
 }
 
 // defaultWorkerCount returns ceil(1.5 × loops). The pool exists to run
@@ -426,7 +452,7 @@ func setSharedCoreHint(loops int) {
 // tuning sweet spot. IO-bound services that keep many handlers blocked at
 // once should still raise this with SetWorkerCount.
 func defaultWorkerCount() int {
-	loops := int(sharedCoreHint.Load())
+	loops := int(uint32(sharedCoreHint.Load()))
 	if loops < 1 {
 		loops = 1
 	}
@@ -454,8 +480,9 @@ func ensureSharedWorkers() {
 		n = defaultWorkerCount()
 	}
 	gen := &sharedWorkerGeneration{
-		stop:    make(chan struct{}),
-		drained: make(chan struct{}),
+		stop:          make(chan struct{}),
+		drained:       make(chan struct{}),
+		coreHintToken: sharedCoreHint.Load(),
 	}
 	gen.live.Store(int32(n))
 	sharedWorkerGen = gen
@@ -521,10 +548,10 @@ func stopSharedWorkersIfIdle() {
 	// inheriting a stale (e.g. RunMultiCore(8)) hint and over-subscribing.
 	// RunMultiCore republishes the hint before its first GetAsync, so the
 	// multi-core path is unaffected.
-	sharedCoreHint.Store(0)
-	if !sharedWorkersStarted {
+	if !sharedWorkersStarted || sharedWorkerGen == nil {
 		return
 	}
+	resetSharedCoreHintIfCurrent(sharedWorkerGen.coreHintToken)
 	close(sharedWorkerGen.stop)
 	sharedWorkersStarted = false
 }

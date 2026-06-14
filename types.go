@@ -2808,7 +2808,10 @@ func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, erro
 	// before the first GetAsync spins up the shared worker pool — so the
 	// default worker count scales with loops. A user SetWorkerCount call
 	// still wins (the hint only feeds the zero/default branch).
-	setSharedCoreHint(n)
+	coreHintToken := setSharedCoreHint(n)
+	resetCoreHint := func() {
+		resetSharedCoreHintIfCurrent(coreHintToken)
+	}
 
 	type startResult struct {
 		idx int
@@ -2911,6 +2914,7 @@ func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, erro
 		if r.err != nil {
 			abortAll()
 			runWg.Wait()
+			resetCoreHint()
 			return nil, r.err
 		}
 		apps[r.idx] = r.app
@@ -2925,6 +2929,7 @@ func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, erro
 		if r.err != nil {
 			abortAll()
 			runWg.Wait()
+			resetCoreHint()
 			return nil, r.err
 		}
 	}
@@ -2936,6 +2941,7 @@ func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, erro
 		if r.err != nil {
 			abortAll()
 			runWg.Wait()
+			resetCoreHint()
 			return nil, r.err
 		}
 	}
@@ -2947,6 +2953,7 @@ func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, erro
 		}
 		close(closeApps)
 		runWg.Wait()
+		resetCoreHint()
 		close(done)
 	}()
 
