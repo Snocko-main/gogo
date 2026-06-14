@@ -2817,6 +2817,12 @@ type RunMultiCoreOptions struct {
 	// Mode controls accepted-socket distribution. Zero selects
 	// MultiCoreAuto.
 	Mode MultiCoreMode
+
+	// WorkerHintLoops overrides the loop count used to size the default
+	// GetAsync worker pool. Zero keeps the mode default: reuseport uses one
+	// loop, balanced uses n loops. Use SetWorkerCount for an exact worker
+	// count instead of a loop-count hint.
+	WorkerHintLoops int
 }
 
 func (opts RunMultiCoreOptions) normalizedMode() (MultiCoreMode, error) {
@@ -2828,6 +2834,22 @@ func (opts RunMultiCoreOptions) normalizedMode() (MultiCoreMode, error) {
 	default:
 		return MultiCoreAuto, fmt.Errorf("gogo: unknown RunMultiCore mode %d", opts.Mode)
 	}
+}
+
+func (opts RunMultiCoreOptions) normalizedWorkerHintLoops(n int, mode MultiCoreMode) (int, error) {
+	if opts.WorkerHintLoops < 0 {
+		return 0, fmt.Errorf("gogo: RunMultiCore WorkerHintLoops must be >= 0, got %d", opts.WorkerHintLoops)
+	}
+	if opts.WorkerHintLoops > n {
+		return 0, fmt.Errorf("gogo: RunMultiCore WorkerHintLoops must be <= n (%d), got %d", n, opts.WorkerHintLoops)
+	}
+	if opts.WorkerHintLoops > 0 {
+		return opts.WorkerHintLoops, nil
+	}
+	if mode == MultiCoreBalanced {
+		return n, nil
+	}
+	return 1, nil
 }
 
 // RunMultiCore spawns n independent App instances on dedicated OS threads.
@@ -2854,7 +2876,7 @@ func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, erro
 }
 
 // RunMultiCoreWithOptions is RunMultiCore with explicit listener distribution
-// controls.
+// and worker-budget hint controls.
 func RunMultiCoreWithOptions(n int, port int, setup func(app *App), opts RunMultiCoreOptions) (*MultiCoreHandle, error) {
 	if n <= 0 {
 		return nil, fmt.Errorf("gogo: RunMultiCore needs n>0, got %d", n)
@@ -2866,17 +2888,18 @@ func RunMultiCoreWithOptions(n int, port int, setup func(app *App), opts RunMult
 	if err != nil {
 		return nil, err
 	}
+	workerHintLoops, err := opts.normalizedWorkerHintLoops(n, mode)
+	if err != nil {
+		return nil, err
+	}
 
 	// Publish the loop count hint before any app runs setup() — and therefore
 	// before the first GetAsync spins up the shared worker pool. Balanced mode
 	// forces traffic across all loops, so its default worker budget scales with
 	// n. ReusePort mode leaves placement to the kernel; short loopback runs and
 	// low-cardinality client sets can land mostly on one loop, so default to the
-	// one-loop worker budget unless the user has called SetWorkerCount.
-	workerHintLoops := 1
-	if mode == MultiCoreBalanced {
-		workerHintLoops = n
-	}
+	// one-loop worker budget unless the user has called SetWorkerCount or set
+	// WorkerHintLoops explicitly.
 	coreHintToken := setSharedCoreHint(workerHintLoops)
 	resetCoreHint := func() {
 		resetSharedCoreHintIfCurrent(coreHintToken)

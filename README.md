@@ -1860,6 +1860,18 @@ tests and low-cardinality client sets exercise every loop. It costs extra
 native handoff work on accepted sockets, so the default `RunMultiCore` path
 uses `MultiCoreReusePort` for lower accept-path overhead.
 
+If your production kernel/load balancer distributes `SO_REUSEPORT` connections
+evenly and your async routes are IO-bound, keep reuseport mode and raise only
+the default async worker hint:
+
+```go
+handle, err := gogo.RunMultiCoreWithOptions(runtime.NumCPU(), 3000, setup,
+    gogo.RunMultiCoreOptions{
+        Mode:            gogo.MultiCoreReusePort,
+        WorkerHintLoops: runtime.NumCPU(),
+    })
+```
+
 `RunMultiCore` currently has no `Config` parameter. Each worker
 `App` is created with the zero-value `Config`, so app-scoped fields such as
 `BodyLimit`, `BodyReadTimeout`, `BindAddr`, `CapturePeerIP`, `TrustProxy`,
@@ -1883,8 +1895,9 @@ Tuning knobs that actually matter:
   `RunMultiCore` reuseport mode use the one-loop default (2 workers) so async
   workers do not steal CPU when the kernel places many connections on one
   listener. `MultiCoreBalanced` uses the full loop count (so 8 loops get 12
-  workers). Raise it for IO-bound handlers that keep many requests blocked at
-  once.
+  workers). `RunMultiCoreOptions.WorkerHintLoops` overrides only that loop
+  hint; `SetWorkerCount` still wins when you need an exact worker count. Raise
+  either value for IO-bound handlers that keep many requests blocked at once.
 - Pin shared resources (DB pools, caches) to one allocation outside
   `setup`.
 - For strict CPU pinning, run under `taskset -c 0-(N-1)`.

@@ -200,10 +200,14 @@
 // overhead. If you need predictable per-loop connection placement,
 // use RunMultiCoreWithOptions with MultiCoreBalanced; that mode
 // round-robins accepted sockets across App loops at extra accept-path
-// cost. setup runs once per instance on the OS thread that instance
-// will own. setup has no error return; do fallible shared
-// initialization before RunMultiCore. A setup panic is recovered,
-// converted to an error, and any created Apps are closed.
+// cost. If SO_REUSEPORT distributes well in your production
+// environment but your async routes need a larger default worker
+// budget, keep MultiCoreReusePort and set
+// RunMultiCoreOptions.WorkerHintLoops. setup runs once per instance
+// on the OS thread that instance will own. setup has no error
+// return; do fallible shared initialization before RunMultiCore.
+// A setup panic is recovered, converted to an error, and any
+// created Apps are closed.
 // RunMultiCore currently creates each worker with the zero-value Config; there
 // is no Config parameter for app-scoped settings such as BodyLimit,
 // BodyReadTimeout, BindAddr, CapturePeerIP, TrustProxy, or custom JSON codecs.
@@ -224,8 +228,10 @@
 //     default RunMultiCore reuseport mode use the one-loop default so
 //     async workers do not steal CPU when the kernel places many
 //     connections on one listener. MultiCoreBalanced uses the full
-//     loop count. Raise it for IO-bound handlers that keep many
-//     requests blocked at once.
+//     loop count. RunMultiCoreOptions.WorkerHintLoops overrides only
+//     that loop-count hint; SetWorkerCount still wins when you need
+//     an exact worker count. Raise either for IO-bound handlers that
+//     keep many requests blocked at once.
 //   - Shared resources (DB pools, caches) — create ONCE outside
 //     RunMultiCore and capture the pointers into the handler
 //     closures. setup runs once per loop; allocating fresh DB pools

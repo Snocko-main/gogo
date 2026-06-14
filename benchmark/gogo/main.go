@@ -86,6 +86,14 @@ func main() {
 	default:
 		log.Fatalf("unknown GOGO_MULTICORE_MODE %q", os.Getenv("GOGO_MULTICORE_MODE"))
 	}
+	workerHintLoops := 0
+	if env := os.Getenv("GOGO_WORKER_HINT_LOOPS"); env != "" {
+		v, err := strconv.Atoi(env)
+		if err != nil || v < 0 {
+			log.Fatalf("invalid GOGO_WORKER_HINT_LOOPS %q", env)
+		}
+		workerHintLoops = v
+	}
 
 	setup := func(app *gogo.App) {
 		app.Get("/plain", func(res *gogo.Response, req *gogo.Request) {
@@ -208,7 +216,10 @@ func main() {
 		return
 	}
 
-	handle, err := gogo.RunMultiCoreWithOptions(n, 3002, setup, gogo.RunMultiCoreOptions{Mode: mode})
+	handle, err := gogo.RunMultiCoreWithOptions(n, 3002, setup, gogo.RunMultiCoreOptions{
+		Mode:            mode,
+		WorkerHintLoops: workerHintLoops,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}

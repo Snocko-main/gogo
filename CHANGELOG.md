@@ -7,6 +7,14 @@ minor releases may include breaking API changes when they move the project
 toward a stable API. Breaking changes should be called out in the release
 notes for the release that introduces them.
 
+## Unreleased
+
+### Added
+
+- Added `RunMultiCoreOptions.WorkerHintLoops` so reuseport multicore apps can
+  raise the default async worker-loop hint without switching to balanced socket
+  handoff mode or setting an exact global worker count.
+
 ## v1.0.1 - 2026-06-11
 
 ### Fixed
