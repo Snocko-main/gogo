@@ -1811,11 +1811,10 @@ app.Post("/upload-stream", func(res *gogo.Response, req *gogo.Request) {
 
 ## Multi-core
 
-Single-loop mode (`NewApp` + `Run`) caps throughput at one OS thread. To
-saturate every vCPU, use `RunMultiCore` — N independent App instances bound
-to the same port. Accepted sockets are round-robined across the App loops, so
-scaling does not depend on the kernel's `SO_REUSEPORT` hash distributing
-connections evenly.
+Single-loop mode (`NewApp` + `Run`) caps throughput at one OS thread.
+`RunMultiCore` starts N independent App instances bound to the same port so
+the server can use more than one loop. By default, gogo uses the low-overhead
+`SO_REUSEPORT` path and lets the kernel place accepted sockets across loops.
 
 ```go
 func main() {
@@ -1849,13 +1848,25 @@ func main() {
 }
 ```
 
-`RunMultiCore` currently has no `Config` or options parameter. Each worker
+When you need deterministic per-loop connection placement, use balanced mode:
+
+```go
+handle, err := gogo.RunMultiCoreWithOptions(runtime.NumCPU(), 3000, setup,
+    gogo.RunMultiCoreOptions{Mode: gogo.MultiCoreBalanced})
+```
+
+Balanced mode round-robins accepted sockets across App loops, which helps
+tests and low-cardinality client sets exercise every loop. It costs extra
+native handoff work on accepted sockets, so the default `RunMultiCore` path
+uses `MultiCoreReusePort` for lower accept-path overhead.
+
+`RunMultiCore` currently has no `Config` parameter. Each worker
 `App` is created with the zero-value `Config`, so app-scoped fields such as
 `BodyLimit`, `BodyReadTimeout`, `BindAddr`, `CapturePeerIP`, `TrustProxy`,
 `JSONEncoder`, and `JSONDecoder` cannot be supplied through this helper today.
-Set process-wide knobs before `RunMultiCore`, register per-route/per-middleware
-options inside `setup`, and create shared resources outside `setup` so every
-worker captures the same instance.
+Set process-wide knobs and `RunMultiCoreOptions` before starting workers,
+register per-route/per-middleware options inside `setup`, and create shared
+resources outside `setup` so every worker captures the same instance.
 
 `MultiCoreHandle.Shutdown` is immediate: it calls `Shutdown` on every worker,
 which closes the listen socket and active connections. It is safe and
@@ -1868,10 +1879,12 @@ Tuning knobs that actually matter:
 
 - `GOMAXPROCS` — pin to the same N you passed to `RunMultiCore`.
 - `gogo.SetWorkerCount(n)` — controls the `GetAsync` worker pool. Default
-  is `ceil(1.5 × loop count)` (so a single `App` gets 2, `RunMultiCore(8)`
-  gets 12) — it scales with loops, not `NumCPU`, to avoid over-subscribing
-  the loop threads. Raise it for IO-bound handlers that keep many requests
-  blocked at once.
+  is `ceil(1.5 × worker-hint loops)`. A single `App` and default
+  `RunMultiCore` reuseport mode use the one-loop default (2 workers) so async
+  workers do not steal CPU when the kernel places many connections on one
+  listener. `MultiCoreBalanced` uses the full loop count (so 8 loops get 12
+  workers). Raise it for IO-bound handlers that keep many requests blocked at
+  once.
 - Pin shared resources (DB pools, caches) to one allocation outside
   `setup`.
 - For strict CPU pinning, run under `taskset -c 0-(N-1)`.

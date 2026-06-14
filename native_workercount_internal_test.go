@@ -127,7 +127,7 @@ func TestSharedCoreHintResetsWhenIdle(t *testing.T) {
 
 // TestRunMultiCoreSyncOnlyResetsSharedCoreHint covers the path that never
 // starts the shared worker pool: sync-only RunMultiCore still publishes a
-// loop-count hint, and that hint must be cleared when the group finishes so
+// worker-budget hint, and that hint must be cleared when the group finishes so
 // a later single App does not inherit it.
 func TestRunMultiCoreSyncOnlyResetsSharedCoreHint(t *testing.T) {
 	savedHint := sharedCoreHint.Load()
@@ -142,10 +142,10 @@ func TestRunMultiCoreSyncOnlyResetsSharedCoreHint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunMultiCore: %v", err)
 	}
-	if got := sharedCoreHintLoops(); got != 2 {
+	if got := sharedCoreHintLoops(); got != 1 {
 		handle.Shutdown()
 		handle.Wait()
-		t.Fatalf("sharedCoreHint loops after RunMultiCore start = %d, want 2", got)
+		t.Fatalf("sharedCoreHint loops after default RunMultiCore start = %d, want 1", got)
 	}
 
 	handle.Shutdown()
@@ -156,6 +156,28 @@ func TestRunMultiCoreSyncOnlyResetsSharedCoreHint(t *testing.T) {
 	if got := defaultWorkerCount(); got != 2 {
 		t.Fatalf("defaultWorkerCount() after sync-only shutdown = %d, want 2", got)
 	}
+}
+
+func TestRunMultiCoreBalancedPublishesLoopWorkerHint(t *testing.T) {
+	savedHint := sharedCoreHint.Load()
+	t.Cleanup(func() { sharedCoreHint.Store(savedHint) })
+	sharedCoreHint.Store(0)
+
+	handle, err := RunMultiCoreWithOptions(3, workerHintFreePort(t), func(app *App) {
+		app.Get("/sync", func(res *Response, req *Request) {
+			res.Send(200, "text/plain; charset=utf-8", "ok")
+		})
+	}, RunMultiCoreOptions{Mode: MultiCoreBalanced})
+	if err != nil {
+		t.Fatalf("RunMultiCoreWithOptions: %v", err)
+	}
+	if got := sharedCoreHintLoops(); got != 3 {
+		handle.Shutdown()
+		handle.Wait()
+		t.Fatalf("sharedCoreHint loops after balanced RunMultiCore start = %d, want 3", got)
+	}
+	handle.Shutdown()
+	handle.Wait()
 }
 
 // TestRunMultiCoreSetupPanicResetsSharedCoreHint covers the early error path:
