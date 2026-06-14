@@ -19,6 +19,10 @@ func acquireSharedWorkerAppRef() {
 	sharedActiveApps.Add(1)
 }
 
+// setSharedCoreHint is a no-op in stub builds — there is no worker pool to
+// size. Defined so RunMultiCore (build-tag-agnostic) compiles without cgo.
+func setSharedCoreHint(int) {}
+
 // stopSharedWorkersIfIdle is a no-op in stub builds — there is no
 // worker pool to tear down without the cgo dispatch ring. Defined so
 // App.Close compiles when the framework is built without the gogo /

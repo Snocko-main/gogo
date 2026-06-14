@@ -2804,6 +2804,12 @@ func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, erro
 		return nil, fmt.Errorf("gogo: RunMultiCore requires a setup function")
 	}
 
+	// Publish the loop count before any app runs setup() — and therefore
+	// before the first GetAsync spins up the shared worker pool — so the
+	// default worker count scales with loops. A user SetWorkerCount call
+	// still wins (the hint only feeds the zero/default branch).
+	setSharedCoreHint(n)
+
 	type startResult struct {
 		idx int
 		app *App

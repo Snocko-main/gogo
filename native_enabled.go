@@ -391,15 +391,51 @@ func (a *appNative) postShared(pattern string, handler AsyncHandler, maxBody int
 
 // workerCount controls how many goroutines drain the request ring. Read once
 // when the first shared route registers (and workers spin up); changing it
-// after that has no effect. Default = NumCPU — spinning workers compete
-// with the uWS loop thread on GOMAXPROCS, so over-subscribing tanks sync
-// route latency. For workloads dominated by slow IO, raise this via
-// SetWorkerCount before the first GetAsync registers.
+// after that has no effect. Default = ceil(1.5 × loop count) — see
+// defaultWorkerCount for why this scales with loops (cores) rather than
+// NumCPU. For workloads dominated by slow IO (many handlers blocked on a
+// DB / network at once), raise this via SetWorkerCount before the first
+// GetAsync registers.
 var workerCount atomic.Int32
+
+// sharedCoreHint records how many uWS loops (cores) will share the worker
+// pool, so the default worker count can scale with loops instead of NumCPU.
+// RunMultiCore publishes its loop count here before any route registers;
+// the plain single-App path leaves it 0, which defaultWorkerCount treats as
+// one loop. User-supplied SetWorkerCount overrides the hint entirely.
+var sharedCoreHint atomic.Int32
+
+// setSharedCoreHint is called by RunMultiCore before setup() runs (and thus
+// before the first GetAsync triggers ensureSharedWorkers) so the worker
+// default reflects the real loop count.
+func setSharedCoreHint(loops int) {
+	if loops < 1 {
+		loops = 1
+	}
+	sharedCoreHint.Store(int32(loops))
+}
+
+// defaultWorkerCount returns ceil(1.5 × loops). The pool exists to run
+// blocking handler work OFF the loop threads; sizing it to NumCPU
+// over-subscribes the common low-loop case (e.g. one loop on a many-core
+// box) where extra worker goroutines just contend with the loop thread for
+// GOMAXPROCS and thrash the ring head — measured to drop a single-loop
+// async route to ~80% of the sync path. 1.5× loops gives each loop one
+// worker to absorb its steady stream plus a half-worker of slack for the
+// occasional concurrently-blocked handler, which matched the empirical
+// tuning sweet spot. IO-bound services that keep many handlers blocked at
+// once should still raise this with SetWorkerCount.
+func defaultWorkerCount() int {
+	loops := int(sharedCoreHint.Load())
+	if loops < 1 {
+		loops = 1
+	}
+	return (loops*3 + 1) / 2
+}
 
 // SetWorkerCount configures the shared-dispatch worker pool size. Call
 // before registering any GetAsync route — calls after the pool starts
-// are no-ops. Pass 0 to restore the default (NumCPU).
+// are no-ops. Pass 0 to restore the default (ceil(1.5 × loop count)).
 func SetWorkerCount(n int) {
 	if n < 0 {
 		n = 0
@@ -415,7 +451,7 @@ func ensureSharedWorkers() {
 	}
 	n := int(workerCount.Load())
 	if n == 0 {
-		n = runtime.NumCPU()
+		n = defaultWorkerCount()
 	}
 	gen := &sharedWorkerGeneration{
 		stop:    make(chan struct{}),
