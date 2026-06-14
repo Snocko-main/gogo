@@ -245,8 +245,10 @@ handle, err := gogo.RunMultiCore(cores, 3000, func(app *gogo.App) {
 
 `gogo.SetWorkerCount(n)` controls the shared-dispatch `GetAsync` worker pool
 and must be called before the first `GetAsync` registration. The default is
-`runtime.NumCPU()`. In `RunMultiCore` deployments with mostly short async work,
-measure whether a smaller worker pool leaves more CPU for the loop threads.
+`ceil(1.5 × loop count)` (2 for a single `App`, 12 for `RunMultiCore(8)`) — it
+scales with loops, not `runtime.NumCPU()`, so it doesn't over-subscribe the
+loop threads. For IO-bound deployments that keep many async handlers blocked
+at once, raise it and measure.
 
 ### DB Pools
 

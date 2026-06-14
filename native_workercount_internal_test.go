@@ -46,3 +46,43 @@ func TestSetSharedCoreHintFloors(t *testing.T) {
 		t.Fatalf("setSharedCoreHint(-5) stored %d, want 1", got)
 	}
 }
+
+// TestSharedCoreHintResetsWhenIdle guards against a stale hint surviving the
+// worker pool lifecycle: after a RunMultiCore(N) run closes, a later single
+// App must fall back to the one-loop default (2 workers) rather than
+// inheriting the old N-loop hint and over-subscribing. The reset fires when
+// the last app drops its pool ref.
+func TestSharedCoreHintResetsWhenIdle(t *testing.T) {
+	savedHint := sharedCoreHint.Load()
+	savedApps := sharedActiveApps.Load()
+	savedStarted := sharedWorkersStarted
+	t.Cleanup(func() {
+		sharedWorkerLifecycleMu.Lock()
+		sharedCoreHint.Store(savedHint)
+		sharedActiveApps.Store(savedApps)
+		sharedWorkersStarted = savedStarted
+		sharedWorkerLifecycleMu.Unlock()
+	})
+
+	// Start from a clean idle pool with a RunMultiCore(8)-style hint.
+	sharedWorkerLifecycleMu.Lock()
+	sharedActiveApps.Store(0)
+	sharedWorkersStarted = false
+	sharedWorkerLifecycleMu.Unlock()
+	setSharedCoreHint(8)
+	if got := defaultWorkerCount(); got != 12 {
+		t.Fatalf("defaultWorkerCount() with hint=8 = %d, want 12", got)
+	}
+
+	// One app acquires then releases the pool ref; the release drains the
+	// active count to zero and must clear the hint.
+	acquireSharedWorkerAppRef()
+	stopSharedWorkersIfIdle()
+
+	if got := sharedCoreHint.Load(); got != 0 {
+		t.Fatalf("sharedCoreHint after idle = %d, want 0 (reset)", got)
+	}
+	if got := defaultWorkerCount(); got != 2 {
+		t.Fatalf("defaultWorkerCount() after idle reset = %d, want 2 (one-loop fallback)", got)
+	}
+}

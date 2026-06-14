@@ -217,10 +217,11 @@
 //     scheduler then has exactly one P per loop; oversubscribing
 //     wastes context-switch budget, undersubscribing starves loops.
 //   - SetWorkerCount — controls the GetAsync worker-goroutine pool.
-//     Default = NumCPU. With RunMultiCore each loop already owns one
-//     core; the workers compete for the same CPUs, so consider
-//     halving this if your GetAsync handlers are short and your
-//     workload is sync-route-heavy.
+//     Default = ceil(1.5 × loop count): one worker per loop plus a
+//     half-worker of slack, so it scales with loops rather than NumCPU
+//     and does not over-subscribe the loop threads on a low-loop /
+//     many-core box. Raise it for IO-bound handlers that keep many
+//     requests blocked at once.
 //   - Shared resources (DB pools, caches) — create ONCE outside
 //     RunMultiCore and capture the pointers into the handler
 //     closures. setup runs once per loop; allocating fresh DB pools

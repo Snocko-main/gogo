@@ -515,6 +515,13 @@ func stopSharedWorkersIfIdle() {
 	if sharedActiveApps.Add(-1) > 0 {
 		return
 	}
+	// Every app sharing the pool is gone. Clear the loop-count hint so a
+	// later pool start re-derives its default from whatever runs next: a
+	// fresh single App falls back to the one-loop default rather than
+	// inheriting a stale (e.g. RunMultiCore(8)) hint and over-subscribing.
+	// RunMultiCore republishes the hint before its first GetAsync, so the
+	// multi-core path is unaffected.
+	sharedCoreHint.Store(0)
 	if !sharedWorkersStarted {
 		return
 	}
