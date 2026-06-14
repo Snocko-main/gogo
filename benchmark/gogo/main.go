@@ -116,6 +116,21 @@ func main() {
 		app.GetAsync("/twinasync/:name", func(res *gogo.Response, req *gogo.Request) {
 			res.Send(200, "text/plain; charset=utf-8", "hello "+req.Parameter(0)+"\n")
 		})
+		// Twin pair doing a REAL blocking DB query — the workload async is
+		// designed for. Offloading the blocking Scan off the loop thread is
+		// what lets async overtake sync once handler work has real cost.
+		dbTwin := func(res *gogo.Response, req *gogo.Request) {
+			id := rand.IntN(1000) + 1
+			var name, email, role string
+			if err := dbConn.QueryRow("SELECT name, email, role FROM users WHERE id = ?", id).Scan(&name, &email, &role); err != nil {
+				res.Send(500, "text/plain", err.Error())
+				return
+			}
+			res.Send(200, "application/json",
+				fmt.Sprintf(`{"id":%d,"name":%q,"email":%q,"role":%q}`+"\n", id, name, email, role))
+		}
+		app.Get("/twindbsync", dbTwin)
+		app.GetAsync("/twindbasync", dbTwin)
 		app.GetAsync("/sleep", func(res *gogo.Response, req *gogo.Request) {
 			time.Sleep(2 * time.Millisecond)
 			res.Send(200, "text/plain; charset=utf-8", "slept\n")
