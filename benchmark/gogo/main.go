@@ -69,6 +69,12 @@ func main() {
 		if v, err := strconv.Atoi(env); err == nil && v > 0 {
 			n = v
 		}
+	} else if runtime.NumCPU() > 1 {
+		// Most frameworks in this suite (fiber, net/http, actix) use every
+		// core out of the box, so an env-less head-to-head silently compares
+		// their full machine against one gogo loop. Make that visible.
+		log.Printf("gogo~ bench: GOGO_CORES unset — running SINGLE-core on a %d-core machine; set GOGO_CORES=%d for a like-for-like comparison",
+			runtime.NumCPU(), runtime.NumCPU())
 	}
 	workers := 0
 	if env := os.Getenv("GOGO_WORKERS"); env != "" {
