@@ -247,6 +247,12 @@ struct SharedAppState {
     std::atomic<int> refcount{1};
     std::atomic<int32_t> closing{0};
     std::atomic<int32_t> active_sends{0};
+    // request_count is a per-loop diagnostic: how many requests this App's
+    // loop accepted/dispatched. With RunMultiCore (one App per loop) the
+    // spread across apps shows how evenly SO_REUSEPORT distributed work.
+    // Incremented on the loop thread in the sync/static/shared dispatch
+    // paths; read lock-free via uwsgo_app_request_count.
+    std::atomic<uint64_t> request_count{0};
     PendingRing pending_ring;
     CtxPool ctx_pool;
 
@@ -397,6 +403,14 @@ extern "C" void uwsgo_app_free(uwsgo_app_t *app);
 // cgo helper for any name that wasn't packed.
 static constexpr size_t HEADERS_SCRATCH_SIZE = 8 * 1024;
 
+// tl_run_state points at the SharedAppState of the App whose loop is
+// currently running on this thread (each App runs on its own native owner
+// thread, so there is at most one). Set for the duration of uwsgo_app_run.
+// uwsgo_res_begin_async reads it to stamp cgo-async ctxs with their owning
+// state, and the dispatch paths use it to bump the per-loop request_count
+// without threading the App pointer through every route lambda.
+static thread_local SharedAppState *tl_run_state = nullptr;
+
 // dispatch_sync invokes uwsgoHandleHTTP with method / URL / query / the
 // first four route parameters already pulled out of the uWS request,
 // plus a single packed `name\0value\0name\0value\0…` headers blob
@@ -417,6 +431,9 @@ static constexpr size_t HEADERS_SCRATCH_SIZE = 8 * 1024;
 // dominant per-request cost for middleware that reads Origin / Cookie
 // / Authorization / User-Agent in series.
 static inline void dispatch_sync(uintptr_t handler_id, uWS::HttpResponse<false> *res, uWS::HttpRequest *req) {
+    if (tl_run_state != nullptr) {
+        tl_run_state->request_count.fetch_add(1, std::memory_order_relaxed);
+    }
     auto method = req->getMethod();
     auto url = req->getUrl();
     auto query = req->getQuery();
@@ -484,6 +501,9 @@ extern "C" void uwsgo_app_get_static(uwsgo_app_t *app, const char *pattern,
 
     app->app->get(pattern, [raw](auto *res, auto *req) {
         (void)req;
+        if (tl_run_state != nullptr) {
+            tl_run_state->request_count.fetch_add(1, std::memory_order_relaxed);
+        }
         res->writeStatus(std::string_view(raw->status));
         if (!raw->content_type.empty()) {
             res->writeHeader(std::string_view("Content-Type", 12),
@@ -755,14 +775,6 @@ extern "C" int uwsgo_app_add_child(uwsgo_app_t *parent, uwsgo_app_t *child) {
     parent->app->addChildApp(child->app.get());
     return 1;
 }
-
-// tl_run_state points at the SharedAppState of the App whose loop is
-// currently running on this thread (each App runs on its own native
-// owner thread, so there is at most one). uwsgo_res_begin_async reads
-// it to stamp cgo-async ctxs with their owning state — the sync
-// handler that calls Response.Async always executes on the loop
-// thread, inside this run() call.
-static thread_local SharedAppState *tl_run_state = nullptr;
 
 extern "C" void uwsgo_app_run(uwsgo_app_t *app) {
     if (app == nullptr || app->app == nullptr) {
@@ -1231,6 +1243,16 @@ static void discard_pending(PendingRing *ring) {
     ring->head.store(h, std::memory_order_relaxed);
 }
 
+// uwsgo_app_request_count returns how many requests this App's loop has
+// dispatched — a per-loop distribution diagnostic. Null-safe so Go can call
+// it on a closed App without crashing.
+extern "C" uint64_t uwsgo_app_request_count(uwsgo_app_t *app) {
+    if (app == nullptr || app->shared_state == nullptr) {
+        return 0;
+    }
+    return app->shared_state->request_count.load(std::memory_order_relaxed);
+}
+
 extern "C" void uwsgo_app_free(uwsgo_app_t *app) {
     if (app->shared_state) {
         SharedAppState *state = app->shared_state;
@@ -1666,6 +1688,7 @@ static bool enqueue_ctx(AsyncCtx *ctx, uWS::HttpResponse<false> *res) {
 // in one place.
 static AsyncCtx *acquire_shared_ctx(uwsgo_app_t *app, uWS::HttpResponse<false> *res, uint32_t handler_id) {
     SharedAppState *state = app->shared_state;
+    state->request_count.fetch_add(1, std::memory_order_relaxed);
     state->retain();
     AsyncCtx *ctx = app->ctx_pool ? app->ctx_pool->pop() : nullptr;
     if (!ctx) {

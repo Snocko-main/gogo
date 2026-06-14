@@ -224,5 +224,14 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Printf("gogo~ listening on http://localhost:3002 (%d cores, %v mode)", n, mode)
+	// GOGO_LOOPSTATS=1 prints per-loop request counts every 2s so you can
+	// watch how evenly the chosen mode distributes work across loops.
+	if os.Getenv("GOGO_LOOPSTATS") == "1" {
+		go func() {
+			for range time.Tick(2 * time.Second) {
+				log.Printf("loop request counts: %v", handle.LoopRequestCounts())
+			}
+		}()
+	}
 	handle.Wait()
 }

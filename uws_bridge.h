@@ -16,6 +16,10 @@ typedef struct uwsgo_loop_t uwsgo_loop_t;
 uwsgo_app_t *uwsgo_app_new(void);
 void uwsgo_app_free(uwsgo_app_t *app);
 
+// uwsgo_app_request_count returns the number of requests this App's loop has
+// dispatched (per-loop distribution diagnostic). Null-safe.
+uint64_t uwsgo_app_request_count(uwsgo_app_t *app);
+
 // uwsgo_app_set_body_limit sets the maximum body bytes a Post / Any route
 // will accept. uWS evaluates the Content-Length header at request arrival
 // and rejects with 413 before dispatching to Go when the declared length

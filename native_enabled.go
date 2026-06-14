@@ -1075,6 +1075,15 @@ func (a *appNative) closeListen() {
 	C.uwsgo_app_close_listen(a.ptr)
 }
 
+// requestCount returns how many requests this App's loop has dispatched.
+// Returns 0 once the App is closed (ptr nil); the C side is null-safe.
+func (a *appNative) requestCount() uint64 {
+	if a.ptr == nil {
+		return 0
+	}
+	return uint64(C.uwsgo_app_request_count(a.ptr))
+}
+
 func (a *appNative) close() {
 	if a.ptr == nil {
 		return
