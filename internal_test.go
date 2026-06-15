@@ -174,6 +174,90 @@ func TestDefaultConfigTrustedProxiesEnableCapturePeerIP(t *testing.T) {
 	}
 }
 
+func TestDefaultRunTuningUsesGOMAXPROCSBudget(t *testing.T) {
+	cases := []struct {
+		procs       int
+		wantCores   int
+		wantWorkers int
+	}{
+		{0, 1, 1},
+		{1, 1, 1},
+		{2, 2, 1},
+		{4, 2, 2},
+		{6, 3, 3},
+		{8, 4, 4},
+		{16, 4, 12},
+	}
+	for _, tc := range cases {
+		got := defaultRunTuning(tc.procs)
+		if got.cores != tc.wantCores || got.workers != tc.wantWorkers {
+			t.Fatalf("defaultRunTuning(%d) = cores=%d workers=%d, want cores=%d workers=%d",
+				tc.procs, got.cores, got.workers, tc.wantCores, tc.wantWorkers)
+		}
+	}
+}
+
+func TestNormalizeRunOptionsOverridesAutoTuning(t *testing.T) {
+	got, err := normalizeRunOptions(RunOptions{Cores: 5, Workers: 7}, 4)
+	if err != nil {
+		t.Fatalf("normalizeRunOptions returned error: %v", err)
+	}
+	if got.cores != 5 || got.workers != 7 {
+		t.Fatalf("normalizeRunOptions override = cores=%d workers=%d, want cores=5 workers=7", got.cores, got.workers)
+	}
+}
+
+func TestNormalizeRunOptionsRecomputesAutoWorkersAfterCoreOverride(t *testing.T) {
+	got, err := normalizeRunOptions(RunOptions{Cores: 1}, 4)
+	if err != nil {
+		t.Fatalf("normalizeRunOptions returned error: %v", err)
+	}
+	if got.cores != 1 || got.workers != 3 {
+		t.Fatalf("normalizeRunOptions core override = cores=%d workers=%d, want cores=1 workers=3", got.cores, got.workers)
+	}
+}
+
+func TestNormalizeRunOptionsRejectsNegativeValues(t *testing.T) {
+	cases := []struct {
+		name string
+		opts RunOptions
+		want string
+	}{
+		{name: "cores", opts: RunOptions{Cores: -1}, want: "RunOptions.Cores"},
+		{name: "workers", opts: RunOptions{Workers: -1}, want: "RunOptions.Workers"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := normalizeRunOptions(tc.opts, 4)
+			if err == nil {
+				t.Fatal("normalizeRunOptions accepted negative value")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("normalizeRunOptions error = %q, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestRunWithOptionsRejectsInvalidConfigBeforeNativeSetup(t *testing.T) {
+	handle, err := RunWithOptions(0, func(app *App) {}, RunOptions{
+		Config: Config{BodyLimit: -2},
+	})
+	if err == nil {
+		if handle != nil {
+			handle.Shutdown()
+			handle.Wait()
+		}
+		t.Fatal("RunWithOptions accepted invalid Config")
+	}
+	if handle != nil {
+		t.Fatal("RunWithOptions returned handle for invalid Config")
+	}
+	if !strings.Contains(err.Error(), "Config.BodyLimit") {
+		t.Fatalf("RunWithOptions invalid config error = %v, want Config.BodyLimit", err)
+	}
+}
+
 func TestNewAppRejectsMultipleConfigs(t *testing.T) {
 	app, err := NewApp(Config{}, Config{})
 	if err == nil {

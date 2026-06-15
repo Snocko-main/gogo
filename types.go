@@ -2812,6 +2812,109 @@ func (mode MultiCoreMode) String() string {
 	}
 }
 
+// RunOptions configures the high-level Run helper.
+type RunOptions struct {
+	// Config is applied to every worker App. Zero uses the same production
+	// defaults as NewApp().
+	Config Config
+
+	// Cores is the number of uWS event loops to start. Zero selects an
+	// automatic value from runtime.GOMAXPROCS(0). Use RunMultiCore when you
+	// want the lower-level API shape with an explicit first argument.
+	Cores int
+
+	// Workers is the exact shared-dispatch GetAsync worker count for this
+	// run. Zero selects an automatic value from runtime.GOMAXPROCS(0) and
+	// Cores. Workers are created only when shared async routes are registered.
+	Workers int
+
+	// Mode controls accepted-socket distribution. Zero selects MultiCoreAuto.
+	Mode MultiCoreMode
+}
+
+type runTuning struct {
+	cores   int
+	workers int
+}
+
+func defaultRunTuning(procs int) runTuning {
+	if procs < 1 {
+		procs = 1
+	}
+
+	cores := 1
+	switch {
+	case procs <= 1:
+		cores = 1
+	case procs <= 4:
+		cores = 2
+	default:
+		cores = procs / 2
+		if cores > 4 {
+			cores = 4
+		}
+		if cores < 2 {
+			cores = 2
+		}
+	}
+
+	workers := defaultRunWorkers(procs, cores)
+	return runTuning{cores: cores, workers: workers}
+}
+
+func defaultRunWorkers(procs, cores int) int {
+	if procs < 1 {
+		procs = 1
+	}
+	if cores < 1 {
+		cores = 1
+	}
+	workers := procs - cores
+	if workers < 1 {
+		workers = 1
+	}
+	return workers
+}
+
+func normalizeRunOptions(opts RunOptions, procs int) (runTuning, error) {
+	if opts.Cores < 0 {
+		return runTuning{}, fmt.Errorf("gogo: RunOptions.Cores must be >= 0, got %d", opts.Cores)
+	}
+	if opts.Workers < 0 {
+		return runTuning{}, fmt.Errorf("gogo: RunOptions.Workers must be >= 0, got %d", opts.Workers)
+	}
+	tuning := defaultRunTuning(procs)
+	if opts.Cores > 0 {
+		tuning.cores = opts.Cores
+		tuning.workers = defaultRunWorkers(procs, opts.Cores)
+	}
+	if opts.Workers > 0 {
+		tuning.workers = opts.Workers
+	}
+	return tuning, nil
+}
+
+// Run starts a production-oriented gogo server. It uses runtime.GOMAXPROCS(0)
+// as the process CPU budget, then chooses sensible default uWS loop and
+// shared-dispatch worker counts. Use RunWithOptions to override the automatic
+// values, or NewApp plus App.Run when you explicitly want one event loop.
+func Run(port int, setup func(app *App)) (*MultiCoreHandle, error) {
+	return RunWithOptions(port, setup, RunOptions{})
+}
+
+// RunWithOptions is Run with explicit configuration and tuning overrides.
+func RunWithOptions(port int, setup func(app *App), opts RunOptions) (*MultiCoreHandle, error) {
+	tuning, err := normalizeRunOptions(opts, runtime.GOMAXPROCS(0))
+	if err != nil {
+		return nil, err
+	}
+	return runMultiCore(tuning.cores, port, setup, runMultiCoreOptions{
+		Config:  opts.Config,
+		Mode:    opts.Mode,
+		Workers: tuning.workers,
+	})
+}
+
 // RunMultiCoreOptions configures RunMultiCoreWithOptions.
 type RunMultiCoreOptions struct {
 	// Mode controls accepted-socket distribution. Zero selects
@@ -2820,8 +2923,8 @@ type RunMultiCoreOptions struct {
 
 	// WorkerHintLoops overrides the loop count used to size the default
 	// GetAsync worker pool. Zero keeps the mode default: reuseport uses one
-	// loop, balanced uses n loops. Use SetWorkerCount for an exact worker
-	// count instead of a loop-count hint.
+	// loop, balanced uses n loops. Prefer RunOptions.Workers for new code that
+	// needs an exact per-run worker count.
 	WorkerHintLoops int
 }
 
@@ -2836,20 +2939,37 @@ func (opts RunMultiCoreOptions) normalizedMode() (MultiCoreMode, error) {
 	}
 }
 
-func (opts RunMultiCoreOptions) normalizedWorkerHintLoops(n int, mode MultiCoreMode) (int, error) {
+type runMultiCoreOptions struct {
+	Config          Config
+	Mode            MultiCoreMode
+	WorkerHintLoops int
+	Workers         int
+}
+
+func (opts runMultiCoreOptions) normalizedMode() (MultiCoreMode, error) {
+	return (RunMultiCoreOptions{Mode: opts.Mode}).normalizedMode()
+}
+
+func (opts runMultiCoreOptions) normalizedWorkerSizing(n int, mode MultiCoreMode) (workerHintLoops int, workers int, err error) {
+	if opts.Workers < 0 {
+		return 0, 0, fmt.Errorf("gogo: Run Workers must be >= 0, got %d", opts.Workers)
+	}
 	if opts.WorkerHintLoops < 0 {
-		return 0, fmt.Errorf("gogo: RunMultiCore WorkerHintLoops must be >= 0, got %d", opts.WorkerHintLoops)
+		return 0, 0, fmt.Errorf("gogo: RunMultiCore WorkerHintLoops must be >= 0, got %d", opts.WorkerHintLoops)
 	}
 	if opts.WorkerHintLoops > n {
-		return 0, fmt.Errorf("gogo: RunMultiCore WorkerHintLoops must be <= n (%d), got %d", n, opts.WorkerHintLoops)
+		return 0, 0, fmt.Errorf("gogo: RunMultiCore WorkerHintLoops must be <= n (%d), got %d", n, opts.WorkerHintLoops)
+	}
+	if opts.Workers > 0 && opts.WorkerHintLoops > 0 {
+		return 0, 0, fmt.Errorf("gogo: RunMultiCore set either Workers or WorkerHintLoops, not both")
 	}
 	if opts.WorkerHintLoops > 0 {
-		return opts.WorkerHintLoops, nil
+		return opts.WorkerHintLoops, 0, nil
 	}
 	if mode == MultiCoreBalanced {
-		return n, nil
+		return n, opts.Workers, nil
 	}
-	return 1, nil
+	return 1, opts.Workers, nil
 }
 
 // RunMultiCore spawns n independent App instances on dedicated OS threads.
@@ -2878,17 +2998,27 @@ func RunMultiCore(n int, port int, setup func(app *App)) (*MultiCoreHandle, erro
 // RunMultiCoreWithOptions is RunMultiCore with explicit listener distribution
 // and worker-budget hint controls.
 func RunMultiCoreWithOptions(n int, port int, setup func(app *App), opts RunMultiCoreOptions) (*MultiCoreHandle, error) {
+	return runMultiCore(n, port, setup, runMultiCoreOptions{
+		Mode:            opts.Mode,
+		WorkerHintLoops: opts.WorkerHintLoops,
+	})
+}
+
+func runMultiCore(n int, port int, setup func(app *App), opts runMultiCoreOptions) (*MultiCoreHandle, error) {
 	if n <= 0 {
 		return nil, fmt.Errorf("gogo: RunMultiCore needs n>0, got %d", n)
 	}
 	if setup == nil {
 		return nil, fmt.Errorf("gogo: RunMultiCore requires a setup function")
 	}
+	if err := validateConfig(opts.Config); err != nil {
+		return nil, err
+	}
 	mode, err := opts.normalizedMode()
 	if err != nil {
 		return nil, err
 	}
-	workerHintLoops, err := opts.normalizedWorkerHintLoops(n, mode)
+	workerHintLoops, workerCount, err := opts.normalizedWorkerSizing(n, mode)
 	if err != nil {
 		return nil, err
 	}
@@ -2898,11 +3028,13 @@ func RunMultiCoreWithOptions(n int, port int, setup func(app *App), opts RunMult
 	// forces traffic across all loops, so its default worker budget scales with
 	// n. ReusePort mode leaves placement to the kernel; short loopback runs and
 	// low-cardinality client sets can land mostly on one loop, so default to the
-	// one-loop worker budget unless the user has called SetWorkerCount or set
-	// WorkerHintLoops explicitly.
+	// one-loop worker budget unless the user has set Workers, WorkerHintLoops,
+	// or the legacy process-wide SetWorkerCount explicitly.
 	coreHintToken := setSharedCoreHint(workerHintLoops)
+	workerHintToken := setSharedWorkerCountHint(workerCount)
 	resetCoreHint := func() {
 		resetSharedCoreHintIfCurrent(coreHintToken)
+		resetSharedWorkerCountHintIfCurrent(workerHintToken)
 	}
 
 	type startResult struct {
@@ -2934,7 +3066,7 @@ func RunMultiCoreWithOptions(n int, port int, setup func(app *App), opts RunMult
 		runWg.Add(1)
 		go func() {
 			defer runWg.Done()
-			app, err := NewApp()
+			app, err := NewApp(opts.Config)
 			if err != nil {
 				starts <- startResult{idx: idx, err: err}
 				return

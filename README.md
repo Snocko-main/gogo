@@ -1812,20 +1812,20 @@ app.Post("/upload-stream", func(res *gogo.Response, req *gogo.Request) {
 ## Multi-core
 
 Single-loop mode (`NewApp` + `Run`) caps throughput at one OS thread.
-`RunMultiCore` starts N independent App instances bound to the same port so
-the server can use more than one loop. By default, gogo uses the low-overhead
-`SO_REUSEPORT` path and lets the kernel place accepted sockets across loops.
+For production defaults, use the package-level `gogo.Run` helper. It reads
+`runtime.GOMAXPROCS(0)` as the process CPU budget, then chooses uWS loop and
+shared async-worker counts automatically. Set `GOMAXPROCS` with the standard
+Go environment variable or `runtime.GOMAXPROCS` when you want to cap the
+process.
 
 ```go
 func main() {
-    runtime.GOMAXPROCS(runtime.NumCPU())
-
     // Shared resources — create ONCE outside setup so every worker captures
     // the same pointers.
     db := mustOpenDB()
     defer db.Close()
 
-    handle, err := gogo.RunMultiCore(runtime.NumCPU(), 3000, func(app *gogo.App) {
+    handle, err := gogo.Run(3000, func(app *gogo.App) {
         app.Get("/plain", func(res *gogo.Response, req *gogo.Request) {
             res.Send(200, "text/plain", "ok")
         })
@@ -1848,37 +1848,51 @@ func main() {
 }
 ```
 
-When you need deterministic per-loop connection placement, use balanced mode:
+When you need to tune explicitly, use `RunWithOptions`:
 
 ```go
-handle, err := gogo.RunMultiCoreWithOptions(runtime.NumCPU(), 3000, setup,
-    gogo.RunMultiCoreOptions{Mode: gogo.MultiCoreBalanced})
+handle, err := gogo.RunWithOptions(3000, setup, gogo.RunOptions{
+    Config: gogo.Config{
+        BindAddr: "127.0.0.1",
+    },
+    Cores:   2, // zero = auto from GOMAXPROCS
+    Workers: 4, // zero = auto from GOMAXPROCS and Cores
+    Mode:    gogo.MultiCoreReusePort,
+})
 ```
 
-Balanced mode round-robins accepted sockets across App loops, which helps
-tests and low-cardinality client sets exercise every loop. It costs extra
-native handoff work on accepted sockets, so the default `RunMultiCore` path
-uses `MultiCoreReusePort` for lower accept-path overhead.
-
-If your production kernel/load balancer distributes `SO_REUSEPORT` connections
-evenly and your async routes are IO-bound, keep reuseport mode and raise only
-the default async worker hint:
+`Run` and `RunWithOptions` start independent App instances bound to the same
+port. By default, gogo uses the low-overhead `SO_REUSEPORT` path and lets the
+kernel place accepted sockets across loops. When you need deterministic
+per-loop connection placement, use balanced mode:
 
 ```go
-handle, err := gogo.RunMultiCoreWithOptions(runtime.NumCPU(), 3000, setup,
+handle, err := gogo.RunWithOptions(3000, setup, gogo.RunOptions{
+    Mode: gogo.MultiCoreBalanced,
+})
+```
+
+Balanced mode round-robins accepted sockets across App loops, which helps tests
+and low-cardinality client sets exercise every loop. It costs extra native
+handoff work on accepted sockets, so the default path uses
+`MultiCoreReusePort` for lower accept-path overhead.
+
+If you want the low-level shape with an explicit loop count, keep using
+`RunMultiCore` / `RunMultiCoreWithOptions`:
+
+```go
+handle, err := gogo.RunMultiCoreWithOptions(4, 3000, setup,
     gogo.RunMultiCoreOptions{
         Mode:            gogo.MultiCoreReusePort,
-        WorkerHintLoops: runtime.NumCPU(),
+        WorkerHintLoops: 4,
     })
 ```
 
-`RunMultiCore` currently has no `Config` parameter. Each worker
-`App` is created with the zero-value `Config`, so app-scoped fields such as
-`BodyLimit`, `BodyReadTimeout`, `BindAddr`, `CapturePeerIP`, `TrustProxy`,
-`JSONEncoder`, and `JSONDecoder` cannot be supplied through this helper today.
-Set process-wide knobs and `RunMultiCoreOptions` before starting workers,
-register per-route/per-middleware options inside `setup`, and create shared
-resources outside `setup` so every worker captures the same instance.
+`RunMultiCore(n, port, setup)` keeps the old explicit loop-count API and uses
+the zero-value `Config`. Use `RunWithOptions` with `Cores` when every worker
+should receive app-scoped fields such as `BodyLimit`, `BodyReadTimeout`,
+`BindAddr`, `CapturePeerIP`, `TrustProxy`, `JSONEncoder`, or `JSONDecoder`, or
+when you want an exact per-run `Workers` count.
 
 `MultiCoreHandle.Shutdown` is immediate: it calls `Shutdown` on every worker,
 which closes the listen socket and active connections. It is safe and
@@ -1889,15 +1903,17 @@ graceful drain behavior.
 
 Tuning knobs that actually matter:
 
-- `GOMAXPROCS` — pin to the same N you passed to `RunMultiCore`.
-- `gogo.SetWorkerCount(n)` — controls the `GetAsync` worker pool. Default
-  is `ceil(1.5 × worker-hint loops)`. A single `App` and default
-  `RunMultiCore` reuseport mode use the one-loop default (2 workers) so async
-  workers do not steal CPU when the kernel places many connections on one
-  listener. `MultiCoreBalanced` uses the full loop count (so 8 loops get 12
-  workers). `RunMultiCoreOptions.WorkerHintLoops` overrides only that loop
-  hint; `SetWorkerCount` still wins when you need an exact worker count. Raise
-  either value for IO-bound handlers that keep many requests blocked at once.
+- `GOMAXPROCS` — the primary CPU budget. `gogo.Run` derives default loop and
+  async-worker counts from it.
+- `RunOptions.Cores` — exact uWS loop count. Leave zero first; override only
+  after benchmarking.
+- `RunOptions.Workers` — exact shared-dispatch `GetAsync` worker count for
+  this server run. Workers are created only when shared async routes are
+  registered. Raise it for IO-bound handlers that keep many requests blocked at
+  once.
+- `RunMultiCoreOptions.WorkerHintLoops` and `SetWorkerCount` — lower-level
+  compatibility knobs. Prefer `RunOptions.Workers` for new production code that
+  wants a per-run exact worker count.
 - Pin shared resources (DB pools, caches) to one allocation outside
   `setup`.
 - For strict CPU pinning, run under `taskset -c 0-(N-1)`.

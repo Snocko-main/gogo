@@ -48,8 +48,9 @@ Notes frozen by this audit:
   `Router.Group`, and `Router.Use`; users do not construct it directly.
 - `SetWorkerCount` is a native-build-only exported tuning hook. It appears in
   source under `native_enabled.go` and in the global-state docs; callers that
-  use it must build with `CGO_ENABLED=1 -tags gogo`. `WaitForSharedWorkers`
-  remains available in stub builds as a no-op compatibility function.
+  use it must build with `CGO_ENABLED=1 -tags gogo`. New multicore services
+  should prefer per-run `RunOptions.Workers`. `WaitForSharedWorkers` remains
+  available in stub builds as a no-op compatibility function.
 - `TestServer.App()` is frozen as a runtime accessor for supported running-app
   operations such as WebSocket publish calls. Late route or middleware
   registration through the returned app is not part of the testing contract.
@@ -62,6 +63,9 @@ covered by existing roadmap decisions and docs.
 Root package symbols:
 
 - `NewApp(cfg ...Config) (*App, error)`
+- `Run(port int, setup func(*App)) (*MultiCoreHandle, error)`
+- `RunWithOptions(port int, setup func(*App), opts RunOptions) (*MultiCoreHandle, error)`
+- `RunOptions`
 - `Config` with fields `BodyLimit`, `BodyReadTimeout`, `BindAddr`,
   `CapturePeerIP`, `TrustProxy`, `TrustedProxies`, `JSONEncoder`, `JSONDecoder`
 - `NoBodyLimit`, `NoBodyReadTimeout`
@@ -329,7 +333,8 @@ Root package symbols:
 - `App.Listen`, `App.Run`, `App.Close`
 - `App.Shutdown`, `App.ShutdownGracefully`, `App.ShutdownContext`
 - `App.OnListen`, `App.OnShutdown`
-- `RunMultiCore`, `MultiCoreHandle` methods `Shutdown`, `Wait`
+- `RunMultiCore`, `RunMultiCoreWithOptions`, `RunMultiCoreOptions`,
+  `MultiCoreMode`, `MultiCoreHandle` methods `Shutdown`, `Wait`
 - `Loop` method `Defer`
 - `Aborted` method `Load`
 - `Response.Loop`, `Response.OnAborted`, `Response.OnFinish`, `Response.Async`,
@@ -339,9 +344,13 @@ Root package symbols:
 Freeze notes:
 
 - `ShutdownContext` is the blocking graceful-shutdown API.
-- `RunMultiCore` still has no `Config` or graceful-drain equivalent; this is
-  already documented as the v1 process-wide configuration boundary, not an
-  open API blocker.
+- `Run` is the production-oriented auto multicore entry point. `NewApp` plus
+  `App.Run` remains the explicit single-loop shape.
+- `RunMultiCore(n, port, setup)` keeps the low-level explicit loop-count shape
+  with zero-value `Config`; `RunWithOptions` with `Cores` is the explicit
+  loop-count shape that also applies one `Config` to every worker.
+- Multicore still has no graceful-drain equivalent; this is documented as a
+  lifecycle boundary, not an open API blocker.
 - `Close` remains a native resource cleanup method to call after `Run` returns
   or before a never-listened app is discarded.
 

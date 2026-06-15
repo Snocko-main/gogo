@@ -12,7 +12,7 @@ service shape.
 | Middleware stack | `examples/authmw` | README middleware section, `docs/configuration.md`, `docs/security-checklist.md` | Helmet, credentialed CORS, session/CSRF, BasicAuth, JWT issuer/audience/claims, production env checks |
 | WebSocket | `examples/websocket`, `examples/authmw` | README WebSocket section, `docs/websocket-hub-adapter.md`, `docs/testing.md` | explicit `Upgrade`, `middleware.WebSocketAuth`, origin allow-list, token verification, subprotocols, payload/idle/backpressure limits, hub pub/sub |
 | Graceful shutdown | `examples/graceful` | README Graceful Shutdown, package docs in `doc.go`, `docs/testing.md` | signal handling, `ShutdownContext`, deadline fallback, waiting for `Run` before `Close` |
-| Multicore operations | `examples/multicore` | README Multi-core, `docs/ops.md`, `docs/global-state.md` | shared resources outside setup, `GOMAXPROCS`, metrics endpoint, immediate worker-group shutdown boundary |
+| Multicore operations | `examples/multicore` | README Multi-core, `docs/ops.md`, `docs/global-state.md` | shared resources outside setup, `gogo.Run`, `GOMAXPROCS`, optional core/worker overrides, metrics endpoint, immediate worker-group shutdown boundary |
 | Install/build | README Requirements and Native Build, `docs/install-build.md`, `docs/downstream-smoke.md` | `docs/release-checklist.md` | Go/cgo/C++20/zlib prerequisites, `-tags gogo`, native example builds, downstream clean-module smoke |
 
 ## Production Shape
@@ -39,8 +39,8 @@ direct starting points for this shape.
   edge request-size policy at a reverse proxy or load balancer.
 - HTTP CORS middleware does not protect WebSocket upgrades. Browser-capable
   WebSocket routes need their own origin/auth checks.
-- `RunMultiCore` currently creates workers with zero-value `Config` and exposes
-  immediate group shutdown, not the single-app graceful drain API.
+- Multicore helpers expose immediate group shutdown, not the single-app
+  graceful drain API. `RunWithOptions` can apply one `Config` to every worker.
 - In-memory session and rate-limit stores are process-local. Use a shared store
   such as Redis when limits or sessions must be consistent across replicas.
 - Native builds currently target macOS and Linux and require the toolchain
