@@ -29,10 +29,9 @@ the new middleware route comparable without changing the Node, Bun, or Actix
 benchmark servers.
 
 For gogo, `GOGO_WORKERS` can override the shared-dispatch worker count. The
-default value `0` keeps gogo's runtime default of `ceil(1.5 × loop count)` —
-it scales with the number of uWS loops, not `NumCPU`, so a single-loop run on
-a many-core box does not over-subscribe the loop thread. Raise it for
-heavily blocking async work.
+default value `0` keeps gogo's runtime default. In application code, prefer
+`gogo.Run` first and use `RunOptions.Cores` / `RunOptions.Workers` when a
+deployment needs explicit tuning from measured results.
 
 Covered GET workloads:
 

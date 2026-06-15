@@ -1,10 +1,11 @@
-// multicore demonstrates the full RunMultiCore production setup:
+// multicore demonstrates the production multicore setup:
 //
-//   - N independent uWS event loops, one per vCPU (NumCPU by default),
-//     with accepted sockets round-robined across loops
+//   - Automatic uWS loop and async-worker sizing from GOMAXPROCS by
+//     default, with explicit GOGO_CORES / GOGO_WORKERS overrides when
+//     benchmarking a deployment
 //   - Shared state (here: a counter; in real apps a *sql.DB pool)
-//     created ONCE before RunMultiCore and captured into the handlers
-//     so per-worker initialization stays cheap
+//     created ONCE before gogo.Run and captured into the handlers so
+//     per-worker initialization stays cheap
 //   - Per-worker request counters aggregated through a /metrics
 //     endpoint formatted as Prometheus text exposition
 //   - Signal-driven immediate group shutdown via SIGINT / SIGTERM
@@ -18,37 +19,32 @@
 // Tuning knobs
 // ============
 //
-// GOMAXPROCS — defaults to NumCPU. For RunMultiCore workloads pin it
-// to the same number you pass as `n` so the runtime scheduler has
-// exactly as many Ps as event loops; pinning beyond that wastes
-// scheduling cycles, pinning below it starves loops.
+// GOMAXPROCS — the primary CPU budget. Set it with the standard Go
+// environment variable or runtime.GOMAXPROCS before calling gogo.Run.
+// gogo derives default loop and worker counts from that value.
 //
-// SetWorkerCount — controls the GetAsync worker-goroutine pool size.
-// Defaults to ceil(1.5 × loop count): it scales with the number of
-// loops, not NumCPU, so it doesn't over-subscribe the loop threads.
-// Trust the default for short async handlers; raise it for IO-bound
-// handlers that keep many requests blocked at once.
+// GOGO_CORES / GOGO_WORKERS — example-local overrides for tuning.
+// Leave them unset first; set them only when comparing 1 / 2 / 4 loops
+// or raising async workers for IO-bound handlers.
 //
 // Per-worker resources — wrap shared resources in plain Go state
 // captured into setup. The example below uses an atomic.Int64 for
 // counts; a production app would create a *sql.DB once at startup
 // and pass it into every handler closure.
 //
-// Config boundary — RunMultiCore currently creates each worker App
-// with the zero-value gogo.Config. App-scoped Config fields are not
-// configurable through this helper; use process-wide knobs before
-// RunMultiCore and per-route/per-middleware options inside setup.
+// Config boundary — gogo.RunWithOptions can apply one gogo.Config to
+// every worker. Create shared resources outside setup; do not allocate
+// a new DB pool per worker.
 //
 // Shutdown behavior — MultiCoreHandle.Shutdown calls each worker's
 // immediate Shutdown. It stops the group quickly, but it is not the
 // same as App.ShutdownContext's single-app graceful drain. See
 // examples/graceful when in-flight requests must finish before exit.
 //
-// Pinning to CPUs — gogo doesn't pin loops to specific cores
-// today. With a `RunMultiCore(N=NumCPU)` config the kernel typically
-// keeps each loop on its initial CPU; if you need stricter pinning
-// run the server under `taskset -c 0-(N-1)` or wrap the
-// LockOSThread inside a sched_setaffinity call (Linux only).
+// Pinning to CPUs — gogo doesn't pin loops to specific cores today.
+// If you need stricter pinning, run the server under
+// `taskset -c 0-(N-1)` or wrap LockOSThread inside a
+// sched_setaffinity call (Linux only).
 
 package main
 
@@ -66,13 +62,13 @@ import (
 )
 
 func main() {
-	cores := runtime.NumCPU()
+	opts := gogo.RunOptions{}
 	if env := os.Getenv("GOGO_CORES"); env != "" {
-		if n, err := fmt.Sscanf(env, "%d", &cores); err != nil || n != 1 || cores <= 0 {
-			log.Fatalf("GOGO_CORES must be a positive integer, got %q", env)
-		}
+		opts.Cores = mustPositiveInt("GOGO_CORES", env)
 	}
-	runtime.GOMAXPROCS(cores)
+	if env := os.Getenv("GOGO_WORKERS"); env != "" {
+		opts.Workers = mustPositiveInt("GOGO_WORKERS", env)
+	}
 
 	// Shared state lives outside setup so every worker captures the
 	// same pointers. Counters are atomic so the loop goroutines can
@@ -81,15 +77,15 @@ func main() {
 	stats := &stats{startedAt: time.Now()}
 
 	startedAt := time.Now()
-	handle, err := gogo.RunMultiCore(cores, 3000, func(app *gogo.App) {
+	handle, err := gogo.RunWithOptions(3000, func(app *gogo.App) {
 		registerRoutes(app, stats)
-	})
+	}, opts)
 	if err != nil {
-		log.Fatalf("RunMultiCore: %v", err)
+		log.Fatalf("gogo.RunWithOptions: %v", err)
 	}
 
-	log.Printf("gogo~ multicore listening on :3000 (%d cores, GOMAXPROCS=%d, started in %s)",
-		cores, runtime.GOMAXPROCS(0), time.Since(startedAt))
+	log.Printf("gogo~ multicore listening on :3000 (GOMAXPROCS=%d, cores=%s, workers=%s, started in %s)",
+		runtime.GOMAXPROCS(0), optionLabel(opts.Cores), optionLabel(opts.Workers), time.Since(startedAt))
 
 	// Signal-driven immediate shutdown: SIGINT (Ctrl+C) or SIGTERM
 	// (container stop) triggers Shutdown on every worker, then Wait
@@ -104,6 +100,21 @@ func main() {
 	handle.Wait()
 	log.Printf("stopped after %s, served %d requests",
 		time.Since(startedAt), stats.totalRequests.Load())
+}
+
+func mustPositiveInt(name, raw string) int {
+	var value int
+	if n, err := fmt.Sscanf(raw, "%d", &value); err != nil || n != 1 || value <= 0 {
+		log.Fatalf("%s must be a positive integer, got %q", name, raw)
+	}
+	return value
+}
+
+func optionLabel(value int) string {
+	if value == 0 {
+		return "auto"
+	}
+	return fmt.Sprintf("%d", value)
 }
 
 // stats holds the per-process metrics surfaced by /metrics.

@@ -181,10 +181,10 @@
 // # Multi-core
 //
 // Single-loop mode (NewApp + Run) caps throughput at one OS thread —
-// uWebSockets is event-loop driven, not goroutine-per-request. To
-// run multiple event loops, use RunMultiCore:
+// uWebSockets is event-loop driven, not goroutine-per-request. For
+// production defaults, use the package-level Run helper:
 //
-//	handle, err := gogo.RunMultiCore(runtime.NumCPU(), 3000, func(app *gogo.App) {
+//	handle, err := gogo.Run(3000, func(app *gogo.App) {
 //	    app.Get("/plain", plainHandler)
 //	    // … same routes / middleware as a single-loop app …
 //	})
@@ -194,25 +194,22 @@
 //	handle.Shutdown()
 //	handle.Wait()
 //
-// RunMultiCore spawns N independent App instances, each bound to the
-// same port. The default mode lets the kernel distribute accepted
-// sockets with SO_REUSEPORT, which avoids cross-loop socket handoff
-// overhead. If you need predictable per-loop connection placement,
-// use RunMultiCoreWithOptions with MultiCoreBalanced; that mode
-// round-robins accepted sockets across App loops at extra accept-path
-// cost. If SO_REUSEPORT distributes well in your production
-// environment but your async routes need a larger default worker
-// budget, keep MultiCoreReusePort and set
-// RunMultiCoreOptions.WorkerHintLoops. setup runs once per instance
-// on the OS thread that instance will own. setup has no error
-// return; do fallible shared initialization before RunMultiCore.
-// A setup panic is recovered, converted to an error, and any
-// created Apps are closed.
-// RunMultiCore currently creates each worker with the zero-value Config; there
-// is no Config parameter for app-scoped settings such as BodyLimit,
-// BodyReadTimeout, BindAddr, CapturePeerIP, TrustProxy, or custom JSON codecs.
-// Use process-wide knobs before RunMultiCore and per-route/per-middleware
-// options inside setup.
+// Run reads runtime.GOMAXPROCS(0) as the process CPU budget, then chooses
+// default uWS loop and shared-dispatch worker counts. Use RunWithOptions
+// when you need explicit Config, Cores, Workers, or MultiCoreMode overrides.
+// Use RunMultiCore / RunMultiCoreWithOptions when you want the lower-level
+// API shape with an explicit loop count as the first argument.
+//
+// All multicore helpers spawn independent App instances bound to the same
+// port. The default mode lets the kernel distribute accepted sockets with
+// SO_REUSEPORT, which avoids cross-loop socket handoff overhead. If you need
+// predictable per-loop connection placement, use MultiCoreBalanced; that mode
+// round-robins accepted sockets across App loops at extra accept-path cost.
+// setup runs once per instance on the OS thread that instance will own. setup
+// has no error return; do fallible shared initialization before Run. A setup
+// panic is recovered, converted to an error, and any created Apps are closed.
+// RunWithOptions applies one Config to every worker; RunMultiCore and
+// RunMultiCoreWithOptions keep the old zero-value Config behavior.
 //
 // MultiCoreHandle.Shutdown calls Shutdown on every worker App, so multicore
 // shutdown is immediate and active connections are closed. There is no
@@ -220,22 +217,20 @@
 //
 // Tuning knobs that actually matter:
 //
-//   - GOMAXPROCS — pin to the same N you passed to RunMultiCore. The
-//     scheduler then has exactly one P per loop; oversubscribing
-//     wastes context-switch budget, undersubscribing starves loops.
-//   - SetWorkerCount — controls the GetAsync worker-goroutine pool.
-//     Default = ceil(1.5 × worker-hint loops). A single App and
-//     default RunMultiCore reuseport mode use the one-loop default so
-//     async workers do not steal CPU when the kernel places many
-//     connections on one listener. MultiCoreBalanced uses the full
-//     loop count. RunMultiCoreOptions.WorkerHintLoops overrides only
-//     that loop-count hint; SetWorkerCount still wins when you need
-//     an exact worker count. Raise either for IO-bound handlers that
-//     keep many requests blocked at once.
+//   - GOMAXPROCS — the primary CPU budget. Run derives default loop and
+//     async-worker counts from it.
+//   - RunOptions.Cores — exact uWS loop count. Leave zero first; override
+//     only after benchmarking.
+//   - RunOptions.Workers — exact shared-dispatch GetAsync worker count for
+//     this server run. Workers start only when shared async routes are
+//     registered.
+//   - RunMultiCoreOptions.WorkerHintLoops and SetWorkerCount — lower-level
+//     compatibility knobs. Prefer RunOptions.Workers for new code that wants
+//     a per-run exact worker count.
 //   - Shared resources (DB pools, caches) — create ONCE outside
-//     RunMultiCore and capture the pointers into the handler
-//     closures. setup runs once per loop; allocating fresh DB pools
-//     per loop wastes RAM and connection slots.
+//     Run and capture the pointers into the handler closures. setup runs once
+//     per loop; allocating fresh DB pools per loop wastes RAM and connection
+//     slots.
 //   - Per-loop CPU pinning — gogo does not pin to specific cores.
 //     Linux's scheduler typically keeps each loop on its initial CPU
 //     for cache locality. If you need stricter pinning run the

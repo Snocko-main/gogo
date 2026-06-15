@@ -291,10 +291,11 @@ var (
 )
 
 type sharedWorkerGeneration struct {
-	stop          chan struct{}
-	drained       chan struct{}
-	coreHintToken uint64
-	live          atomic.Int32
+	stop                 chan struct{}
+	drained              chan struct{}
+	coreHintToken        uint64
+	workerCountHintToken uint64
+	live                 atomic.Int32
 }
 
 func init() {
@@ -390,25 +391,29 @@ func (a *appNative) postShared(pattern string, handler AsyncHandler, maxBody int
 	ensureSharedWorkers()
 }
 
-// workerCount controls how many goroutines drain the request ring. Read once
+// workerCount is the legacy process-wide exact worker override. Read once
 // when the first shared route registers (and workers spin up); changing it
-// after that has no effect. Default = ceil(1.5 × loop count) — see
-// defaultWorkerCount for why this scales with loops (cores) rather than
-// NumCPU. For workloads dominated by slow IO (many handlers blocked on a
-// DB / network at once), raise this via SetWorkerCount before the first
-// GetAsync registers.
+// after that has no effect. Per-run RunOptions.Workers /
+// RunMultiCoreOptions.Workers takes precedence when present. Otherwise the
+// default is derived from the active loop-count hint.
 var workerCount atomic.Int32
 
 // sharedCoreHint records how many uWS loops (cores) will share the worker
 // pool, so the default worker count can scale with loops instead of NumCPU.
 // RunMultiCore publishes its loop count here before any route registers;
 // the plain single-App path leaves it 0, which defaultWorkerCount treats as
-// one loop. User-supplied SetWorkerCount overrides the hint entirely.
+// one loop. Per-run Workers and user-supplied SetWorkerCount override the
+// default worker-count calculation.
 //
 // The high 32 bits are a generation counter and the low 32 bits are the loop
 // count. Reset paths compare the full token so an older RunMultiCore lifecycle
 // cannot clear a newer hint that happens to use the same loop count.
 var sharedCoreHint atomic.Uint64
+
+// sharedWorkerCountHint records an exact per-Run worker count. It is separate
+// from workerCount so high-level RunOptions can tune one server lifecycle
+// without leaving SetWorkerCount-style global state behind.
+var sharedWorkerCountHint atomic.Uint64
 
 // setSharedCoreHint is called by RunMultiCore before setup() runs (and thus
 // before the first GetAsync triggers ensureSharedWorkers) so the worker
@@ -441,6 +446,33 @@ func resetSharedCoreHintIfCurrent(token uint64) {
 	}
 }
 
+func setSharedWorkerCountHint(workers int) uint64 {
+	if workers < 1 {
+		return 0
+	}
+	for {
+		old := sharedWorkerCountHint.Load()
+		gen := old>>32 + 1
+		if gen == 0 {
+			gen = 1
+		}
+		next := gen<<32 | uint64(uint32(workers))
+		if sharedWorkerCountHint.CompareAndSwap(old, next) {
+			return next
+		}
+	}
+}
+
+func resetSharedWorkerCountHintIfCurrent(token uint64) {
+	if token != 0 {
+		sharedWorkerCountHint.CompareAndSwap(token, 0)
+	}
+}
+
+func sharedWorkerCountHintValue() int {
+	return int(uint32(sharedWorkerCountHint.Load()))
+}
+
 // defaultWorkerCount returns ceil(1.5 × loops). The pool exists to run
 // blocking handler work OFF the loop threads; sizing it to NumCPU
 // over-subscribes the common low-loop case (e.g. one loop on a many-core
@@ -450,7 +482,7 @@ func resetSharedCoreHintIfCurrent(token uint64) {
 // worker to absorb its steady stream plus a half-worker of slack for the
 // occasional concurrently-blocked handler, which matched the empirical
 // tuning sweet spot. IO-bound services that keep many handlers blocked at
-// once should still raise this with SetWorkerCount.
+// once should still raise this with RunOptions.Workers or SetWorkerCount.
 func defaultWorkerCount() int {
 	loops := int(uint32(sharedCoreHint.Load()))
 	if loops < 1 {
@@ -461,7 +493,7 @@ func defaultWorkerCount() int {
 
 // SetWorkerCount configures the shared-dispatch worker pool size. Call
 // before registering any GetAsync route — calls after the pool starts
-// are no-ops. Pass 0 to restore the default (ceil(1.5 × loop count)).
+// are no-ops. Pass 0 to restore the active run's default sizing policy.
 func SetWorkerCount(n int) {
 	if n < 0 {
 		n = 0
@@ -475,14 +507,18 @@ func ensureSharedWorkers() {
 	if sharedWorkersStarted {
 		return
 	}
-	n := int(workerCount.Load())
+	n := sharedWorkerCountHintValue()
+	if n == 0 {
+		n = int(workerCount.Load())
+	}
 	if n == 0 {
 		n = defaultWorkerCount()
 	}
 	gen := &sharedWorkerGeneration{
-		stop:          make(chan struct{}),
-		drained:       make(chan struct{}),
-		coreHintToken: sharedCoreHint.Load(),
+		stop:                 make(chan struct{}),
+		drained:              make(chan struct{}),
+		coreHintToken:        sharedCoreHint.Load(),
+		workerCountHintToken: sharedWorkerCountHint.Load(),
 	}
 	gen.live.Store(int32(n))
 	sharedWorkerGen = gen
@@ -552,6 +588,7 @@ func stopSharedWorkersIfIdle() {
 		return
 	}
 	resetSharedCoreHintIfCurrent(sharedWorkerGen.coreHintToken)
+	resetSharedWorkerCountHintIfCurrent(sharedWorkerGen.workerCountHintToken)
 	close(sharedWorkerGen.stop)
 	sharedWorkersStarted = false
 }

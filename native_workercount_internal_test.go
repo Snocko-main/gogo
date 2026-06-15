@@ -81,6 +81,7 @@ func TestSharedCoreHintResetUsesGenerationToken(t *testing.T) {
 // the last app drops its pool ref.
 func TestSharedCoreHintResetsWhenIdle(t *testing.T) {
 	savedHint := sharedCoreHint.Load()
+	savedWorkerHint := sharedWorkerCountHint.Load()
 	savedApps := sharedActiveApps.Load()
 	savedStarted := sharedWorkersStarted
 	savedGen := sharedWorkerGen
@@ -88,6 +89,7 @@ func TestSharedCoreHintResetsWhenIdle(t *testing.T) {
 	t.Cleanup(func() {
 		sharedWorkerLifecycleMu.Lock()
 		sharedCoreHint.Store(savedHint)
+		sharedWorkerCountHint.Store(savedWorkerHint)
 		sharedActiveApps.Store(savedApps)
 		sharedWorkersStarted = savedStarted
 		sharedWorkerGen = savedGen
@@ -97,12 +99,14 @@ func TestSharedCoreHintResetsWhenIdle(t *testing.T) {
 
 	// Start from a clean idle pool with a RunMultiCore(8)-style hint.
 	token := setSharedCoreHint(8)
+	workerToken := setSharedWorkerCountHint(5)
 	sharedWorkerLifecycleMu.Lock()
 	sharedActiveApps.Store(0)
 	gen := &sharedWorkerGeneration{
-		stop:          make(chan struct{}),
-		drained:       make(chan struct{}),
-		coreHintToken: token,
+		stop:                 make(chan struct{}),
+		drained:              make(chan struct{}),
+		coreHintToken:        token,
+		workerCountHintToken: workerToken,
 	}
 	sharedWorkerGen = gen
 	sharedWorkerGens = []*sharedWorkerGeneration{gen}
@@ -119,6 +123,9 @@ func TestSharedCoreHintResetsWhenIdle(t *testing.T) {
 
 	if got := sharedCoreHint.Load(); got != 0 {
 		t.Fatalf("sharedCoreHint after idle = %d, want 0 (reset)", got)
+	}
+	if got := sharedWorkerCountHint.Load(); got != 0 {
+		t.Fatalf("sharedWorkerCountHint after idle = %d, want 0 (reset)", got)
 	}
 	if got := defaultWorkerCount(); got != 2 {
 		t.Fatalf("defaultWorkerCount() after idle reset = %d, want 2 (one-loop fallback)", got)
@@ -202,12 +209,52 @@ func TestRunMultiCoreWorkerHintLoopsOverridesModeDefault(t *testing.T) {
 	handle.Wait()
 }
 
+func TestRunWithOptionsWorkersPublishesExactWorkerHint(t *testing.T) {
+	savedHint := sharedCoreHint.Load()
+	savedWorkerHint := sharedWorkerCountHint.Load()
+	t.Cleanup(func() {
+		sharedCoreHint.Store(savedHint)
+		sharedWorkerCountHint.Store(savedWorkerHint)
+	})
+	sharedCoreHint.Store(0)
+	sharedWorkerCountHint.Store(0)
+
+	handle, err := RunWithOptions(workerHintFreePort(t), func(app *App) {
+		app.Get("/sync", func(res *Response, req *Request) {
+			res.Send(200, "text/plain; charset=utf-8", "ok")
+		})
+	}, RunOptions{Cores: 3, Workers: 4})
+	if err != nil {
+		t.Fatalf("RunWithOptions: %v", err)
+	}
+	if got := sharedCoreHintLoops(); got != 1 {
+		handle.Shutdown()
+		handle.Wait()
+		t.Fatalf("sharedCoreHint loops after exact Workers = %d, want default reuseport hint 1", got)
+	}
+	if got := sharedWorkerCountHintValue(); got != 4 {
+		handle.Shutdown()
+		handle.Wait()
+		t.Fatalf("sharedWorkerCountHint after exact Workers = %d, want 4", got)
+	}
+	handle.Shutdown()
+	handle.Wait()
+	if got := sharedWorkerCountHint.Load(); got != 0 {
+		t.Fatalf("sharedWorkerCountHint after sync-only RunMultiCore shutdown = %d, want 0", got)
+	}
+}
+
 // TestRunMultiCoreSetupPanicResetsSharedCoreHint covers the early error path:
 // setup can fail before any shared route acquires a worker-pool ref.
 func TestRunMultiCoreSetupPanicResetsSharedCoreHint(t *testing.T) {
 	savedHint := sharedCoreHint.Load()
-	t.Cleanup(func() { sharedCoreHint.Store(savedHint) })
+	savedWorkerHint := sharedWorkerCountHint.Load()
+	t.Cleanup(func() {
+		sharedCoreHint.Store(savedHint)
+		sharedWorkerCountHint.Store(savedWorkerHint)
+	})
 	sharedCoreHint.Store(0)
+	sharedWorkerCountHint.Store(0)
 
 	handle, err := RunMultiCore(2, workerHintFreePort(t), func(app *App) {
 		panic("worker hint setup failed")
@@ -229,6 +276,9 @@ func TestRunMultiCoreSetupPanicResetsSharedCoreHint(t *testing.T) {
 	}
 	if got := sharedCoreHint.Load(); got != 0 {
 		t.Fatalf("sharedCoreHint after setup panic = %d, want 0", got)
+	}
+	if got := sharedWorkerCountHint.Load(); got != 0 {
+		t.Fatalf("sharedWorkerCountHint after setup panic = %d, want 0", got)
 	}
 }
 

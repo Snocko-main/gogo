@@ -231,24 +231,32 @@ Single-app mode (`NewApp` plus `Run`) has one uWS event loop. Raising
 does give async handlers, DB drivers, and background goroutines scheduler
 capacity.
 
-For `RunMultiCore`, choose an explicit worker count and pin `GOMAXPROCS` to the
-same value unless benchmarks show your workload needs a different split:
+For production defaults, set `GOMAXPROCS` as the process CPU budget and use
+the package-level `gogo.Run` helper. gogo derives default uWS loop and
+shared-dispatch worker counts from that budget:
 
 ```go
-cores := runtime.NumCPU()
-runtime.GOMAXPROCS(cores)
-
-handle, err := gogo.RunMultiCore(cores, 3000, func(app *gogo.App) {
+handle, err := gogo.Run(3000, func(app *gogo.App) {
 	// Register the same routes and middleware on every worker.
 })
 ```
 
-`gogo.SetWorkerCount(n)` controls the shared-dispatch `GetAsync` worker pool
-and must be called before the first `GetAsync` registration. The default is
-`ceil(1.5 × loop count)` (2 for a single `App`, 12 for `RunMultiCore(8)`) — it
-scales with loops, not `runtime.NumCPU()`, so it doesn't over-subscribe the
-loop threads. For IO-bound deployments that keep many async handlers blocked
-at once, raise it and measure.
+When tuning, keep `GOMAXPROCS` as the total Go scheduler budget and override
+gogo loop/worker counts independently:
+
+```go
+handle, err := gogo.RunWithOptions(3000, setup, gogo.RunOptions{
+	Cores:   2,
+	Workers: 4,
+})
+```
+
+`RunOptions.Workers` controls the exact shared-dispatch `GetAsync` worker
+count for that server run. Workers are created only when shared async routes
+are registered. For IO-bound deployments that keep many async handlers blocked
+at once, raise it and measure. `SetWorkerCount` remains available as a
+process-wide compatibility knob; prefer `RunOptions.Workers` for new
+multicore services.
 
 ### DB Pools
 
@@ -269,7 +277,7 @@ db.SetMaxIdleConns(10)
 db.SetConnMaxLifetime(time.Hour)
 db.SetConnMaxIdleTime(5 * time.Minute)
 
-handle, err := gogo.RunMultiCore(cores, 3000, func(app *gogo.App) {
+handle, err := gogo.Run(3000, func(app *gogo.App) {
 	app.GetAsync("/users/:id<int>", func(res *gogo.Response, req *gogo.Request) {
 		ctx, cancel := context.WithTimeout(req.Context(), 2*time.Second)
 		defer cancel()
@@ -416,7 +424,8 @@ your panic handler.
 - `TrustedProxies` lists immediate proxy peers, not arbitrary public clients.
 - Proxy body limits are no larger than `Config.BodyLimit`.
 - `ulimit -n` covers peak clients, WebSockets, DB sockets, and log files.
-- `GOMAXPROCS`, `RunMultiCore`, and `SetWorkerCount` are sized intentionally.
+- `GOMAXPROCS`, `RunOptions.Cores`, and `RunOptions.Workers` are sized
+  intentionally.
 - DB pool limits are multiplied across all replicas before comparing to the DB
   server limit.
 - `SetPanicHandler`, request logging, adapter error hooks, and abort handling

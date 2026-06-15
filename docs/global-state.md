@@ -23,11 +23,12 @@ found there.
   parallel execution unless the test owns the whole process state for its
   duration.
 
-## RunMultiCore Configuration Boundary
+## Multicore Configuration Boundary
 
-`RunMultiCore(n, port, setup)` currently creates each worker with `NewApp()`
-and the zero-value `Config`. It has no `Config` or options parameter, so these
-app-scoped fields cannot be supplied through the multicore helper today:
+`gogo.Run(port, setup)` is the recommended production entry point. It derives
+default loop and worker counts from `GOMAXPROCS`. `RunWithOptions` applies one
+`Config` to every worker, so these app-scoped fields can be supplied through
+the multicore path:
 
 - `BodyLimit`
 - `BodyReadTimeout`
@@ -37,12 +38,15 @@ app-scoped fields cannot be supplied through the multicore helper today:
 - `JSONEncoder`
 - `JSONDecoder`
 
+`RunMultiCore(n, port, setup)` and `RunMultiCoreWithOptions` remain low-level
+compatibility helpers with an explicit loop count and zero-value `Config`; use
+`RunWithOptions` with `Cores` when that shape also needs `Config`.
+
 Configuration that is process-wide by design, such as `SetWorkerCount`,
 `SetPanicHandler`, `RegisterParamType`, and the package-level limit setters
-below, should be applied before `RunMultiCore`. Route, middleware, WebSocket,
-hub, upload, and file-serving options should be registered inside `setup` so
-every worker receives the same routes and options. Use single-loop
-`NewApp(cfg)` + `Run` when an app-scoped `Config` field is required.
+below, should be applied before starting the server. Route, middleware,
+WebSocket, hub, upload, and file-serving options should be registered inside
+`setup` so every worker receives the same routes and options.
 
 ## Public Global Configuration
 
@@ -50,7 +54,7 @@ every worker receives the same routes and options. Use single-loop
 | --- | --- | --- | --- |
 | `SetPanicHandler(fn)` | Default handler prints the recovered value and stack to `stderr` | All framework recovery sites across HTTP handlers, async handlers, body callbacks, WebSocket callbacks, deferred callbacks, and the default WebSocket hub adapter error handler | Atomic pointer swap. Takes effect for future recovered panics immediately. Passing `nil` restores the default handler. Panics inside the handler are recovered silently. |
 | `RegisterParamType(name, check)` | Built-ins: `int`, `uint`, `uuid`, `alpha`, `alnum`, `slug` | Typed route parameter registry for the whole process | Protected by a mutex. Route registration captures the check function, so changes affect routes registered after the call; existing routes keep their previously captured checker. Re-registering any name, including a built-in, overwrites that registry entry for future routes. |
-| `SetWorkerCount(n)` | `0`, interpreted as `ceil(1.5 × loop count)` when workers start (scales with uWS loops, not `NumCPU`) | Native shared-dispatch worker pool used by shared async routes | Native builds only. Negative values are clamped to `0`. The value is read when a shared worker generation starts. Calls after workers are already running do not resize that generation; set it before the first shared async route is registered. |
+| `SetWorkerCount(n)` | `0`, interpreted from the active run's worker hint when workers start | Native shared-dispatch worker pool used by shared async routes | Native builds only. Prefer `RunOptions.Workers` for per-run tuning. Negative values are clamped to `0`. The value is read when a shared worker generation starts. Calls after workers are already running do not resize that generation; set it before the first shared async route is registered. |
 | `WaitForSharedWorkers(timeout)` | Not a setting | Native shared-dispatch worker generations | Observes worker drain state. It does not configure global state, but it is the public observation hook for the process-wide shared worker pool. Stub builds always return `true`. |
 
 `SetPanicHandler` is intentionally the supported panic-recovery configuration

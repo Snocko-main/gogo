@@ -282,6 +282,39 @@ func TestRunMultiCoreRejectsInvalidWorkerHintLoops(t *testing.T) {
 	}
 }
 
+func TestRunWithOptionsAppliesConfigToWorkers(t *testing.T) {
+	port := freePort(t)
+	handle, err := gogo.RunWithOptions(port, func(app *gogo.App) {
+		app.Get("/json", func(res *gogo.Response, req *gogo.Request) {
+			res.JSON(200, map[string]string{"default": "encoder"})
+		})
+	}, gogo.RunOptions{
+		Cores:   2,
+		Workers: 1,
+		Config: gogo.Config{
+			BindAddr: "127.0.0.1",
+			JSONEncoder: func(v any) ([]byte, error) {
+				return []byte(`{"custom":true}`), nil
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("RunWithOptions: %v", err)
+	}
+	defer func() {
+		handle.Shutdown()
+		handle.Wait()
+	}()
+
+	status, body := httpGet(t, port, "/json")
+	if status != 200 {
+		t.Fatalf("GET /json status = %d body = %q, want 200", status, body)
+	}
+	if body != `{"custom":true}` {
+		t.Fatalf("GET /json body = %q, want custom JSON encoder output", body)
+	}
+}
+
 func TestRunMultiCoreSetupPanicReturnsError(t *testing.T) {
 	port := freePort(t)
 	handle, err := gogo.RunMultiCore(2, port, func(app *gogo.App) {
