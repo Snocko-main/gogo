@@ -1,7 +1,7 @@
 // multicore demonstrates the full RunMultiCore production setup:
 //
-//   - N independent uWS event loops, one per vCPU (NumCPU by default),
-//     with accepted sockets round-robined across loops
+//   - N independent uWS event loops bound to the same port. The example
+//     starts conservatively and lets SO_REUSEPORT place accepted sockets.
 //   - Shared state (here: a counter; in real apps a *sql.DB pool)
 //     created ONCE before RunMultiCore and captured into the handlers
 //     so per-worker initialization stays cheap
@@ -18,16 +18,20 @@
 // Tuning knobs
 // ============
 //
-// GOMAXPROCS — defaults to NumCPU. For RunMultiCore workloads pin it
-// to the same number you pass as `n` so the runtime scheduler has
-// exactly as many Ps as event loops; pinning beyond that wastes
-// scheduling cycles, pinning below it starves loops.
+// GOGO_CORES — defaults to min(GOMAXPROCS, 2), not NumCPU. Start
+// with 1 or 2 loops and benchmark 1 / 2 / 4 on the target machine;
+// more loops are not automatically faster with SO_REUSEPORT.
+//
+// GOMAXPROCS — controls scheduler capacity for loop goroutines,
+// async workers, DB drivers, and background work. It may be larger
+// than GOGO_CORES for IO-heavy async apps.
 //
 // SetWorkerCount — controls the GetAsync worker-goroutine pool size.
-// Defaults to ceil(1.5 × loop count): it scales with the number of
-// loops, not NumCPU, so it doesn't over-subscribe the loop threads.
-// Trust the default for short async handlers; raise it for IO-bound
-// handlers that keep many requests blocked at once.
+// Default RunMultiCore reuseport mode uses the one-loop hint (2
+// workers) so async workers do not steal CPU when SO_REUSEPORT
+// concentrates connections on one listener. For IO-bound handlers,
+// set RunMultiCoreOptions.WorkerHintLoops or SetWorkerCount before
+// registering routes, then measure.
 //
 // Per-worker resources — wrap shared resources in plain Go state
 // captured into setup. The example below uses an atomic.Int64 for
@@ -44,11 +48,10 @@
 // same as App.ShutdownContext's single-app graceful drain. See
 // examples/graceful when in-flight requests must finish before exit.
 //
-// Pinning to CPUs — gogo doesn't pin loops to specific cores
-// today. With a `RunMultiCore(N=NumCPU)` config the kernel typically
-// keeps each loop on its initial CPU; if you need stricter pinning
-// run the server under `taskset -c 0-(N-1)` or wrap the
-// LockOSThread inside a sched_setaffinity call (Linux only).
+// Pinning to CPUs — gogo doesn't pin loops to specific cores today.
+// If you need stricter pinning, run the server under
+// `taskset -c 0-(N-1)` or wrap the LockOSThread inside a
+// sched_setaffinity call (Linux only).
 
 package main
 
@@ -66,13 +69,12 @@ import (
 )
 
 func main() {
-	cores := runtime.NumCPU()
+	cores := defaultCoreCount()
 	if env := os.Getenv("GOGO_CORES"); env != "" {
 		if n, err := fmt.Sscanf(env, "%d", &cores); err != nil || n != 1 || cores <= 0 {
 			log.Fatalf("GOGO_CORES must be a positive integer, got %q", env)
 		}
 	}
-	runtime.GOMAXPROCS(cores)
 
 	// Shared state lives outside setup so every worker captures the
 	// same pointers. Counters are atomic so the loop goroutines can
@@ -104,6 +106,17 @@ func main() {
 	handle.Wait()
 	log.Printf("stopped after %s, served %d requests",
 		time.Since(startedAt), stats.totalRequests.Load())
+}
+
+func defaultCoreCount() int {
+	procs := runtime.GOMAXPROCS(0)
+	if procs < 1 {
+		return 1
+	}
+	if procs > 2 {
+		return 2
+	}
+	return procs
 }
 
 // stats holds the per-process metrics surfaced by /metrics.

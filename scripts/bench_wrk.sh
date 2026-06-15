@@ -30,7 +30,9 @@
 #   FRAMEWORKS     subset to run                        (route-set default)
 #   MODES          subset to run                        (default "single multi")
 #   MULTI_WORKERS  server workers/processes for multi   (default min(NumCPU, 4))
-#   GOGO_WORKERS   shared-dispatch workers for gogo     (default 0 = NumCPU)
+#   GOGO_WORKERS   exact shared-dispatch workers for gogo (default 0 = auto)
+#   GOGO_WORKER_HINT_LOOPS
+#                  loop-count hint for gogo async workers (default mode auto)
 #   WARMUP         seconds of warmup hits before timing (default 2)
 #   RESULTS_DIR    where to write logs                  (default benchmark/results)
 #

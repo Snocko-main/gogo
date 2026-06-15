@@ -1818,14 +1818,17 @@ the server can use more than one loop. By default, gogo uses the low-overhead
 
 ```go
 func main() {
-    runtime.GOMAXPROCS(runtime.NumCPU())
+    // Let the Go runtime keep its scheduler budget (or set GOMAXPROCS
+    // explicitly in your process manager), then start with a conservative
+    // number of uWS loops. Benchmark 1, 2, and 4 loops for your workload.
+    cores := min(runtime.GOMAXPROCS(0), 2)
 
     // Shared resources — create ONCE outside setup so every worker captures
     // the same pointers.
     db := mustOpenDB()
     defer db.Close()
 
-    handle, err := gogo.RunMultiCore(runtime.NumCPU(), 3000, func(app *gogo.App) {
+    handle, err := gogo.RunMultiCore(cores, 3000, func(app *gogo.App) {
         app.Get("/plain", func(res *gogo.Response, req *gogo.Request) {
             res.Send(200, "text/plain", "ok")
         })
@@ -1851,7 +1854,7 @@ func main() {
 When you need deterministic per-loop connection placement, use balanced mode:
 
 ```go
-handle, err := gogo.RunMultiCoreWithOptions(runtime.NumCPU(), 3000, setup,
+handle, err := gogo.RunMultiCoreWithOptions(cores, 3000, setup,
     gogo.RunMultiCoreOptions{Mode: gogo.MultiCoreBalanced})
 ```
 
@@ -1865,10 +1868,10 @@ evenly and your async routes are IO-bound, keep reuseport mode and raise only
 the default async worker hint:
 
 ```go
-handle, err := gogo.RunMultiCoreWithOptions(runtime.NumCPU(), 3000, setup,
+handle, err := gogo.RunMultiCoreWithOptions(cores, 3000, setup,
     gogo.RunMultiCoreOptions{
         Mode:            gogo.MultiCoreReusePort,
-        WorkerHintLoops: runtime.NumCPU(),
+        WorkerHintLoops: cores,
     })
 ```
 
@@ -1889,7 +1892,14 @@ graceful drain behavior.
 
 Tuning knobs that actually matter:
 
-- `GOMAXPROCS` — pin to the same N you passed to `RunMultiCore`.
+- `RunMultiCore` loop count — do not blindly pass `runtime.NumCPU()`. Start
+  with 1 or 2 loops, then benchmark 1 / 2 / 4 on the target machine. More
+  loops can lower throughput when `SO_REUSEPORT` concentrates connections or
+  when extra loops compete with async workers, DB drivers, and the load
+  generator.
+- `GOMAXPROCS` — controls Go scheduler capacity for loop goroutines, async
+  workers, DB drivers, and background work. It may be larger than the
+  `RunMultiCore` loop count for IO-heavy async apps.
 - `gogo.SetWorkerCount(n)` — controls the `GetAsync` worker pool. Default
   is `ceil(1.5 × worker-hint loops)`. A single `App` and default
   `RunMultiCore` reuseport mode use the one-loop default (2 workers) so async

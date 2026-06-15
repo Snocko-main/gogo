@@ -26,13 +26,18 @@ RESULTS_DIR="benchmark/results/v07-http-$(date -u +%Y%m%dT%H%M%SZ)" \
 
 The `v07-http` route set runs `gogo`, `fiber`, and `nethttp` only. That keeps
 the new middleware route comparable without changing the Node, Bun, or Actix
-benchmark servers.
+benchmark servers. For gogo multicore measurements, sweep `MULTI_WORKERS=1`,
+`2`, and `4` instead of assuming `runtime.NumCPU()` is the best loop count.
+The harness uses `MULTI_WORKERS` as both `GOGO_CORES` and `GOMAXPROCS`; for
+manual tuning outside the harness, it is often useful to keep `GOMAXPROCS`
+larger than `GOGO_CORES` so async workers and DB drivers have scheduler
+capacity.
 
 For gogo, `GOGO_WORKERS` can override the shared-dispatch worker count. The
-default value `0` keeps gogo's runtime default of `ceil(1.5 × loop count)` —
-it scales with the number of uWS loops, not `NumCPU`, so a single-loop run on
-a many-core box does not over-subscribe the loop thread. Raise it for
-heavily blocking async work.
+default value `0` keeps gogo's runtime default. A single App and default
+RunMultiCore reuseport mode use the one-loop worker hint; balanced mode uses
+the full loop count. Use `GOGO_WORKER_HINT_LOOPS` or `GOGO_WORKERS` for
+heavily blocking async work, then measure.
 
 Covered GET workloads:
 

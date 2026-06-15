@@ -231,24 +231,31 @@ Single-app mode (`NewApp` plus `Run`) has one uWS event loop. Raising
 does give async handlers, DB drivers, and background goroutines scheduler
 capacity.
 
-For `RunMultiCore`, choose an explicit worker count and pin `GOMAXPROCS` to the
-same value unless benchmarks show your workload needs a different split:
+For `RunMultiCore`, choose an explicit loop count. Do not default to
+`runtime.NumCPU()` just because the machine has that many CPUs; with
+`SO_REUSEPORT`, extra loops can lower throughput when the kernel concentrates
+connections or when the loops compete with async workers and database drivers.
+Start conservatively, then benchmark 1 / 2 / 4 loops on the target machine:
 
 ```go
-cores := runtime.NumCPU()
-runtime.GOMAXPROCS(cores)
+cores := min(runtime.GOMAXPROCS(0), 2)
 
 handle, err := gogo.RunMultiCore(cores, 3000, func(app *gogo.App) {
 	// Register the same routes and middleware on every worker.
 })
 ```
 
+Keep `GOMAXPROCS` as a separate process-level scheduler budget. It may be
+larger than the `RunMultiCore` loop count for IO-heavy async apps, for example
+`GOMAXPROCS=4` with two gogo loops and async workers doing DB or network work.
+
 `gogo.SetWorkerCount(n)` controls the shared-dispatch `GetAsync` worker pool
 and must be called before the first `GetAsync` registration. The default is
-`ceil(1.5 × loop count)` (2 for a single `App`, 12 for `RunMultiCore(8)`) — it
-scales with loops, not `runtime.NumCPU()`, so it doesn't over-subscribe the
-loop threads. For IO-bound deployments that keep many async handlers blocked
-at once, raise it and measure.
+`ceil(1.5 × worker-hint loops)`. Default `RunMultiCore` reuseport mode uses the
+one-loop hint so async workers do not steal CPU when the kernel places many
+connections on one listener. For IO-bound deployments that keep many async
+handlers blocked at once, use `RunMultiCoreOptions.WorkerHintLoops` or
+`SetWorkerCount`, then measure.
 
 ### DB Pools
 

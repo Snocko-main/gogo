@@ -182,9 +182,11 @@
 //
 // Single-loop mode (NewApp + Run) caps throughput at one OS thread —
 // uWebSockets is event-loop driven, not goroutine-per-request. To
-// run multiple event loops, use RunMultiCore:
+// run multiple event loops, choose an explicit loop count and use
+// RunMultiCore:
 //
-//	handle, err := gogo.RunMultiCore(runtime.NumCPU(), 3000, func(app *gogo.App) {
+//	cores := min(runtime.GOMAXPROCS(0), 2) // benchmark 1, 2, and 4
+//	handle, err := gogo.RunMultiCore(cores, 3000, func(app *gogo.App) {
 //	    app.Get("/plain", plainHandler)
 //	    // … same routes / middleware as a single-loop app …
 //	})
@@ -195,9 +197,11 @@
 //	handle.Wait()
 //
 // RunMultiCore spawns N independent App instances, each bound to the
-// same port. The default mode lets the kernel distribute accepted
-// sockets with SO_REUSEPORT, which avoids cross-loop socket handoff
-// overhead. If you need predictable per-loop connection placement,
+// same port. Do not assume runtime.NumCPU() is the best N: start with
+// one or two loops and benchmark the target workload. The default mode
+// lets the kernel distribute accepted sockets with SO_REUSEPORT, which
+// avoids cross-loop socket handoff overhead. If you need predictable
+// per-loop connection placement,
 // use RunMultiCoreWithOptions with MultiCoreBalanced; that mode
 // round-robins accepted sockets across App loops at extra accept-path
 // cost. If SO_REUSEPORT distributes well in your production
@@ -220,9 +224,13 @@
 //
 // Tuning knobs that actually matter:
 //
-//   - GOMAXPROCS — pin to the same N you passed to RunMultiCore. The
-//     scheduler then has exactly one P per loop; oversubscribing
-//     wastes context-switch budget, undersubscribing starves loops.
+//   - RunMultiCore loop count — start with 1 or 2 loops and benchmark
+//     1 / 2 / 4 on the target machine. More loops can lower throughput
+//     when SO_REUSEPORT concentrates connections or when extra loops
+//     compete with async workers, DB drivers, and the load generator.
+//   - GOMAXPROCS — controls Go scheduler capacity for loop goroutines,
+//     async workers, DB drivers, and background work. It may be larger
+//     than the RunMultiCore loop count for IO-heavy async apps.
 //   - SetWorkerCount — controls the GetAsync worker-goroutine pool.
 //     Default = ceil(1.5 × worker-hint loops). A single App and
 //     default RunMultiCore reuseport mode use the one-loop default so
